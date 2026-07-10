@@ -21,6 +21,11 @@ path = "src/bin/cst-server.rs"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+# `process` (absent des features runtime) sert au test d'integration live qui
+# pilote un vrai `codex exec` contre le serveur MCP du salon.
+tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "time"] }
+
 [dependencies]
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -40,3 +45,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [patch.crates-io]
 tauri-utils = { path = "vendor/tauri-utils-2.9.3" }
+portable-pty = { path = "vendor/portable-pty-0.9.0" }

@@ -2456,6 +2456,37 @@ body {
   min-width: 160px;
 }
 
+/* Selecteur de compte cible, toujours visible dans chaque ligne de discussion. */
+.discussion-account {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #8f8878;
+}
+
+.discussion-account svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.discussion-account .discussion-target {
+  min-width: 150px;
+  max-width: 220px;
+}
+
+@media (max-width: 720px) {
+  .discussion-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .discussion-actions {
+    flex-wrap: wrap;
+  }
+  .discussion-account .discussion-target {
+    min-width: 120px;
+  }
+}
+
 /* Historique des demandes (recherche globale des messages utilisateur) */
 #promptList {
   gap: 8px;
@@ -2530,4 +2561,166 @@ body {
   font-size: 12px;
   color: #8f8878;
   padding: 8px;
+}
+
+/* --- Salon d'agents (Agent Room) --- */
+.room-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  padding: 16px;
+  gap: 14px;
+  overflow: hidden;
+}
+.room-panel .panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.room-panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.room-panel .panel-sub {
+  margin: 4px 0 0;
+  color: #a9a291;
+  font-size: 12px;
+}
+.room-panel .panel-actions {
+  display: flex;
+  gap: 8px;
+}
+.room-hint {
+  padding: 10px 12px;
+  border: 1px dashed #403a31;
+  border-radius: 8px;
+  color: #a9a291;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.room-hint code {
+  background: #27241e;
+  border: 1px solid #302e29;
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: #e8e1d2;
+}
+.room-grid {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 14px;
+  min-height: 0;
+  flex: 1;
+}
+.room-agents {
+  border: 1px solid #302e29;
+  border-radius: 10px;
+  background: #1f1d19;
+  padding: 10px;
+  overflow-y: auto;
+}
+.room-agent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 6px;
+  border-bottom: 1px solid #26241f;
+}
+.room-agent:last-child {
+  border-bottom: 0;
+}
+.room-agent-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.room-agent-main strong {
+  font-size: 13px;
+}
+.room-agent-main small {
+  color: #a9a291;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.room-main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 10px;
+}
+.room-feed {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid #302e29;
+  border-radius: 10px;
+  background: #1a1815;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.room-msg {
+  border: 1px solid #302e29;
+  border-radius: 8px;
+  background: #211f1b;
+  padding: 8px 10px;
+  max-width: 80%;
+  align-self: flex-start;
+}
+.room-msg.dm {
+  border-color: #6a5a2f;
+  background: #241f16;
+}
+.room-msg.system {
+  align-self: center;
+  background: transparent;
+  border: 0;
+  color: #8a8375;
+  font-size: 11px;
+  padding: 2px;
+  max-width: 100%;
+}
+.room-msg-head {
+  font-size: 12px;
+  color: #cbb98c;
+  margin-bottom: 3px;
+}
+.room-msg-body {
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.room-tag {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #e8c98a;
+  border: 1px solid #6a5a2f;
+  border-radius: 999px;
+  padding: 0 6px;
+  margin-left: 4px;
+}
+.room-composer {
+  display: flex;
+  gap: 8px;
+}
+.room-composer #roomText {
+  flex: 1;
+  min-width: 0;
+  background: #1f1d19;
+  border: 1px solid #38342c;
+  border-radius: 8px;
+  color: #e8e1d2;
+  padding: 9px 11px;
+}
+.room-composer #roomText:focus {
+  outline: none;
+  border-color: #6a5a2f;
+}
+.room-composer #roomTarget {
+  max-width: 180px;
 }

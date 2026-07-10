@@ -28,6 +28,12 @@ type RemoteNodeHealth = {
   activeTerminals: number;
   capacity: number;
   startedAt: number;
+  // Champs ajoutes par le serveur self-updating. Optionnels : un ancien noeud
+  // (avant cette version) ne les renvoie pas -> traite comme non draine / pret.
+  version?: string;
+  commit?: string;
+  ready?: boolean;
+  draining?: boolean;
 };
 
 type RemoteTerminalRoute = {
@@ -253,7 +259,7 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
     case "launch_ide":
       throw new Error("Le lancement d'IDE local n'est pas disponible en mode SaaS.");
     case "list_discussions":
-      return { generatedAt: Math.floor(Date.now() / 1000), totalDiscussions: 0, accounts: [] } as T;
+      return api<T>("GET", "/api/discussions");
     case "list_prompt_history":
       return {
         generatedAt: Math.floor(Date.now() / 1000),
@@ -263,9 +269,38 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         prompts: [],
       } as T;
     case "claim_session_for_terminal":
+      return api<T>("POST", "/api/discussions/claim", {
+        accountId: args.accountId,
+        afterUnix: args.afterUnix,
+        excludeSessionIds: args.excludeSessionIds ?? [],
+        matchSessionId: args.matchSessionId ?? null,
+      });
     case "copy_discussion_to_account":
+      return api<T>("POST", "/api/discussions/copy", {
+        sessionId: args.sessionId,
+        sourceAccountId: args.sourceAccountId,
+        targetAccountId: args.targetAccountId,
+      });
     case "delete_discussion":
-      return undefined as T;
+      return api<T>("POST", "/api/discussions/delete", {
+        accountId: args.accountId,
+        sessionId: args.sessionId,
+        archive: args.archive,
+      });
+    case "room_status":
+      return api<T>("GET", "/api/room/status");
+    case "room_messages":
+      return api<T>(
+        "GET",
+        `/api/room/messages${args.since ? `?since=${encodeURIComponent(args.since)}` : ""}`,
+      );
+    case "room_send":
+      return api<T>("POST", "/api/room/send", { text: args.text, to: args.to ?? null });
+    // En SaaS le salon est toujours actif (monte dans le serveur) : enable/disable
+    // cote client sont des no-op qui renvoient l'etat courant.
+    case "room_enable":
+    case "room_disable":
+      return api<T>("GET", "/api/room/status");
     default:
       throw new Error(`Commande remote non supportee: ${command}`);
   }
@@ -388,7 +423,14 @@ async function terminalNodeCandidates() {
             label: health.nodeLabel || node.label,
           },
           score: (health.activeTerminals || 0) / capacity + node.priority / 100,
-          healthy: health.ok !== false,
+          // Un noeud en drain ou non pret (mise a jour en cours) sort du tier
+          // "healthy" et retombe en fallback : on ne lui envoie de NOUVEAUX
+          // terminaux qu'en dernier recours. Retro-compatible : champs absents
+          // sur un ancien noeud -> considere pret et non draine.
+          healthy:
+            health.ok !== false &&
+            health.draining !== true &&
+            health.ready !== false,
         };
       } catch {
         return {
@@ -477,9 +519,15 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
     } else if (message.type === "error") {
       emit("pty-data", { id: message.id, data: `\r\n${message.message}\r\n` });
     } else if (message.type === "status") {
+      // Le message WS "status" peut arriver en camelCase (workspacePath) ou en
+      // snake_case (workspace_path) selon la version du noeud : on tolere les
+      // deux pour ne pas afficher "undefined" (utile aussi pendant une mise a
+      // jour rolling ou d'anciens et nouveaux noeuds coexistent).
+      const workspacePath =
+        message.workspacePath ?? (message as unknown as { workspace_path?: string }).workspace_path ?? "";
       emit("pty-data", {
         id: message.id,
-        data: `\r\n[Workspace] ${message.workspacePath}\r\n`,
+        data: `\r\n[Workspace] ${workspacePath}\r\n`,
       });
     }
   });

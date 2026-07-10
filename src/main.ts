@@ -42,6 +42,7 @@ import {
   Copy,
   MessagesSquare,
   Search,
+  Send,
   createIcons,
 } from "lucide";
 import "@xterm/xterm/css/xterm.css";
@@ -55,6 +56,9 @@ type AccountProfile = {
   proxyId?: string | null;
   startupCommand?: string | null;
   limits?: AccountLimitTracking;
+  // Bypass Codex par compte (defaut ON). Absent des configs anterieures : on
+  // retombe alors sur le defaut global `codexBypass`, puis `true`.
+  bypass?: boolean;
 };
 
 type AccountLimitTracking = {
@@ -106,6 +110,12 @@ type KombaiStatus = {
   message?: string | null;
 };
 
+type AgentRoomConfig = {
+  enabled: boolean;
+  port: number;
+  secret: string;
+};
+
 type AppSettings = {
   accounts: AccountProfile[];
   proxies: ProxyProfile[];
@@ -118,8 +128,42 @@ type AppSettings = {
   agents: AgentProfile[];
   activeAgentId?: string | null;
   kombai: KombaiConfig;
+  agentRoom: AgentRoomConfig;
   codexBypass: boolean;
   autoDiscoverAccounts: boolean;
+};
+
+type RoomAgent = {
+  ident: string;
+  agentId: string;
+  accountId: string;
+  label: string;
+  cwd?: string | null;
+  present: boolean;
+  joinedAt: number;
+  lastSeen: number;
+};
+
+type RoomMessage = {
+  id: number;
+  ts: number;
+  from: string;
+  fromLabel: string;
+  to?: string | null;
+  kind: "room" | "dm" | "system";
+  text: string;
+};
+
+type RoomStatus = {
+  running: boolean;
+  port: number;
+  url: string;
+  snapshot: {
+    agents: RoomAgent[];
+    present: number;
+    totalMessages: number;
+    cursor: number;
+  };
 };
 
 type PoolConfig = {
@@ -303,10 +347,25 @@ type PersistedTerminalState = {
   terminals: PersistedTerminalRecord[];
 };
 
-type AppView = "terminal" | "pool" | "limits" | "dashboard" | "kombai" | "discussions" | "history";
+type AppView =
+  | "terminal"
+  | "pool"
+  | "limits"
+  | "dashboard"
+  | "kombai"
+  | "discussions"
+  | "history"
+  | "room";
 
 type DiscussionSummary = {
+  // Identite LOGIQUE de la conversation (stable a travers les reprises/forks).
+  // Sert de cle de regroupement et de suppression.
   sessionId: string;
+  // Identite du fichier rollout HEAD (le plus recent). Cible de `codex resume`
+  // et de la copie vers un autre compte.
+  rolloutId: string;
+  // Nombre de fichiers rollout regroupes sous ce sessionId (>1 = repris).
+  forkCount: number;
   accountId: string;
   accountLabel: string;
   codexHome: string;
@@ -399,11 +458,20 @@ let discussions: DiscussionsView | null = null;
 let discussionsLoaded = false;
 let discussionsPoll: number | null = null;
 let discussionSearch = "";
-let discussionAccountPicker: string | null = null;
+// Compte cible choisi par discussion (sessionId -> accountId). Defaut : le
+// compte d'origine. Persiste entre les re-rendus (poll 60s) pour ne pas perdre
+// le choix en cours.
+const discussionTargetSel = new Map<string, string>();
 let discussionBusyId: string | null = null;
 let promptHistory: PromptHistoryView | null = null;
 let promptHistoryLoaded = false;
 let promptSearch = "";
+let roomStatus: RoomStatus | null = null;
+let roomMessages: RoomMessage[] = [];
+let roomPoll: number | null = null;
+// Destinataire choisi dans le composer : "" = diffusion salon, sinon ident d'un
+// agent (DM). Conserve entre les rendus complets.
+let roomComposeTarget = "";
 
 const lucideIcons = {
   AppWindow,
@@ -435,6 +503,7 @@ const lucideIcons = {
   Copy,
   MessagesSquare,
   Search,
+  Send,
 };
 
 const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v2";
@@ -502,8 +571,10 @@ const persistTerminalSessions = () => {
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const isPlausibleSessionId = (id: string | null | undefined): id is string => !!id && UUID_RE.test(id);
 
-// Le flag bypass Codex est global et doit preceder le sous-commande `resume`.
-const buildResumeCommand = (id: string) => `${agentRunCommand(agentById(codexAgentId()))} resume ${id}`;
+// Le flag bypass Codex depend du compte et doit preceder la sous-commande
+// `resume`. On passe le compte cible pour respecter son reglage bypass.
+const buildResumeCommand = (id: string, account: AccountProfile | null | undefined = null) =>
+  `${agentRunCommand(agentById(codexAgentId()), account)} resume ${id}`;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const SESSION_CAPTURE_DELAYS_MS = [1200, 2000, 3000, 4500, 7000, 10000];
@@ -594,6 +665,9 @@ const newTerminalAccount = () =>
 const agentById = (id: string | null | undefined) =>
   settings?.agents.find((agent) => agent.id === id) ?? null;
 
+const accountById = (id: string | null | undefined) =>
+  settings?.accounts.find((account) => account.id === id) ?? null;
+
 const activeAgent = () => agentById(settings?.activeAgentId) ?? settings?.agents[0] ?? null;
 
 const newTerminalAgent = () => agentById(newTerminalAgentId) ?? activeAgent();
@@ -614,12 +688,20 @@ const isCodexAgent = (agent: AgentProfile | null | undefined) =>
 
 const CODEX_BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 
+// Le bypass est un reglage PAR COMPTE (defaut ON). Un compte sans champ `bypass`
+// (config anterieure) retombe sur le defaut global `codexBypass`, puis `true`.
+const accountBypassEnabled = (account: AccountProfile | null | undefined) =>
+  account?.bypass ?? settings?.codexBypass ?? true;
+
 // Commande a taper dans le PTY pour lancer un agent. Pour Codex, ajoute le flag
-// bypass quand le reglage `codexBypass` est actif (defaut), sauf s'il est deja
+// bypass quand le compte concerne l'a active (defaut), sauf s'il est deja
 // present dans une commande personnalisee.
-const agentRunCommand = (agent: AgentProfile | null | undefined) => {
+const agentRunCommand = (
+  agent: AgentProfile | null | undefined,
+  account: AccountProfile | null | undefined = null,
+) => {
   const base = agentCommand(agent);
-  if (isCodexAgent(agent) && (settings?.codexBypass ?? true) && !base.includes(CODEX_BYPASS_FLAG)) {
+  if (isCodexAgent(agent) && accountBypassEnabled(account) && !base.includes(CODEX_BYPASS_FLAG)) {
     return `${base} ${CODEX_BYPASS_FLAG}`;
   }
   return base;
@@ -785,6 +867,200 @@ const stopPoolPoll = () => {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Salon d'agents (Agent Room)
+// ---------------------------------------------------------------------------
+
+const roomPresentAgents = (): RoomAgent[] =>
+  roomStatus?.snapshot.agents.filter((agent) => agent.present) ?? [];
+
+const roomAgentLabel = (ident: string): string => {
+  if (ident === "operator") return "Opérateur";
+  return roomStatus?.snapshot.agents.find((agent) => agent.ident === ident)?.label ?? ident;
+};
+
+const renderRoomAgentsInner = (): string => {
+  const agents = roomPresentAgents();
+  if (!agents.length) return `<div class="empty">Aucun agent présent</div>`;
+  return agents
+    .map(
+      (agent) => `
+        <div class="room-agent">
+          <span class="live-dot on"></span>
+          <div class="room-agent-main">
+            <strong>${escapeHtml(agent.label)}</strong>
+            <small>${escapeHtml(agent.ident)}${agent.cwd ? ` · ${escapeHtml(agent.cwd)}` : ""}</small>
+          </div>
+        </div>`,
+    )
+    .join("");
+};
+
+const renderRoomFeedInner = (): string => {
+  if (!roomMessages.length) return `<div class="empty">Aucun message pour l'instant</div>`;
+  return roomMessages
+    .map((message) => {
+      if (message.kind === "system") {
+        return `<div class="room-msg system"><em>${escapeHtml(message.text)}</em></div>`;
+      }
+      const target = message.to ? ` → ${escapeHtml(roomAgentLabel(message.to))}` : "";
+      const tag = message.kind === "dm" ? ` <span class="room-tag">privé</span>` : "";
+      return `
+        <div class="room-msg ${message.kind}">
+          <div class="room-msg-head"><strong>${escapeHtml(message.fromLabel)}</strong>${target}${tag}</div>
+          <div class="room-msg-body">${escapeHtml(message.text)}</div>
+        </div>`;
+    })
+    .join("");
+};
+
+const roomTargetOptions = (): string =>
+  roomPresentAgents()
+    .map(
+      (agent) =>
+        `<option value="${escapeAttr(agent.ident)}" ${agent.ident === roomComposeTarget ? "selected" : ""}>${escapeHtml(agent.label)} (privé)</option>`,
+    )
+    .join("");
+
+const renderRoomPanel = (): string => {
+  const enabled = settings?.agentRoom?.enabled ?? false;
+  const running = roomStatus?.running ?? false;
+  const present = roomStatus?.snapshot.present ?? 0;
+  const sub = enabled
+    ? `${running ? `Actif · ${escapeHtml(roomStatus?.url ?? "")}` : "Serveur arrêté"} · ${present} agent(s) présent(s)`
+    : "Désactivé";
+  return `
+    <div class="panel room-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Salon d'agents</h2>
+          <p class="panel-sub">${sub}</p>
+        </div>
+        <div class="panel-actions">
+          <button id="roomRefresh" class="icon-button wide" title="Rafraîchir"><i data-lucide="refresh-ccw"></i></button>
+          <button id="roomToggleEnabled" class="tool-button ${enabled ? "primary" : ""}" title="${enabled ? "Désactiver le salon" : "Activer le salon"}">
+            <i data-lucide="power"></i><span>${enabled ? "Activé" : "Désactivé"}</span>
+          </button>
+        </div>
+      </div>
+      ${
+        enabled
+          ? ""
+          : `<div class="room-hint">Active le salon pour que les agents Codex se voient et se parlent (outils MCP <code>list_agents</code>, <code>send_message</code>, <code>read_messages</code>). L'app ajoute une entrée <code>agent_room</code> dans le <code>config.toml</code> de chaque compte au lancement d'un terminal — réversible à la désactivation.</div>`
+      }
+      <div class="room-grid">
+        <aside class="room-agents">
+          <div class="section-row"><span>Présents</span></div>
+          <div id="roomAgents">${renderRoomAgentsInner()}</div>
+        </aside>
+        <div class="room-main">
+          <div id="roomFeed" class="room-feed">${renderRoomFeedInner()}</div>
+          <form id="roomComposer" class="room-composer">
+            <select id="roomTarget" class="agent-select" title="Destinataire" aria-label="Destinataire">
+              <option value="">Salon (tous)</option>
+              ${roomTargetOptions()}
+            </select>
+            <input id="roomText" type="text" placeholder="Message en tant qu'opérateur…" autocomplete="off" />
+            <button type="submit" class="tool-button primary" title="Envoyer"><i data-lucide="send"></i><span>Envoyer</span></button>
+          </form>
+        </div>
+      </div>
+    </div>`;
+};
+
+const syncRoomTargetOptions = () => {
+  const select = document.querySelector<HTMLSelectElement>("#roomTarget");
+  if (!select) return;
+  // Ne reconstruit que si le nombre d'agents a change (evite de casser une
+  // selection en cours d'ouverture a chaque poll).
+  if (select.options.length - 1 === roomPresentAgents().length) return;
+  const current = select.value;
+  select.innerHTML = `<option value="">Salon (tous)</option>${roomTargetOptions()}`;
+  select.value = current;
+};
+
+const refreshRoom = async () => {
+  try {
+    roomStatus = await invoke<RoomStatus>("room_status");
+  } catch {
+    return;
+  }
+  try {
+    const result = await invoke<{ messages: RoomMessage[]; cursor: number }>("room_messages", {
+      since: 0,
+    });
+    roomMessages = result.messages ?? [];
+  } catch {
+    // le fil reste tel quel
+  }
+  if (activeView !== "room") return;
+  const agentsEl = document.querySelector<HTMLDivElement>("#roomAgents");
+  const feedEl = document.querySelector<HTMLDivElement>("#roomFeed");
+  if (agentsEl && feedEl) {
+    const atBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 40;
+    agentsEl.innerHTML = renderRoomAgentsInner();
+    feedEl.innerHTML = renderRoomFeedInner();
+    syncRoomTargetOptions();
+    createIcons({ icons: lucideIcons });
+    if (atBottom) feedEl.scrollTop = feedEl.scrollHeight;
+  } else {
+    render();
+  }
+};
+
+const startRoomPoll = () => {
+  stopRoomPoll();
+  roomPoll = window.setInterval(() => void refreshRoom(), 2000);
+};
+
+const stopRoomPoll = () => {
+  if (roomPoll !== null) {
+    clearInterval(roomPoll);
+    roomPoll = null;
+  }
+};
+
+const enableRoom = async () => {
+  try {
+    await invoke("room_enable", {});
+    if (settings) settings.agentRoom.enabled = true;
+    statusText = "Salon activé";
+  } catch (error) {
+    statusText = String(error);
+  }
+  await refreshRoom();
+  render();
+};
+
+const disableRoom = async () => {
+  try {
+    await invoke("room_disable");
+    if (settings) settings.agentRoom.enabled = false;
+    statusText = "Salon désactivé";
+  } catch (error) {
+    statusText = String(error);
+  }
+  await refreshRoom();
+  render();
+};
+
+const sendRoomMessage = async () => {
+  const input = document.querySelector<HTMLInputElement>("#roomText");
+  const target = document.querySelector<HTMLSelectElement>("#roomTarget");
+  const text = input?.value.trim() ?? "";
+  if (!text) return;
+  const to = target?.value || null;
+  try {
+    await invoke("room_send", { text, to });
+    if (input) input.value = "";
+  } catch (error) {
+    statusText = String(error);
+    render();
+    return;
+  }
+  await refreshRoom();
+};
+
 const removeAccount = async (id: string | null) => {
   if (!settings || !id) return;
   const account = settings.accounts.find((candidate) => candidate.id === id);
@@ -824,12 +1100,20 @@ const setActiveView = (view: AppView) => {
               ? "Vue discussions"
               : activeView === "history"
                 ? "Vue historique"
-                : "Vue terminal";
+                : activeView === "room"
+                  ? "Vue salon"
+                  : "Vue terminal";
 
   if (activeView === "limits") {
     startLimitPoll();
   } else {
     stopLimitPoll();
+  }
+
+  if (activeView === "room") {
+    startRoomPoll();
+  } else {
+    stopRoomPoll();
   }
 
   if (activeView === "dashboard") {
@@ -861,6 +1145,7 @@ const setActiveView = (view: AppView) => {
   if (activeView === "kombai") void refreshKombaiStatus();
   if (activeView === "discussions") void refreshDiscussions();
   if (activeView === "history" && !promptHistoryLoaded) void refreshPromptHistory();
+  if (activeView === "room") void refreshRoom();
 };
 
 const refreshLimitStatus = async () => {
@@ -1042,15 +1327,19 @@ const resumeSessionInTerminal = async (accountId: string, sessionId: string) => 
   await createNewTerminal(
     accountId,
     true,
-    buildResumeCommand(sessionId),
+    buildResumeCommand(sessionId, accountById(accountId)),
     codexAgentId(),
     sessionId,
   );
 };
 
+// Reprise dans le compte D'ORIGINE : on relance le fichier rollout HEAD (le
+// plus recent de la chaine) via son `rolloutId`, non ambigu.
 const resumeDiscussion = (discussion: DiscussionSummary) =>
-  resumeSessionInTerminal(discussion.accountId, discussion.sessionId);
+  resumeSessionInTerminal(discussion.accountId, discussion.rolloutId || discussion.sessionId);
 
+// Reprise dans un AUTRE compte : on copie le rollout HEAD vers le compte cible
+// (nouvel uuid) puis on le reprend la-bas. La source reste intacte.
 const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccountId: string) => {
   if (!settings || !targetAccountId || targetAccountId === discussion.accountId) return;
   if (!settings.accounts.some((account) => account.id === targetAccountId)) return;
@@ -1058,13 +1347,13 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
   render();
   try {
     const copied = await invoke<DiscussionSummary>("copy_discussion_to_account", {
-      sessionId: discussion.sessionId,
+      sessionId: discussion.rolloutId || discussion.sessionId,
       sourceAccountId: discussion.accountId,
       targetAccountId,
     });
-    discussionAccountPicker = null;
     discussionBusyId = null;
-    if (!isPlausibleSessionId(copied.sessionId)) {
+    const resumeId = copied.rolloutId || copied.sessionId;
+    if (!isPlausibleSessionId(resumeId)) {
       statusText = "Copie effectuee mais identifiant invalide";
       await refreshDiscussions();
       return;
@@ -1077,9 +1366,9 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
     await createNewTerminal(
       targetAccountId,
       true,
-      buildResumeCommand(copied.sessionId),
+      buildResumeCommand(resumeId, accountById(targetAccountId)),
       codexAgentId(),
-      copied.sessionId,
+      resumeId,
     );
     void refreshDiscussions();
   } catch (error) {
@@ -1090,19 +1379,25 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
 };
 
 const deleteDiscussion = async (discussion: DiscussionSummary) => {
+  const forkNote =
+    discussion.forkCount > 1
+      ? `\n\n${discussion.forkCount} fichiers (reprises incluses) seront archives.`
+      : "";
   const confirmed = window.confirm(
-    `Retirer cette discussion de l'historique ?\n\n${discussion.title || discussion.sessionId}\n\nLe fichier est deplace dans sessions-archive (recuperable), pas supprime definitivement.`,
+    `Retirer cette discussion de l'historique ?\n\n${discussion.title || discussion.sessionId}${forkNote}\n\nLes fichiers sont deplaces dans sessions-archive (recuperables), pas supprimes definitivement.`,
   );
   if (!confirmed) return;
   discussionBusyId = discussion.sessionId;
   render();
   try {
-    await invoke("delete_discussion", {
+    const result = await invoke<{ count?: number }>("delete_discussion", {
       accountId: discussion.accountId,
       sessionId: discussion.sessionId,
       archive: true,
     });
-    statusText = "Discussion archivee";
+    discussionTargetSel.delete(discussion.sessionId);
+    const count = result?.count ?? 1;
+    statusText = count > 1 ? `Discussion archivee (${count} fichiers)` : "Discussion archivee";
   } catch (error) {
     statusText = String(error);
   }
@@ -1110,10 +1405,19 @@ const deleteDiscussion = async (discussion: DiscussionSummary) => {
   await refreshDiscussions();
 };
 
+// Compte cible retenu pour une discussion (defaut = compte d'origine, borne
+// aux comptes existants pour rester valide meme si la liste a change).
+const discussionTargetFor = (discussion: DiscussionSummary): string => {
+  const stored = discussionTargetSel.get(discussion.sessionId);
+  if (stored && settings?.accounts.some((account) => account.id === stored)) return stored;
+  return discussion.accountId;
+};
+
 const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string) => {
   const busy = discussionBusyId === discussion.sessionId;
-  const picking = discussionAccountPicker === discussion.sessionId;
-  const otherAccounts = settings?.accounts.filter((account) => account.id !== discussion.accountId) ?? [];
+  const accounts = settings?.accounts ?? [];
+  const target = discussionTargetFor(discussion);
+  const willCopy = target !== discussion.accountId;
   const meta = [
     discussion.cwd
       ? `<span title="${escapeAttr(discussion.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(discussion.cwd))}</span>`
@@ -1123,22 +1427,25 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
       ? `<span><i data-lucide="bar-chart-3"></i>${escapeHtml(formatTokens(discussion.totalTokens))} tok</span>`
       : "",
     `<span>${discussion.messageCount} msg</span>`,
+    discussion.forkCount > 1
+      ? `<span title="Reprises regroupees (${discussion.forkCount} fichiers)"><i data-lucide="history"></i>${discussion.forkCount - 1} reprise${discussion.forkCount - 1 > 1 ? "s" : ""}</span>`
+      : "",
   ]
     .filter(Boolean)
     .join("");
-  const picker = picking
-    ? `<div class="discussion-continue">
-        <select class="discussion-target">
-          ${otherAccounts
-            .map((account) => `<option value="${escapeAttr(account.id)}">${escapeHtml(account.label)}</option>`)
-            .join("") || `<option value="">Aucun autre compte</option>`}
-        </select>
-        <button class="tool-button primary" data-continue-confirm="${escapeAttr(discussion.sessionId)}" ${otherAccounts.length ? "" : "disabled"}>
-          <i data-lucide="copy"></i><span>Copier + reprendre</span>
-        </button>
-        <button class="tool-button" data-continue-cancel="${escapeAttr(discussion.sessionId)}">Annuler</button>
-      </div>`
-    : "";
+
+  // Le compte d'origine est propose EN PREMIER (marque), puis les autres. On
+  // choisit le compte dans lequel reprendre directement ; s'il differe du
+  // compte d'origine la reprise copie d'abord la discussion (non destructif).
+  const options = accounts
+    .map((account) => {
+      const selected = account.id === target ? " selected" : "";
+      const suffix = account.id === discussion.accountId ? " (origine)" : "";
+      return `<option value="${escapeAttr(account.id)}"${selected}>${escapeHtml(account.label)}${suffix}</option>`;
+    })
+    .join("") ||
+    `<option value="${escapeAttr(discussion.accountId)}" selected>${escapeHtml(accountLabel)}</option>`;
+
   return `
     <div class="discussion-row ${busy ? "busy" : ""}">
       <div class="discussion-main">
@@ -1147,17 +1454,19 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
         <span class="discussion-meta">${meta}</span>
       </div>
       <div class="discussion-actions">
-        <button class="tool-button" data-resume-session="${escapeAttr(discussion.sessionId)}" title="Reprendre dans un terminal (${escapeAttr(accountLabel)})">
-          <i data-lucide="play"></i><span>Reprendre</span>
+        <label class="discussion-account" title="Choisir le compte dans lequel reprendre cette discussion">
+          <i data-lucide="users"></i>
+          <select class="discussion-target" data-target-for="${escapeAttr(discussion.sessionId)}">
+            ${options}
+          </select>
+        </label>
+        <button class="tool-button primary" data-resume-session="${escapeAttr(discussion.sessionId)}" title="${willCopy ? "Copier la discussion dans le compte choisi puis la reprendre" : "Reprendre dans un terminal"}">
+          <i data-lucide="${willCopy ? "copy" : "play"}"></i><span data-resume-label>${willCopy ? "Copier + reprendre" : "Reprendre"}</span>
         </button>
-        <button class="icon-button wide" data-continue-session="${escapeAttr(discussion.sessionId)}" title="Continuer avec un autre compte">
-          <i data-lucide="copy"></i>
-        </button>
-        <button class="icon-button wide danger" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Retirer de l'historique (archive)">
+        <button class="icon-button wide danger" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Retirer de l'historique (archive toutes les reprises)">
           <i data-lucide="trash-2"></i>
         </button>
       </div>
-      ${picker}
     </div>
   `;
 };
@@ -1230,32 +1539,40 @@ const refreshDiscussionList = () => {
 };
 
 const bindDiscussionRowUi = () => {
+  // Changement de compte cible : on memorise le choix et on met a jour, sans
+  // re-render complet, le libelle/icone du bouton (Reprendre <-> Copier +
+  // reprendre) pour ne pas voler le focus du select.
+  document.querySelectorAll<HTMLSelectElement>(".discussion-target[data-target-for]").forEach((select) => {
+    select.addEventListener("change", () => {
+      const id = select.dataset.targetFor ?? "";
+      const discussion = findDiscussion(id);
+      if (!discussion) return;
+      discussionTargetSel.set(id, select.value);
+      const willCopy = select.value !== discussion.accountId;
+      const row = select.closest(".discussion-row");
+      const button = row?.querySelector<HTMLButtonElement>("[data-resume-session]");
+      const label = button?.querySelector<HTMLElement>("[data-resume-label]");
+      // On met a jour le libelle/title en place (l'icone se resynchronise au
+      // prochain rendu complet). Pas de createIcons ici : lucide a deja remplace
+      // le <i data-lucide> par un <svg> au premier rendu.
+      if (label) label.textContent = willCopy ? "Copier + reprendre" : "Reprendre";
+      if (button) {
+        button.title = willCopy
+          ? "Copier la discussion dans le compte choisi puis la reprendre"
+          : "Reprendre dans un terminal";
+      }
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-resume-session]").forEach((button) => {
     button.addEventListener("click", () => {
       const discussion = findDiscussion(button.dataset.resumeSession);
-      if (discussion) void resumeDiscussion(discussion);
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-continue-session]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const id = button.dataset.continueSession ?? null;
-      discussionAccountPicker = discussionAccountPicker === id ? null : id;
-      refreshDiscussionList();
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-continue-cancel]").forEach((button) => {
-    button.addEventListener("click", () => {
-      discussionAccountPicker = null;
-      refreshDiscussionList();
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-continue-confirm]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const discussion = findDiscussion(button.dataset.continueConfirm);
-      const select = button
-        .closest(".discussion-continue")
-        ?.querySelector<HTMLSelectElement>(".discussion-target");
-      if (discussion && select && select.value) void continueDiscussionWith(discussion, select.value);
+      if (!discussion) return;
+      const target = discussionTargetFor(discussion);
+      if (target && target !== discussion.accountId) {
+        void continueDiscussionWith(discussion, target);
+      } else {
+        void resumeDiscussion(discussion);
+      }
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-delete-session]").forEach((button) => {
@@ -1282,14 +1599,9 @@ const refreshPromptHistory = async () => {
     promptHistoryLoaded = true;
   }
 
-  if (activeView === "history") {
-    const host = document.querySelector<HTMLDivElement>("#promptList");
-    if (host) {
-      refreshPromptList();
-    } else {
-      render();
-    }
-  }
+  // Rerender complet quand on est sur la vue : reconstruit aussi l'en-tete
+  // (compteur « X demande(s) » + note de troncature), pas seulement la liste.
+  if (activeView === "history") render();
 };
 
 const allPrompts = (): PromptEntry[] => promptHistory?.prompts ?? [];
@@ -1302,24 +1614,26 @@ const promptMatches = (entry: PromptEntry) => {
   );
 };
 
-// Surligne les occurrences de la requete APRES echappement HTML : on ne wrappe
-// que des tranches de texte deja echappe, donc aucune injection possible.
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Surligne les occurrences de la requete en matchant sur le texte BRUT (les
+// bornes <mark> tombent donc toujours sur des frontieres de caracteres reels,
+// jamais au milieu d'une entite HTML ni decalees par toLowerCase), puis echappe
+// CHAQUE tranche emise : aucune injection possible et le rendu reste exact.
 const highlightMatch = (text: string, query: string) => {
-  const safeText = escapeHtml(text);
-  const safeQuery = escapeHtml(query.trim());
-  if (!safeQuery) return safeText;
-  const lowerText = safeText.toLowerCase();
-  const lowerQuery = safeQuery.toLowerCase();
+  const needle = query.trim();
+  if (!needle) return escapeHtml(text);
+  const re = new RegExp(escapeRegExp(needle), "gi");
   let result = "";
-  let from = 0;
-  let index = lowerText.indexOf(lowerQuery, from);
-  while (index !== -1) {
-    result += safeText.slice(from, index);
-    result += `<mark>${safeText.slice(index, index + safeQuery.length)}</mark>`;
-    from = index + safeQuery.length;
-    index = lowerText.indexOf(lowerQuery, from);
+  let last = 0;
+  for (const match of text.matchAll(re)) {
+    const start = match.index ?? 0;
+    if (match[0].length === 0) break;
+    result += escapeHtml(text.slice(last, start));
+    result += `<mark>${escapeHtml(match[0])}</mark>`;
+    last = start + match[0].length;
   }
-  result += safeText.slice(from);
+  result += escapeHtml(text.slice(last));
   return result;
 };
 
@@ -1470,7 +1784,7 @@ const restoreTerminals = async () => {
 
   for (const session of restored) {
     const command = isPlausibleSessionId(session.codexSessionId)
-      ? buildResumeCommand(session.codexSessionId)
+      ? buildResumeCommand(session.codexSessionId, accountById(session.accountId))
       : null;
     await startTerminalSession(session, command);
   }
@@ -1856,6 +2170,10 @@ const render = () => {
               <i data-lucide="history"></i>
               <span>Historique</span>
             </button>
+            <button id="roomToggle" class="tool-button ${activeView === "room" ? "primary" : ""}" title="Salon d'agents (communication inter-agents)">
+              <i data-lucide="users"></i>
+              <span>Salon</span>
+            </button>
             <button id="newTerminal" class="tool-button primary" title="Nouveau terminal">
               <i data-lucide="plus"></i>
               <span>Terminal</span>
@@ -1902,7 +2220,9 @@ const render = () => {
                     ? renderDiscussionsPanel()
                     : activeView === "history"
                       ? renderPromptHistoryPanel()
-                      : `<div id="terminal"></div>`}
+                      : activeView === "room"
+                        ? renderRoomPanel()
+                        : `<div id="terminal"></div>`}
         </section>
 
         <footer class="statusbar">
@@ -2003,6 +2323,10 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
               <span>Proxy compte</span>
               <select id="proxySelect" ${account && proxiesEnabled ? "" : "disabled"}>${proxyOptions}</select>
             </label>
+            <label class="toggle" title="Lance Codex en mode bypass (--dangerously-bypass-approvals-and-sandbox) pour CE compte">
+              <input id="accountBypass" type="checkbox" ${(account?.bypass ?? settings.codexBypass ?? true) ? "checked" : ""} ${account ? "" : "disabled"} />
+              <span>Bypass compte</span>
+            </label>
           </div>
         </section>
 
@@ -2031,9 +2355,9 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
               <input id="autoRun" type="checkbox" ${settings.autoRunCodex ? "checked" : ""} />
               <span>Auto</span>
             </label>
-            <label class="toggle" title="Lance Codex en mode bypass (--dangerously-bypass-approvals-and-sandbox) a chaque lancement par l'app">
+            <label class="toggle" title="Bypass Codex par defaut pour les NOUVEAUX comptes (--dangerously-bypass-approvals-and-sandbox). Chaque compte peut ensuite l'activer/desactiver individuellement.">
               <input id="codexBypass" type="checkbox" ${settings.codexBypass ? "checked" : ""} />
-              <span>Bypass</span>
+              <span>Bypass defaut</span>
             </label>
             <label class="toggle" title="Re-scanne ~/.codex* et ajoute automatiquement les comptes trouves a chaque chargement">
               <input id="autoDiscover" type="checkbox" ${settings.autoDiscoverAccounts ? "checked" : ""} />
@@ -2916,6 +3240,8 @@ const newAccountProfile = (
   projectDir,
   proxyId,
   startupCommand: null,
+  // Nouveau compte : herite du defaut global (ON par defaut).
+  bypass: settings?.codexBypass ?? true,
 });
 
 const refreshPoolAfterAccountChange = async (message: string) => {
@@ -3255,6 +3581,31 @@ const bindUi = () => {
     setActiveView("kombai");
   });
 
+  document.querySelector<HTMLButtonElement>("#roomToggle")?.addEventListener("click", () => {
+    setActiveView("room");
+  });
+
+  document.querySelector<HTMLButtonElement>("#roomRefresh")?.addEventListener("click", () => {
+    void refreshRoom();
+  });
+
+  document.querySelector<HTMLButtonElement>("#roomToggleEnabled")?.addEventListener("click", () => {
+    if (settings?.agentRoom?.enabled) {
+      void disableRoom();
+    } else {
+      void enableRoom();
+    }
+  });
+
+  document.querySelector<HTMLSelectElement>("#roomTarget")?.addEventListener("change", (event) => {
+    roomComposeTarget = (event.target as HTMLSelectElement).value;
+  });
+
+  document.querySelector<HTMLFormElement>("#roomComposer")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendRoomMessage();
+  });
+
   document.querySelector<HTMLButtonElement>("#kombaiStart")?.addEventListener("click", () => {
     void startKombai();
   });
@@ -3376,7 +3727,7 @@ const bindUi = () => {
     if (agentIsIde(agent)) {
       void launchIde(agent);
     } else {
-      void sendLine(agentRunCommand(agent));
+      void sendLine(agentRunCommand(agent, accountById(activeTerminal()?.accountId)));
     }
   });
 
@@ -3464,6 +3815,20 @@ const bindUi = () => {
     statusText = "Proxy associe";
     render();
   });
+
+  document.querySelector<HTMLInputElement>("#accountBypass")?.addEventListener("change", () => {
+    if (!settings || !selectedAccount()) return;
+    // Lit tout le formulaire (dont la case bypass) puis persiste tout de suite,
+    // pour que le reglage par compte survive au rechargement.
+    readSettingsForm();
+    void invoke<AppSettings>("save_settings", { settings }).then((updated) => {
+      settings = updated;
+      statusText = selectedAccount()?.bypass
+        ? "Bypass active pour ce compte"
+        : "Bypass desactive pour ce compte";
+      render();
+    });
+  });
 };
 
 const readSettingsForm = () => {
@@ -3478,14 +3843,16 @@ const readSettingsForm = () => {
   const accountHome = document.querySelector<HTMLInputElement>("#accountHome");
   const projectDir = document.querySelector<HTMLInputElement>("#projectDir");
   const proxySelect = document.querySelector<HTMLSelectElement>("#proxySelect");
+  const accountBypass = document.querySelector<HTMLInputElement>("#accountBypass");
 
-  if (account && (accountLabel || accountHome || projectDir || proxySelect)) {
+  if (account && (accountLabel || accountHome || projectDir || proxySelect || accountBypass)) {
     if (accountLabel) account.label = accountLabel.value.trim() || account.label;
     if (accountHome) account.codexHome = accountHome.value.trim() || account.codexHome;
     if (projectDir) account.projectDir = projectDir.value.trim() || null;
     if (settings.proxyControlsEnabled) {
       account.proxyId = proxySelect?.value || null;
     }
+    if (accountBypass) account.bypass = accountBypass.checked;
     syncSessionsForAccount(account);
   }
 
@@ -3588,6 +3955,7 @@ const mountActiveTerminal = () => {
 
   queueMicrotask(() => {
     fitAndResizeActiveTerminal();
+    session.terminal.focus();
   });
 };
 
@@ -3634,6 +4002,7 @@ const createNewTerminal = async (
   stopLimitPoll();
   stopUsagePoll();
   stopDiscussionsPoll();
+  stopRoomPoll();
   statusText = "Demarrage terminal";
   render();
 
@@ -3658,7 +4027,10 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
   const sessionAgent = agentById(session.agentId);
   const isIde = agentIsIde(sessionAgent);
   // Un agent IDE ne se tape pas dans le PTY : on ouvre l'editeur apres coup.
-  const autoRunCommand = settings.autoRunCodex && !isIde ? agentRunCommand(sessionAgent) : null;
+  const autoRunCommand =
+    settings.autoRunCodex && !isIde
+      ? agentRunCommand(sessionAgent, accountById(session.accountId))
+      : null;
 
   try {
     const ptyId = await invoke<number>("start_terminal", {

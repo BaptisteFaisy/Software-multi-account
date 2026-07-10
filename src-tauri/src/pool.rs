@@ -719,7 +719,11 @@ pub fn router(mgr: Arc<PoolManager>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/admin/status", get(admin_status))
-        .route("/healthz", get(healthz))
+        // NB: pas de `/healthz` ici. Le routeur du pool est monte a la racine via
+        // `.merge()`, et le serveur principal expose deja `GET /healthz`
+        // (`api_healthz`, avec version/commit/readiness). Enregistrer un second
+        // `/healthz` faisait paniquer axum au demarrage ("Overlapping method
+        // route. Handler for `GET /healthz` already exists").
         .layer(CorsLayer::very_permissive())
         .with_state(mgr)
 }
@@ -746,10 +750,6 @@ fn api_error(code: StatusCode, message: &str) -> Response {
         "error": { "message": message, "type": "pool_error", "code": code.as_u16() }
     });
     (code, Json(body)).into_response()
-}
-
-async fn healthz() -> impl IntoResponse {
-    "ok"
 }
 
 async fn models(State(mgr): State<Arc<PoolManager>>) -> impl IntoResponse {

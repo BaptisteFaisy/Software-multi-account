@@ -34,6 +34,7 @@ use crate::settings::{self, expand_home, AccountProfile, AppSettings};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -67,7 +68,17 @@ pub struct DiscussionAccountGroup {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussionSummary {
+    /// Identite LOGIQUE de la conversation. Codex conserve le meme
+    /// `payload.session_id` a travers toutes les reprises/forks : c'est la cle
+    /// de regroupement (et de suppression) d'une discussion.
     pub session_id: String,
+    /// Identite du fichier rollout HEAD (le plus recent de la chaine) =
+    /// `payload.id` (== uuid du nom de fichier). C'est la cible deterministe de
+    /// `codex resume <rollout_id>` et de la copie vers un autre compte.
+    pub rollout_id: String,
+    /// Nombre de fichiers rollout regroupes sous ce `session_id` (1 = jamais
+    /// repris ; N = N-1 reprises/forks). Sert d'indicateur dans l'UI.
+    pub fork_count: u64,
     pub account_id: String,
     pub account_label: String,
     pub codex_home: String,
@@ -86,6 +97,10 @@ pub struct DiscussionSummary {
 #[serde(rename_all = "camelCase")]
 pub struct DeleteDiscussionResult {
     pub archived: bool,
+    /// Nombre de fichiers rollout traites (une conversation reprise = plusieurs
+    /// fichiers partageant le meme `session_id`, tous archives ensemble).
+    pub count: u64,
+    /// Chemin du premier fichier traite (retro-compatibilite d'affichage).
     pub path: String,
 }
 
@@ -95,10 +110,17 @@ pub struct DeleteDiscussionResult {
 
 #[tauri::command]
 pub async fn list_discussions() -> Result<DiscussionsDashboard, String> {
-    let settings = settings::load_settings_for_terminal()?;
-    tauri::async_runtime::spawn_blocking(move || build(&settings))
+    tauri::async_runtime::spawn_blocking(list_discussions_dashboard)
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
+}
+
+/// Variante synchrone reutilisable hors du runtime Tauri (serveur SaaS).
+/// Charge les settings du contexte courant (desktop local ou `CST_DATA_DIR`
+/// cote serveur) puis construit le tableau de bord des discussions.
+pub fn list_discussions_dashboard() -> Result<DiscussionsDashboard, String> {
+    let settings = settings::load_settings_for_terminal()?;
+    Ok(build(&settings))
 }
 
 fn build(settings: &AppSettings) -> DiscussionsDashboard {
@@ -155,8 +177,19 @@ fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
         }
     }
 
-    // Les plus recentes d'abord.
-    discussions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    // Regroupe les reprises/forks : Codex ecrit un NOUVEAU fichier rollout a
+    // chaque `resume` (nouveau nom + nouveau `payload.id`) mais conserve le meme
+    // `payload.session_id`. Sans regroupement, une meme conversation apparait
+    // autant de fois qu'elle a ete reprise (les "doublons" observes). On garde
+    // une entree par `session_id`.
+    let mut discussions = collapse_forks(discussions);
+
+    // Les plus recemment actives d'abord (le HEAD porte le dernier `mtime`).
+    discussions.sort_by(|a, b| {
+        b.last_activity
+            .cmp(&a.last_activity)
+            .then_with(|| b.started_at.cmp(&a.started_at))
+    });
     let discussion_count = discussions.len() as u64;
 
     DiscussionAccountGroup {
@@ -200,6 +233,17 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
         .map(ToString::to_string)
         .or_else(|| parse_rollout_filename(path).map(|(uuid, _)| uuid))
         .unwrap_or_default();
+
+    // `payload.id` = identite du FICHIER rollout (== uuid du nom de fichier).
+    // A la difference de `session_id`, il change a chaque reprise/fork ; c'est
+    // la cible non ambigue de `codex resume`.
+    let rollout_id = meta
+        .pointer("/payload/id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| parse_rollout_filename(path).map(|(uuid, _)| uuid))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| session_id.clone());
 
     let cwd = meta
         .pointer("/payload/cwd")
@@ -275,6 +319,8 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
 
     Some(DiscussionSummary {
         session_id,
+        rollout_id,
+        fork_count: 1,
         account_id: account.id.clone(),
         account_label: account.label.clone(),
         codex_home: account.codex_home.clone(),
@@ -290,12 +336,102 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
     })
 }
 
+/// Regroupe les fichiers rollout d'une meme conversation (meme
+/// `payload.session_id`) en une seule entree. Codex cree un nouveau fichier a
+/// chaque reprise ; on n'en garde qu'une carte :
+/// - HEAD = le fork le plus recent (par `started_at`, puis `last_activity`) : il
+///   fournit `rollout_id` (cible de reprise), `file_path`, titre/apercu/cwd et
+///   version CLI ;
+/// - agregats : `started_at` = min (debut original), `last_activity` = max,
+///   `message_count`/`total_tokens` = max (le dernier fork a l'historique le
+///   plus complet), `fork_count` = nombre de fichiers regroupes.
+///
+/// L'ordre de premiere apparition des `session_id` est preserve (deterministe).
+fn collapse_forks(summaries: Vec<DiscussionSummary>) -> Vec<DiscussionSummary> {
+    use std::collections::HashMap;
+
+    // Phase 1 : regroupe par cle (session_id, ou chemin si session_id vide pour
+    // ne pas fusionner des rollouts corrompus), en preservant l'ordre de
+    // premiere apparition.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<DiscussionSummary>> = HashMap::new();
+
+    for summary in summaries {
+        let key = if summary.session_id.is_empty() {
+            format!("file:{}", summary.file_path)
+        } else {
+            summary.session_id.clone()
+        };
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+            groups.insert(key.clone(), Vec::new());
+        }
+        groups.get_mut(&key).expect("group present").push(summary);
+    }
+
+    // Phase 2 : reduit chaque groupe a une entree (HEAD + agregats).
+    order
+        .into_iter()
+        .filter_map(|key| groups.remove(&key))
+        .filter_map(merge_fork_group)
+        .collect()
+}
+
+/// Reduit une chaine de forks (memes `session_id`) a une seule entree. Les
+/// agregats sont calcules sur le groupe ENTIER (pas sur un accumulateur muable),
+/// ce qui evite tout biais du choix du HEAD.
+fn merge_fork_group(group: Vec<DiscussionSummary>) -> Option<DiscussionSummary> {
+    if group.is_empty() {
+        return None;
+    }
+
+    let fork_count = group.len() as u64;
+    // HEAD = le fork le plus recent (started_at, puis last_activity).
+    let mut head_idx = 0usize;
+    for (index, candidate) in group.iter().enumerate() {
+        let head = &group[head_idx];
+        let newer = candidate.started_at > head.started_at
+            || (candidate.started_at == head.started_at
+                && candidate.last_activity > head.last_activity);
+        if newer {
+            head_idx = index;
+        }
+    }
+
+    let started_at = group.iter().map(|s| s.started_at).min().unwrap_or(0);
+    let last_activity = group.iter().map(|s| s.last_activity).max().unwrap_or(0);
+    let message_count = group.iter().map(|s| s.message_count).max().unwrap_or(0);
+    let total_tokens = group.iter().filter_map(|s| s.total_tokens).max();
+
+    let mut head = group.into_iter().nth(head_idx)?;
+    head.fork_count = fork_count;
+    head.started_at = started_at;
+    head.last_activity = last_activity;
+    head.message_count = message_count;
+    head.total_tokens = total_tokens;
+    Some(head)
+}
+
 // ---------------------------------------------------------------------------
 // (b) claim_session_for_terminal
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
 pub async fn claim_session_for_terminal(
+    account_id: String,
+    after_unix: i64,
+    exclude_session_ids: Vec<String>,
+    match_session_id: Option<String>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        claim_session_for_account(account_id, after_unix, exclude_session_ids, match_session_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Variante synchrone reutilisable hors du runtime Tauri (serveur SaaS).
+pub fn claim_session_for_account(
     account_id: String,
     after_unix: i64,
     exclude_session_ids: Vec<String>,
@@ -308,19 +444,13 @@ pub async fn claim_session_for_terminal(
         .find(|account| account.id == account_id)
         .cloned()
         .ok_or_else(|| "Compte introuvable".to_string())?;
-    let codex_home = account.codex_home;
-
-    tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
-        let dir = expand_home(&codex_home)?.join("sessions");
-        Ok(claim_session(
-            &dir,
-            after_unix,
-            &exclude_session_ids,
-            match_session_id,
-        ))
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    let dir = expand_home(&account.codex_home)?.join("sessions");
+    Ok(claim_session(
+        &dir,
+        after_unix,
+        &exclude_session_ids,
+        match_session_id,
+    ))
 }
 
 /// Selection basee UNIQUEMENT sur le nom de fichier (aucune ouverture) :
@@ -386,6 +516,20 @@ pub async fn copy_discussion_to_account(
     source_account_id: String,
     target_account_id: String,
 ) -> Result<DiscussionSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        copy_discussion_between(session_id, source_account_id, target_account_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Variante synchrone reutilisable hors du runtime Tauri (serveur SaaS) :
+/// duplique la discussion `session_id` du compte source vers le compte cible.
+pub fn copy_discussion_between(
+    session_id: String,
+    source_account_id: String,
+    target_account_id: String,
+) -> Result<DiscussionSummary, String> {
     if !is_uuid_shaped(&session_id) {
         return Err("Identifiant de session invalide".to_string());
     }
@@ -404,9 +548,7 @@ pub async fn copy_discussion_to_account(
         .cloned()
         .ok_or_else(|| "Compte cible introuvable".to_string())?;
 
-    tauri::async_runtime::spawn_blocking(move || copy_discussion(session_id, source, target))
-        .await
-        .map_err(|error| error.to_string())?
+    copy_discussion(session_id, source, target)
 }
 
 fn copy_discussion(
@@ -498,7 +640,11 @@ fn copy_discussion(
         .map(ToString::to_string);
 
     Ok(DiscussionSummary {
-        session_id: new_id,
+        // La copie repart sur une session neuve (nouvel uuid pour le nom, le
+        // `session_id` ET le `payload.id`) : session_id == rollout_id.
+        session_id: new_id.clone(),
+        rollout_id: new_id,
+        fork_count: 1,
         account_id: target.id.clone(),
         account_label: target.label.clone(),
         codex_home: target.codex_home.clone(),
@@ -524,6 +670,19 @@ pub async fn delete_discussion(
     session_id: String,
     archive: bool,
 ) -> Result<DeleteDiscussionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_discussion_for_account(account_id, session_id, archive)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Variante synchrone reutilisable hors du runtime Tauri (serveur SaaS).
+pub fn delete_discussion_for_account(
+    account_id: String,
+    session_id: String,
+    archive: bool,
+) -> Result<DeleteDiscussionResult, String> {
     if !is_uuid_shaped(&session_id) {
         return Err("Identifiant de session invalide".to_string());
     }
@@ -535,13 +694,8 @@ pub async fn delete_discussion(
         .find(|account| account.id == account_id)
         .cloned()
         .ok_or_else(|| "Compte introuvable".to_string())?;
-    let codex_home = account.codex_home;
 
-    tauri::async_runtime::spawn_blocking(move || {
-        delete_discussion_impl(codex_home, session_id, archive)
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    delete_discussion_impl(account.codex_home, session_id, archive)
 }
 
 fn delete_discussion_impl(
@@ -551,39 +705,79 @@ fn delete_discussion_impl(
 ) -> Result<DeleteDiscussionResult, String> {
     let home = expand_home(&codex_home)?;
     let sessions_dir = home.join("sessions");
-    let src = find_rollout_by_id(&sessions_dir, &session_id)
-        .ok_or_else(|| "Discussion introuvable".to_string())?;
 
-    if archive {
-        let rel = src
-            .strip_prefix(&sessions_dir)
-            .map_err(|error| error.to_string())?;
-        let mut dest = home.join("sessions-archive").join(rel);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        if dest.exists() {
-            dest = append_suffix_before_ext(&dest, metrics::now_ts());
-        }
-
-        // Deplacement (rename) rapide ; a defaut (ex. traversee de volume),
-        // copie puis suppression de la source.
-        if let Err(_rename_error) = fs::rename(&src, &dest) {
-            fs::copy(&src, &dest).map_err(|error| error.to_string())?;
-            fs::remove_file(&src).map_err(|error| error.to_string())?;
-        }
-
-        Ok(DeleteDiscussionResult {
-            archived: true,
-            path: dest.to_string_lossy().to_string(),
-        })
-    } else {
-        fs::remove_file(&src).map_err(|error| error.to_string())?;
-        Ok(DeleteDiscussionResult {
-            archived: false,
-            path: src.to_string_lossy().to_string(),
-        })
+    // Une conversation reprise = plusieurs fichiers partageant le meme
+    // `session_id`. On les traite TOUS, sinon la carte reapparaitrait a la
+    // prochaine actualisation (regroupee sur un fork restant).
+    let targets = find_all_rollouts_for(&sessions_dir, &session_id);
+    if targets.is_empty() {
+        return Err("Discussion introuvable".to_string());
     }
+
+    let mut first_path = String::new();
+    let mut count: u64 = 0;
+
+    for src in &targets {
+        let final_path = if archive {
+            let rel = src
+                .strip_prefix(&sessions_dir)
+                .map_err(|error| error.to_string())?;
+            let mut dest = home.join("sessions-archive").join(rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            if dest.exists() {
+                dest = append_suffix_before_ext(&dest, metrics::now_ts() + count as i64);
+            }
+
+            // Deplacement (rename) rapide ; a defaut (ex. traversee de volume),
+            // copie puis suppression de la source.
+            if let Err(_rename_error) = fs::rename(src, &dest) {
+                fs::copy(src, &dest).map_err(|error| error.to_string())?;
+                fs::remove_file(src).map_err(|error| error.to_string())?;
+            }
+            dest
+        } else {
+            fs::remove_file(src).map_err(|error| error.to_string())?;
+            src.clone()
+        };
+
+        if first_path.is_empty() {
+            first_path = final_path.to_string_lossy().to_string();
+        }
+        count += 1;
+    }
+
+    Ok(DeleteDiscussionResult {
+        archived: archive,
+        count,
+        path: first_path,
+    })
+}
+
+/// Tous les rollouts d'une conversation dans `sessions_dir` : ceux dont le NOM
+/// se termine par `-<id>.jsonl` (id de fichier) OU dont la ligne 0 porte
+/// `payload.session_id == id` (identite logique partagee par tous les forks).
+fn find_all_rollouts_for(sessions_dir: &Path, id: &str) -> Vec<PathBuf> {
+    if !sessions_dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    collect_rollouts(sessions_dir, &mut files);
+
+    let suffix = format!("-{id}.jsonl");
+    files
+        .into_iter()
+        .filter(|file| {
+            let by_name = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(&suffix))
+                .unwrap_or(false);
+            by_name || line0_session_id(file).as_deref() == Some(id)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -633,11 +827,25 @@ pub async fn list_prompt_history(limit: Option<usize>) -> Result<PromptHistory, 
 fn build_prompt_history(settings: &AppSettings, limit: Option<usize>) -> PromptHistory {
     let limit = limit.unwrap_or(DEFAULT_PROMPT_LIMIT).max(1);
 
-    // Un thread par compte (scan disque independant), comme `build`.
-    let handles = settings
+    // Dedupe les comptes qui resolvent vers le meme CODEX_HOME : sinon chaque
+    // rollout serait lu ET indexe une fois par compte (doublons dans la
+    // recherche + I/O redondante). On garde le premier compte pour l'etiquette.
+    let mut seen_homes = HashSet::new();
+    let accounts = settings
         .accounts
         .iter()
+        .filter(|account| {
+            let key = expand_home(&account.codex_home)
+                .map(|path| path.to_string_lossy().to_lowercase())
+                .unwrap_or_else(|_| account.codex_home.to_lowercase());
+            seen_homes.insert(key)
+        })
         .cloned()
+        .collect::<Vec<_>>();
+
+    // Un thread par compte (scan disque independant), comme `build`.
+    let handles = accounts
+        .into_iter()
         .map(|account| thread::spawn(move || scan_account_prompts(&account)))
         .collect::<Vec<_>>();
 
@@ -684,6 +892,15 @@ fn scan_account_prompts(account: &AccountProfile) -> Vec<PromptEntry> {
         scan_prompt_file(file, account, &mut entries);
     }
     entries
+}
+
+/// Vrai pour les messages `user_message` synthetiques injectes par Codex au
+/// debut d'une session (contexte d'environnement / instructions) : ce ne sont
+/// jamais des demandes tapees par l'utilisateur. On NE filtre PAS sur un simple
+/// prefixe '<' car de vraies demandes commencent par '<' (HTML/JSX colle,
+/// generiques TS `<T>`, comparaisons `<= 5`, ...).
+fn is_synthetic_prompt(msg: &str) -> bool {
+    msg.starts_with("<environment_context>") || msg.starts_with("<user_instructions>")
 }
 
 /// Extrait toutes les demandes utilisateur d'un rollout et les pousse dans
@@ -749,9 +966,7 @@ fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptE
             continue;
         };
         let msg = message.trim();
-        // Le premier contenu synthetique (`<environment_context>...`) ou toute
-        // enveloppe balisee n'est pas une demande reelle de l'utilisateur.
-        if msg.is_empty() || msg.starts_with('<') {
+        if msg.is_empty() || is_synthetic_prompt(msg) {
             continue;
         }
 
@@ -938,6 +1153,7 @@ mod tests {
             proxy_id: None,
             startup_command: None,
             limits: Default::default(),
+            bypass: true,
         }
     }
 
@@ -1183,6 +1399,143 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text.chars().count(), PROMPT_TEXT_MAX_CHARS);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prompt_history_keeps_angle_bracket_prompts_but_skips_synthetic() {
+        let base = fresh_dir();
+        let home = base.join("home");
+        let sessions = home.join("sessions").join("2026").join("07").join("07");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let uuid = "019f3ceb-69d3-7862-b69f-f6e1136622df";
+        let path = sessions.join(format!("rollout-2026-07-07T16-11-28-{uuid}.jsonl"));
+        let content = [
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{uuid}\"}}}}"),
+            // Enveloppes synthetiques Codex : ignorees.
+            "{\"timestamp\":\"2026-07-07T16:11:29.000Z\",\"type\":\"user_message\",\"payload\":{\"message\":\"<environment_context>ctx</environment_context>\"}}".to_string(),
+            "{\"timestamp\":\"2026-07-07T16:11:29.500Z\",\"type\":\"user_message\",\"payload\":{\"message\":\"<user_instructions>do x</user_instructions>\"}}".to_string(),
+            // Vraie demande commencant par '<' : conservee.
+            "{\"timestamp\":\"2026-07-07T16:11:30.000Z\",\"type\":\"user_message\",\"payload\":{\"message\":\"<div className=x> what renders?\"}}".to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, content).unwrap();
+
+        let account = test_account("acc", &home);
+        let mut out = Vec::new();
+        scan_prompt_file(&path, &account, &mut out);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "<div className=x> what renders?");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn sample_summary(
+        session_id: &str,
+        rollout_id: &str,
+        started_at: i64,
+        last_activity: i64,
+        msgs: u64,
+        tokens: Option<u64>,
+    ) -> DiscussionSummary {
+        DiscussionSummary {
+            session_id: session_id.to_string(),
+            rollout_id: rollout_id.to_string(),
+            fork_count: 1,
+            account_id: "acc".to_string(),
+            account_label: "Acc".to_string(),
+            codex_home: "home".to_string(),
+            file_path: format!("/x/rollout-{rollout_id}.jsonl"),
+            cwd: Some("/proj".to_string()),
+            started_at,
+            last_activity,
+            title: Some(format!("t-{rollout_id}")),
+            preview: Some("p".to_string()),
+            message_count: msgs,
+            total_tokens: tokens,
+            cli_version: Some("0.1".to_string()),
+        }
+    }
+
+    #[test]
+    fn collapse_forks_groups_by_session_id() {
+        let sid = "019f0000-0000-7000-8000-000000000001";
+        let other = "019f0000-0000-7000-8000-000000000099";
+        // Forks volontairement en desordre pour verifier la selection du HEAD.
+        let input = vec![
+            sample_summary(sid, "r1", 100, 110, 2, Some(50)), // original
+            sample_summary(sid, "r3", 300, 330, 9, Some(400)), // HEAD (plus recent)
+            sample_summary(sid, "r2", 200, 220, 5, Some(200)),
+            sample_summary(other, "r9", 150, 150, 1, None), // conversation distincte
+        ];
+
+        let out = collapse_forks(input);
+        assert_eq!(out.len(), 2, "une entree par session_id");
+
+        let g = out.iter().find(|d| d.session_id == sid).unwrap();
+        assert_eq!(g.fork_count, 3);
+        assert_eq!(g.rollout_id, "r3", "HEAD = fork le plus recent");
+        assert_eq!(g.title.as_deref(), Some("t-r3"));
+        assert_eq!(g.started_at, 100, "debut = min");
+        assert_eq!(g.last_activity, 330, "derniere activite = max");
+        assert_eq!(g.message_count, 9, "messages = max");
+        assert_eq!(g.total_tokens, Some(400), "tokens = max");
+
+        let o = out.iter().find(|d| d.session_id == other).unwrap();
+        assert_eq!(o.fork_count, 1);
+    }
+
+    #[test]
+    fn collapse_forks_keeps_empty_session_ids_distinct() {
+        // Deux rollouts corrompus (session_id vide) ne doivent pas fusionner.
+        let mut a = sample_summary("", "ra", 100, 100, 1, None);
+        a.file_path = "/x/a.jsonl".to_string();
+        let mut b = sample_summary("", "rb", 200, 200, 1, None);
+        b.file_path = "/x/b.jsonl".to_string();
+
+        let out = collapse_forks(vec![a, b]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn delete_archives_all_forks_of_a_session() {
+        let base = fresh_dir();
+        let home = base.join("home");
+        let sessions = home.join("sessions").join("2026").join("07").join("07");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let sid = "019f4bb2-0000-7000-8000-000000000001";
+        // 1er fichier : nom == session_id. 2 forks : nom different, meme
+        // payload.session_id.
+        let file_uuids = [
+            sid,
+            "019f4bbc-0000-7000-8000-0000000000aa",
+            "019f4bbc-0000-7000-8000-0000000000bb",
+        ];
+        for (i, file_uuid) in file_uuids.iter().enumerate() {
+            let name = format!("rollout-2026-07-07T16-11-2{i}-{file_uuid}.jsonl");
+            let content = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{sid}\",\"id\":\"{file_uuid}\"}}}}\n"
+            );
+            fs::write(sessions.join(name), content).unwrap();
+        }
+
+        let result =
+            delete_discussion_impl(home.to_string_lossy().to_string(), sid.to_string(), true)
+                .expect("archive should succeed");
+        assert!(result.archived);
+        assert_eq!(result.count, 3, "les 3 forks sont archives");
+
+        let mut remaining = Vec::new();
+        collect_rollouts(&home.join("sessions"), &mut remaining);
+        assert_eq!(remaining.len(), 0, "plus aucun rollout actif");
+
+        let mut archived = Vec::new();
+        collect_rollouts(&home.join("sessions-archive"), &mut archived);
+        assert_eq!(archived.len(), 3, "3 rollouts archives");
 
         let _ = fs::remove_dir_all(&base);
     }

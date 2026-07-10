@@ -1,4 +1,5 @@
 use crate::{
+    agent_room::{AgentMeta, RoomState},
     metrics,
     settings::{expand_home, load_settings_for_terminal, AccountProfile, AppSettings},
 };
@@ -64,6 +65,7 @@ struct PtyExitEvent {
 pub fn start_terminal(
     app: AppHandle,
     state: State<'_, TerminalManager>,
+    room: State<'_, RoomState>,
     id: Option<u64>,
     account_id: String,
     cols: u16,
@@ -126,6 +128,36 @@ pub fn start_terminal(
         }
     }
 
+    // Salon d'agents : si active, on provisionne le CODEX_HOME (entree MCP
+    // mergee) puis on injecte un token UNIQUE par terminal pour que le serveur
+    // distingue cet agent des autres (meme s'ils partagent un CODEX_HOME).
+    let mut room_token: Option<String> = None;
+    if settings.agent_room.enabled {
+        let url = format!("http://127.0.0.1:{}/mcp", settings.agent_room.port);
+        match room.provision_home(&settings.codex_command, &codex_home, &url) {
+            Ok(()) => {
+                let token = room.register(AgentMeta {
+                    agent_id: "codex".to_string(),
+                    account_id: account.id.clone(),
+                    label: account.label.clone(),
+                    cwd: project_dir
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                });
+                builder.env("CST_ROOM_TOKEN", token.clone());
+                room_token = Some(token);
+            }
+            // Non bloquant : le terminal demarre sans salon si le provisioning
+            // echoue (ex. binaire codex introuvable depuis ce process).
+            Err(error) => {
+                eprintln!(
+                    "[agent_room] provisioning ignore pour {}: {error}",
+                    account.label
+                );
+            }
+        }
+    }
+
     let child = pair
         .slave
         .spawn_command(builder)
@@ -160,6 +192,8 @@ pub fn start_terminal(
 
     let sessions = state.sessions.clone();
     let reader_app = app.clone();
+    let room_state = (*room).clone();
+    let room_token_thread = room_token.clone();
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -177,6 +211,10 @@ pub fn start_terminal(
             if let Some(session) = guard.remove(&id) {
                 finish_session(&session);
             }
+        }
+        // Le PTY s'est ferme (fin naturelle ou kill) : on retire l'agent du salon.
+        if let Some(token) = &room_token_thread {
+            room_state.deregister(token);
         }
         let _ = reader_app.emit("pty-exit", PtyExitEvent { id });
     });

@@ -1,5 +1,7 @@
 use crate::{
     account_usage,
+    agent_room::{self, AgentMeta, RoomState},
+    discussions,
     kombai::{KombaiManager, KombaiStatus},
     metrics,
     pool::{self, AccountStatus, PoolManager},
@@ -39,6 +41,14 @@ use uuid::Uuid;
 
 const WORKSPACE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Version du binaire, exposee par `/healthz`, `/api/health` et `--version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Commit git embarque au build (voir `build.rs`). "unknown" si indisponible.
+pub const COMMIT: &str = match option_env!("CST_GIT_COMMIT") {
+    Some(value) => value,
+    None => "unknown",
+};
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     bind: String,
@@ -57,7 +67,14 @@ struct ServerState {
     config: ServerConfig,
     terminals: RemoteTerminalManager,
     kombai: Arc<KombaiManager>,
+    /// Salon d'agents partage (serveur MCP monte a `/mcp`).
+    room: RoomState,
     started_at: i64,
+    /// Quand true, le noeud refuse les NOUVEAUX terminaux (503) et se signale
+    /// `draining`/non `ready` ; les sessions deja ouvertes continuent. En
+    /// memoire uniquement : un redemarrage repart non draine (voulu par
+    /// l'updater qui redemarre apres la bascule).
+    draining: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,9 +105,34 @@ struct HealthResponse {
     node_id: String,
     node_label: String,
     public_base_url: String,
+    version: &'static str,
+    commit: &'static str,
+    ready: bool,
+    draining: bool,
     active_terminals: usize,
     capacity: usize,
     started_at: i64,
+}
+
+/// Liveness minimale NON authentifiee (`GET /healthz`), pour l'updater,
+/// l'orchestrateur rolling et le routage client. Aucun secret : ni token, ni
+/// compte, ni usage.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LivenessResponse {
+    ok: bool,
+    node_id: String,
+    version: &'static str,
+    commit: &'static str,
+    ready: bool,
+    draining: bool,
+    active_terminals: usize,
+    capacity: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct DrainRequest {
+    draining: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +161,34 @@ struct ResizeTerminalRequest {
 #[serde(rename_all = "camelCase")]
 struct KombaiStartRequest {
     project_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CopyDiscussionRequest {
+    session_id: String,
+    source_account_id: String,
+    target_account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimSessionRequest {
+    account_id: String,
+    after_unix: i64,
+    #[serde(default)]
+    exclude_session_ids: Vec<String>,
+    #[serde(default)]
+    match_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteDiscussionRequest {
+    account_id: String,
+    session_id: String,
+    #[serde(default)]
+    archive: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +278,7 @@ impl RemoteTerminalManager {
     fn start(
         &self,
         config: &ServerConfig,
+        room: &RoomState,
         request: StartTerminalRequest,
     ) -> Result<StartTerminalResponse, String> {
         let settings = settings::load_settings_for_terminal()?;
@@ -277,6 +348,34 @@ impl RemoteTerminalManager {
             }
         }
 
+        // Salon d'agents (SaaS) : le serveur MCP tourne dans CE process, les
+        // agents server-spawned l'atteignent en loopback. On provisionne le
+        // CODEX_HOME et on injecte un token unique par terminal.
+        let mut room_token: Option<String> = None;
+        if settings.agent_room.enabled {
+            let port = config
+                .bind
+                .parse::<SocketAddr>()
+                .map(|addr| addr.port())
+                .unwrap_or(settings.agent_room.port);
+            let url = format!("http://127.0.0.1:{port}/mcp");
+            match room.provision_home(&settings.codex_command, &codex_home, &url) {
+                Ok(()) => {
+                    let token = room.register(AgentMeta {
+                        agent_id: "codex".to_string(),
+                        account_id: account.id.clone(),
+                        label: account.label.clone(),
+                        cwd: Some(repo_dir.to_string_lossy().to_string()),
+                    });
+                    builder.env("CST_ROOM_TOKEN", token.clone());
+                    room_token = Some(token);
+                }
+                Err(error) => {
+                    eprintln!("[agent_room] provisioning ignore (SaaS): {error}");
+                }
+            }
+        }
+
         let child = pair
             .slave
             .spawn_command(builder)
@@ -313,6 +412,8 @@ impl RemoteTerminalManager {
 
         let sessions = self.sessions.clone();
         let reader_events = events.clone();
+        let room_clone = room.clone();
+        let room_token_thread = room_token.clone();
         thread::spawn(move || {
             let mut buffer = [0_u8; 8192];
             loop {
@@ -337,6 +438,9 @@ impl RemoteTerminalManager {
                     finish_session(&session);
                     let _ = session.events.send(ServerWsMessage::Exit { id });
                 }
+            }
+            if let Some(token) = &room_token_thread {
+                room_clone.deregister(token);
             }
         });
 
@@ -450,17 +554,21 @@ pub async fn run_from_env() -> Result<(), String> {
 
     let settings = settings::load_settings_for_terminal()?;
     let pool_manager = Arc::new(PoolManager::build(&settings)?);
+    let room = RoomState::with_data_dir(config.data_dir.join("agent-room"));
     let state = Arc::new(ServerState {
         config: config.clone(),
         terminals: RemoteTerminalManager::default(),
         kombai: Arc::new(KombaiManager::default()),
+        room: room.clone(),
         started_at: metrics::now_ts(),
+        draining: Arc::new(AtomicBool::new(false)),
     });
 
     spawn_workspace_cleanup(config.data_dir.clone());
 
     let api = Router::new()
         .route("/health", get(api_health))
+        .route("/admin/drain", post(api_admin_drain))
         .route("/settings", get(api_get_settings).put(api_put_settings))
         .route("/accounts", get(api_get_accounts))
         .route("/accounts/import", post(api_import_account))
@@ -469,6 +577,10 @@ pub async fn run_from_env() -> Result<(), String> {
         .route("/limits", get(api_limits))
         .route("/usage", get(api_usage))
         .route("/account-usage", get(api_account_usage))
+        .route("/discussions", get(api_list_discussions))
+        .route("/discussions/copy", post(api_copy_discussion))
+        .route("/discussions/claim", post(api_claim_session))
+        .route("/discussions/delete", post(api_delete_discussion))
         .route("/pool/status", get(api_pool_status))
         .route("/pool/start", post(api_pool_status))
         .route("/pool/stop", post(api_pool_stop))
@@ -485,19 +597,31 @@ pub async fn run_from_env() -> Result<(), String> {
         )
         .route("/workspaces", get(api_workspaces))
         .route("/workspaces/:id", delete(api_delete_workspace))
+        .route("/room/status", get(api_room_status))
+        .route("/room/messages", get(api_room_messages))
+        .route("/room/send", post(api_room_send))
         .with_state(state.clone());
 
     let ws = Router::new()
         .route("/terminals/:id", get(ws_terminal))
         .with_state(state.clone());
 
+    // Liveness NON authentifiee, a la racine (`/healthz`) : l'auth de ce projet
+    // est appliquee par handler, pas par couche de routeur, donc ce handler est
+    // simplement lisible sans token.
+    let health = Router::new()
+        .route("/healthz", get(api_healthz))
+        .with_state(state.clone());
+
     let static_service = ServeDir::new(config.static_dir.clone())
         .not_found_service(ServeDir::new(config.static_dir.clone()));
 
     let app = Router::new()
+        .merge(health)
         .nest("/api", api)
         .nest("/ws", ws)
         .merge(pool::router(pool_manager))
+        .merge(agent_room::router(room))
         .fallback_service(static_service)
         .layer(CorsLayer::very_permissive());
 
@@ -519,11 +643,36 @@ pub async fn run_from_env() -> Result<(), String> {
     );
 
     axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Arret propre sur Ctrl-C (SIGINT) ET SIGTERM (envoye par `systemctl restart`
+/// / `Stop-ScheduledTask`). Sans la branche SIGTERM, un redemarrage coupait
+/// l'HTTP en vol au lieu de laisser Axum terminer les requetes en cours.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 impl ServerConfig {
@@ -589,17 +738,53 @@ fn default_static_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("dist"))
 }
 
+async fn api_healthz(State(state): State<Arc<ServerState>>) -> Response {
+    let draining = state.draining.load(Ordering::Relaxed);
+    json_response(LivenessResponse {
+        ok: true,
+        node_id: state.config.node_id.clone(),
+        version: VERSION,
+        commit: COMMIT,
+        // `ready` = pret a accepter de NOUVEAUX terminaux. Un noeud en drain se
+        // declare non pret (semantique readiness type k8s) tout en restant
+        // vivant pour ses sessions en cours.
+        ready: !draining,
+        draining,
+        active_terminals: state.terminals.active_count(),
+        capacity: state.config.node_capacity,
+    })
+}
+
 async fn api_health(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
     auth_or(&state, &headers, || {
+        let draining = state.draining.load(Ordering::Relaxed);
         Ok(json_response(HealthResponse {
             ok: true,
             node_id: state.config.node_id.clone(),
             node_label: state.config.node_label.clone(),
             public_base_url: state.config.public_base_url.clone(),
+            version: VERSION,
+            commit: COMMIT,
+            ready: !draining,
+            draining,
             active_terminals: state.terminals.active_count(),
             capacity: state.config.node_capacity,
             started_at: state.started_at,
         }))
+    })
+}
+
+async fn api_admin_drain(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<DrainRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        state.draining.store(request.draining, Ordering::Relaxed);
+        Ok(json_response(json!({
+            "draining": request.draining,
+            "activeTerminals": state.terminals.active_count(),
+        })))
     })
 }
 
@@ -679,6 +864,58 @@ async fn api_account_usage(State(state): State<Arc<ServerState>>, headers: Heade
     })
 }
 
+async fn api_list_discussions(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
+    auth_or(&state, &headers, || {
+        discussions::list_discussions_dashboard().map(json_response)
+    })
+}
+
+async fn api_copy_discussion(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<CopyDiscussionRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        discussions::copy_discussion_between(
+            request.session_id,
+            request.source_account_id,
+            request.target_account_id,
+        )
+        .map(json_response)
+    })
+}
+
+async fn api_claim_session(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<ClaimSessionRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        discussions::claim_session_for_account(
+            request.account_id,
+            request.after_unix,
+            request.exclude_session_ids,
+            request.match_session_id,
+        )
+        .map(json_response)
+    })
+}
+
+async fn api_delete_discussion(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteDiscussionRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        discussions::delete_discussion_for_account(
+            request.account_id,
+            request.session_id,
+            request.archive,
+        )
+        .map(json_response)
+    })
+}
+
 async fn api_pool_status(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
     auth_or(&state, &headers, || {
         let settings = settings::load_settings_for_terminal()?;
@@ -703,11 +940,74 @@ async fn api_start_terminal(
     headers: HeaderMap,
     Json(request): Json<StartTerminalRequest>,
 ) -> Response {
+    // Auth d'abord (401 pour un appelant sans token), puis refus explicite en
+    // 503 si le noeud est en drain. On NE passe PAS par auth_or ici : auth_or
+    // mappe toute Err en 500, or on veut un 503 distinguable que le client
+    // interprete comme "essaie un autre noeud".
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    if state.draining.load(Ordering::Relaxed) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "noeud en drain: nouveaux terminaux refuses",
+            &state.config,
+        );
+    }
+    match state
+        .terminals
+        .start(&state.config, &state.room, request)
+    {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RoomMessagesQuery {
+    since: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RoomSendRequest {
+    text: String,
+    to: Option<String>,
+}
+
+async fn api_room_status(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
     auth_or(&state, &headers, || {
-        state
-            .terminals
-            .start(&state.config, request)
-            .map(json_response)
+        Ok(json_response(json!({
+            "running": true,
+            "snapshot": state.room.snapshot(),
+        })))
+    })
+}
+
+async fn api_room_messages(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<RoomMessagesQuery>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        let since = query.since.unwrap_or(0);
+        let messages = state.room.messages_for(agent_room::OPERATOR_IDENT, since);
+        let cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
+        Ok(json_response(json!({ "messages": messages, "cursor": cursor })))
+    })
+}
+
+async fn api_room_send(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<RoomSendRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        let text = request.text.trim().to_string();
+        if text.is_empty() {
+            return Err("message vide".to_string());
+        }
+        Ok(json_response(state.room.operator_post(request.to, text)))
     })
 }
 

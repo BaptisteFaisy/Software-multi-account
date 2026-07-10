@@ -24,6 +24,11 @@ pub struct AccountProfile {
     pub startup_command: Option<String>,
     #[serde(default)]
     pub limits: AccountLimitTracking,
+    /// Lance Codex en mode bypass (`--dangerously-bypass-approvals-and-sandbox`)
+    /// pour CE compte. Actif par defaut ; les comptes existants (champ absent du
+    /// settings.json) sont migres a `true` au chargement via ce default serde.
+    #[serde(default = "default_true")]
+    pub bypass: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -121,6 +126,9 @@ pub struct AppSettings {
     pub active_agent_id: Option<String>,
     #[serde(default)]
     pub kombai: KombaiConfig,
+    /// Salon de communication inter-agents (serveur MCP + provisioning).
+    #[serde(default)]
+    pub agent_room: AgentRoomConfig,
     /// Ajoute `--dangerously-bypass-approvals-and-sandbox` quand l'app lance
     /// Codex (bouton Run + auto-run). Actif par defaut.
     #[serde(default = "default_true")]
@@ -130,6 +138,38 @@ pub struct AppSettings {
     /// (import + suppression).
     #[serde(default)]
     pub auto_discover_accounts: bool,
+}
+
+/// Reglages du salon d'agents (« Agent Room »). Desactive par defaut : tant que
+/// `enabled` est faux, l'app n'ecrit RIEN dans les `CODEX_HOME` et ne demarre
+/// aucun serveur.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRoomConfig {
+    /// Active le salon : demarrage du serveur MCP + provisioning des agents
+    /// (ecriture d'une entree `[mcp_servers.agent_room]` mergee dans config.toml).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Port loopback du serveur MCP du salon (desktop).
+    #[serde(default = "default_room_port")]
+    pub port: u16,
+    /// Secret partage optionnel (second facteur en plus du token par agent).
+    #[serde(default)]
+    pub secret: String,
+}
+
+impl Default for AgentRoomConfig {
+    fn default() -> Self {
+        AgentRoomConfig {
+            enabled: false,
+            port: default_room_port(),
+            secret: String::new(),
+        }
+    }
+}
+
+fn default_room_port() -> u16 {
+    8123
 }
 
 /// Reglages du VS Code embarque (code-server) qui heberge l'extension Kombai
@@ -459,12 +499,13 @@ mod tests {
             default_account_id: None,
             shell: "sh".to_string(),
             codex_command: codex_command.to_string(),
-            auto_run_codex: false,
+            auto_run_codex: true,
             proxy_controls_enabled: true,
             pool: PoolConfig::default(),
             agents,
             active_agent_id: active.map(ToString::to_string),
             kombai: KombaiConfig::default(),
+            agent_room: AgentRoomConfig::default(),
             codex_bypass: true,
             auto_discover_accounts: false,
         }
@@ -604,6 +645,24 @@ fn settings_path() -> Result<PathBuf, String> {
     Ok(base.join("codex-switch-terminal").join("settings.json"))
 }
 
+/// Repertoire de persistance du salon d'agents (`.../agent-room`), aligne sur la
+/// meme resolution que `settings_path` (honore `CST_DATA_DIR`).
+pub fn agent_room_data_dir() -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os("CST_DATA_DIR") {
+        return Ok(PathBuf::from(value).join("agent-room"));
+    }
+    let base = if let Some(value) = env::var_os("APPDATA") {
+        PathBuf::from(value)
+    } else if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(value)
+    } else {
+        home_dir()?.join(".config")
+    };
+    Ok(base
+        .join("codex-switch-terminal")
+        .join("agent-room"))
+}
+
 fn discover_initial_settings() -> Result<AppSettings, String> {
     let mut settings = AppSettings {
         accounts: Vec::new(),
@@ -611,12 +670,13 @@ fn discover_initial_settings() -> Result<AppSettings, String> {
         default_account_id: None,
         shell: default_shell(),
         codex_command: "codex".to_string(),
-        auto_run_codex: false,
+        auto_run_codex: true,
         proxy_controls_enabled: true,
         pool: PoolConfig::default(),
         agents: Vec::new(),
         active_agent_id: None,
         kombai: KombaiConfig::default(),
+        agent_room: AgentRoomConfig::default(),
         codex_bypass: true,
         auto_discover_accounts: false,
     };
@@ -794,6 +854,9 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
 
         if (has_auth || has_config || proxy_id.is_some()) && !account_paths.contains(&normalized) {
             let id = stable_id("account", &path_string);
+            // Compte auto-decouvert : herite du defaut global "Bypass defaut"
+            // (comme la creation via l'UI), pas un `true` code en dur.
+            let bypass_default = settings.codex_bypass;
             settings.accounts.push(AccountProfile {
                 id,
                 label: label_from_codex_dir(name),
@@ -802,6 +865,7 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
                 proxy_id,
                 startup_command: None,
                 limits: AccountLimitTracking::default(),
+                bypass: bypass_default,
             });
             account_paths.insert(normalized);
             changed = true;
@@ -1070,7 +1134,13 @@ fn read_server_rate_limits(
             format!("ecriture app-server impossible: {error}")
         })?;
     }
-    drop(stdin);
+    let _ = stdin.flush();
+    // NE PAS fermer stdin ici. Depuis codex >= 0.144, `codex app-server`
+    // interprete la fin de stdin (EOF) comme un signal d'arret et quitte
+    // *avant* d'avoir termine la requete asynchrone `account/rateLimits/read`
+    // (~1 a 2 s de reseau). Fermer stdin trop tot faisait quitter le serveur
+    // sans reponse, ce qui remontait a tort en "timeout lecture limites
+    // serveur". On garde donc `stdin` ouvert jusqu'a reception de la reponse.
 
     let timeout = Duration::from_secs(RATE_LIMIT_READ_TIMEOUT_SECS);
     let response = loop {
@@ -1084,6 +1154,7 @@ fn read_server_rate_limits(
                 }
             }
             Err(_) => {
+                drop(stdin);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err("timeout lecture limites serveur".to_string());
@@ -1091,6 +1162,7 @@ fn read_server_rate_limits(
         }
     };
 
+    drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -1312,6 +1384,9 @@ fn import_single_account(
         None => None,
     };
 
+    // Compte importe : herite du defaut global "Bypass defaut" (comme la
+    // creation via l'UI / newAccountProfile), pas un `true` code en dur.
+    let bypass_default = settings.codex_bypass;
     match settings
         .accounts
         .iter_mut()
@@ -1331,6 +1406,7 @@ fn import_single_account(
             proxy_id,
             startup_command: None,
             limits: new_connected_limits(now),
+            bypass: bypass_default,
         }),
     }
 
