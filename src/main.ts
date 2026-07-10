@@ -10,6 +10,7 @@ import {
   saveRemoteConfig,
   type UnlistenFn,
 } from "./platform";
+import { initDesktopUpdater } from "./updater";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import {
@@ -4215,6 +4216,7 @@ const renderRemoteLogin = (error: string | null = null) => {
 
 const boot = async () => {
   await initializePlatform();
+  void initDesktopUpdater();
 
   if (isRemoteMode() && !hasRemoteAuth()) {
     renderRemoteLogin();
