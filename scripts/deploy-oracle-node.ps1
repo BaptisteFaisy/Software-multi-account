@@ -13,6 +13,10 @@ $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $ScriptDir
+# Commit a embarquer dans le binaire distant (pas de .git transfere sur Oracle).
+$commit = ""
+$rev = & git -C $Root rev-parse --short HEAD 2>$null
+if ($LASTEXITCODE -eq 0 -and $rev) { $commit = ([string]$rev).Trim() }
 $DataDir = Join-Path $env:APPDATA "codex-switch-terminal-server"
 $LocalEnvFile = Join-Path $DataDir "server.local.env.ps1"
 $SettingsFile = Join-Path $DataDir "settings.json"
@@ -96,7 +100,7 @@ try {
   @(
     'CST_BIND="127.0.0.1:8080"'
     'CST_DATA_DIR="/srv/cst"'
-    'CST_STATIC_DIR="/opt/codex-switch-terminal/dist"'
+    'CST_STATIC_DIR="/opt/codex-switch-terminal/current/dist"'
     'CST_PUBLIC_BASE_URL=' + (Quote-SystemdEnvironment $OracleUrl)
     'CST_ALLOWED_ORIGINS=' + (Quote-SystemdEnvironment $OracleUrl)
     'CST_ADMIN_TOKEN=' + (Quote-SystemdEnvironment $env:CST_ADMIN_TOKEN)
@@ -112,12 +116,17 @@ try {
     $dataArchive `
     $remoteEnv `
     (Join-Path $Root "deploy\install-oracle-node.sh") `
+    (Join-Path $Root "deploy\update-node.sh") `
     (Join-Path $Root "deploy\codex-switch-terminal.service") `
     "${SshTarget}:/tmp/"
   if ($LASTEXITCODE -ne 0) { throw "Le transfert SCP a echoue." }
 
-  & ssh @sshArgs $SshTarget "sudo bash /tmp/install-oracle-node.sh"
-  if ($LASTEXITCODE -ne 0) { throw "L'installation Oracle a echoue." }
+  # Premier deploiement -> install complet ; deploiements suivants -> mise a jour
+  # sure (drain -> bascule atomique -> verif -> rollback) qui preserve les
+  # donnees distantes.
+  $remoteCmd = "if systemctl list-unit-files 2>/dev/null | grep -q '^codex-switch-terminal.service' && [ -x /opt/codex-switch-terminal/current/cst-server ]; then sudo bash /tmp/update-node.sh --source /tmp/cst-source.tar.gz --commit '$commit'; else sudo bash /tmp/install-oracle-node.sh --commit '$commit'; fi"
+  & ssh @sshArgs $SshTarget $remoteCmd
+  if ($LASTEXITCODE -ne 0) { throw "Le deploiement Oracle a echoue." }
 
   if (-not $SkipTailscaleLogin) {
     Write-Host "Autorise maintenant le noeud Oracle dans la page Tailscale affichee." -ForegroundColor Yellow
