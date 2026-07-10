@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex Switch Terminal SaaS server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cst
+Group=cst
+WorkingDirectory=/opt/codex-switch-terminal
+EnvironmentFile=/etc/codex-switch-terminal.env
+Environment=PATH=/home/cst/.local/bin:/home/cst/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/codex-switch-terminal/cst-server
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
