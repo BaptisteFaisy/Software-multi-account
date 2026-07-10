@@ -4,12 +4,25 @@ param(
   [int]$DrainTimeoutSec = 300,
   [int]$VerifyTimeoutSec = 60,
   [switch]$Force,
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  # --- Mode release (Phase 2 : artefacts CI signes) ---
+  [string]$ReleaseTag = "",
+  [string]$Repo = "BaptisteFaisy/Software-multi-account",
+  [string]$Asset = "cst-server-windows-x86_64.zip",
+  [string]$MinisignPubKey = "",
+  [switch]$AllowUnsigned
 )
 
 # Mise a jour SURE d'un noeud Windows.
 #
-# Sequence : build (ou --SkipBuild) -> self-check `--version` -> installe dans
+# DEUX modes pour peupler releases\<v> :
+#   - build   (defaut)       : compile sur l'hote (ou -SkipBuild pour reutiliser
+#                              un binaire deja compile).
+#   - release (-ReleaseTag)  : TELECHARGE l'artefact signe de la GitHub Release,
+#                              verifie SHA-256 + signature minisign (fail-closed),
+#                              puis l'installe.
+#
+# Sequence commune ensuite : self-check `--version` -> installe dans
 # releases\<version> -> drain -> attente activeTerminals==0 (borne) -> stop
 # tache (l'exe est verrouille tant qu'il tourne) -> bascule de la jonction
 # 'current' -> (re)demarrage tache -> verification "vraiment revenu" -> rollback
@@ -19,6 +32,8 @@ param(
 #          + jonction 'current'. Donnees separees dans %APPDATA%\codex-switch-terminal-server.
 
 $ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$IsReleaseMode = [bool]$ReleaseTag
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $ScriptDir
@@ -90,24 +105,72 @@ function Test-NodeBack {
   }
 }
 
-# --- 1. Build ---
-if (-not $SkipBuild) {
-  Push-Location $Root
-  try {
-    $rev = & git -C $Root rev-parse --short HEAD 2>$null
-    if ($LASTEXITCODE -eq 0 -and $rev) { $env:CST_GIT_COMMIT = ([string]$rev).Trim() }
-    npm run build:frontend; if ($LASTEXITCODE -ne 0) { throw "Le build frontend a echoue." }
-    npm run build:server;   if ($LASTEXITCODE -ne 0) { throw "Le build serveur a echoue." }
-  } finally { Pop-Location }
-}
+# --- 1. Peupler la release : mode build OU mode release (download + verif) ---
+$distSrc = $null
+$builtExe = $null
 
-$builtExe = Join-Path $Root "src-tauri\target\release\cst-server.exe"
-if (-not (Test-Path $builtExe)) { throw "Binaire introuvable: $builtExe (retire -SkipBuild ?)." }
+if ($IsReleaseMode) {
+  if (-not $MinisignPubKey) { $MinisignPubKey = $env:CST_MINISIGN_PUBKEY }
+  $dl = Join-Path ([System.IO.Path]::GetTempPath()) ("cst-dl-" + [System.IO.Path]::GetRandomFileName())
+  $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("cst-stage-" + [System.IO.Path]::GetRandomFileName())
+  New-Item -ItemType Directory -Force -Path $dl, $stage | Out-Null
+
+  $baseUrl = "https://github.com/$Repo/releases/download/$ReleaseTag"
+  $zipPath = Join-Path $dl $Asset
+  Write-Host "Telechargement de $Asset depuis $Repo@$ReleaseTag" -ForegroundColor Cyan
+  foreach ($suffix in @("", ".sha256", ".minisig")) {
+    Invoke-WebRequest -Uri "$baseUrl/$Asset$suffix" -OutFile "$zipPath$suffix" -UseBasicParsing -TimeoutSec 180
+  }
+
+  # 1a. Empreinte SHA-256 (fail-closed). Le .sha256 contient "<hash>  <basename>".
+  $expected = (((Get-Content "$zipPath.sha256" -TotalCount 1) -split '\s+')[0]).Trim().ToLower()
+  $actual = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLower()
+  if ($expected -ne $actual) { throw "SHA-256 invalide: attendu $expected, obtenu $actual." }
+  Write-Host "SHA-256 verifiee." -ForegroundColor Green
+
+  # 1b. Signature minisign (fail-closed sauf -AllowUnsigned explicite).
+  if ($AllowUnsigned) {
+    Write-Warning "Verification de signature IGNOREE (-AllowUnsigned)."
+  } else {
+    if (-not $MinisignPubKey -or $MinisignPubKey -like "RWQPLACEHOLDER*") {
+      throw "Cle publique minisign non configuree (-MinisignPubKey / CST_MINISIGN_PUBKEY ; voir deploy/PHASE2-UPDATES.md)."
+    }
+    if (-not (Get-Command minisign -ErrorAction SilentlyContinue)) {
+      throw "minisign introuvable sur le PATH (installe-le, ou -AllowUnsigned). Voir deploy/PHASE2-UPDATES.md."
+    }
+    & minisign -Vm $zipPath -x "$zipPath.minisig" -P $MinisignPubKey
+    if ($LASTEXITCODE -ne 0) { throw "Signature minisign INVALIDE pour $Asset." }
+    Write-Host "Signature minisign verifiee." -ForegroundColor Green
+  }
+
+  # 1c. Extraction (l'archive contient cst-server.exe + dist\).
+  Expand-Archive -Path $zipPath -DestinationPath $stage -Force
+  $builtExe = Join-Path $stage "cst-server.exe"
+  $distSrc = Join-Path $stage "dist"
+  if (-not (Test-Path $builtExe)) { throw "Archive invalide: cst-server.exe introuvable." }
+  if (-not (Test-Path $distSrc)) { throw "Archive invalide: dist\ introuvable." }
+} else {
+  if (-not $SkipBuild) {
+    Push-Location $Root
+    try {
+      $rev = & git -C $Root rev-parse --short HEAD 2>$null
+      if ($LASTEXITCODE -eq 0 -and $rev) { $env:CST_GIT_COMMIT = ([string]$rev).Trim() }
+      npm run build:frontend; if ($LASTEXITCODE -ne 0) { throw "Le build frontend a echoue." }
+      npm run build:server;   if ($LASTEXITCODE -ne 0) { throw "Le build serveur a echoue." }
+    } finally { Pop-Location }
+  }
+  $builtExe = Join-Path $Root "src-tauri\target\release\cst-server.exe"
+  if (-not (Test-Path $builtExe)) { throw "Binaire introuvable: $builtExe (retire -SkipBuild ?)." }
+  $distSrc = Join-Path $Root "dist"
+}
 
 # --- 2. Self-check version ---
 $verLine = & $builtExe --version
 $version = ($verLine -split '\s+')[1]
 if (-not $version) { throw "Version illisible via 'cst-server --version'." }
+if ($IsReleaseMode -and ($ReleaseTag.TrimStart('v') -ne $version)) {
+  throw "Incoherence: tag $ReleaseTag mais binaire en version $version."
+}
 Write-Host "Nouvelle release : $verLine" -ForegroundColor Cyan
 
 # Release active actuelle (cible du rollback).
@@ -123,7 +186,7 @@ New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 Copy-Item $builtExe (Join-Path $releaseDir "cst-server.exe") -Force
 $releaseDist = Join-Path $releaseDir "dist"
 if (Test-Path $releaseDist) { Remove-Item $releaseDist -Recurse -Force }
-Copy-Item (Join-Path $Root "dist") $releaseDist -Recurse -Force
+Copy-Item $distSrc $releaseDist -Recurse -Force
 
 # --- 4. Drain (si un noeud tourne deja) ---
 $running = $null -ne (Get-Healthz)
