@@ -12,11 +12,43 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Fournisseur CLI gere par un compte / un agent.
+///
+/// `Codex` (ChatGPT/OpenAI) est le defaut historique : les comptes et agents
+/// existants (champ `provider` absent du settings.json) ainsi que tout code qui
+/// ne precise pas de provider restent Codex, ce qui preserve le comportement
+/// actuel bit pour bit. `Claude` designe Claude Code (CLI `claude`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Codex,
+    Claude,
+}
+
+impl Provider {
+    /// Identifiant stable (utilise pour les logs, l'agent-room, l'UI).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Codex => "codex",
+            Provider::Claude => "claude",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountProfile {
     pub id: String,
     pub label: String,
+    /// Fournisseur CLI de ce compte. `#[serde(default)]` => les comptes crees
+    /// par une version anterieure (sans ce champ) sont interpretes comme Codex.
+    #[serde(default)]
+    pub provider: Provider,
+    /// Dossier "home" isole du compte. Pour Codex c'est `CODEX_HOME` ; pour
+    /// Claude c'est `CLAUDE_CONFIG_DIR` (meme role : sessions + credentials +
+    /// config propres au compte). Le nom de champ reste `codexHome` cote JSON
+    /// pour la retro-compat des settings.json existants.
     pub codex_home: String,
     #[serde(default)]
     pub project_dir: Option<String>,
@@ -29,6 +61,14 @@ pub struct AccountProfile {
     /// settings.json) sont migres a `true` au chargement via ce default serde.
     #[serde(default = "default_true")]
     pub bypass: bool,
+    /// Modele Codex par defaut de CE compte. `None` preserve le comportement et
+    /// le `config.toml` des profils crees par une ancienne version de l'app.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Intensite de raisonnement Codex (`model_reasoning_effort`) de CE compte.
+    /// `None` laisse une eventuelle valeur existante du `config.toml` intacte.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,6 +131,11 @@ pub struct AgentProfile {
     pub id: String,
     pub label: String,
     pub command: String,
+    /// Fournisseur CLI pilote par cet agent. `#[serde(default)]` => les agents
+    /// existants (sans ce champ) sont Codex. L'agent Claude Code integre porte
+    /// `Provider::Claude`.
+    #[serde(default)]
+    pub provider: Provider,
     /// "cli" : la commande est envoyee dans le terminal (Codex).
     /// "ide" : la commande est un lanceur d'editeur (code, cursor, windsurf,
     /// trae, antigravity, kiro) ouvert sur le dossier projet — c'est ainsi que
@@ -213,6 +258,7 @@ fn default_auto_install_extension() -> bool {
 }
 
 const CODEX_AGENT_ID: &str = "codex";
+const CLAUDE_AGENT_ID: &str = "claude";
 const KOMBAI_AGENT_ID: &str = "kombai";
 
 fn default_agent_kind() -> String {
@@ -290,6 +336,9 @@ fn default_true() -> bool {
     true
 }
 
+const DEFAULT_ACCOUNT_MODEL: &str = "gpt-5.6-sol";
+const DEFAULT_ACCOUNT_REASONING_EFFORT: &str = "medium";
+
 #[tauri::command]
 pub fn load_settings() -> Result<AppSettings, String> {
     let path = settings_path()?;
@@ -330,25 +379,53 @@ pub fn save_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub fn ensure_account_home(codex_home: String) -> Result<(), String> {
+pub fn ensure_account_home(
+    codex_home: String,
+    provider: Option<Provider>,
+    bypass: bool,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<(), String> {
     let home = expand_home(&codex_home)?;
-    fs::create_dir_all(&home).map_err(|error| error.to_string())
+    fs::create_dir_all(&home).map_err(|error| error.to_string())?;
+    // `provider` absent (anciens appels front) => Codex : comportement inchange.
+    provider
+        .unwrap_or_default()
+        .write_account_config(&home, bypass, model.as_deref(), reasoning_effort.as_deref())
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
-/// Retire un compte du Pool / de la liste. Ne touche PAS au dossier CODEX_HOME
-/// sur le disque : seul l'enregistrement dans `settings.json` est supprime.
-/// Avec l'auto-detection desactivee (`auto_discover_accounts = false`), le
-/// compte ne reapparait pas au prochain chargement.
+/// Retire un compte du Pool / de la liste. Si `delete_files` est faux, ne touche
+/// PAS au dossier CODEX_HOME sur le disque : seul l'enregistrement dans
+/// `settings.json` est supprime (avec `auto_discover_accounts = false`, le compte
+/// ne reapparait pas au prochain chargement).
+///
+/// Si `delete_files` est vrai, le dossier CODEX_HOME du compte est aussi efface
+/// du disque (auth.json, sessions, config...). Garde-fous stricts :
+/// - le dossier n'est efface que s'il ressemble a un CODEX_HOME (nom `.codex*`,
+///   dossier sous `codex-homes`, ou presence d'un `auth.json`/`config.toml`) ;
+/// - jamais le dossier utilisateur, un de ses ancetres, ni le dossier de
+///   configuration de l'app ;
+/// - si un AUTRE compte restant pointe vers le meme dossier, il est conserve.
+/// En cas de dossier dangereux ou non supprimable, l'operation est annulee AVANT
+/// d'ecrire `settings.json` (etat inchange) et l'erreur est remontee : le compte
+/// reste alors present et l'utilisateur peut le retirer sans effacer les fichiers.
 #[tauri::command]
-pub fn remove_account(account_id: String) -> Result<AppSettings, String> {
+pub fn remove_account(account_id: String, delete_files: bool) -> Result<AppSettings, String> {
     let path = settings_path()?;
     let mut settings = load_settings()?;
 
-    let before = settings.accounts.len();
-    settings.accounts.retain(|account| account.id != account_id);
-    if settings.accounts.len() == before {
+    let Some(target) = settings
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .cloned()
+    else {
         return Err("Compte introuvable".to_string());
-    }
+    };
+
+    settings.accounts.retain(|account| account.id != account_id);
 
     if settings.default_account_id.as_deref() == Some(account_id.as_str()) {
         settings.default_account_id = settings.accounts.first().map(|account| account.id.clone());
@@ -356,8 +433,120 @@ pub fn remove_account(account_id: String) -> Result<AppSettings, String> {
 
     ensure_agents(&mut settings);
     sync_account_limit_trackers(&mut settings);
+
+    // Suppression du dossier AVANT l'ecriture de settings.json : si elle echoue
+    // (chemin refuse par les garde-fous, verrou fichier...), on renvoie l'erreur
+    // sans rien persister -> l'etat reste coherent (le compte est toujours la).
+    if delete_files {
+        let normalized_target = normalize_string_path(&target.codex_home);
+        let still_referenced = settings
+            .accounts
+            .iter()
+            .any(|account| normalize_string_path(&account.codex_home) == normalized_target);
+        if !still_referenced {
+            delete_codex_home_dir(&target.codex_home)?;
+        }
+    }
+
     write_settings(&path, &settings)?;
     Ok(settings)
+}
+
+/// Supprime le dossier CODEX_HOME d'un compte apres validation stricte. Un
+/// dossier absent est traite comme un succes (rien a effacer).
+fn delete_codex_home_dir(codex_home: &str) -> Result<(), String> {
+    let path = expand_home(codex_home)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "Le CODEX_HOME du compte n'est pas un dossier : {}",
+            path.display()
+        ));
+    }
+    guard_deletable_codex_home(&path)?;
+    fs::remove_dir_all(&path)
+        .map_err(|error| format!("Suppression de {} impossible : {error}", path.display()))
+}
+
+/// Refuse d'effacer un dossier qui n'est pas manifestement le CODEX_HOME d'un
+/// compte, ou qui est un chemin critique (racine/drive root, dossier
+/// utilisateur et ses ancetres, dossier de configuration de l'app).
+fn guard_deletable_codex_home(path: &Path) -> Result<(), String> {
+    let path_key = guard_key(path);
+
+    // Chemins trop courts (racine, drive root, chemin relatif ambigu) : refus.
+    if path.components().count() < 3 || path.file_name().is_none() {
+        return Err(format!(
+            "Refus : chemin trop court ou critique ({}).",
+            path.display()
+        ));
+    }
+
+    // Dossier utilisateur lui-meme ou l'un de ses ancetres.
+    if let Ok(home) = home_dir() {
+        let home_key = guard_key(&home);
+        if path_key == home_key || home_key.starts_with(&format!("{path_key}\\")) {
+            return Err(format!(
+                "Refus : {} est le dossier utilisateur (ou un parent).",
+                path.display()
+            ));
+        }
+    }
+
+    // Dossier de configuration de l'app (settings.json, agent-room...).
+    if let Ok(settings_file) = settings_path() {
+        if let Some(app_dir) = settings_file.parent() {
+            let app_key = guard_key(app_dir);
+            if path_key == app_key || app_key.starts_with(&format!("{path_key}\\")) {
+                return Err(format!(
+                    "Refus : {} est le dossier de configuration de l'app.",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    // Le dossier doit ressembler au home d'un compte (Codex ou Claude).
+    let looks_like_home = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            is_codex_like_dir(name)
+                || Provider::Codex.is_home_like_dir(name)
+                || Provider::Claude.is_home_like_dir(name)
+        })
+        .unwrap_or(false);
+    let under_homes = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.eq_ignore_ascii_case("codex-homes") || name.eq_ignore_ascii_case("claude-homes")
+        })
+        .unwrap_or(false);
+    let has_marker = path.join("auth.json").is_file()      // Codex
+        || path.join("config.toml").is_file()              // Codex
+        || path.join(".credentials.json").is_file()        // Claude
+        || path.join(".claude.json").is_file();            // Claude
+
+    if !(looks_like_home || under_homes || has_marker) {
+        return Err(format!(
+            "Refus : {} ne ressemble pas a un dossier de compte Codex (nom .codex*, dossier codex-homes, ou auth.json/config.toml requis).",
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Cle normalisee pour comparer des chemins de facon robuste : minuscules,
+/// separateurs `\`, sans separateur final.
+fn guard_key(path: &Path) -> String {
+    normalize_string_path(&path.to_string_lossy())
+        .trim_end_matches('\\')
+        .to_string()
 }
 
 #[tauri::command]
@@ -466,6 +655,148 @@ fn parse_import_json_content(content: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
 
+    fn fresh_account_home(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        env::temp_dir().join(format!("cst-{prefix}-{unique}"))
+    }
+
+    #[test]
+    fn account_home_is_provisioned_with_all_account_defaults() {
+        let home = fresh_account_home("account-config");
+
+        ensure_account_home(
+            home.to_string_lossy().to_string(),
+            Some(Provider::Codex),
+            true,
+            Some("gpt-5.6-sol".to_string()),
+            Some("medium".to_string()),
+        )
+        .expect("account home should be created and provisioned");
+
+        let config = fs::read_to_string(home.join("config.toml"))
+            .expect("config.toml should exist immediately");
+        assert!(config.contains("approval_policy = \"never\""));
+        assert!(config.contains("sandbox_mode = \"danger-full-access\""));
+        assert!(config.contains("model = \"gpt-5.6-sol\""));
+        assert!(config.contains("model_reasoning_effort = \"medium\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn non_bypass_account_gets_safe_explicit_permissions() {
+        let home = fresh_account_home("safe-account");
+
+        ensure_account_home(
+            home.to_string_lossy().to_string(),
+            Some(Provider::Codex),
+            false,
+            None,
+            None,
+        )
+        .expect("non-bypass account should be provisioned");
+
+        let config = fs::read_to_string(home.join("config.toml")).expect("config.toml");
+        assert!(config.contains("approval_policy = \"on-request\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+        assert!(!config.contains("danger-full-access"));
+        assert!(!config.contains("approval_policy = \"never\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn disabling_bypass_replaces_previously_persisted_bypass() {
+        let home = fresh_account_home("bypass-transition");
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("high"))
+            .expect("bypass config");
+        ensure_codex_account_config(&home, false, Some("gpt-5.6-sol"), Some("high"))
+            .expect("safe config");
+
+        let config = fs::read_to_string(home.join("config.toml")).expect("config.toml");
+        assert!(config.contains("approval_policy = \"on-request\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+        assert!(!config.contains("danger-full-access"));
+        assert!(!config.contains("approval_policy = \"never\""));
+        assert_eq!(config.matches("approval_policy =").count(), 1);
+        assert_eq!(config.matches("sandbox_mode =").count(), 1);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn account_config_preserves_sections_and_is_idempotent() {
+        let home = fresh_account_home("config-idempotent");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            "[mcp_servers.agent_room]\nurl = \"http://127.0.0.1:8123/mcp\"\n",
+        )
+        .unwrap();
+
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"))
+            .expect("first provisioning");
+        let once = fs::read_to_string(home.join("config.toml")).unwrap();
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"))
+            .expect("second provisioning");
+        let twice = fs::read_to_string(home.join("config.toml")).unwrap();
+
+        assert_eq!(once, twice);
+        assert!(twice.contains("[mcp_servers.agent_room]"));
+        assert!(twice.contains("url = \"http://127.0.0.1:8123/mcp\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn account_config_rejects_invalid_reasoning_effort() {
+        let home = fresh_account_home("invalid-effort");
+        let error = ensure_codex_account_config(&home, true, None, Some("ultra"))
+            .expect_err("unsupported effort must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!home.join("config.toml").exists());
+    }
+
+    #[test]
+    fn account_config_escapes_model_before_writing_toml() {
+        let home = fresh_account_home("model-escape");
+        let injected = "gpt-5.6-sol\"\nsandbox_mode = \"danger-full-access";
+        ensure_codex_account_config(&home, false, Some(injected), Some("low"))
+            .expect("escaped model should remain a TOML string");
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        ensure_codex_account_config(&home, false, Some(injected), Some("low"))
+            .expect("escaped model should stay idempotent");
+        let second = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(config, second);
+        assert!(
+            config.contains("model = \"gpt-5.6-sol\\\"\\nsandbox_mode = \\\"danger-full-access\"")
+        );
+        assert_eq!(config.matches("sandbox_mode =").count(), 2);
+        assert_eq!(config.matches("\nsandbox_mode =").count(), 1);
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn legacy_account_json_keeps_optional_model_fields_unset() {
+        let account: AccountProfile = serde_json::from_value(json!({
+            "id": "legacy",
+            "label": "Legacy",
+            "codexHome": "~/.codex-legacy",
+            "bypass": false
+        }))
+        .expect("legacy account should deserialize");
+
+        assert_eq!(account.model, None);
+        assert_eq!(account.reasoning_effort, None);
+    }
+
     fn assert_session_blob_import(content: &str) {
         let value = parse_import_json_content(content).expect("session blob should parse");
         let accounts = extract_import_accounts(&value);
@@ -486,6 +817,101 @@ mod tests {
         assert_session_blob_import(raw);
         assert_session_blob_import(&escaped_object);
         assert_session_blob_import(&quoted_json_string);
+    }
+
+    #[test]
+    fn upsert_inserts_key_into_empty_document() {
+        let out = upsert_top_level_string("", "approval_policy", "never");
+        assert_eq!(out, "approval_policy = \"never\"\n");
+    }
+
+    #[test]
+    fn upsert_prefixes_key_before_existing_tables() {
+        let existing = "[mcp_servers.agent_room]\nurl = \"http://127.0.0.1:8123/mcp\"\n";
+        let out = upsert_top_level_string(existing, "sandbox_mode", "danger-full-access");
+        // La cle racine doit preceder la table pour rester du TOML valide.
+        assert!(out.starts_with("sandbox_mode = \"danger-full-access\"\n"));
+        assert!(out.contains("[mcp_servers.agent_room]"));
+    }
+
+    #[test]
+    fn upsert_replaces_existing_top_level_value() {
+        let existing = "approval_policy = \"on-request\"\nmodel = \"gpt-5\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(!out.contains("on-request"));
+        assert!(out.contains("model = \"gpt-5\""));
+        // Une seule occurrence de la cle (pas de doublon => TOML valide).
+        assert_eq!(out.matches("approval_policy").count(), 1);
+    }
+
+    #[test]
+    fn upsert_ignores_same_key_inside_a_table_and_comments() {
+        let existing = "# approval_policy = \"never\"\n[profiles.x]\napproval_policy = \"untrusted\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        // La cle sous [profiles.x] et la ligne commentee ne sont pas touchees ;
+        // la cle racine est prefixee.
+        assert!(out.starts_with("approval_policy = \"never\"\n"));
+        assert!(out.contains("[profiles.x]"));
+        assert!(out.contains("approval_policy = \"untrusted\""));
+        assert!(out.contains("# approval_policy = \"never\""));
+    }
+
+    #[test]
+    fn upsert_does_not_match_key_prefix() {
+        // `approval_policy_extra` ne doit pas etre confondu avec `approval_policy`.
+        let existing = "approval_policy_extra = \"x\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.starts_with("approval_policy = \"never\"\n"));
+        assert!(out.contains("approval_policy_extra = \"x\""));
+    }
+
+    #[test]
+    fn upsert_is_idempotent() {
+        let once = upsert_top_level_string("", "approval_policy", "never");
+        let twice = upsert_top_level_string(&once, "approval_policy", "never");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn upsert_does_not_misfire_inside_multiline_string() {
+        // Une chaine multi-ligne contenant une ligne `[...]` ET une ligne
+        // `approval_policy = ...` ne doit NI latcher in_table NI etre prise pour
+        // la vraie cle top-level. La vraie cle (apres la chaine) est remplacee.
+        let existing = "notify_tpl = \"\"\"\n[warn] hi\napproval_policy = \"x\"\n\"\"\"\napproval_policy = \"on-request\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        // Contenu de la chaine preserve tel quel.
+        assert!(out.contains("[warn] hi"));
+        assert!(out.contains("approval_policy = \"x\""));
+        // Une seule occurrence EFFECTIVE remplacee, pas de doublon top-level.
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(!out.contains("on-request"));
+        // Pas de prefixe : la cle a ete remplacee en place, donc le fichier
+        // commence toujours par la chaine multi-ligne.
+        assert!(out.starts_with("notify_tpl = \"\"\""));
+        assert_eq!(out.matches("approval_policy = \"never\"").count(), 1);
+    }
+
+    #[test]
+    fn upsert_does_not_latch_on_multiline_array_rows() {
+        // Un tableau multi-ligne dont des lignes commencent par `[` ne doit pas
+        // etre pris pour une table : la cle top-level qui suit reste remplacable.
+        let existing = "matrix = [\n[1, 2],\n[3, 4],\n]\napproval_policy = \"on-request\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.contains("matrix = ["));
+        assert!(out.contains("[1, 2],"));
+        assert!(out.contains("approval_policy = \"never\""));
+        assert!(!out.contains("on-request"));
+        assert!(out.starts_with("matrix = ["));
+    }
+
+    #[test]
+    fn upsert_is_utf8_safe() {
+        // Ne doit pas paniquer sur des caracteres multi-octets (chemins accentues).
+        let existing = "label = \"Café Références ☕\"\n[mcp_servers.x]\nurl = \"http://é\"\n";
+        let out = upsert_top_level_string(existing, "approval_policy", "never");
+        assert!(out.starts_with("approval_policy = \"never\"\n"));
+        assert!(out.contains("Café Références ☕"));
     }
 
     fn empty_settings(
@@ -512,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_agents_seeds_codex_only_on_fresh_settings() {
+    fn ensure_agents_seeds_codex_and_claude_on_fresh_settings() {
         let mut settings = empty_settings("codex", Vec::new(), None);
 
         let changed = ensure_agents(&mut settings);
@@ -526,12 +952,24 @@ mod tests {
         assert!(codex.builtin);
         assert_eq!(codex.command, "codex");
         assert_eq!(codex.kind, "cli");
+        assert_eq!(codex.provider, Provider::Codex);
         assert_eq!(codex.status_command.as_deref(), Some("login status"));
+        // L'agent Claude Code integre est seed a cote de Codex.
+        let claude = settings
+            .agents
+            .iter()
+            .find(|agent| agent.id == CLAUDE_AGENT_ID)
+            .expect("claude agent seeded");
+        assert!(claude.builtin);
+        assert_eq!(claude.command, "claude");
+        assert_eq!(claude.kind, "cli");
+        assert_eq!(claude.provider, Provider::Claude);
         // Kombai n'est pas un agent terminal : il ne doit PAS etre seed ici.
         assert!(!settings
             .agents
             .iter()
             .any(|agent| agent.id == KOMBAI_AGENT_ID));
+        // L'agent actif par defaut reste Codex (comportement historique).
         assert_eq!(settings.active_agent_id.as_deref(), Some(CODEX_AGENT_ID));
     }
 
@@ -541,6 +979,7 @@ mod tests {
             id: KOMBAI_AGENT_ID.to_string(),
             label: "Kombai".to_string(),
             command: "kombai".to_string(),
+            provider: Provider::Codex,
             kind: "cli".to_string(),
             builtin: false,
             login_command: None,
@@ -564,6 +1003,7 @@ mod tests {
             id: KOMBAI_AGENT_ID.to_string(),
             label: "Kombai".to_string(),
             command: "my-kombai-wrapper".to_string(),
+            provider: Provider::Codex,
             kind: "cli".to_string(),
             builtin: false,
             login_command: None,
@@ -587,6 +1027,7 @@ mod tests {
             id: CODEX_AGENT_ID.to_string(),
             label: "Codex".to_string(),
             command: "codex-custom".to_string(),
+            provider: Provider::Codex,
             kind: "cli".to_string(),
             builtin: true,
             login_command: Some("login".to_string()),
@@ -721,6 +1162,7 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
                 id: CODEX_AGENT_ID.to_string(),
                 label: "Codex".to_string(),
                 command: codex_command,
+                provider: Provider::Codex,
                 kind: "cli".to_string(),
                 builtin: true,
                 login_command: Some("login".to_string()),
@@ -728,6 +1170,29 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
                 doctor_command: Some("doctor --summary --ascii".to_string()),
             },
         );
+        changed = true;
+    }
+
+    // Agent Claude Code integre. Comme l'agent Codex, il est (re)cree s'il
+    // manque : Claude Code est un fournisseur pris en charge de premier rang.
+    // `login`/`status` se font en session interactive (`/login`, `/status`) et
+    // ne sont donc pas des sous-commandes CLI ; seul `claude doctor` en est une.
+    if !settings
+        .agents
+        .iter()
+        .any(|agent| agent.id == CLAUDE_AGENT_ID)
+    {
+        settings.agents.push(AgentProfile {
+            id: CLAUDE_AGENT_ID.to_string(),
+            label: "Claude Code".to_string(),
+            command: "claude".to_string(),
+            provider: Provider::Claude,
+            kind: "cli".to_string(),
+            builtin: true,
+            login_command: None,
+            status_command: None,
+            doctor_command: Some("doctor".to_string()),
+        });
         changed = true;
     }
 
@@ -860,12 +1325,18 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
             settings.accounts.push(AccountProfile {
                 id,
                 label: label_from_codex_dir(name),
+                provider: Provider::Codex,
                 codex_home: path_string.clone(),
                 project_dir: None,
                 proxy_id,
                 startup_command: None,
                 limits: AccountLimitTracking::default(),
                 bypass: bypass_default,
+                // Ce CODEX_HOME existait deja avant sa decouverte : ne pas
+                // ecraser un modele/effort potentiellement defini dans son
+                // config.toml. L'utilisateur pourra les choisir dans l'UI.
+                model: None,
+                reasoning_effort: None,
             });
             account_paths.insert(normalized);
             changed = true;
@@ -926,18 +1397,25 @@ pub fn account_has_auth_tokens(account: &AccountProfile) -> bool {
     let Ok(home) = expand_home(&account.codex_home) else {
         return false;
     };
-    let Ok(content) = fs::read_to_string(home.join("auth.json")) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
-    value
-        .get("tokens")
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(Value::as_str)
-        .map(|token| !token.is_empty())
-        .unwrap_or(false)
+    // Detection des credentials propre au provider (Codex: auth.json ;
+    // Claude: .credentials.json). Voir `provider::Provider::has_auth`.
+    account.provider.has_auth(&home)
+}
+
+/// Commande CLI a utiliser pour lancer/piloter un `provider` : commande de
+/// l'agent integre correspondant (Codex ou Claude Code), avec repli sur la
+/// commande par defaut du provider si l'agent a ete retire du registre.
+pub fn command_for_provider(settings: &AppSettings, provider: Provider) -> String {
+    settings
+        .agents
+        .iter()
+        .find(|agent| agent.provider == provider && agent.builtin)
+        .map(|agent| agent.command.trim().to_string())
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| match provider {
+            Provider::Codex => "codex".to_string(),
+            Provider::Claude => "claude".to_string(),
+        })
 }
 
 fn sync_account_limit_trackers(settings: &mut AppSettings) -> bool {
@@ -1387,7 +1865,7 @@ fn import_single_account(
     // Compte importe : herite du defaut global "Bypass defaut" (comme la
     // creation via l'UI / newAccountProfile), pas un `true` code en dur.
     let bypass_default = settings.codex_bypass;
-    match settings
+    let (bypass_enabled, model, reasoning_effort) = match settings
         .accounts
         .iter_mut()
         .find(|candidate| candidate.id == id)
@@ -1397,18 +1875,39 @@ fn import_single_account(
             existing.codex_home = home_string;
             existing.proxy_id = proxy_id;
             touch_account_limits(&mut existing.limits, now);
+            (
+                existing.bypass,
+                existing.model.clone(),
+                existing.reasoning_effort.clone(),
+            )
         }
-        None => settings.accounts.push(AccountProfile {
-            id,
-            label: account.label,
-            codex_home: home_string,
-            project_dir: None,
-            proxy_id,
-            startup_command: None,
-            limits: new_connected_limits(now),
-            bypass: bypass_default,
-        }),
-    }
+        None => {
+            let model = Some(DEFAULT_ACCOUNT_MODEL.to_string());
+            let reasoning_effort = Some(DEFAULT_ACCOUNT_REASONING_EFFORT.to_string());
+            settings.accounts.push(AccountProfile {
+                id,
+                label: account.label,
+                provider: Provider::Codex,
+                codex_home: home_string,
+                project_dir: None,
+                proxy_id,
+                startup_command: None,
+                limits: new_connected_limits(now),
+                bypass: bypass_default,
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+            });
+            (bypass_default, model, reasoning_effort)
+        }
+    };
+
+    ensure_codex_account_config(
+        &home,
+        bypass_enabled,
+        model.as_deref(),
+        reasoning_effort.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
 
     Ok(())
 }
@@ -1758,6 +2257,223 @@ fn now_iso8601() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
+/// Synchronise (idempotent) les reglages Codex propres a un compte.
+///
+/// Le choix bypass est toujours materialise explicitement : le desactiver remet
+/// `approval_policy = "on-request"` et `sandbox_mode = "workspace-write"`, ce
+/// qui neutralise un ancien bypass persiste dans le meme `config.toml`. Le
+/// modele et l'intensite ne sont touches que lorsqu'une valeur non vide est
+/// fournie, afin de préserver les profils des versions anterieures (`None`).
+///
+/// Les autres entrees du fichier (dont `[mcp_servers.*]`) sont preservees et
+/// l'ecriture est atomique. Les valeurs sont echappees comme des chaines TOML :
+/// un nom de modele fourni par l'UI ne peut donc pas injecter une nouvelle cle.
+pub fn ensure_codex_account_config(
+    home: &Path,
+    bypass: bool,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> std::io::Result<()> {
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    let reasoning_effort = reasoning_effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(effort) = reasoning_effort {
+        if !matches!(effort, "minimal" | "low" | "medium" | "high" | "xhigh") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Intensite de raisonnement invalide: {effort} (valeurs: minimal, low, medium, high, xhigh)"
+                ),
+            ));
+        }
+    }
+
+    fs::create_dir_all(home)?;
+    let path = home.join("config.toml");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+
+    let approval_policy = if bypass { "never" } else { "on-request" };
+    let sandbox_mode = if bypass {
+        "danger-full-access"
+    } else {
+        "workspace-write"
+    };
+    let mut updated = upsert_top_level_string(&existing, "approval_policy", approval_policy);
+    updated = upsert_top_level_string(&updated, "sandbox_mode", sandbox_mode);
+    if let Some(model) = model {
+        updated = upsert_top_level_string(&updated, "model", model);
+    }
+    if let Some(effort) = reasoning_effort {
+        updated = upsert_top_level_string(&updated, "model_reasoning_effort", effort);
+    }
+
+    if updated == existing {
+        return Ok(());
+    }
+
+    let tmp = home.join("config.toml.cst-tmp");
+    fs::write(&tmp, updated)?;
+    fs::rename(&tmp, &path)
+}
+
+/// Insere ou remplace une cle scalaire chaine AU NIVEAU RACINE d'un document TOML
+/// (avant toute table `[section]`). Ne touche jamais une cle de meme nom situee
+/// dans une table, une chaine multi-ligne (`"""`/`'''`), un tableau multi-ligne,
+/// ni une ligne commentee. Si la cle est absente, elle est prefixee (une cle
+/// racine doit preceder toute table pour rester du TOML valide).
+///
+/// Ce n'est pas un parseur TOML complet, mais il suit l'etat des chaines
+/// multi-lignes et la profondeur des crochets pour ne pas confondre le CONTENU
+/// d'une valeur avec une structure top-level (ce qui pourrait dupliquer une cle
+/// et corrompre le fichier).
+fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
+    let desired = format!("{key} = \"{}\"", escape_toml_basic_string(value));
+    let mut out = String::with_capacity(content.len() + desired.len() + 1);
+    let mut replaced = false;
+    let mut in_table = false;
+    // Etat de lexing, evalue au DEBUT de chaque ligne.
+    let mut ml: Option<&'static str> = None; // chaine multi-ligne ouverte
+    let mut depth: i32 = 0; // profondeur de crochets (tableaux multi-lignes)
+
+    for line in content.lines() {
+        // Une ligne n'est "top-level" que hors chaine multi-ligne et hors tableau.
+        let at_top_level = ml.is_none() && depth == 0;
+        let trimmed = line.trim_start();
+
+        let mut is_target = false;
+        if at_top_level {
+            if trimmed.starts_with('[') {
+                in_table = true;
+            } else if !replaced
+                && !in_table
+                && !trimmed.starts_with('#')
+                && trimmed
+                    .strip_prefix(key)
+                    .map(|rest| rest.trim_start().starts_with('='))
+                    .unwrap_or(false)
+            {
+                is_target = true;
+            }
+        }
+
+        if is_target {
+            out.push_str(&desired);
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+
+        advance_toml_lex(line, &mut ml, &mut depth);
+    }
+
+    if replaced {
+        out
+    } else if content.is_empty() {
+        format!("{desired}\n")
+    } else {
+        format!("{desired}\n{content}")
+    }
+}
+
+/// Echappe une valeur pour une chaine TOML basique delimitee par `"`. Les
+/// retours a la ligne restent ainsi dans la valeur et ne peuvent pas devenir
+/// des cles TOML au niveau racine.
+fn escape_toml_basic_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\u{000C}' => escaped.push_str("\\f"),
+            '\r' => escaped.push_str("\\r"),
+            control if control.is_control() => {
+                let codepoint = control as u32;
+                if codepoint <= 0xFFFF {
+                    escaped.push_str(&format!("\\u{codepoint:04X}"));
+                } else {
+                    escaped.push_str(&format!("\\U{codepoint:08X}"));
+                }
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Fait avancer l'etat de lexing TOML (chaine multi-ligne ouverte, profondeur de
+/// crochets) au fil d'une ligne. UTF-8 safe : toutes les decoupes se font sur des
+/// frontieres de caracteres. Ne vise pas la conformite TOML complete, juste de
+/// quoi distinguer le niveau racine du contenu des valeurs.
+fn advance_toml_lex(line: &str, ml: &mut Option<&'static str>, depth: &mut i32) {
+    let mut rest = line;
+    loop {
+        // Dans une chaine multi-ligne : on cherche sa fermeture.
+        if let Some(delim) = *ml {
+            match rest.find(delim) {
+                Some(pos) => {
+                    *ml = None;
+                    rest = &rest[pos + delim.len()..];
+                }
+                None => return,
+            }
+            continue;
+        }
+
+        let Some(c) = rest.chars().next() else {
+            return;
+        };
+
+        // Ouverture d'une chaine multi-ligne ?
+        if rest.starts_with("\"\"\"") || rest.starts_with("'''") {
+            let delim = if rest.starts_with("\"\"\"") {
+                "\"\"\""
+            } else {
+                "'''"
+            };
+            let after_open = &rest[3..];
+            match after_open.find(delim) {
+                Some(pos) => rest = &after_open[pos + 3..], // ouverte + fermee ici
+                None => {
+                    *ml = Some(delim);
+                    return;
+                }
+            }
+            continue;
+        }
+
+        match c {
+            // Commentaire : le reste de la ligne est ignore.
+            '#' => return,
+            // Chaine simple ligne : consommee jusqu'a sa fermeture (ou fin de ligne).
+            '"' | '\'' => {
+                let after = &rest[c.len_utf8()..];
+                match after.find(c) {
+                    Some(pos) => rest = &after[pos + c.len_utf8()..],
+                    None => return,
+                }
+            }
+            '[' => {
+                *depth += 1;
+                rest = &rest[1..];
+            }
+            ']' => {
+                if *depth > 0 {
+                    *depth -= 1;
+                }
+                rest = &rest[1..];
+            }
+            _ => rest = &rest[c.len_utf8()..],
+        }
+    }
+}
+
 fn normalize_string_path(value: &str) -> String {
     value.trim().replace('/', "\\").to_ascii_lowercase()
 }
@@ -1838,5 +2554,105 @@ fn default_shell() -> String {
         "powershell.exe".to_string()
     } else {
         env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    }
+}
+
+#[cfg(test)]
+mod delete_home_tests {
+    use super::*;
+
+    /// Base temporaire unique par test (pas de `Date`/`rand` : nom fixe + nettoyage).
+    fn scratch(tag: &str) -> PathBuf {
+        let base = env::temp_dir()
+            .join("cst-remove-account-tests")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create scratch dir");
+        base
+    }
+
+    #[test]
+    fn guard_accepts_codex_like_dir_name() {
+        let base = scratch("codex-like");
+        let dir = base.join(".codex-pool-alpha");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_accepts_dir_with_auth_marker() {
+        let base = scratch("marker");
+        // Nom quelconque, mais contient un auth.json => reconnu comme CODEX_HOME.
+        let dir = base.join("some-random-name");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("auth.json"), "{}").unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_accepts_dir_under_codex_homes() {
+        let base = scratch("codex-homes");
+        let dir = base.join("codex-homes").join("pool-beta");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_rejects_non_codex_dir() {
+        let base = scratch("non-codex");
+        let dir = base.join("my-documents");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(guard_deletable_codex_home(&dir).is_err());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_rejects_user_home() {
+        let home = home_dir().expect("home dir");
+        assert!(guard_deletable_codex_home(&home).is_err());
+    }
+
+    #[test]
+    fn guard_rejects_ancestor_of_home() {
+        let home = home_dir().expect("home dir");
+        if let Some(parent) = home.parent() {
+            assert!(guard_deletable_codex_home(parent).is_err());
+        }
+    }
+
+    #[test]
+    fn delete_missing_dir_is_ok() {
+        let base = scratch("missing");
+        let missing = base.join(".codex-does-not-exist");
+        assert!(delete_codex_home_dir(&missing.to_string_lossy()).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_removes_codex_home_dir() {
+        let base = scratch("delete-ok");
+        let dir = base.join(".codex-pool-gamma");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("auth.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+
+        delete_codex_home_dir(&dir.to_string_lossy()).expect("delete should succeed");
+        assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_refuses_and_keeps_non_codex_dir() {
+        let base = scratch("delete-refuse");
+        let dir = base.join("important-stuff");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("data.txt"), "keep me").unwrap();
+
+        assert!(delete_codex_home_dir(&dir.to_string_lossy()).is_err());
+        assert!(dir.exists(), "un dossier refuse ne doit pas etre efface");
+        let _ = fs::remove_dir_all(&base);
     }
 }

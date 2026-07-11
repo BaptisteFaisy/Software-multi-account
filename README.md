@@ -38,6 +38,8 @@ Depuis PowerShell, une action peut etre lancee directement :
 - Les profils proxy sont detectes depuis les fichiers `proxy.txt` presents dans `~\.codex*`.
 - Le terminal lance un shell avec `CODEX_HOME`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` et leurs variantes minuscules selon le compte selectionne.
 - Chaque compte peut avoir un `Dossier projet`; les nouveaux terminaux demarrent directement dans ce dossier pour que Codex prenne ce workspace comme environnement.
+- A la creation d'un compte/environnement, l'interface demande le mode de securite (bypass ou sandbox), le modele Codex par defaut et son intensite de raisonnement. Ces choix sont propres au compte.
+- L'app synchronise ces choix dans le `config.toml` du `CODEX_HOME` (`approval_policy`, `sandbox_mode`, `model`, `model_reasoning_effort`), y compris lors du passage du bypass vers la sandbox.
 - Le bouton `Terminal` cree un nouvel onglet PTY sans fermer les sessions existantes.
 - Le bouton `Pool term` ouvre un nouvel onglet PTY en piochant le prochain compte qui possede un `auth.json` valide.
 - La vue `Pool` permet d'importer des fichiers JSON de comptes (`*_cpa.json`, exports avec `accounts[].credentials`, dossier de JSON ou wildcard `*.json`).
@@ -172,10 +174,21 @@ Le script :
 - cree un dossier serveur dans `%APPDATA%\codex-switch-terminal-server`
 - genere un token admin local la premiere fois
 - build le frontend / serveur si besoin
-- demarre `cst-server` sur `0.0.0.0:8080`
-- affiche l'URL a ouvrir, par exemple `http://192.168.1.20:8080`
+- demarre `cst-server` en local sur `127.0.0.1:8080` (aucune fenetre pare-feu)
+- affiche l'URL locale a ouvrir : `http://127.0.0.1:8080`
 
-Depuis ton PC ou un autre appareil du meme reseau, ouvre l'URL affichee puis
+Par defaut le serveur n'ecoute qu'en local, donc aucune fenetre "Pare-feu
+Windows". Pour l'ouvrir aux autres appareils du meme reseau (telephone, autre
+PC, noeud Oracle), definis `CST_BIND` avant le lanceur :
+
+```powershell
+$env:CST_BIND = "0.0.0.0:8080"
+& ".\Lancer Codex Switch Terminal.cmd" server
+```
+
+La fenetre pare-feu n'apparait alors qu'une seule fois (ou lance une bonne fois
+`scripts/allow-local-server-firewall.ps1` en admin), et le lanceur affiche
+l'URL reseau, par exemple `http://192.168.1.20:8080`. Ouvre l'URL affichee puis
 colle le token admin affiche dans la console.
 
 Pour ouvrir directement le site web dans ton navigateur :
@@ -192,8 +205,10 @@ l'ecran de connexion. Pour l'arreter :
 & ".\Lancer Codex Switch Terminal.cmd" stop
 ```
 
-Si tu veux l'ouvrir depuis un telephone ou un autre PC du meme reseau, utilise
-l'URL reseau affichee par le lanceur, par exemple `http://192.168.1.20:8080`.
+Par defaut le serveur n'ecoute qu'en local (`127.0.0.1`), donc aucune fenetre
+pare-feu. Pour l'ouvrir depuis un telephone ou un autre PC du meme reseau,
+definis `CST_BIND=0.0.0.0:8080` avant de lancer le serveur : le lanceur affiche
+alors l'URL reseau, par exemple `http://192.168.1.20:8080`.
 
 ### Setup PC + Oracle avec choix automatique
 
@@ -202,14 +217,17 @@ Tailscale/WireGuard, puis de lancer un `cst-server` sur chaque machine.
 L'app ou le site garde Oracle comme serveur principal, mais les nouveaux
 terminaux peuvent partir sur ton PC si disponible, sinon sur Oracle.
 
-1. Lance le serveur sur ton PC :
+1. Lance le serveur sur ton PC en l'exposant au reseau prive (sinon il n'ecoute
+qu'en local) :
 
 ```powershell
+$env:CST_BIND = "0.0.0.0:8080"
 & ".\Lancer Codex Switch Terminal.cmd" server
 ```
 
-Note l'URL Tailscale ou LAN du PC et le token admin. Le script annonce aussi le
-nom du noeud et sa capacite.
+Note l'URL Tailscale ou LAN du PC et le token admin. La premiere fois, accepte
+la fenetre pare-feu (ou lance une bonne fois `scripts/allow-local-server-firewall.ps1`
+en admin). Le script annonce aussi le nom du noeud et sa capacite.
 
 2. Lance le serveur sur Oracle avec les memes fichiers `dist/` et `cst-server`.
 Dans `/etc/codex-switch-terminal.env`, mets au minimum :

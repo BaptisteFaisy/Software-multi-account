@@ -1,13 +1,20 @@
 mod account_usage;
 pub mod agent_room;
 mod client_startup;
+pub mod devices;
 mod discussions;
 mod kombai;
 mod metrics;
 mod pool;
+mod provider;
+mod security;
 pub mod server;
 mod settings;
 mod terminal;
+
+// `Provider` fait partie de l'API publique (champ de `agent_room::AgentMeta`,
+// DTOs serveur) : on le re-exporte pour qu'il soit nommable hors du crate.
+pub use settings::Provider;
 
 use agent_room::RoomState;
 use pool::PoolManager;
@@ -78,6 +85,8 @@ async fn serve_room(
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(terminal::TerminalManager::default())
         .manage(PoolState::default())
         .manage(build_room_state())
@@ -122,6 +131,7 @@ pub fn run() {
             discussions::list_prompt_history,
             discussions::claim_session_for_terminal,
             discussions::copy_discussion_to_account,
+            discussions::export_discussion_transcript,
             discussions::delete_discussion,
             terminal::start_terminal,
             terminal::write_terminal,
@@ -154,20 +164,37 @@ fn stop_runtime(state: &PoolState) {
     }
 }
 
+/// Adresse d'ecoute du proxy de pool. Le pool est un proxy PUREMENT LOCAL,
+/// consomme via `http://localhost:{port}` : on bind donc sur loopback par
+/// defaut. Cela evite la fenetre "Pare-feu Windows Defender / Autoriser l'acces"
+/// (declenchee uniquement par un bind sur `0.0.0.0`), qui exige l'admin a chaque
+/// lancement tant qu'aucune regle n'est acceptee. Un override explicite reste
+/// possible via `CST_POOL_BIND=0.0.0.0:<port>` pour exposer le pool sur le LAN.
+fn pool_bind_addr(port: u16) -> String {
+    std::env::var("CST_POOL_BIND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"))
+}
+
 #[tauri::command]
 async fn pool_start(state: tauri::State<'_, PoolState>) -> Result<Value, String> {
     stop_runtime(&state);
 
     let settings = settings::load_settings_for_terminal()?;
     let port = settings.pool.port;
-    let addr = format!("0.0.0.0:{port}");
+    let addr = pool_bind_addr(port);
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("port {port} indisponible: {e}"))?;
 
     let manager = Arc::new(PoolManager::build(&settings)?);
-    let router = pool::router(manager.clone());
+    // Pool local desktop : proxy purement loopback, pas d'admin_token dans ce
+    // process -> pas de jeton break-glass (l'auth reste facultative via la cle
+    // API du pool si l'utilisateur en configure une).
+    let router = pool::router(manager.clone(), None);
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
     tauri::async_runtime::spawn(async move {
@@ -219,15 +246,17 @@ fn pool_pick_terminal_account(
     state: tauri::State<'_, PoolState>,
 ) -> Result<settings::AccountProfile, String> {
     let settings = settings::load_settings_for_terminal()?;
+    // Le pool ChatGPT ne rotationne que des comptes Codex authentifies (auth.json).
     let accounts = settings
         .accounts
         .into_iter()
+        .filter(|account| account.provider == settings::Provider::Codex)
         .filter(settings::account_has_auth_tokens)
         .collect::<Vec<_>>();
 
     if accounts.is_empty() {
         return Err(
-            "Aucun compte avec auth.json dans le pool. Importe d'abord des JSON.".to_string(),
+            "Aucun compte Codex avec auth.json dans le pool. Importe d'abord des JSON.".to_string(),
         );
     }
 
@@ -307,11 +336,13 @@ fn room_disable(
     stop_room(&server);
     let mut settings = settings::load_settings_for_terminal()?;
     settings.agent_room.enabled = false;
-    let codex_bin = settings.codex_command.clone();
-    // Deprovision de chaque compte (best-effort).
+    // Deprovision de chaque compte (best-effort), avec le CLI du provider du
+    // compte (Codex retire l'entree de config.toml, Claude via `claude mcp
+    // remove` dans son CLAUDE_CONFIG_DIR).
     for account in &settings.accounts {
         if let Ok(home) = settings::expand_home(&account.codex_home) {
-            room.deprovision_home(&codex_bin, &home);
+            let cli_bin = settings::command_for_provider(&settings, account.provider);
+            room.deprovision_home(account.provider, &cli_bin, &home);
         }
     }
     settings::save_settings(settings)?;

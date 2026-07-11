@@ -32,6 +32,7 @@ use axum::{
     routing::post,
     Router,
 };
+use crate::settings::Provider;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -79,6 +80,9 @@ fn now_ts() -> i64 {
 #[derive(Debug, Clone, Default)]
 pub struct AgentMeta {
     pub agent_id: String,
+    /// Fournisseur CLI de l'agent (Codex / Claude). Permet au salon de
+    /// distinguer des pairs de providers differents.
+    pub provider: Provider,
     pub account_id: String,
     pub label: String,
     pub cwd: Option<String>,
@@ -204,8 +208,16 @@ impl RoomState {
 
     /// Provisionne un `CODEX_HOME` (idempotent, avec cache par session) : ajoute
     /// l'entree `[mcp_servers.agent_room]` via `codex mcp add` si absente.
-    pub fn provision_home(&self, codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), String> {
-        let key = codex_home.to_string_lossy().to_lowercase();
+    pub fn provision_home(
+        &self,
+        provider: Provider,
+        cli_bin: &str,
+        home: &Path,
+        url: &str,
+    ) -> Result<(), String> {
+        // Cle de cache = (provider, home) : Codex et Claude ecrivent des configs
+        // differentes, et leurs homes sont de toute facon distincts.
+        let key = format!("{}:{}", provider.as_str(), home.to_string_lossy().to_lowercase());
         if self
             .inner
             .provisioned
@@ -215,17 +227,17 @@ impl RoomState {
         {
             return Ok(());
         }
-        provision(codex_bin, codex_home, url)?;
+        provision(provider, cli_bin, home, url)?;
         if let Ok(mut set) = self.inner.provisioned.lock() {
             set.insert(key);
         }
         Ok(())
     }
 
-    /// Retire l'entree du salon d'un `CODEX_HOME` et oublie le cache associe.
-    pub fn deprovision_home(&self, codex_bin: &str, codex_home: &Path) {
-        deprovision(codex_bin, codex_home);
-        let key = codex_home.to_string_lossy().to_lowercase();
+    /// Retire l'entree du salon d'un home de compte et oublie le cache associe.
+    pub fn deprovision_home(&self, provider: Provider, cli_bin: &str, home: &Path) {
+        deprovision(provider, cli_bin, home);
+        let key = format!("{}:{}", provider.as_str(), home.to_string_lossy().to_lowercase());
         if let Ok(mut set) = self.inner.provisioned.lock() {
             set.remove(&key);
         }
@@ -900,17 +912,25 @@ fn accepted() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Provisioning de config.toml (via le CLI codex, merge-safe)
+// Provisioning de la config MCP par compte (via le CLI du provider, merge-safe)
 // ---------------------------------------------------------------------------
 
-/// Idempotent : verifie via `codex mcp get agent_room` ; si absent (ou URL
-/// differente), (re)ajoute via `codex mcp add ... --url <url>
-/// --bearer-token-env-var CST_ROOM_TOKEN`. `codex` fusionne dans le config.toml
-/// existant sans ecraser les autres entrees.
-pub fn provision(codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), String> {
-    let get = Command::new(codex_bin)
+/// Idempotent : verifie via `<cli> mcp get agent_room` ; si absent (ou URL
+/// differente), (re)ajoute l'entree. Chaque CLI fusionne dans sa propre config
+/// sans ecraser les autres entrees :
+/// - **Codex** : `codex mcp add ... --url <url> --bearer-token-env-var
+///   CST_ROOM_TOKEN` (le token reste hors du config.toml).
+/// - **Claude** : `claude mcp add --transport http agent_room <url> --header
+///   "Authorization: Bearer ${CST_ROOM_TOKEN}" --scope user`. Claude n'a pas de
+///   flag `--bearer-token-env-var` ; on passe le token par **expansion
+///   d'environnement** (`${CST_ROOM_TOKEN}`) pour qu'il reste hors du fichier et
+///   demeure UNIQUE par PTY (comme pour Codex).
+pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> Result<(), String> {
+    let home_env = provider.home_env_var();
+
+    let get = Command::new(cli_bin)
         .args(["mcp", "get", "agent_room"])
-        .env("CODEX_HOME", codex_home)
+        .env(home_env, home)
         .output();
 
     if let Ok(output) = &get {
@@ -922,29 +942,48 @@ pub fn provision(codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), St
             }
             // Present mais URL differente (ex. port change) : on retire avant de
             // reajouter proprement.
-            deprovision(codex_bin, codex_home);
+            deprovision(provider, cli_bin, home);
         }
     }
 
-    let add = Command::new(codex_bin)
-        .args([
-            "mcp",
-            "add",
-            "agent_room",
-            "--url",
-            url,
-            "--bearer-token-env-var",
-            "CST_ROOM_TOKEN",
-        ])
-        .env("CODEX_HOME", codex_home)
+    let mut add = Command::new(cli_bin);
+    match provider {
+        Provider::Codex => {
+            add.args([
+                "mcp",
+                "add",
+                "agent_room",
+                "--url",
+                url,
+                "--bearer-token-env-var",
+                "CST_ROOM_TOKEN",
+            ]);
+        }
+        Provider::Claude => {
+            add.args([
+                "mcp",
+                "add",
+                "--transport",
+                "http",
+                "agent_room",
+                url,
+                "--header",
+                "Authorization: Bearer ${CST_ROOM_TOKEN}",
+                "--scope",
+                "user",
+            ]);
+        }
+    }
+    let add = add
+        .env(home_env, home)
         .output()
-        .map_err(|e| format!("lancement de `{codex_bin} mcp add` impossible: {e}"))?;
+        .map_err(|e| format!("lancement de `{cli_bin} mcp add` impossible: {e}"))?;
 
     if add.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "`codex mcp add` a echoue: {}",
+            "`{cli_bin} mcp add` a echoue: {}",
             String::from_utf8_lossy(&add.stderr).trim()
         ))
     }
@@ -952,10 +991,10 @@ pub fn provision(codex_bin: &str, codex_home: &Path, url: &str) -> Result<(), St
 
 /// Retire l'entree du salon (best-effort : un retrait d'une entree absente
 /// n'est pas une erreur bloquante).
-pub fn deprovision(codex_bin: &str, codex_home: &Path) {
-    let _ = Command::new(codex_bin)
+pub fn deprovision(provider: Provider, cli_bin: &str, home: &Path) {
+    let _ = Command::new(cli_bin)
         .args(["mcp", "remove", "agent_room"])
-        .env("CODEX_HOME", codex_home)
+        .env(provider.home_env_var(), home)
         .output();
 }
 
@@ -980,6 +1019,7 @@ mod tests {
     fn meta(label: &str) -> AgentMeta {
         AgentMeta {
             agent_id: "codex".to_string(),
+            provider: Provider::Codex,
             account_id: "acc".to_string(),
             label: label.to_string(),
             cwd: Some("C:/proj".to_string()),

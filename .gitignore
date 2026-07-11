@@ -11,6 +11,8 @@ android/app/build
 
 # Portable EXE build artifacts (replaced by signed installers / the updater)
 *.exe
+# Android debug/build artifacts (produits par scripts/build-android-apk.ps1)
+*.apk
 
 # Local machine tooling / editor state (personal, not shared)
 .claude/settings.local.json

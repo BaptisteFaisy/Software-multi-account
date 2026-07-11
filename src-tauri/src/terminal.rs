@@ -71,6 +71,7 @@ pub fn start_terminal(
     cols: u16,
     rows: u16,
     command: Option<String>,
+    project_dir: Option<String>,
 ) -> Result<u64, String> {
     let settings = load_settings_for_terminal()?;
     let account = settings
@@ -78,7 +79,8 @@ pub fn start_terminal(
         .iter()
         .find(|candidate| candidate.id == account_id)
         .cloned()
-        .ok_or_else(|| "Compte Codex introuvable".to_string())?;
+        .ok_or_else(|| "Compte introuvable".to_string())?;
+    let provider = account.provider;
     let proxy = if settings.proxy_controls_enabled {
         account.proxy_id.as_ref().and_then(|id| {
             settings
@@ -90,9 +92,43 @@ pub fn start_terminal(
         None
     };
 
-    let codex_home = expand_home(&account.codex_home)?;
-    std::fs::create_dir_all(&codex_home).map_err(|error| error.to_string())?;
-    let project_dir = resolve_project_dir(&account)?;
+    let account_home = expand_home(&account.codex_home)?;
+    std::fs::create_dir_all(&account_home).map_err(|error| error.to_string())?;
+
+    // Synchronise a chaque demarrage les permissions/modele propres au compte,
+    // dans le format du provider (Codex config.toml / Claude settings.json). Non
+    // bloquant : une config invalide/non inscriptible ne doit pas empecher le
+    // terminal de demarrer.
+    if let Err(error) = provider.write_account_config(
+        &account_home,
+        account.bypass,
+        account.model.as_deref(),
+        account.reasoning_effort.as_deref(),
+    ) {
+        eprintln!(
+            "[config] config {} non ecrite pour {}: {error}",
+            provider.as_str(),
+            account.label
+        );
+    }
+
+    // Workspace choisi dans l'UI (dossier de travail global) : prioritaire sur le
+    // `project_dir` par defaut du compte. Sinon, on retombe sur le comportement
+    // historique (dossier projet du compte).
+    let project_dir = match project_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => {
+            let path = expand_home(raw)?;
+            if !path.is_dir() {
+                return Err(format!("Dossier workspace introuvable: {raw}"));
+            }
+            Some(path)
+        }
+        None => resolve_project_dir(&account)?,
+    };
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -105,7 +141,12 @@ pub fn start_terminal(
         .map_err(|error| error.to_string())?;
 
     let mut builder = shell_command(&settings);
-    builder.env("CODEX_HOME", codex_home.to_string_lossy().to_string());
+    // Isolation multi-comptes : Codex lit CODEX_HOME, Claude lit
+    // CLAUDE_CONFIG_DIR. Voir `provider::Provider::home_env_var`.
+    builder.env(
+        provider.home_env_var(),
+        account_home.to_string_lossy().to_string(),
+    );
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
 
@@ -128,16 +169,19 @@ pub fn start_terminal(
         }
     }
 
-    // Salon d'agents : si active, on provisionne le CODEX_HOME (entree MCP
-    // mergee) puis on injecte un token UNIQUE par terminal pour que le serveur
-    // distingue cet agent des autres (meme s'ils partagent un CODEX_HOME).
+    // Salon d'agents : si active, on provisionne l'entree MCP dans le home du
+    // compte (via le CLI du provider) puis on injecte un token UNIQUE par
+    // terminal pour que le serveur distingue cet agent des autres (meme s'ils
+    // partagent un home).
     let mut room_token: Option<String> = None;
     if settings.agent_room.enabled {
         let url = format!("http://127.0.0.1:{}/mcp", settings.agent_room.port);
-        match room.provision_home(&settings.codex_command, &codex_home, &url) {
+        let cli_bin = crate::settings::command_for_provider(&settings, provider);
+        match room.provision_home(provider, &cli_bin, &account_home, &url) {
             Ok(()) => {
                 let token = room.register(AgentMeta {
-                    agent_id: "codex".to_string(),
+                    agent_id: provider.as_str().to_string(),
+                    provider,
                     account_id: account.id.clone(),
                     label: account.label.clone(),
                     cwd: project_dir
@@ -148,7 +192,7 @@ pub fn start_terminal(
                 room_token = Some(token);
             }
             // Non bloquant : le terminal demarre sans salon si le provisioning
-            // echoue (ex. binaire codex introuvable depuis ce process).
+            // echoue (ex. binaire CLI introuvable depuis ce process).
             Err(error) => {
                 eprintln!(
                     "[agent_room] provisioning ignore pour {}: {error}",
@@ -374,9 +418,12 @@ fn emit_banner(
     let project = project_dir
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "dossier par defaut".to_string());
+    let home_var = account.provider.home_env_var();
     let banner = format!(
-        "\r\n[Codex Switch Terminal] session #{id} | compte: {} | CODEX_HOME: {} | projet: {project} | proxy: {proxy}\r\n\r\n",
-        account.label, account.codex_home
+        "\r\n[Codex Switch Terminal] session #{id} | provider: {} | compte: {} | {home_var}: {} | projet: {project} | proxy: {proxy}\r\n\r\n",
+        account.provider.as_str(),
+        account.label,
+        account.codex_home
     );
 
     app.emit("pty-data", PtyDataEvent { id, data: banner })

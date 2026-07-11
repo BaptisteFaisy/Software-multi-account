@@ -44,14 +44,26 @@ import {
   MessagesSquare,
   Search,
   Send,
+  ShieldCheck,
+  Sparkles,
+  ScanEye,
+  FolderX,
+  Library,
   createIcons,
 } from "lucide";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 
+type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+
+// Fournisseur CLI d'un compte / agent. Absent des configs anterieures => Codex.
+type Provider = "codex" | "claude";
+
 type AccountProfile = {
   id: string;
   label: string;
+  // Fournisseur CLI de ce compte. Optionnel pour la retro-compat (defaut Codex).
+  provider?: Provider;
   codexHome: string;
   projectDir?: string | null;
   proxyId?: string | null;
@@ -60,7 +72,38 @@ type AccountProfile = {
   // Bypass Codex par compte (defaut ON). Absent des configs anterieures : on
   // retombe alors sur le defaut global `codexBypass`, puis `true`.
   bypass?: boolean;
+  // Preferences Codex propres a ce CODEX_HOME. Optionnelles pour rester
+  // compatible avec les settings.json crees avant leur introduction.
+  model?: string | null;
+  reasoningEffort?: CodexReasoningEffort | null;
 };
+
+const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "medium";
+// Claude Code : alias de modele (pas d'intensite de raisonnement).
+const DEFAULT_CLAUDE_MODEL = "sonnet";
+const CLAUDE_MODEL_SUGGESTIONS = [
+  "sonnet",
+  "opus",
+  "haiku",
+  "claude-sonnet-4-5",
+  "claude-opus-4-1",
+];
+const CODEX_MODEL_SUGGESTIONS = [
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+];
+const CODEX_REASONING_EFFORTS: Array<{ value: CodexReasoningEffort; label: string }> = [
+  { value: "minimal", label: "Minimale" },
+  { value: "low", label: "Faible" },
+  { value: "medium", label: "Moyenne" },
+  { value: "high", label: "Elevee" },
+  { value: "xhigh", label: "Tres elevee" },
+];
 
 type AccountLimitTracking = {
   connectedAt?: number | null;
@@ -81,6 +124,7 @@ type AgentProfile = {
   id: string;
   label: string;
   command: string;
+  provider?: Provider;
   kind?: AgentKind;
   builtin?: boolean;
   loginCommand?: string | null;
@@ -115,6 +159,16 @@ type AgentRoomConfig = {
   enabled: boolean;
   port: number;
   secret: string;
+};
+
+// Entree/reponse du navigateur de dossiers du serveur (mode web). En desktop on
+// utilise le dialogue natif (`pick_project_dir`), pas cette API.
+type FsEntry = { name: string; path: string; isDir: boolean };
+type FsListResponse = {
+  root: string;
+  path: string;
+  parent: string | null;
+  entries: FsEntry[];
 };
 
 type AppSettings = {
@@ -356,7 +410,9 @@ type AppView =
   | "kombai"
   | "discussions"
   | "history"
-  | "room";
+  | "room"
+  | "audit"
+  | "skills";
 
 type DiscussionSummary = {
   // Identite LOGIQUE de la conversation (stable a travers les reprises/forks).
@@ -367,6 +423,8 @@ type DiscussionSummary = {
   rolloutId: string;
   // Nombre de fichiers rollout regroupes sous ce sessionId (>1 = repris).
   forkCount: number;
+  // Fournisseur d'origine (codex/claude) : badge + routage de la continuation.
+  provider?: Provider;
   accountId: string;
   accountLabel: string;
   codexHome: string;
@@ -384,6 +442,7 @@ type DiscussionSummary = {
 type DiscussionAccountGroup = {
   accountId: string;
   label: string;
+  provider?: Provider;
   codexHome: string;
   hasTokens: boolean;
   discussionCount: number;
@@ -423,6 +482,23 @@ if (!app) {
   throw new Error("Missing #app");
 }
 
+// Event Horizon : fond « trou noir » (disque d'accretion + singularite +
+// vignette) injecte une seule fois, hors de #app, pour survivre aux re-render
+// et laisser l'animation tourner sans interruption. Respecte prefers-reduced-motion
+// via la CSS (.eh-accretion). aria-hidden : purement decoratif.
+function ensureEventHorizonBackground(): void {
+  if (typeof document === "undefined" || !document.body) return;
+  if (document.querySelector(".eh-bg")) return;
+  const bg = document.createElement("div");
+  bg.className = "eh-bg";
+  bg.setAttribute("aria-hidden", "true");
+  bg.innerHTML =
+    '<div class="eh-accretion"></div><div class="eh-singularity"></div><div class="eh-vignette"></div>';
+  document.body.prepend(bg);
+}
+
+ensureEventHorizonBackground();
+
 let settings: AppSettings | null = null;
 let selectedAccountId: string | null = null;
 let activeTerminalKey: string | null = null;
@@ -437,6 +513,9 @@ let poolPoll: number | null = null;
 let poolImportPaths = "";
 let poolNewAccountLabel = "";
 let poolNewAccountProxyId = "";
+let poolNewAccountBypass = true;
+let poolNewAccountModel = DEFAULT_CODEX_MODEL;
+let poolNewAccountReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
 let pendingDeleteAccountId: string | null = null;
 let limitStatus: AccountLimitView[] = [];
 let limitStatusLoaded = false;
@@ -454,6 +533,10 @@ let isFullscreen = false;
 let newTerminalModalOpen = false;
 let newTerminalAccountId: string | null = null;
 let newTerminalAgentId: string | null = null;
+let newTerminalAccountLabel = "";
+let newTerminalAccountBypass = true;
+let newTerminalAccountModel = DEFAULT_CODEX_MODEL;
+let newTerminalAccountReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
 let agentsModalOpen = false;
 let discussions: DiscussionsView | null = null;
 let discussionsLoaded = false;
@@ -473,6 +556,45 @@ let roomPoll: number | null = null;
 // Destinataire choisi dans le composer : "" = diffusion salon, sinon ident d'un
 // agent (DM). Conserve entre les rendus complets.
 let roomComposeTarget = "";
+// Selecteur de workspace (mode web) : modale de navigation de dossiers serveur.
+let workspaceModalOpen = false;
+let workspaceBrowse: FsListResponse | null = null;
+let workspaceBrowseLoading = false;
+let workspaceBrowseError = "";
+
+// --- Audit design (détecteur Impeccable) -----------------------------------
+// Un finding = un anti-pattern détecté sur un élément de la page courante.
+type AuditFinding = {
+  type: string;
+  category: string;
+  severity: string;
+  detail: string;
+  name: string;
+  description: string;
+  selector: string;
+  tagName: string;
+};
+
+// Résultats du dernier audit (null tant qu'aucun audit n'a été lancé).
+let auditFindings: AuditFinding[] | null = null;
+let auditLoading = false;
+let auditError: string | null = null;
+// Libellé de la vue auditée (affiché dans l'en-tête du rapport).
+let auditViewLabel: string | null = null;
+// Chargement mémoïsé du bundle détecteur (injecté à la demande, une seule fois).
+let impeccableLoadPromise: Promise<void> | null = null;
+
+// --- Bibliothèque de skills (fichiers embarqués, indépendants d'AgentsRoom) --
+type SkillEntry = {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  content: string;
+};
+let skillsList: SkillEntry[] | null = null;
+let skillsLoaded = false;
+let skillsError: string | null = null;
 
 const lucideIcons = {
   AppWindow,
@@ -505,9 +627,35 @@ const lucideIcons = {
   MessagesSquare,
   Search,
   Send,
+  ShieldCheck,
+  Sparkles,
+  ScanEye,
+  FolderX,
+  Library,
 };
 
 const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v2";
+
+// Workspace courant = dossier de travail (cwd) applique aux PROCHAINS agents.
+// Memorise par appareil (localStorage) : chaque navigateur/PC garde son propre
+// choix. En web c'est un dossier du serveur ; en desktop un dossier local.
+const WORKSPACE_STORAGE_KEY = "codex-switch-terminal.workspace.path";
+
+const currentWorkspace = (): string | null =>
+  localStorage.getItem(WORKSPACE_STORAGE_KEY)?.trim() || null;
+
+const setCurrentWorkspace = (path: string | null) => {
+  const trimmed = path?.trim();
+  if (trimmed) {
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
+  } else {
+    localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+  }
+};
+
+// Dernier segment d'un chemin (nom du dossier) pour un affichage compact.
+const workspaceBaseName = (path: string): string =>
+  path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
 
 const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -572,10 +720,14 @@ const persistTerminalSessions = () => {
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const isPlausibleSessionId = (id: string | null | undefined): id is string => !!id && UUID_RE.test(id);
 
-// Le flag bypass Codex depend du compte et doit preceder la sous-commande
-// `resume`. On passe le compte cible pour respecter son reglage bypass.
-const buildResumeCommand = (id: string, account: AccountProfile | null | undefined = null) =>
-  `${agentRunCommand(agentById(codexAgentId()), account)} resume ${id}`;
+// Commande de reprise d'une discussion, selon le provider du compte cible :
+// Codex -> `codex … resume <id>` ; Claude -> `claude … --resume <id>`. Le flag
+// bypass (propre au provider) est ajoute par `agentRunCommand`.
+const buildResumeCommand = (id: string, account: AccountProfile | null | undefined = null) => {
+  const provider = accountProvider(account);
+  const base = agentRunCommand(agentById(providerAgentId(provider)), account);
+  return provider === "claude" ? `${base} --resume ${id}` : `${base} resume ${id}`;
+};
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const SESSION_CAPTURE_DELAYS_MS = [1200, 2000, 3000, 4500, 7000, 10000];
@@ -680,19 +832,81 @@ const codexAgentId = () =>
   settings?.agents.find((agent) => agent.builtin)?.id ??
   "codex";
 
+// --- Multi-provider (Codex / Claude Code) --------------------------------
+// Provider d'un compte / d'un agent (defaut Codex pour les configs anterieures).
+const accountProvider = (account: AccountProfile | null | undefined): Provider =>
+  account?.provider ?? "codex";
+const agentProvider = (agent: AgentProfile | null | undefined): Provider =>
+  agent?.provider ?? (agent?.id === "claude" ? "claude" : "codex");
+const providerLabel = (provider: Provider) => (provider === "claude" ? "Claude" : "Codex");
+
+// Id de l'agent integre correspondant a un provider : sert a lancer un compte
+// Claude avec l'agent Claude, un compte Codex avec l'agent Codex.
+const providerAgentId = (provider: Provider): string =>
+  settings?.agents.find((agent) => (agent.provider ?? "codex") === provider && agent.builtin)?.id ??
+  settings?.agents.find((agent) => agent.id === provider)?.id ??
+  provider;
+
 const agentCommand = (agent: AgentProfile | null | undefined) => agent?.command.trim() || "codex";
 
-// Seul l'agent Codex integre recoit le flag bypass ; un agent CLI generique
-// (autre binaire) ne comprendrait pas ce flag.
-const isCodexAgent = (agent: AgentProfile | null | undefined) =>
-  agent?.id === "codex" || agent?.builtin === true;
+// Agent CLI "premier rang" (Codex ou Claude Code integre) : recoit un flag
+// bypass et voit ses sessions capturees pour la reprise. Un agent CLI generique
+// (autre binaire) n'en beneficie pas.
+const isFirstPartyAgent = (agent: AgentProfile | null | undefined) =>
+  agent?.builtin === true || agent?.id === "codex" || agent?.id === "claude";
+
+// Vrai uniquement pour un agent Codex (chemins specifiques au pool ChatGPT).
+const isCodexAgent = (agent: AgentProfile | null | undefined) => agentProvider(agent) === "codex";
 
 const CODEX_BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
+const CLAUDE_BYPASS_FLAG = "--dangerously-skip-permissions";
+const providerBypassFlag = (provider: Provider) =>
+  provider === "claude" ? CLAUDE_BYPASS_FLAG : CODEX_BYPASS_FLAG;
 
 // Le bypass est un reglage PAR COMPTE (defaut ON). Un compte sans champ `bypass`
 // (config anterieure) retombe sur le defaut global `codexBypass`, puis `true`.
 const accountBypassEnabled = (account: AccountProfile | null | undefined) =>
   account?.bypass ?? settings?.codexBypass ?? true;
+
+const isCodexReasoningEffort = (value: string | null | undefined): value is CodexReasoningEffort =>
+  CODEX_REASONING_EFFORTS.some((item) => item.value === value);
+
+const normalizeCodexReasoningEffort = (
+  value: string | null | undefined,
+): CodexReasoningEffort =>
+  isCodexReasoningEffort(value) ? value : DEFAULT_CODEX_REASONING_EFFORT;
+
+const providerDefaultModel = (provider: Provider) =>
+  provider === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
+
+const accountModel = (account: AccountProfile | null | undefined) =>
+  account?.model?.trim() || providerDefaultModel(accountProvider(account));
+
+const accountReasoningEffort = (account: AccountProfile | null | undefined) =>
+  normalizeCodexReasoningEffort(account?.reasoningEffort);
+
+const reasoningEffortOptions = (selected: string | null | undefined) => {
+  const normalized = normalizeCodexReasoningEffort(selected);
+  return CODEX_REASONING_EFFORTS.map(
+    (item) =>
+      `<option value="${item.value}" ${item.value === normalized ? "selected" : ""}>${item.label}</option>`,
+  ).join("");
+};
+
+const renderCodexModelSuggestions = () => `
+  <datalist id="codexModelSuggestions">
+    ${CODEX_MODEL_SUGGESTIONS.map((model) => `<option value="${escapeAttr(model)}"></option>`).join("")}
+  </datalist>
+`;
+
+const provisionAccountHome = (account: AccountProfile) =>
+  invoke("ensure_account_home", {
+    codexHome: account.codexHome,
+    provider: accountProvider(account),
+    bypass: accountBypassEnabled(account),
+    model: accountModel(account),
+    reasoningEffort: accountReasoningEffort(account),
+  });
 
 // Commande a taper dans le PTY pour lancer un agent. Pour Codex, ajoute le flag
 // bypass quand le compte concerne l'a active (defaut), sauf s'il est deja
@@ -702,18 +916,20 @@ const agentRunCommand = (
   account: AccountProfile | null | undefined = null,
 ) => {
   const base = agentCommand(agent);
-  if (isCodexAgent(agent) && accountBypassEnabled(account) && !base.includes(CODEX_BYPASS_FLAG)) {
-    return `${base} ${CODEX_BYPASS_FLAG}`;
+  if (isFirstPartyAgent(agent) && accountBypassEnabled(account)) {
+    const flag = providerBypassFlag(agentProvider(agent));
+    if (!base.includes(flag)) return `${base} ${flag}`;
   }
   return base;
 };
 
 const agentIsIde = (agent: AgentProfile | null | undefined) => agent?.kind === "ide";
 
-// Dossier projet a ouvrir pour un agent IDE : celui du terminal actif, sinon
-// celui du compte selectionne.
+// Dossier projet a ouvrir pour un agent IDE / Kombai : le workspace choisi est
+// prioritaire (choix explicite global), sinon le dossier du terminal actif,
+// sinon celui du compte selectionne.
 const currentProjectDir = () =>
-  activeTerminal()?.projectDir ?? selectedAccount()?.projectDir?.trim() ?? null;
+  currentWorkspace() ?? activeTerminal()?.projectDir ?? selectedAccount()?.projectDir?.trim() ?? null;
 
 const launchIde = async (agent: AgentProfile, projectDir: string | null = currentProjectDir()) => {
   try {
@@ -794,9 +1010,17 @@ const toggleFullscreen = async () => {
 
 const saveSettings = async () => {
   if (!settings) return;
-  settings.defaultAccountId = selectedAccountId;
-  settings = await invoke<AppSettings>("save_settings", { settings });
-  statusText = "Configuration enregistree";
+  try {
+    settings.defaultAccountId = selectedAccountId;
+    settings = await invoke<AppSettings>("save_settings", { settings });
+    const account = selectedAccount();
+    if (account) {
+      await provisionAccountHome(account);
+    }
+    statusText = "Configuration enregistree";
+  } catch (error) {
+    statusText = String(error);
+  }
   render();
 };
 
@@ -922,6 +1146,390 @@ const roomTargetOptions = (): string =>
         `<option value="${escapeAttr(agent.ident)}" ${agent.ident === roomComposeTarget ? "selected" : ""}>${escapeHtml(agent.label)} (privé)</option>`,
     )
     .join("");
+
+// ---------------------------------------------------------------------------
+// Audit design (détecteur Impeccable, exécuté côté navigateur)
+// ---------------------------------------------------------------------------
+// Le détecteur Impeccable (bundle autonome Apache-2.0, vendu dans
+// public/impeccable/) analyse la PAGE COURANTE et renvoie la liste des
+// anti-patterns de design. Il tourne dans le navigateur, donc identiquement en
+// desktop (webview Tauri) et en web/mobile — aucun backend requis. On force
+// `autoScan:false` pour qu'il ne dessine aucun overlay au chargement : la
+// détection n'a lieu que sur clic du bouton « Auditer cette page ».
+
+const IMPECCABLE_DETECTOR_SRC = "/impeccable/detect-antipatterns-browser.js";
+// error < warning < advisory ; les sévérités inconnues sont triées en dernier.
+const AUDIT_SEVERITY_RANK: Record<string, number> = { error: 0, warning: 1, advisory: 2 };
+// Sévérité inconnue → triée après les sévérités connues.
+const auditSeverityRank = (severity: string): number =>
+  AUDIT_SEVERITY_RANK[severity] ?? Number.MAX_SAFE_INTEGER;
+// Message « rien à signaler » (source unique, affiché une seule fois).
+const AUDIT_CLEAN_MESSAGE = "Aucun anti-pattern détecté 🎉";
+
+// Libellé FR de la vue auditée, pour l'en-tête du rapport.
+const auditViewLabelFor = (view: AppView): string => {
+  switch (view) {
+    case "audit":
+      return "écran d'audit";
+    case "pool":
+      return "vue Pool";
+    case "limits":
+      return "vue Limites";
+    case "dashboard":
+      return "vue Stats";
+    case "kombai":
+      return "vue Kombai";
+    case "discussions":
+      return "vue Discussions";
+    case "history":
+      return "vue Historique";
+    case "room":
+      return "vue Salon";
+    default:
+      return "vue Terminal";
+  }
+};
+
+type ImpeccableWindow = Window & {
+  impeccableDetect?: (options?: Record<string, unknown>) => unknown;
+  __IMPECCABLE_CONFIG__?: Record<string, unknown>;
+};
+
+const auditSeverityLabel = (severity: string): string =>
+  severity === "error"
+    ? "Erreur"
+    : severity === "warning"
+      ? "Alerte"
+      : severity === "advisory"
+        ? "Conseil"
+        : severity;
+
+const auditCategoryLabel = (category: string): string =>
+  category === "slop" ? "IA slop" : category === "quality" ? "Qualité" : category;
+
+// Injecte le bundle détecteur une seule fois (mémoïsé). `__IMPECCABLE_CONFIG__`
+// est posé AVANT l'insertion du <script> pour désactiver le scan auto : sinon le
+// bundle dessine des overlays sur toute l'app dès son chargement.
+const ensureImpeccableLoaded = (): Promise<void> => {
+  const impeccableWindow = window as ImpeccableWindow;
+  if (typeof impeccableWindow.impeccableDetect === "function") return Promise.resolve();
+  if (impeccableLoadPromise) return impeccableLoadPromise;
+
+  impeccableWindow.__IMPECCABLE_CONFIG__ = {
+    ...(impeccableWindow.__IMPECCABLE_CONFIG__ ?? {}),
+    autoScan: false,
+  };
+
+  impeccableLoadPromise = new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = IMPECCABLE_DETECTOR_SRC;
+    script.async = true;
+    script.dataset.impeccable = "true";
+    script.addEventListener("load", () => {
+      if (typeof impeccableWindow.impeccableDetect === "function") resolve();
+      else reject(new Error("Détecteur chargé mais API absente"));
+    });
+    script.addEventListener("error", () =>
+      reject(new Error("Chargement du détecteur Impeccable impossible")),
+    );
+    document.head.appendChild(script);
+  }).catch((error) => {
+    // Autorise une nouvelle tentative au prochain clic.
+    impeccableLoadPromise = null;
+    throw error;
+  });
+
+  return impeccableLoadPromise;
+};
+
+// La sortie sérialisée du détecteur est un tableau de groupes
+// {selector, tagName, findings[]}. On l'aplati en une liste de findings enrichis
+// du sélecteur de leur élément (pour pouvoir les mettre en évidence ensuite).
+const flattenAuditFindings = (raw: unknown): AuditFinding[] => {
+  if (!Array.isArray(raw)) return [];
+  const findings: AuditFinding[] = [];
+  for (const group of raw) {
+    const selector = typeof group?.selector === "string" ? group.selector : "";
+    const tagName = typeof group?.tagName === "string" ? group.tagName : "";
+    const groupFindings = Array.isArray(group?.findings) ? group.findings : [];
+    for (const item of groupFindings) {
+      findings.push({
+        type: String(item?.type ?? "unknown"),
+        category: String(item?.category ?? "quality"),
+        severity: String(item?.severity ?? "warning"),
+        detail: String(item?.detail ?? ""),
+        name: String(item?.name ?? item?.type ?? "Anti-pattern"),
+        description: String(item?.description ?? ""),
+        selector,
+        tagName,
+      });
+    }
+  }
+  return findings;
+};
+
+const runAudit = async (sourceLabel: string): Promise<void> => {
+  auditLoading = true;
+  auditError = null;
+  auditViewLabel = sourceLabel;
+  statusText = `Audit design de la ${sourceLabel}…`;
+  render();
+  try {
+    await ensureImpeccableLoaded();
+    const detect = (window as ImpeccableWindow).impeccableDetect;
+    if (typeof detect !== "function") throw new Error("Détecteur indisponible");
+    auditFindings = flattenAuditFindings(detect({ serialize: true }));
+    statusText = `Audit design : ${auditFindings.length} problème(s) détecté(s)`;
+  } catch (error) {
+    auditError = String((error as Error)?.message ?? error);
+    statusText = "Audit design : échec";
+  } finally {
+    auditLoading = false;
+    render();
+  }
+};
+
+// Ouvre/ferme la vue d'audit. À l'OUVERTURE, on lance d'abord le détecteur sur la
+// VUE COURANTE (avant de basculer : son DOM n'est plus monté une fois la vue
+// « audit » affichée), puis on montre le rapport.
+const toggleAudit = async (): Promise<void> => {
+  if (activeView === "audit") {
+    setActiveView("audit"); // referme la vue (revient au terminal)
+    return;
+  }
+  await runAudit(auditViewLabelFor(activeView));
+  setActiveView("audit");
+};
+
+// Fait défiler jusqu'à l'élément fautif et l'entoure brièvement.
+const highlightAuditTarget = (selector: string): void => {
+  if (!selector) return;
+  let target: Element | null = null;
+  try {
+    target = document.querySelector(selector);
+  } catch {
+    target = null;
+  }
+  if (!target) {
+    statusText = "Élément introuvable dans la page (le DOM a peut-être changé)";
+    render();
+    return;
+  }
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  target.classList.add("audit-highlight");
+  window.setTimeout(() => target?.classList.remove("audit-highlight"), 2200);
+};
+
+const renderAuditFinding = (finding: AuditFinding): string => {
+  const location = finding.selector
+    ? `${finding.tagName || "élément"} · ${finding.selector}`
+    : "niveau page";
+  return `
+    <button type="button" class="audit-finding" data-audit-selector="${escapeAttr(finding.selector)}" title="Mettre en évidence dans la page">
+      <span class="audit-badge sev-${escapeAttr(finding.severity)}">${escapeHtml(auditSeverityLabel(finding.severity))}</span>
+      <span class="audit-finding-main">
+        <span class="audit-finding-head">
+          <strong>${escapeHtml(finding.name)}</strong>
+          <span class="audit-cat">${escapeHtml(auditCategoryLabel(finding.category))}</span>
+        </span>
+        ${finding.detail ? `<span class="audit-detail">${escapeHtml(finding.detail)}</span>` : ""}
+        ${finding.description ? `<span class="audit-desc">${escapeHtml(finding.description)}</span>` : ""}
+        <span class="audit-target">${escapeHtml(location)}</span>
+      </span>
+    </button>`;
+};
+
+const renderAuditPanel = (): string => {
+  const findings = auditFindings ?? [];
+  const ran = auditFindings !== null;
+  const target = auditViewLabel ?? "interface";
+  const sorted = [...findings].sort(
+    (a, b) =>
+      auditSeverityRank(a.severity) - auditSeverityRank(b.severity) ||
+      a.category.localeCompare(b.category) ||
+      a.name.localeCompare(b.name),
+  );
+  const counts = findings.reduce<Record<string, number>>((acc, finding) => {
+    acc[finding.severity] = (acc[finding.severity] ?? 0) + 1;
+    return acc;
+  }, {});
+  const countsText = Object.entries(counts)
+    .sort(([a], [b]) => auditSeverityRank(a) - auditSeverityRank(b))
+    .map(([severity, n]) => `${n} ${auditSeverityLabel(severity).toLowerCase()}`)
+    .join(" · ");
+
+  const summary = ran
+    ? `Audit · ${target} — ${findings.length} problème(s)${findings.length ? ` · ${countsText}` : ""}`
+    : "Depuis la vue à auditer, clique « Audit » dans la barre d'outils. Le détecteur Impeccable analyse l'interface affichée, entièrement dans le navigateur (rien n'est envoyé à un serveur).";
+
+  const body = auditError
+    ? `<div class="empty audit-error">${escapeHtml(auditError)}</div>`
+    : auditLoading
+      ? `<div class="empty">Analyse en cours…</div>`
+      : !ran
+        ? `<div class="empty">Aucun audit lancé pour l'instant.</div>`
+        : findings.length === 0
+          ? `<div class="empty">${AUDIT_CLEAN_MESSAGE}</div>`
+          : `<div id="auditList" class="audit-list">${sorted.map(renderAuditFinding).join("")}</div>`;
+
+  return `
+    <div class="panel audit-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Audit design</h2>
+          <p class="panel-sub">${escapeHtml(summary)}</p>
+        </div>
+        <div class="panel-actions">
+          <button id="auditRun" class="tool-button primary" ${auditLoading ? "disabled" : ""} title="Relancer l'audit sur l'écran actuel">
+            <i data-lucide="scan-eye"></i><span>${ran ? "Relancer" : "Auditer"}</span>
+          </button>
+        </div>
+      </div>
+      ${body}
+    </div>`;
+};
+
+// ---------------------------------------------------------------------------
+// Bibliothèque de skills (vue « Skills »)
+// ---------------------------------------------------------------------------
+// Source INDÉPENDANTE (aucune dépendance à AgentsRoom) : fichiers statiques
+// embarqués sous public/skills/ (copiés dans dist/ au build, servis à /skills/…).
+// On lit le manifeste index.json puis le contenu .md de chaque skill par fetch —
+// identique en desktop (webview), web et mobile, sans backend. Ajouter un skill =
+// déposer un .md dans public/skills/ et l'ajouter à index.json.
+const SKILLS_INDEX_URL = "/skills/index.json";
+
+const refreshSkills = async (): Promise<void> => {
+  try {
+    const indexResponse = await fetch(SKILLS_INDEX_URL, { cache: "no-cache" });
+    if (!indexResponse.ok) throw new Error(`index.json: HTTP ${indexResponse.status}`);
+    const index = (await indexResponse.json()) as { skills?: unknown };
+    const entries = Array.isArray(index.skills) ? index.skills : [];
+    skillsList = await Promise.all(
+      entries.map(async (raw): Promise<SkillEntry> => {
+        const entry = (raw ?? {}) as Record<string, unknown>;
+        const file = String(entry.file ?? "");
+        let content = "";
+        try {
+          const contentResponse = await fetch(`/skills/${file}`, { cache: "no-cache" });
+          if (contentResponse.ok) content = await contentResponse.text();
+        } catch {
+          // contenu indisponible : la carte reste affichée sans corps
+        }
+        return {
+          id: String(entry.id ?? file),
+          name: String(entry.name ?? entry.id ?? "skill"),
+          description: String(entry.description ?? ""),
+          tags: Array.isArray(entry.tags) ? entry.tags.map(String) : [],
+          content,
+        };
+      }),
+    );
+    skillsError = null;
+  } catch (error) {
+    skillsError = String((error as Error)?.message ?? error);
+  }
+  skillsLoaded = true;
+  if (activeView === "skills") render();
+};
+
+// Colle du texte (potentiellement multi-lignes) dans la session Codex active via
+// le MODE PASTE (bracketed paste : ESC[200~ … ESC[201~), SANS Entrée : le contenu
+// atterrit dans le composer de Codex, l'utilisateur relit puis valide. `sendLine`
+// (qui ajoute \r) soumettrait dès le premier saut de ligne.
+const pasteToActiveSession = async (text: string): Promise<boolean> => {
+  const session = activeTerminal();
+  if (!session?.running || session.ptyId === null) return false;
+  try {
+    await invoke("write_terminal", {
+      id: session.ptyId,
+      data: `[200~${text}[201~`,
+    });
+    return true;
+  } catch (error) {
+    statusText = String(error);
+    return false;
+  }
+};
+
+const applySkill = async (id: string): Promise<void> => {
+  const skill = (skillsList ?? []).find((entry) => entry.id === id);
+  if (!skill) return;
+  const injected = await pasteToActiveSession(skill.content);
+  statusText = injected
+    ? `Skill « ${skill.name} » collé dans Codex — relis puis appuie sur Entrée`
+    : "Aucune session Codex active pour injecter ce skill";
+  render();
+};
+
+const copySkill = async (id: string): Promise<void> => {
+  const skill = (skillsList ?? []).find((entry) => entry.id === id);
+  if (!skill) return;
+  try {
+    await navigator.clipboard.writeText(skill.content);
+    statusText = `Skill « ${skill.name} » copié dans le presse-papiers`;
+  } catch {
+    statusText = "Copie impossible (presse-papiers indisponible)";
+  }
+  render();
+};
+
+const renderSkillCard = (skill: SkillEntry, hasActiveSession: boolean): string => {
+  const tags = skill.tags
+    .slice(0, 6)
+    .map((tag) => `<span class="skill-tag">${escapeHtml(tag)}</span>`)
+    .join("");
+  return `
+    <div class="skill-card">
+      <div class="skill-card-head">
+        <strong>${escapeHtml(skill.name)}</strong>
+      </div>
+      ${skill.description ? `<p class="skill-desc">${escapeHtml(skill.description)}</p>` : ""}
+      ${tags ? `<div class="skill-tags">${tags}</div>` : ""}
+      <div class="skill-actions">
+        <button class="tool-button primary" data-skill-apply="${escapeAttr(skill.id)}" ${hasActiveSession ? "" : "disabled"} title="${hasActiveSession ? "Coller le skill dans la session Codex active (relis puis Entrée)" : "Aucune session Codex active"}">
+          <i data-lucide="send"></i><span>Injecter dans Codex</span>
+        </button>
+        <button class="tool-button" data-skill-copy="${escapeAttr(skill.id)}" title="Copier le contenu du skill dans le presse-papiers">
+          <i data-lucide="copy"></i><span>Copier</span>
+        </button>
+      </div>
+      <details class="skill-details">
+        <summary>Voir le contenu</summary>
+        <pre class="skill-content">${escapeHtml(skill.content)}</pre>
+      </details>
+    </div>`;
+};
+
+const renderSkillsPanel = (): string => {
+  const skills = skillsList ?? [];
+  const hasActiveSession = activeTerminal()?.running ?? false;
+  const sub = !skillsLoaded
+    ? "Chargement…"
+    : `${skills.length} skill(s) disponible(s)${hasActiveSession ? "" : " · démarre un terminal Codex pour pouvoir les injecter"}`;
+
+  const body = skillsError
+    ? `<div class="empty audit-error">${escapeHtml(skillsError)}</div>`
+    : !skillsLoaded
+      ? `<div class="empty">Chargement des skills…</div>`
+      : skills.length === 0
+        ? `<div class="empty">Aucun skill trouvé (<code>public/skills/index.json</code>).</div>`
+        : `<div id="skillsList" class="skills-list">${skills.map((skill) => renderSkillCard(skill, hasActiveSession)).join("")}</div>`;
+
+  return `
+    <div class="panel audit-panel skills-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Skills</h2>
+          <p class="panel-sub">${escapeHtml(sub)}</p>
+        </div>
+        <div class="panel-actions">
+          <button id="skillsRefresh" class="icon-button wide" title="Rafraîchir la bibliothèque"><i data-lucide="refresh-ccw"></i></button>
+        </div>
+      </div>
+      ${body}
+    </div>`;
+};
 
 const renderRoomPanel = (): string => {
   const enabled = settings?.agentRoom?.enabled ?? false;
@@ -1062,14 +1670,14 @@ const sendRoomMessage = async () => {
   await refreshRoom();
 };
 
-const removeAccount = async (id: string | null) => {
+const removeAccount = async (id: string | null, deleteFiles = false) => {
   if (!settings || !id) return;
   const account = settings.accounts.find((candidate) => candidate.id === id);
   if (!account) return;
 
   pendingDeleteAccountId = null;
   try {
-    settings = await invoke<AppSettings>("remove_account", { accountId: id });
+    settings = await invoke<AppSettings>("remove_account", { accountId: id, deleteFiles });
     if (selectedAccountId === id) {
       selectedAccountId = settings.defaultAccountId ?? settings.accounts[0]?.id ?? null;
     }
@@ -1079,7 +1687,9 @@ const removeAccount = async (id: string | null) => {
     } else {
       poolStatus = await invoke<PoolStatus>("pool_status");
     }
-    statusText = `Compte « ${account.label} » retiré du pool`;
+    statusText = deleteFiles
+      ? `Compte « ${account.label} » supprimé (dossier effacé du disque)`
+      : `Compte « ${account.label} » retiré du pool`;
   } catch (error) {
     statusText = String(error);
   }
@@ -1103,7 +1713,11 @@ const setActiveView = (view: AppView) => {
                 ? "Vue historique"
                 : activeView === "room"
                   ? "Vue salon"
-                  : "Vue terminal";
+                  : activeView === "audit"
+                    ? "Audit design"
+                    : activeView === "skills"
+                      ? "Skills"
+                      : "Vue terminal";
 
   if (activeView === "limits") {
     startLimitPoll();
@@ -1147,6 +1761,7 @@ const setActiveView = (view: AppView) => {
   if (activeView === "discussions") void refreshDiscussions();
   if (activeView === "history" && !promptHistoryLoaded) void refreshPromptHistory();
   if (activeView === "room") void refreshRoom();
+  if (activeView === "skills") void refreshSkills();
 };
 
 const refreshLimitStatus = async () => {
@@ -1329,7 +1944,7 @@ const resumeSessionInTerminal = async (accountId: string, sessionId: string) => 
     accountId,
     true,
     buildResumeCommand(sessionId, accountById(accountId)),
-    codexAgentId(),
+    providerAgentId(accountProvider(accountById(accountId))),
     sessionId,
   );
 };
@@ -1414,11 +2029,27 @@ const discussionTargetFor = (discussion: DiscussionSummary): string => {
   return discussion.accountId;
 };
 
+// Le backend conserve le premier message complet dans `preview` pour que la
+// recherche porte sur davantage que le titre. Pour l'affichage, on retire le
+// titre (qui est un prefixe exact de ce message) afin de ne pas presenter deux
+// fois le meme texte dans la carte.
+const discussionSubtitle = (discussion: DiscussionSummary): string => {
+  const preview = discussion.preview?.trim() ?? "";
+  const title = discussion.title?.trim() ?? "";
+  if (!preview || !title || !preview.startsWith(title)) return preview;
+  return preview
+    .slice(title.length)
+    .replace(/^[\s:;,.!?\u2014\u2013-]+/, "")
+    .trim();
+};
+
 const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string) => {
   const busy = discussionBusyId === discussion.sessionId;
   const accounts = settings?.accounts ?? [];
   const target = discussionTargetFor(discussion);
   const willCopy = target !== discussion.accountId;
+  const title = discussion.title?.trim() || "(sans titre)";
+  const subtitle = discussionSubtitle(discussion);
   const meta = [
     discussion.cwd
       ? `<span title="${escapeAttr(discussion.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(discussion.cwd))}</span>`
@@ -1450,8 +2081,8 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
   return `
     <div class="discussion-row ${busy ? "busy" : ""}">
       <div class="discussion-main">
-        <strong>${escapeHtml(discussion.title || "(sans titre)")}</strong>
-        ${discussion.preview ? `<span class="discussion-preview">${escapeHtml(discussion.preview)}</span>` : ""}
+        <strong class="discussion-title" title="${escapeAttr(title)}">${escapeHtml(title)}</strong>
+        ${subtitle ? `<span class="discussion-preview">${escapeHtml(subtitle)}</span>` : ""}
         <span class="discussion-meta">${meta}</span>
       </div>
       <div class="discussion-actions">
@@ -1980,6 +2611,63 @@ const pickProjectDir = async () => {
   render();
 };
 
+// --- Selecteur de workspace ----------------------------------------------
+// Ouvre le choix du dossier de travail global. Desktop : dialogue natif.
+// Web : modale de navigation des dossiers du serveur (borne a la racine).
+const openWorkspacePicker = async () => {
+  if (isRemoteMode()) {
+    workspaceModalOpen = true;
+    workspaceBrowse = null;
+    workspaceBrowseError = "";
+    render();
+    await loadWorkspaceDir(currentWorkspace());
+    return;
+  }
+
+  try {
+    const picked = await invoke<string | null>("pick_project_dir", {
+      currentDir: currentWorkspace() ?? "",
+    });
+    if (picked) {
+      setCurrentWorkspace(picked);
+      statusText = `Workspace: ${picked}`;
+    } else {
+      statusText = "Selection annulee";
+    }
+  } catch (error) {
+    statusText = String(error);
+  }
+  render();
+};
+
+const loadWorkspaceDir = async (path: string | null) => {
+  workspaceBrowseLoading = true;
+  workspaceBrowseError = "";
+  render();
+  try {
+    workspaceBrowse = await invoke<FsListResponse>("list_dir", {
+      path: path ?? undefined,
+    });
+  } catch (error) {
+    workspaceBrowseError = String(error);
+    workspaceBrowse = null;
+  }
+  workspaceBrowseLoading = false;
+  render();
+};
+
+const closeWorkspaceModal = () => {
+  workspaceModalOpen = false;
+  render();
+};
+
+const chooseWorkspace = (path: string | null) => {
+  setCurrentWorkspace(path);
+  workspaceModalOpen = false;
+  statusText = path ? `Workspace: ${path}` : "Workspace retire";
+  render();
+};
+
 const createPoolTerminal = async () => {
   try {
     const picked = await invoke<AccountProfile>("pool_pick_terminal_account");
@@ -2007,14 +2695,17 @@ const renderPoolRow = (account: PoolAccountView) => {
   const pending = account.id === pendingDeleteAccountId;
   const actions = pending
     ? `<div class="pool-row-actions">
-        <button class="icon-button danger" data-remove-account-confirm="${escapeAttr(account.id)}" title="Confirmer la suppression">
+        <button class="icon-button danger" data-remove-account-confirm="${escapeAttr(account.id)}" title="Retirer du pool (garder les fichiers sur le disque)">
           <i data-lucide="check"></i>
+        </button>
+        <button class="icon-button danger" data-remove-account-purge="${escapeAttr(account.id)}" title="Retirer ET supprimer le dossier du disque (irréversible)">
+          <i data-lucide="folder-x"></i>
         </button>
         <button class="icon-button" data-remove-account-cancel="${escapeAttr(account.id)}" title="Annuler">
           <i data-lucide="x"></i>
         </button>
       </div>`
-    : `<button class="icon-button danger" data-remove-account="${escapeAttr(account.id)}" title="Retirer ce compte du pool (le dossier reste sur le disque)">
+    : `<button class="icon-button danger" data-remove-account="${escapeAttr(account.id)}" title="Retirer ce compte du pool">
         <i data-lucide="trash-2"></i>
       </button>`;
   return `
@@ -2047,6 +2738,181 @@ const syncSessionsForAccount = (account: AccountProfile) => {
   });
 };
 
+// --- Coque mobile : barre haute + navigation basse + tiroir lateral, injectes
+// une seule fois hors de #app (comme .eh-bg) pour survivre aux re-render. Les
+// controles pilotent directement les fonctions internes (setActiveView,
+// modales...) plutot que de simuler des clics : rien a re-binder a chaque rendu.
+function closeMobileOverlays(): void {
+  document.body.classList.remove("m-drawer-open", "m-sheet-open");
+}
+
+function mobileViewLabel(view: AppView): string {
+  switch (view) {
+    case "pool":
+      return "Pool";
+    case "limits":
+      return "Limites";
+    case "dashboard":
+      return "Stats";
+    case "kombai":
+      return "Kombai";
+    case "discussions":
+      return "Discussions";
+    case "history":
+      return "Historique";
+    case "room":
+      return "Salon";
+    case "audit":
+      return "Audit";
+    case "skills":
+      return "Skills";
+    default:
+      return "Terminal";
+  }
+}
+
+function syncMobileChrome(): void {
+  const chrome = document.querySelector(".m-chrome");
+  if (!chrome) return;
+  chrome.querySelectorAll<HTMLElement>(".m-tab[data-view]").forEach((tab) => {
+    const view = tab.getAttribute("data-view");
+    const active = view === "terminal" ? activeView === "terminal" : activeView === view;
+    tab.classList.toggle("active", active);
+  });
+  const title = document.getElementById("mTitle");
+  if (title) {
+    const session = activeTerminal();
+    title.textContent =
+      activeView !== "terminal"
+        ? mobileViewLabel(activeView)
+        : session
+          ? terminalTitle(session)
+          : "Codex Terminal";
+  }
+}
+
+function ensureMobileChrome(): void {
+  if (typeof document === "undefined" || !document.body) return;
+  if (document.querySelector(".m-chrome")) {
+    syncMobileChrome();
+    return;
+  }
+
+  const chrome = document.createElement("div");
+  chrome.className = "m-chrome";
+  chrome.innerHTML = `
+    <header class="m-topbar">
+      <button class="m-icon" type="button" data-m="drawer" aria-label="Terminaux ouverts">
+        <i data-lucide="menu"></i>
+      </button>
+      <div class="m-title"><strong id="mTitle">Codex Terminal</strong></div>
+      <button class="m-icon" type="button" data-m="new" aria-label="Nouveau terminal">
+        <i data-lucide="plus"></i>
+      </button>
+    </header>
+    <nav class="m-bottomnav" aria-label="Navigation">
+      <button class="m-tab" type="button" data-view="terminal"><i data-lucide="square-terminal"></i><span>Terminal</span></button>
+      <button class="m-tab" type="button" data-view="pool"><i data-lucide="server"></i><span>Pool</span></button>
+      <button class="m-tab" type="button" data-view="dashboard"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
+      <button class="m-tab" type="button" data-view="room"><i data-lucide="users"></i><span>Salon</span></button>
+      <button class="m-tab" type="button" data-m="menu"><i data-lucide="layout-grid"></i><span>Menu</span></button>
+    </nav>
+    <div class="m-scrim" data-m="scrim"></div>
+    <div class="m-sheet">
+      <div class="m-sheet-panel" role="menu" aria-label="Plus d'actions">
+        <div class="m-sheet-handle"></div>
+        <div class="m-sheet-grid">
+          <button type="button" data-view="limits"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
+          <button type="button" data-view="kombai"><i data-lucide="bot"></i><span>Kombai</span></button>
+          <button type="button" data-view="discussions"><i data-lucide="messages-square"></i><span>Discussions</span></button>
+          <button type="button" data-view="history"><i data-lucide="history"></i><span>Historique</span></button>
+          <button type="button" data-view="skills"><i data-lucide="library"></i><span>Skills</span></button>
+          <button type="button" data-view="audit"><i data-lucide="scan-eye"></i><span>Audit</span></button>
+          <button type="button" data-act="poolTerminal"><i data-lucide="shuffle"></i><span>Pool term</span></button>
+          <button type="button" data-act="agents"><i data-lucide="bot"></i><span>Agents</span></button>
+          <button type="button" data-act="fullscreen"><i data-lucide="maximize-2"></i><span>Plein ecran</span></button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(chrome);
+
+  const gotoView = (view: AppView) => {
+    if (view === "terminal") {
+      if (activeView !== "terminal") setActiveView(activeView);
+    } else if (activeView !== view) {
+      setActiveView(view);
+    }
+    closeMobileOverlays();
+    syncMobileChrome();
+  };
+
+  chrome.addEventListener("click", (event) => {
+    const el = (event.target as HTMLElement).closest<HTMLElement>(
+      "[data-m],[data-view],[data-act]",
+    );
+    if (!el) return;
+
+    const view = el.getAttribute("data-view");
+    if (view) {
+      gotoView(view as AppView);
+      return;
+    }
+
+    const act = el.getAttribute("data-act");
+    if (act) {
+      closeMobileOverlays();
+      if (act === "poolTerminal") void createPoolTerminal();
+      else if (act === "agents") openAgentsModal();
+      else if (act === "fullscreen") void toggleFullscreen();
+      return;
+    }
+
+    switch (el.getAttribute("data-m")) {
+      case "drawer":
+        document.body.classList.remove("m-sheet-open");
+        document.body.classList.toggle("m-drawer-open");
+        break;
+      case "new":
+        closeMobileOverlays();
+        openNewTerminalModal();
+        break;
+      case "menu":
+        document.body.classList.remove("m-drawer-open");
+        document.body.classList.toggle("m-sheet-open");
+        break;
+      case "scrim":
+        closeMobileOverlays();
+        break;
+    }
+  });
+
+  // Choisir ou fermer un terminal dans la liste referme le tiroir.
+  document.addEventListener("click", (event) => {
+    if (
+      (event.target as HTMLElement).closest(
+        "[data-terminal-key],[data-close-terminal],#newTerminalSide",
+      )
+    ) {
+      document.body.classList.remove("m-drawer-open");
+    }
+  });
+
+  // Reajuste le terminal a l'ouverture/fermeture du clavier ou a la rotation.
+  let refitTimer = 0;
+  const refit = () => {
+    window.clearTimeout(refitTimer);
+    refitTimer = window.setTimeout(() => fitAndResizeActiveTerminal(), 120);
+  };
+  window.visualViewport?.addEventListener("resize", refit);
+  window.addEventListener("orientationchange", () =>
+    window.setTimeout(() => fitAndResizeActiveTerminal(), 280),
+  );
+
+  createIcons({ icons: lucideIcons });
+  syncMobileChrome();
+}
+
 const render = () => {
   if (!settings) {
     app.innerHTML = `<main class="boot">Chargement</main>`;
@@ -2074,6 +2940,11 @@ const render = () => {
     ? (activeSession?.proxySummary ?? (proxy ? maskProxy(proxy.proxyUrl) : "sans proxy"))
     : "proxy off";
   const contextProject = displayProjectDir(activeSession?.projectDir ?? account?.projectDir);
+  const workspacePath = currentWorkspace();
+  const workspaceChipLabel = workspacePath ? workspaceBaseName(workspacePath) : "Workspace";
+  const workspaceTitle = workspacePath
+    ? `Workspace des nouveaux agents: ${workspacePath}`
+    : "Aucun workspace: les nouveaux agents demarrent dans le dossier par defaut";
   const terminalCountLabel =
     terminalSessions.length === 1 ? "1 terminal" : `${terminalSessions.length} terminaux`;
   const terminalSideItems = terminalSessions
@@ -2144,6 +3015,17 @@ const render = () => {
             </div>
           </div>
           <div class="actions">
+            <div class="workspace-control" title="${escapeAttr(workspaceTitle)}">
+              <button id="workspacePick" class="tool-button ${workspacePath ? "primary" : ""}" title="${escapeAttr(workspaceTitle)}">
+                <i data-lucide="folder-open"></i>
+                <span>${escapeHtml(workspaceChipLabel)}</span>
+              </button>
+              ${workspacePath
+                ? `<button id="workspaceClear" class="icon-button" title="Retirer le workspace">
+                <i data-lucide="x"></i>
+              </button>`
+                : ""}
+            </div>
             <button id="fullscreenToggle" class="icon-button wide ${isFullscreen ? "active" : ""}" title="${isFullscreen ? "Quitter plein ecran (F11)" : "Plein ecran (F11)"}" aria-label="${isFullscreen ? "Quitter plein ecran" : "Plein ecran"}" aria-pressed="${isFullscreen}">
               <i data-lucide="${isFullscreen ? "minimize-2" : "maximize-2"}"></i>
             </button>
@@ -2174,6 +3056,14 @@ const render = () => {
             <button id="roomToggle" class="tool-button ${activeView === "room" ? "primary" : ""}" title="Salon d'agents (communication inter-agents)">
               <i data-lucide="users"></i>
               <span>Salon</span>
+            </button>
+            <button id="auditToggle" class="tool-button ${activeView === "audit" ? "primary" : ""}" title="Audit design de la vue affichée (détecteur Impeccable)">
+              <i data-lucide="scan-eye"></i>
+              <span>Audit</span>
+            </button>
+            <button id="skillsToggle" class="tool-button ${activeView === "skills" ? "primary" : ""}" title="Bibliothèque de skills">
+              <i data-lucide="library"></i>
+              <span>Skills</span>
             </button>
             <button id="newTerminal" class="tool-button primary" title="Nouveau terminal">
               <i data-lucide="plus"></i>
@@ -2223,7 +3113,11 @@ const render = () => {
                       ? renderPromptHistoryPanel()
                       : activeView === "room"
                         ? renderRoomPanel()
-                        : `<div id="terminal"></div>`}
+                        : activeView === "audit"
+                          ? renderAuditPanel()
+                          : activeView === "skills"
+                            ? renderSkillsPanel()
+                            : `<div id="terminal"></div>`}
         </section>
 
         <footer class="statusbar">
@@ -2234,11 +3128,14 @@ const render = () => {
     </div>
     ${renderNewTerminalModal()}
     ${renderAgentsModal()}
+    ${renderWorkspaceModal()}
+    ${renderCodexModelSuggestions()}
   `;
 
   createIcons({ icons: lucideIcons });
   bindUi();
   mountActiveTerminal();
+  ensureMobileChrome();
 };
 
 const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
@@ -2324,9 +3221,17 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
               <span>Proxy compte</span>
               <select id="proxySelect" ${account && proxiesEnabled ? "" : "disabled"}>${proxyOptions}</select>
             </label>
-            <label class="toggle" title="Lance Codex en mode bypass (--dangerously-bypass-approvals-and-sandbox) pour CE compte">
+            <label>
+              <span>Modele Codex par defaut</span>
+              <input id="accountModel" list="codexModelSuggestions" value="${escapeAttr(accountModel(account))}" ${account ? "" : "disabled"} />
+            </label>
+            <label>
+              <span>Intensite par defaut</span>
+              <select id="accountReasoningEffort" ${account ? "" : "disabled"}>${reasoningEffortOptions(accountReasoningEffort(account))}</select>
+            </label>
+            <label class="toggle" title="Desactive les approbations et la sandbox pour CE compte">
               <input id="accountBypass" type="checkbox" ${(account?.bypass ?? settings.codexBypass ?? true) ? "checked" : ""} ${account ? "" : "disabled"} />
-              <span>Bypass compte</span>
+              <span>Mode bypass (sans sandbox)</span>
             </label>
           </div>
         </section>
@@ -2427,14 +3332,28 @@ const renderNewTerminalModal = () => {
                 ${accountOptions || `<option value="">Aucun compte</option>`}
               </select>
             </label>
-            <div class="modal-inline">
-              <label>
-                <span>Ajouter un compte</span>
-                <input id="newTerminalAccountLabel" placeholder="perso, pro, client" />
-              </label>
+            <div class="account-create-box">
+              <strong>Ajouter un nouvel environnement</strong>
+              <div class="account-create-grid">
+                <label>
+                  <span>Nom du compte</span>
+                  <input id="newTerminalAccountLabel" value="${escapeAttr(newTerminalAccountLabel)}" placeholder="perso, pro, client" />
+                </label>
+                <label>
+                  <span>Modele par defaut</span>
+                  <input id="newAccountModel" list="codexModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${DEFAULT_CODEX_MODEL}" />
+                </label>
+                <label>
+                  <span>Intensite par defaut</span>
+                  <select id="newAccountReasoningEffort">${reasoningEffortOptions(newTerminalAccountReasoningEffort)}</select>
+                </label>
+                <label class="modal-check" title="Sans approbations et sans sandbox Codex">
+                  <input id="newAccountBypass" type="checkbox" ${newTerminalAccountBypass ? "checked" : ""} />
+                  <span>Mode bypass</span>
+                </label>
+              </div>
               <button class="tool-button" id="addAccountFromModal">
-                <i data-lucide="plus"></i>
-                <span>Ajouter</span>
+                <i data-lucide="plus"></i><span>Ajouter ce compte</span>
               </button>
             </div>
           </section>
@@ -2453,6 +3372,18 @@ const renderNewTerminalModal = () => {
               <select id="newTerminalProxy" ${account && settings.proxyControlsEnabled ? "" : "disabled"}>
                 ${proxyOptions}
               </select>
+            </label>
+            <label>
+              <span>Modele Codex par defaut</span>
+              <input id="newTerminalModel" list="codexModelSuggestions" value="${escapeAttr(accountModel(account))}" ${account ? "" : "disabled"} />
+            </label>
+            <label>
+              <span>Intensite par defaut</span>
+              <select id="newTerminalReasoningEffort" ${account ? "" : "disabled"}>${reasoningEffortOptions(accountReasoningEffort(account))}</select>
+            </label>
+            <label class="modal-check" title="Sans approbations et sans sandbox Codex">
+              <input id="newTerminalBypass" type="checkbox" ${accountBypassEnabled(account) ? "checked" : ""} ${account ? "" : "disabled"} />
+              <span>Mode bypass pour ce compte</span>
             </label>
             <label class="modal-check">
               <input id="newTerminalAutoRun" type="checkbox" ${settings.autoRunCodex ? "checked" : ""} />
@@ -2553,6 +3484,68 @@ const renderAgentsModal = () => {
           <button class="tool-button primary" id="saveAgentsModal">
             <i data-lucide="save"></i>
             <span>Enregistrer</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+  `;
+};
+
+const renderWorkspaceModal = () => {
+  if (!workspaceModalOpen) return "";
+
+  const data = workspaceBrowse;
+  const entries = data?.entries ?? [];
+  const list = entries
+    .map(
+      (entry) => `
+        <button class="ws-entry" data-ws-dir="${escapeAttr(entry.path)}" title="${escapeAttr(entry.path)}">
+          <i data-lucide="folder-open"></i>
+          <span>${escapeHtml(entry.name)}</span>
+        </button>`,
+    )
+    .join("");
+  const selected = currentWorkspace();
+
+  return `
+    <div class="modal-backdrop" id="workspaceBackdrop">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="workspaceModalTitle">
+        <header class="modal-head">
+          <div>
+            <h2 id="workspaceModalTitle">Choisir un workspace</h2>
+            <p>Dossier du serveur ou demarreront les prochains agents (cwd).</p>
+          </div>
+          <button class="icon-button" id="closeWorkspaceModal" title="Fermer">
+            <i data-lucide="x"></i>
+          </button>
+        </header>
+
+        <div class="modal-body">
+          <div class="ws-path-row">
+            <input id="workspacePathInput" value="${escapeAttr(data?.path ?? "")}" placeholder="/chemin/vers/dossier" spellcheck="false" />
+            <button class="tool-button" id="workspaceGo" title="Aller a ce chemin">
+              <i data-lucide="search"></i>
+              <span>Aller</span>
+            </button>
+          </div>
+          ${selected ? `<div class="ws-current">Workspace actuel : <strong>${escapeHtml(selected)}</strong></div>` : ""}
+          ${data?.parent
+            ? `<button class="ws-entry ws-parent" data-ws-dir="${escapeAttr(data.parent)}" title="${escapeAttr(data.parent)}">
+                 <i data-lucide="folder-open"></i>
+                 <span>.. (dossier parent)</span>
+               </button>`
+            : ""}
+          ${workspaceBrowseLoading ? `<div class="ws-hint">Chargement...</div>` : ""}
+          ${workspaceBrowseError ? `<div class="ws-error">${escapeHtml(workspaceBrowseError)}</div>` : ""}
+          <div class="ws-list">${list || (workspaceBrowseLoading ? "" : `<div class="empty">Aucun sous-dossier</div>`)}</div>
+        </div>
+
+        <footer class="modal-actions">
+          <button class="tool-button" id="cancelWorkspaceModal">Annuler</button>
+          <button class="tool-button" id="clearWorkspaceModal">Aucun workspace</button>
+          <button class="tool-button primary" id="confirmWorkspaceModal" ${data?.path ? "" : "disabled"}>
+            <i data-lucide="badge-check"></i>
+            <span>Choisir ce dossier</span>
           </button>
         </footer>
       </section>
@@ -2666,6 +3659,18 @@ const renderPoolPanel = () => {
               <option value="" ${poolNewAccountProxyId ? "" : "selected"}>Sans proxy</option>
               ${poolProxyOptions}
             </select>
+          </label>
+          <label>
+            <span>Modele Codex par defaut</span>
+            <input id="poolNewAccountModel" list="codexModelSuggestions" value="${escapeAttr(poolNewAccountModel)}" placeholder="${DEFAULT_CODEX_MODEL}" />
+          </label>
+          <label>
+            <span>Intensite par defaut</span>
+            <select id="poolNewAccountReasoningEffort">${reasoningEffortOptions(poolNewAccountReasoningEffort)}</select>
+          </label>
+          <label class="pool-check" title="Sans approbations et sans sandbox Codex">
+            <input id="poolNewAccountBypass" type="checkbox" ${poolNewAccountBypass ? "checked" : ""} />
+            <span>Mode bypass</span>
           </label>
         </div>
         <button class="tool-button" type="submit">
@@ -2966,10 +3971,7 @@ const renderDashboardPanel = () => {
         ${renderUsageAreaChart(chartDays)}
       </section>
 
-      <div class="dashboard-tabs">
-        <button class="active">Resume</button>
-        <button>Agents <span>${dash.totalAgentRuns}</span></button>
-        <button>API <span>${dash.totalApiRequests}</span></button>
+      <div class="dashboard-table-toolbar">
         <div class="dashboard-table-actions">
           <button id="dashboardRefresh"><i data-lucide="refresh-ccw"></i><span>Actualiser</span></button>
         </div>
@@ -3229,11 +4231,18 @@ const uniqueCodexHomeForLabel = (label: string) => {
   return defaultCodexHomeForLabel(`${label}-${Date.now().toString(36)}`);
 };
 
+type NewAccountPreferences = {
+  bypass?: boolean;
+  model?: string | null;
+  reasoningEffort?: string | null;
+};
+
 const newAccountProfile = (
   label: string,
   codexHome = defaultCodexHomeForLabel(label),
   projectDir: string | null = null,
   proxyId: string | null = null,
+  preferences: NewAccountPreferences = {},
 ): AccountProfile => ({
   id: uid("account"),
   label,
@@ -3241,8 +4250,9 @@ const newAccountProfile = (
   projectDir,
   proxyId,
   startupCommand: null,
-  // Nouveau compte : herite du defaut global (ON par defaut).
-  bypass: settings?.codexBypass ?? true,
+  bypass: preferences.bypass ?? settings?.codexBypass ?? true,
+  model: preferences.model?.trim() || DEFAULT_CODEX_MODEL,
+  reasoningEffort: normalizeCodexReasoningEffort(preferences.reasoningEffort),
 });
 
 const refreshPoolAfterAccountChange = async (message: string) => {
@@ -3262,11 +4272,24 @@ const readPoolNewAccountForm = () => {
     document.querySelector<HTMLInputElement>("#poolNewAccountLabel")?.value.trim() ?? poolNewAccountLabel;
   poolNewAccountProxyId =
     document.querySelector<HTMLSelectElement>("#poolNewAccountProxy")?.value ?? poolNewAccountProxyId;
+  poolNewAccountBypass =
+    document.querySelector<HTMLInputElement>("#poolNewAccountBypass")?.checked ?? poolNewAccountBypass;
+  poolNewAccountModel =
+    document.querySelector<HTMLInputElement>("#poolNewAccountModel")?.value.trim() ||
+    poolNewAccountModel ||
+    DEFAULT_CODEX_MODEL;
+  poolNewAccountReasoningEffort = normalizeCodexReasoningEffort(
+    document.querySelector<HTMLSelectElement>("#poolNewAccountReasoningEffort")?.value ??
+      poolNewAccountReasoningEffort,
+  );
 };
 
 const clearPoolNewAccountForm = () => {
   poolNewAccountLabel = "";
   poolNewAccountProxyId = "";
+  poolNewAccountBypass = settings?.codexBypass ?? true;
+  poolNewAccountModel = DEFAULT_CODEX_MODEL;
+  poolNewAccountReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
 };
 
 const addPoolAccount = async () => {
@@ -3279,8 +4302,15 @@ const addPoolAccount = async () => {
   const proxyId = settings.proxyControlsEnabled ? poolNewAccountProxyId || null : null;
 
   try {
-    await invoke("ensure_account_home", { codexHome });
-    const account = newAccountProfile(label, codexHome, null, proxyId);
+    const account = newAccountProfile(label, codexHome, null, proxyId, {
+      bypass: poolNewAccountBypass,
+      model: poolNewAccountModel,
+      reasoningEffort: poolNewAccountReasoningEffort,
+    });
+    // Provisionne les permissions des la creation. Sans cela, le compte etait
+    // marque bypass dans settings.json mais son config.toml ne l'etait qu'au
+    // premier lancement d'un terminal.
+    await provisionAccountHome(account);
     settings.accounts.push(account);
     settings.defaultAccountId = account.id;
     selectedAccountId = account.id;
@@ -3297,6 +4327,10 @@ const openNewTerminalModal = () => {
   if (!settings) return;
   newTerminalAccountId = selectedAccountId || settings.defaultAccountId || settings.accounts[0]?.id || null;
   newTerminalAgentId = settings.activeAgentId || settings.agents[0]?.id || null;
+  newTerminalAccountLabel = "";
+  newTerminalAccountBypass = settings.codexBypass ?? true;
+  newTerminalAccountModel = DEFAULT_CODEX_MODEL;
+  newTerminalAccountReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
   newTerminalModalOpen = true;
   statusText = "Choisis l'agent et le compte du nouveau terminal";
   render();
@@ -3392,26 +4426,59 @@ const readNewTerminalModalForm = () => {
   if (settings.proxyControlsEnabled) {
     account.proxyId = document.querySelector<HTMLSelectElement>("#newTerminalProxy")?.value || null;
   }
+  account.model =
+    document.querySelector<HTMLInputElement>("#newTerminalModel")?.value.trim() ||
+    accountModel(account);
+  account.reasoningEffort = normalizeCodexReasoningEffort(
+    document.querySelector<HTMLSelectElement>("#newTerminalReasoningEffort")?.value ??
+      account.reasoningEffort,
+  );
+  account.bypass =
+    document.querySelector<HTMLInputElement>("#newTerminalBypass")?.checked ??
+    accountBypassEnabled(account);
   const agentSelect = document.querySelector<HTMLSelectElement>("#newTerminalAgent");
   if (agentSelect) newTerminalAgentId = agentSelect.value || newTerminalAgentId;
   settings.autoRunCodex = document.querySelector<HTMLInputElement>("#newTerminalAutoRun")?.checked ?? settings.autoRunCodex;
   return account;
 };
 
+const readNewTerminalAccountDraft = () => {
+  newTerminalAccountLabel =
+    document.querySelector<HTMLInputElement>("#newTerminalAccountLabel")?.value.trim() ??
+    newTerminalAccountLabel;
+  newTerminalAccountBypass =
+    document.querySelector<HTMLInputElement>("#newAccountBypass")?.checked ??
+    newTerminalAccountBypass;
+  newTerminalAccountModel =
+    document.querySelector<HTMLInputElement>("#newAccountModel")?.value.trim() ||
+    newTerminalAccountModel ||
+    DEFAULT_CODEX_MODEL;
+  newTerminalAccountReasoningEffort = normalizeCodexReasoningEffort(
+    document.querySelector<HTMLSelectElement>("#newAccountReasoningEffort")?.value ??
+      newTerminalAccountReasoningEffort,
+  );
+};
+
 const addAccountFromModal = () => {
   if (!settings) return;
-  const label = document.querySelector<HTMLInputElement>("#newTerminalAccountLabel")?.value.trim();
+  readNewTerminalAccountDraft();
+  const label = newTerminalAccountLabel;
   if (!label) {
     statusText = "Nom de compte manquant";
     render();
     return;
   }
 
-  const account = newAccountProfile(label);
+  const account = newAccountProfile(label, undefined, null, null, {
+    bypass: newTerminalAccountBypass,
+    model: newTerminalAccountModel,
+    reasoningEffort: newTerminalAccountReasoningEffort,
+  });
   settings.accounts.push(account);
   selectedAccountId = account.id;
   newTerminalAccountId = account.id;
-  statusText = "Compte ajoute pour le nouveau terminal";
+  newTerminalAccountLabel = "";
+  statusText = `Compte ajoute (${account.bypass ? "bypass" : "sandbox"}, ${account.model}, ${account.reasoningEffort})`;
   render();
 };
 
@@ -3455,7 +4522,7 @@ const bindUi = () => {
     );
     settings.accounts.push(account);
     selectedAccountId = account.id;
-    statusText = "Compte ajoute";
+    statusText = "Choisis le bypass, le modele et l'intensite, puis clique sur Save";
     render();
   });
 
@@ -3478,6 +4545,57 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#pickProjectDir")?.addEventListener("click", () => {
     void pickProjectDir();
+  });
+
+  document.querySelector<HTMLButtonElement>("#workspacePick")?.addEventListener("click", () => {
+    void openWorkspacePicker();
+  });
+
+  document.querySelector<HTMLButtonElement>("#workspaceClear")?.addEventListener("click", () => {
+    chooseWorkspace(null);
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-ws-dir]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const path = button.dataset.wsDir;
+      if (path) void loadWorkspaceDir(path);
+    });
+  });
+
+  document.querySelector<HTMLButtonElement>("#workspaceGo")?.addEventListener("click", () => {
+    const value = document.querySelector<HTMLInputElement>("#workspacePathInput")?.value.trim();
+    void loadWorkspaceDir(value || null);
+  });
+
+  document.querySelector<HTMLInputElement>("#workspacePathInput")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const value = (event.currentTarget as HTMLInputElement).value.trim();
+      void loadWorkspaceDir(value || null);
+    }
+  });
+
+  document.querySelector<HTMLButtonElement>("#confirmWorkspaceModal")?.addEventListener("click", () => {
+    const path = workspaceBrowse?.path?.trim();
+    if (path) chooseWorkspace(path);
+  });
+
+  document.querySelector<HTMLButtonElement>("#clearWorkspaceModal")?.addEventListener("click", () => {
+    chooseWorkspace(null);
+  });
+
+  document.querySelector<HTMLButtonElement>("#cancelWorkspaceModal")?.addEventListener("click", () => {
+    closeWorkspaceModal();
+  });
+
+  document.querySelector<HTMLButtonElement>("#closeWorkspaceModal")?.addEventListener("click", () => {
+    closeWorkspaceModal();
+  });
+
+  document.querySelector<HTMLDivElement>("#workspaceBackdrop")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeWorkspaceModal();
+    }
   });
 
   document.querySelector<HTMLButtonElement>("#newTerminal")?.addEventListener("click", () => {
@@ -3503,6 +4621,8 @@ const bindUi = () => {
   });
 
   document.querySelector<HTMLSelectElement>("#newTerminalAccount")?.addEventListener("change", (event) => {
+    readNewTerminalAccountDraft();
+    readNewTerminalModalForm();
     newTerminalAccountId = (event.currentTarget as HTMLSelectElement).value || null;
     render();
   });
@@ -3510,6 +4630,7 @@ const bindUi = () => {
   document.querySelector<HTMLSelectElement>("#newTerminalAgent")?.addEventListener("change", (event) => {
     // Committe les champs saisis (CODEX_HOME, projet, proxy) avant le re-render,
     // sinon changer d'agent (qui ne change pas de compte) les remettrait a zero.
+    readNewTerminalAccountDraft();
     readNewTerminalModalForm();
     newTerminalAgentId = (event.currentTarget as HTMLSelectElement).value || null;
     render();
@@ -3584,6 +4705,38 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#roomToggle")?.addEventListener("click", () => {
     setActiveView("room");
+  });
+
+  document.querySelector<HTMLButtonElement>("#auditToggle")?.addEventListener("click", () => {
+    void toggleAudit();
+  });
+
+  document.querySelector<HTMLButtonElement>("#auditRun")?.addEventListener("click", () => {
+    void runAudit(auditViewLabelFor("audit"));
+  });
+
+  document.querySelector<HTMLDivElement>("#auditList")?.addEventListener("click", (event) => {
+    const row = (event.target as HTMLElement).closest<HTMLElement>("[data-audit-selector]");
+    if (row?.dataset.auditSelector) highlightAuditTarget(row.dataset.auditSelector);
+  });
+
+  document.querySelector<HTMLButtonElement>("#skillsToggle")?.addEventListener("click", () => {
+    setActiveView("skills");
+  });
+
+  document.querySelector<HTMLButtonElement>("#skillsRefresh")?.addEventListener("click", () => {
+    void refreshSkills();
+  });
+
+  document.querySelector<HTMLDivElement>("#skillsList")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    const applyEl = target.closest<HTMLElement>("[data-skill-apply]");
+    if (applyEl?.dataset.skillApply) {
+      void applySkill(applyEl.dataset.skillApply);
+      return;
+    }
+    const copyEl = target.closest<HTMLElement>("[data-skill-copy]");
+    if (copyEl?.dataset.skillCopy) void copySkill(copyEl.dataset.skillCopy);
   });
 
   document.querySelector<HTMLButtonElement>("#roomRefresh")?.addEventListener("click", () => {
@@ -3681,7 +4834,7 @@ const bindUi = () => {
 
   document
     .querySelectorAll<HTMLInputElement | HTMLSelectElement>(
-      "#poolNewAccountLabel, #poolNewAccountProxy",
+      "#poolNewAccountLabel, #poolNewAccountProxy, #poolNewAccountBypass, #poolNewAccountModel, #poolNewAccountReasoningEffort",
     )
     .forEach((input) => {
       input.addEventListener("input", readPoolNewAccountForm);
@@ -3702,7 +4855,23 @@ const bindUi = () => {
     const target = event.target as HTMLElement;
     const confirmBtn = target.closest<HTMLElement>("[data-remove-account-confirm]");
     if (confirmBtn) {
-      void removeAccount(confirmBtn.dataset.removeAccountConfirm ?? null);
+      void removeAccount(confirmBtn.dataset.removeAccountConfirm ?? null, false);
+      return;
+    }
+    const purgeBtn = target.closest<HTMLElement>("[data-remove-account-purge]");
+    if (purgeBtn) {
+      const id = purgeBtn.dataset.removeAccountPurge ?? null;
+      const acc = poolStatus?.accounts?.find((item) => item.id === id);
+      const home = acc?.codexHome ?? "";
+      const confirmed = window.confirm(
+        `Supprimer définitivement le compte « ${acc?.label ?? id ?? ""} » ET son dossier sur le disque ?\n\n${home}\n\nCette action est irréversible : auth.json, sessions, config… seront effacés.`,
+      );
+      if (confirmed) {
+        void removeAccount(id, true);
+      } else {
+        pendingDeleteAccountId = null;
+        render();
+      }
       return;
     }
     const cancelBtn = target.closest<HTMLElement>("[data-remove-account-cancel]");
@@ -3822,13 +4991,20 @@ const bindUi = () => {
     // Lit tout le formulaire (dont la case bypass) puis persiste tout de suite,
     // pour que le reglage par compte survive au rechargement.
     readSettingsForm();
-    void invoke<AppSettings>("save_settings", { settings }).then((updated) => {
-      settings = updated;
-      statusText = selectedAccount()?.bypass
-        ? "Bypass active pour ce compte"
-        : "Bypass desactive pour ce compte";
-      render();
-    });
+    void invoke<AppSettings>("save_settings", { settings })
+      .then(async (updated) => {
+        settings = updated;
+        const account = selectedAccount();
+        if (account) await provisionAccountHome(account);
+        statusText = account?.bypass
+          ? "Bypass active pour ce compte"
+          : "Bypass desactive : sandbox workspace-write active";
+        render();
+      })
+      .catch((error) => {
+        statusText = String(error);
+        render();
+      });
   });
 };
 
@@ -3845,8 +5021,20 @@ const readSettingsForm = () => {
   const projectDir = document.querySelector<HTMLInputElement>("#projectDir");
   const proxySelect = document.querySelector<HTMLSelectElement>("#proxySelect");
   const accountBypass = document.querySelector<HTMLInputElement>("#accountBypass");
+  const accountModelInput = document.querySelector<HTMLInputElement>("#accountModel");
+  const accountReasoningEffortSelect =
+    document.querySelector<HTMLSelectElement>("#accountReasoningEffort");
 
-  if (account && (accountLabel || accountHome || projectDir || proxySelect || accountBypass)) {
+  if (
+    account &&
+    (accountLabel ||
+      accountHome ||
+      projectDir ||
+      proxySelect ||
+      accountBypass ||
+      accountModelInput ||
+      accountReasoningEffortSelect)
+  ) {
     if (accountLabel) account.label = accountLabel.value.trim() || account.label;
     if (accountHome) account.codexHome = accountHome.value.trim() || account.codexHome;
     if (projectDir) account.projectDir = projectDir.value.trim() || null;
@@ -3854,6 +5042,10 @@ const readSettingsForm = () => {
       account.proxyId = proxySelect?.value || null;
     }
     if (accountBypass) account.bypass = accountBypass.checked;
+    if (accountModelInput) account.model = accountModelInput.value.trim() || DEFAULT_CODEX_MODEL;
+    if (accountReasoningEffortSelect) {
+      account.reasoningEffort = normalizeCodexReasoningEffort(accountReasoningEffortSelect.value);
+    }
     syncSessionsForAccount(account);
   }
 
@@ -4034,10 +5226,17 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
       : null;
 
   try {
+    // Workspace choisi (dossier de travail global) :
+    //  - web  : envoye au serveur comme `workspacePath` (cwd = ce dossier ; le
+    //           serveur ignore alors `repoUrl`) ;
+    //  - desktop : envoye comme `projectDir` (override du dossier du compte).
+    const workspace = currentWorkspace();
     const ptyId = await invoke<number>("start_terminal", {
       id: requestedId,
       accountId: session.accountId,
       repoUrl: isRemoteMode() ? session.projectDir ?? "" : undefined,
+      workspacePath: isRemoteMode() ? workspace ?? undefined : undefined,
+      projectDir: !isRemoteMode() ? workspace ?? undefined : undefined,
       branch: null,
       cols: session.terminal.cols,
       rows: session.terminal.rows,
@@ -4049,7 +5248,10 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
     session.status = "Actif";
     statusText = "Terminal actif";
     if (settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
-      void launchIde(sessionAgent, session.projectDir);
+      // Cohérent avec le terminal (cwd = workspace choisi) et avec le lancement
+      // manuel : currentProjectDir() priorise le workspace, sinon le dossier du
+      // terminal/compte. Sans ça, l'IDE s'ouvrirait sur le dossier du compte.
+      void launchIde(sessionAgent, currentProjectDir());
     }
     persistTerminalSessions();
     const startedAccount = settings.accounts.find((candidate) => candidate.id === session.accountId) ?? null;
@@ -4103,6 +5305,7 @@ const sendLine = async (line: string) => {
     return false;
   }
 };
+
 
 const escapeHtml = (value: string) =>
   value
@@ -4233,6 +5436,7 @@ const boot = async () => {
     throw error;
   }
   selectedAccountId = settings.defaultAccountId || settings.accounts[0]?.id || null;
+  poolNewAccountBypass = settings.codexBypass ?? true;
   isFullscreen = await appWindow.isFullscreen().catch(() => false);
   await setupEvents();
   render();

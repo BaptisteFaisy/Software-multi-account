@@ -35,6 +35,7 @@ async fn codex_client_handshakes_and_calls_tools() {
         account_id: "test".into(),
         label: "Tester".into(),
         cwd: None,
+        ..Default::default()
     });
 
     // 2) Serveur MCP sur un port loopback ephemere.

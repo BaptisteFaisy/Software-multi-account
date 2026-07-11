@@ -214,13 +214,23 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
     case "save_settings":
       return api<T>("PUT", "/api/settings", args.settings);
     case "ensure_account_home":
-      return api<T>("POST", "/api/accounts/home", { codexHome: args.codexHome });
+      return api<T>("POST", "/api/accounts/home", {
+        codexHome: args.codexHome,
+        bypass: args.bypass ?? true,
+        model: args.model ?? null,
+        reasoningEffort: args.reasoningEffort ?? null,
+      });
     case "import_account_json":
       return api<T>("POST", "/api/accounts/import", { content: args.content });
     case "import_account_docs":
       throw new Error("En mode SaaS, colle le contenu JSON plutot qu'un chemin de fichier local.");
     case "remove_account":
-      return api<T>("DELETE", `/api/accounts/${encodeURIComponent(args.accountId)}`);
+      return api<T>(
+        "DELETE",
+        `/api/accounts/${encodeURIComponent(args.accountId)}?deleteFiles=${
+          args.deleteFiles ? "true" : "false"
+        }`,
+      );
     case "account_limit_status":
       return api<T>("GET", "/api/limits");
     case "usage_dashboard":
@@ -237,6 +247,11 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return pickRemotePoolAccount<T>();
     case "start_terminal":
       return startRemoteTerminal<T>(args);
+    case "list_dir":
+      return api<T>(
+        "GET",
+        `/api/fs/list${args.path ? `?path=${encodeURIComponent(String(args.path))}` : ""}`,
+      );
     case "write_terminal":
       writeRemoteTerminal(args.id, args.data);
       return undefined as T;
@@ -472,6 +487,7 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
     id: args.id,
     accountId: args.accountId,
     repoUrl: args.repoUrl,
+    workspacePath: args.workspacePath,
     branch: args.branch,
     cols: args.cols,
     rows: args.rows,
@@ -519,16 +535,9 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
     } else if (message.type === "error") {
       emit("pty-data", { id: message.id, data: `\r\n${message.message}\r\n` });
     } else if (message.type === "status") {
-      // Le message WS "status" peut arriver en camelCase (workspacePath) ou en
-      // snake_case (workspace_path) selon la version du noeud : on tolere les
-      // deux pour ne pas afficher "undefined" (utile aussi pendant une mise a
-      // jour rolling ou d'anciens et nouveaux noeuds coexistent).
-      const workspacePath =
-        message.workspacePath ?? (message as unknown as { workspace_path?: string }).workspace_path ?? "";
-      emit("pty-data", {
-        id: message.id,
-        data: `\r\n[Workspace] ${workspacePath}\r\n`,
-      });
+      // Message de controle uniquement. L'injecter dans xterm deplace le
+      // curseur a l'insu de la TUI et son prochain redraw peut alors effacer la
+      // ligne en cours. Le chemin du workspace figure deja dans la banniere PTY.
     }
   });
 

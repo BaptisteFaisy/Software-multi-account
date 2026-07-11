@@ -1,3 +1,5 @@
+@import url("https://fonts.googleapis.com/css2?family=League+Spartan:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
+
 :root {
   color: #e8e1d2;
   background: #151513;
@@ -1043,6 +1045,20 @@ button {
   grid-column: span 2;
 }
 
+.pool-add label.pool-check {
+  display: flex;
+  align-items: center;
+  align-self: end;
+  gap: 8px;
+  min-height: 34px;
+}
+
+.pool-add label.pool-check input {
+  width: 18px;
+  height: 18px;
+  accent-color: #d2ae4f;
+}
+
 .pool-add input,
 .pool-add select {
   min-width: 0;
@@ -1613,6 +1629,36 @@ button {
   align-items: end;
 }
 
+.account-create-box {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #3d392f;
+  border-radius: 8px;
+  background: rgba(17, 16, 14, 0.58);
+}
+
+.account-create-box > strong {
+  color: #e8e1d2;
+  font-size: 12px;
+}
+
+.account-create-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.account-create-box > .tool-button {
+  justify-self: end;
+}
+
+@media (max-width: 680px) {
+  .account-create-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .modal-check {
   display: flex !important;
   grid-template-columns: none !important;
@@ -1625,6 +1671,112 @@ button {
   width: 18px;
   height: 18px;
   accent-color: #d2ae4f;
+}
+
+/* --- Selecteur de workspace ------------------------------------------- */
+.workspace-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.workspace-control .tool-button span {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-path-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 16px 18px 10px;
+}
+
+.ws-path-row input {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  border: 1px solid #3d392f;
+  border-radius: 8px;
+  background: #11100e;
+  color: #e8e1d2;
+  outline: 0;
+  padding: 0 10px;
+}
+
+.ws-path-row input:focus {
+  border-color: #d2ae4f;
+}
+
+.ws-current {
+  padding: 0 18px 8px;
+  color: #a9a291;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.ws-current strong {
+  color: #e8e1d2;
+}
+
+.ws-hint {
+  padding: 4px 18px;
+  color: #a9a291;
+  font-size: 13px;
+}
+
+.ws-error {
+  padding: 8px 18px;
+  color: #f06f6c;
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.ws-list {
+  display: grid;
+  gap: 2px;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 6px 12px 14px;
+}
+
+.ws-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #e8e1d2;
+  padding: 9px 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ws-entry:hover {
+  background: #1c1a16;
+  border-color: #3d392f;
+}
+
+.ws-entry i {
+  width: 16px;
+  height: 16px;
+  color: #d2ae4f;
+  flex: 0 0 auto;
+}
+
+.ws-entry span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-parent {
+  color: #a9a291;
 }
 
 .modal-actions {
@@ -1783,7 +1935,6 @@ body {
 
 .tool-button,
 .icon-button,
-.dashboard-tabs button,
 .dashboard-table-actions button,
 .dashboard-segment button {
   border: 1px solid var(--line);
@@ -1795,7 +1946,6 @@ body {
 
 .tool-button:hover:not(:disabled),
 .icon-button:hover:not(:disabled),
-.dashboard-tabs button:hover,
 .dashboard-table-actions button:hover,
 .dashboard-segment button:hover {
   background: var(--panel-muted);
@@ -1803,7 +1953,6 @@ body {
 
 .tool-button.primary,
 .icon-button.active,
-.dashboard-tabs button.active,
 .dashboard-segment button.active {
   border-color: var(--accent);
   background: var(--accent);
@@ -2052,8 +2201,7 @@ body {
   font-size: 12px;
 }
 
-.dashboard-segment,
-.dashboard-tabs {
+.dashboard-segment {
   display: flex;
   flex-wrap: wrap;
   gap: 0;
@@ -2066,13 +2214,11 @@ body {
   font-size: 12px;
 }
 
-.dashboard-segment button:first-child,
-.dashboard-tabs button:first-child {
+.dashboard-segment button:first-child {
   border-radius: var(--radius) 0 0 var(--radius);
 }
 
-.dashboard-segment button:last-child,
-.dashboard-tabs button:last-of-type {
+.dashboard-segment button:last-child {
   border-radius: 0 var(--radius) var(--radius) 0;
 }
 
@@ -2112,9 +2258,15 @@ body {
   font-size: 11px;
 }
 
-.dashboard-tabs {
+.dashboard-table-toolbar {
+  display: flex;
   align-items: center;
   margin-top: 4px;
+}
+
+.dashboard-table-toolbar .dashboard-table-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .usage-table-wrap {
@@ -2126,30 +2278,6 @@ body {
 .tab-close {
   border-color: var(--line);
   color: var(--muted);
-}
-
-.dashboard-tabs button {
-  height: 32px;
-  padding: 0 12px;
-  font-size: 12px;
-}
-
-.dashboard-tabs button span {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 18px;
-  height: 18px;
-  margin-left: 6px;
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.dashboard-tabs button.active span {
-  background: rgba(255, 255, 255, 0.17);
-  color: #ffffff;
 }
 
 .dashboard-table-actions {
@@ -2246,17 +2374,13 @@ body {
     padding: 12px;
   }
 
-  .dashboard-segment,
-  .dashboard-tabs {
+  .dashboard-segment {
     gap: 6px;
   }
 
   .dashboard-segment button,
-  .dashboard-tabs button,
   .dashboard-segment button:first-child,
-  .dashboard-segment button:last-child,
-  .dashboard-tabs button:first-child,
-  .dashboard-tabs button:last-of-type {
+  .dashboard-segment button:last-child {
     border-radius: var(--radius);
   }
 
@@ -2281,28 +2405,33 @@ body {
 .discussions-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 12px;
-  padding: 16px;
+  gap: 16px;
+  padding: 20px;
   overflow: hidden;
   height: 100%;
 }
 
 .discussions-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 16px;
   flex-wrap: wrap;
 }
 
 .discussions-head > div > strong {
   display: block;
-  font-size: 15px;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.25;
 }
 
 .discussions-head > div > span {
+  display: block;
+  margin-top: 3px;
   font-size: 12px;
-  color: #8f8878;
+  color: var(--muted);
 }
 
 .discussions-tools {
@@ -2315,12 +2444,20 @@ body {
 .discussion-search {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  background: #11100e;
-  border: 1px solid #302e29;
-  border-radius: 6px;
-  padding: 4px 8px;
-  color: #8f8878;
+  gap: 8px;
+  min-height: 36px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  color: var(--muted);
+  box-shadow: 0 1px 1px rgba(29, 32, 28, 0.03);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.discussion-search:focus-within {
+  border-color: #b9bcb5;
+  box-shadow: 0 0 0 3px rgba(32, 33, 31, 0.07);
 }
 
 .discussion-search svg {
@@ -2331,21 +2468,26 @@ body {
 .discussion-search input {
   background: transparent;
   border: 0;
-  color: #e8e1d2;
+  color: var(--text);
   outline: none;
-  min-width: 200px;
+  min-width: 240px;
+}
+
+.discussion-search input::placeholder {
+  color: var(--muted-2);
 }
 
 .discussion-groups {
   overflow-y: auto;
   display: grid;
-  gap: 16px;
+  gap: 20px;
   align-content: start;
+  padding-right: 4px;
 }
 
 .discussion-group {
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .discussion-group-head {
@@ -2353,17 +2495,19 @@ body {
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
-  border-bottom: 1px solid #302e29;
-  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+  padding: 0 2px 7px;
 }
 
 .discussion-group-head strong {
+  color: var(--text);
   font-size: 13px;
+  font-weight: 650;
 }
 
 .discussion-group-head span {
   font-size: 11px;
-  color: #8f8878;
+  color: var(--muted);
 }
 
 .discussion-list {
@@ -2375,11 +2519,19 @@ body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
-  background: #11100e;
-  border: 1px solid #302e29;
-  border-radius: 8px;
-  padding: 10px 12px;
+  gap: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: 0 3px 12px rgba(58, 64, 61, 0.045);
+  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+
+.discussion-row:hover {
+  border-color: #c7cac3;
+  box-shadow: 0 7px 20px rgba(58, 64, 61, 0.08);
+  transform: translateY(-1px);
 }
 
 .discussion-row.busy {
@@ -2389,12 +2541,15 @@ body {
 
 .discussion-main {
   display: grid;
-  gap: 3px;
+  gap: 5px;
   min-width: 0;
 }
 
-.discussion-main > strong {
-  font-size: 13px;
+.discussion-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2402,7 +2557,8 @@ body {
 
 .discussion-preview {
   font-size: 12px;
-  color: #b8b09f;
+  line-height: 1.4;
+  color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2411,9 +2567,9 @@ body {
 .discussion-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 10px;
   font-size: 11px;
-  color: #8f8878;
+  color: var(--muted-2);
 }
 
 .discussion-meta span {
@@ -2434,7 +2590,7 @@ body {
 .discussion-actions {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 .discussion-continue {
@@ -2443,17 +2599,24 @@ body {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  border-top: 1px dashed #302e29;
+  border-top: 1px dashed var(--line);
   padding-top: 8px;
 }
 
 .discussion-target {
-  background: #11100e;
-  border: 1px solid #302e29;
-  color: #e8e1d2;
+  min-height: 34px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--text);
   padding: 6px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius);
   min-width: 160px;
+}
+
+.discussion-target:focus {
+  border-color: #b9bcb5;
+  outline: 3px solid rgba(32, 33, 31, 0.07);
+  outline-offset: 0;
 }
 
 /* Selecteur de compte cible, toujours visible dans chaque ligne de discussion. */
@@ -2461,7 +2624,7 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: #8f8878;
+  color: var(--muted);
 }
 
 .discussion-account svg {
@@ -2476,8 +2639,23 @@ body {
 }
 
 @media (max-width: 720px) {
+  .discussions-panel {
+    padding: 14px;
+  }
+  .discussion-search {
+    width: 100%;
+  }
+  .discussion-search input {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+  }
+  .discussions-tools {
+    width: 100%;
+  }
   .discussion-row {
     grid-template-columns: minmax(0, 1fr);
+    padding: 12px;
   }
   .discussion-actions {
     flex-wrap: wrap;
@@ -2723,4 +2901,1353 @@ body {
 }
 .room-composer #roomTarget {
   max-width: 180px;
+}
+
+/* --- Audit design (détecteur Impeccable) --------------------------------- */
+.audit-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+/* .panel-head/.panel-sub/.panel-actions/h2 ne sont stylés que sous .room-panel ;
+   on les reprend ici pour l'en-tête du panneau d'audit (thème clair). */
+.audit-panel .panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.audit-panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.audit-panel .panel-sub {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.audit-panel .panel-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.audit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+
+.audit-finding {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  width: 100%;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.audit-finding:hover {
+  background: var(--panel-muted);
+  border-color: #bebfb9;
+}
+
+.audit-badge {
+  flex: none;
+  margin-top: 1px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  color: #fff;
+  background: var(--muted-2);
+}
+.audit-badge.sev-error {
+  background: var(--danger);
+}
+.audit-badge.sev-warning {
+  background: var(--warning);
+}
+.audit-badge.sev-advisory {
+  background: var(--info);
+}
+
+.audit-finding-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.audit-finding-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.audit-cat {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.audit-detail {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.audit-desc {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.audit-target {
+  font-size: 11px;
+  color: var(--muted-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all;
+}
+
+.audit-error {
+  color: var(--danger);
+}
+
+/* Mise en évidence temporaire de l'élément fautif sur clic d'un finding. */
+.audit-highlight {
+  outline: 2px solid var(--danger) !important;
+  outline-offset: 2px;
+  border-radius: 4px;
+  animation: auditPulse 1.1s ease-out 2;
+}
+
+@keyframes auditPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(195, 93, 85, 0.5);
+  }
+  100% {
+    box-shadow: 0 0 0 10px rgba(195, 93, 85, 0);
+  }
+}
+
+/* --- Bibliothèque de skills (vue « Skills ») ----------------------------- */
+/* .skills-panel réutilise la mise en page/en-tête de .audit-panel (même classe). */
+.skills-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+.skill-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.skill-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.skill-card-head strong {
+  font-size: 14px;
+}
+.skill-desc {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.skill-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.skill-tag {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel-muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.skill-tag.perso {
+  color: var(--info);
+}
+.skill-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.skill-details {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 8px;
+}
+.skill-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  user-select: none;
+}
+.skill-content {
+  margin: 8px 0 0;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--panel-muted);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+/* ====================================================================
+   EVENT HORIZON — theme sombre « trou noir » (couche active)
+   --------------------------------------------------------------------
+   Design system : sidereal-voyage.ds (Event Horizon). Noir absolu,
+   bordures 1px, lueurs blanches sur les elements actifs, typographie
+   architecturale (League Spartan) + donnees en mono (JetBrains Mono).
+
+   Cette couche vient APRES le theme clair « reference-inspired » : elle
+   redefinit les tokens (:root) — ce qui bascule d'un coup tous les
+   composants tokenises — puis re-cible les valeurs claires en dur et les
+   panneaux chauds non tokenises (agent-control, kombai, prompt, salon…).
+   Purement additive, reversible, une seule section.
+   ==================================================================== */
+
+:root {
+  color: #ffffff;
+  --app-bg: #000000;
+  --app-bg-soft: #050505;
+  --panel: rgba(13, 13, 13, 0.82);
+  --panel-muted: rgba(28, 28, 28, 0.9);
+  --line: #1f1f1f;
+  --line-soft: #171717;
+  --text: #ffffff;
+  --muted: #7c7c7c;
+  --muted-2: #565656;
+  --accent: #ffffff;
+  --accent-ink: #000000; /* texte lisible sur fond accent (blanc) */
+  --accent-soft: rgba(255, 255, 255, 0.06);
+  --success: #8fd694;
+  --warning: #e0b341;
+  --danger: #ff5c53;
+  --info: #9db4c0;
+  --radius: 2px;
+  --eh-glow: 0 0 20px rgba(255, 255, 255, 0.12);
+  --font-head: "League Spartan", "Spartan", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-body: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  font-family: var(--font-body);
+}
+
+body {
+  background: #000000;
+  color: var(--text);
+  font-family: var(--font-body);
+}
+
+#app {
+  position: relative;
+  z-index: 1;
+}
+
+/* --- Fond « trou noir » (injecte par main.ts, hors #app) ------------- */
+.eh-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background: #000000;
+}
+
+@keyframes eh-spin {
+  to {
+    transform: translate(-50%, -50%) rotate(360deg);
+  }
+}
+
+.eh-accretion {
+  position: absolute;
+  top: 62%;
+  left: 72%;
+  width: 1400px;
+  height: 1400px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(255, 255, 255, 0) 0deg,
+    rgba(255, 255, 255, 0.35) 40deg,
+    rgba(255, 255, 255, 0.05) 90deg,
+    rgba(255, 255, 255, 0.55) 160deg,
+    rgba(255, 255, 255, 0) 210deg,
+    rgba(255, 255, 255, 0.3) 300deg,
+    rgba(255, 255, 255, 0) 360deg
+  );
+  -webkit-mask: radial-gradient(circle, transparent 33%, #000 40%, #000 60%, transparent 73%);
+  mask: radial-gradient(circle, transparent 33%, #000 40%, #000 60%, transparent 73%);
+  filter: blur(30px);
+  opacity: 0.2;
+  animation: eh-spin 70s linear infinite;
+}
+
+.eh-singularity {
+  position: absolute;
+  top: 62%;
+  left: 72%;
+  width: 420px;
+  height: 420px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: #000;
+  box-shadow: 0 0 3px 1px rgba(255, 255, 255, 0.8), inset 0 0 70px 12px rgba(0, 0, 0, 1);
+  opacity: 0.5;
+}
+
+.eh-vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 78% 72% at 72% 62%, transparent 0%, rgba(0, 0, 0, 0.72) 66%, #000 100%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .eh-accretion {
+    animation: none;
+  }
+}
+
+/* --- Coque : cadre translucide, halo qui transparait derriere ------- */
+.layout {
+  background: transparent;
+  border: 1px solid var(--line);
+  box-shadow: 0 0 60px rgba(0, 0, 0, 0.6);
+}
+
+.sidebar,
+.topbar,
+.statusbar {
+  background: rgba(5, 5, 5, 0.82);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border-color: var(--line);
+}
+
+.terminal-shell,
+.pool-panel,
+.limits-panel,
+.dashboard-panel,
+.discussions-panel,
+.room-panel {
+  background: transparent;
+}
+
+.brand strong {
+  font-family: var(--font-head);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.brand svg,
+.terminal-side-button svg,
+.terminal-tab svg,
+.ws-entry i {
+  color: var(--accent);
+}
+
+.session-title strong {
+  font-family: var(--font-head);
+}
+
+.section-row {
+  font-family: var(--font-head);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.statusbar {
+  font-family: var(--font-head);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+/* --- Elements de liste (terminaux, comptes, proxys, onglets) -------- */
+.terminal-side-item,
+.account,
+.proxy-item,
+.terminal-tab-item,
+.limit-summary > div,
+.limit-bucket,
+.empty {
+  border-color: var(--line);
+  background: var(--panel);
+  border-radius: 2px;
+}
+
+.terminal-side-item.active,
+.account.active,
+.terminal-tab-item.active {
+  border-color: var(--accent);
+  background: var(--panel-muted);
+  box-shadow: var(--eh-glow);
+}
+
+.terminal-side-title,
+.account-name {
+  font-family: var(--font-head);
+}
+
+.terminal-side-close:hover,
+.tab-close:hover {
+  color: var(--danger);
+}
+
+.live-dot,
+.proxy-dot {
+  background: #333;
+}
+
+.live-dot.on,
+.proxy-dot.bound {
+  background: var(--success);
+  box-shadow: 0 0 8px var(--success);
+}
+
+/* --- Boutons ------------------------------------------------------- */
+.tool-button {
+  font-family: var(--font-head);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 11px;
+}
+
+.tool-button.primary,
+.icon-button.active,
+.dashboard-segment button.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+  box-shadow: var(--eh-glow);
+  font-weight: 700;
+}
+
+.tool-button:hover:not(:disabled),
+.icon-button:hover:not(:disabled),
+.dashboard-table-actions button:hover,
+.dashboard-segment button:hover {
+  background: var(--panel-muted);
+  border-color: var(--muted-2);
+}
+
+.danger,
+.tool-button.danger {
+  border-color: rgba(255, 92, 83, 0.4);
+  background: rgba(255, 92, 83, 0.08);
+  color: var(--danger);
+}
+
+.tool-button.danger:hover:not(:disabled) {
+  background: rgba(255, 92, 83, 0.16);
+}
+
+/* --- Selecteur d'agent (topbar) ------------------------------------ */
+.agent-control {
+  background: var(--panel);
+  border-color: var(--line);
+  border-radius: 2px;
+}
+
+.agent-control .agent-select {
+  background: var(--app-bg-soft);
+  border-right-color: var(--line);
+  color: var(--text);
+}
+
+.agent-control .agent-select:focus {
+  color: var(--accent);
+}
+
+.agent-control .agent-run:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* --- Gestionnaire d'agents (modale) -------------------------------- */
+.agent-row {
+  background: var(--panel);
+  border-color: var(--line);
+  border-radius: 2px;
+}
+
+.agent-row-title {
+  color: var(--text);
+  font-family: var(--font-head);
+}
+
+.agent-row-title svg {
+  color: var(--accent);
+}
+
+.agent-tag {
+  background: var(--accent-soft);
+  border-color: var(--line);
+  color: var(--text);
+  border-radius: 2px;
+}
+
+.agent-tag.ide {
+  color: var(--info);
+  border-color: rgba(157, 180, 192, 0.4);
+  background: rgba(157, 180, 192, 0.08);
+}
+
+/* --- Kombai (VS Code embarque) ------------------------------------- */
+.kombai-bar,
+.kombai-meta > div {
+  background: var(--panel);
+  border-color: var(--line);
+  border-radius: 2px;
+}
+
+.kombai-bar-info strong,
+.kombai-hero h2,
+.kombai-meta strong {
+  color: var(--text);
+}
+
+.kombai-hero h2,
+.kombai-meta span {
+  font-family: var(--font-head);
+}
+
+.kombai-bar-info span,
+.kombai-hero p,
+.agent-hint {
+  color: var(--muted);
+}
+
+.kombai-frame {
+  background: #000;
+  border-color: var(--line);
+  border-radius: 2px;
+}
+
+.kombai-hero-icon {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+}
+
+.kombai-warn {
+  background: rgba(255, 92, 83, 0.08);
+  border-color: rgba(255, 92, 83, 0.35);
+  color: #ffb4ae;
+}
+
+.kombai-warn span {
+  color: var(--muted);
+}
+
+.kombai-warn code,
+.kombai-note code,
+.room-hint code {
+  background: #000;
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+
+.kombai-note {
+  background: rgba(143, 214, 148, 0.06);
+  border-color: rgba(143, 214, 148, 0.3);
+  color: #cfe3b6;
+}
+
+.kombai-hint {
+  border-color: var(--line);
+  color: var(--muted);
+}
+
+/* --- Bandeau de reglages / login distant --------------------------- */
+.settings-strip {
+  background: var(--app-bg-soft);
+  border-color: var(--line);
+}
+
+.settings-strip label span {
+  font-family: var(--font-head);
+  text-transform: uppercase;
+}
+
+.remote-login {
+  background: #000;
+  color: var(--text);
+}
+
+.remote-login-panel {
+  background: var(--app-bg-soft);
+  border-color: var(--line);
+  border-radius: 2px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
+}
+
+.remote-login-head > span {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.remote-login-head h1 {
+  font-family: var(--font-head);
+}
+
+.remote-login-head p,
+.remote-login-form label span {
+  color: var(--muted);
+}
+
+.remote-login-form input,
+.remote-login-form textarea {
+  background: #000;
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.remote-login-error {
+  background: rgba(255, 92, 83, 0.1);
+  border-color: rgba(255, 92, 83, 0.35);
+  color: #ffb4ae;
+}
+
+/* --- Champs de saisie : focus lueur blanche ------------------------ */
+.settings-strip input:focus,
+.settings-strip select:focus,
+.pool-add input:focus,
+.pool-add select:focus,
+.pool-import textarea:focus,
+.remote-login-form input:focus,
+.remote-login-form textarea:focus,
+.modal-section input:focus,
+.modal-section select:focus,
+.discussion-target:focus {
+  border-color: var(--muted);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
+  outline: none;
+}
+
+/* --- Tables (pool / limites / usage) ------------------------------- */
+.pool-table th,
+.limits-table th,
+.usage-table th {
+  font-family: var(--font-head);
+  color: var(--muted);
+  letter-spacing: 0.1em;
+}
+
+.pool-table td,
+.limits-table td,
+.usage-table td {
+  border-bottom-color: var(--line-soft);
+}
+
+.pool-table tbody tr:hover td,
+.limits-table tr:hover td,
+.usage-table tr:hover td {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.usage-table .usage-month-row td {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text);
+  font-family: var(--font-head);
+}
+
+.limit-bucket {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.limit-bucket small {
+  color: var(--muted);
+}
+
+.limits-head strong,
+.discussions-head > div > strong {
+  font-family: var(--font-head);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+/* --- Badges : rectangulaires bordes (statut) ----------------------- */
+.pool-badge,
+.limit-badge {
+  border-radius: 2px;
+  border: 1px solid;
+  font-weight: 650;
+}
+
+.pool-badge.idle,
+.limit-badge.connected {
+  background: rgba(143, 214, 148, 0.1);
+  border-color: rgba(143, 214, 148, 0.35);
+  color: var(--success);
+}
+
+.pool-badge.busy,
+.limit-badge.empty {
+  background: rgba(224, 179, 65, 0.1);
+  border-color: rgba(224, 179, 65, 0.35);
+  color: var(--warning);
+}
+
+.pool-badge.cooling,
+.pool-badge.refreshing {
+  background: rgba(157, 180, 192, 0.1);
+  border-color: rgba(157, 180, 192, 0.35);
+  color: var(--info);
+}
+
+.pool-badge.banned,
+.pool-badge.missing,
+.limit-badge.error,
+.limit-badge.missing {
+  background: rgba(255, 92, 83, 0.1);
+  border-color: rgba(255, 92, 83, 0.35);
+  color: var(--danger);
+}
+
+/* --- Cartes du dashboard + graphe ---------------------------------- */
+.metric-card {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: none;
+}
+
+.metric-card-top span {
+  font-family: var(--font-head);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.metric-card-top em {
+  background: var(--accent-soft);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.metric-card strong {
+  font-family: var(--font-head);
+}
+
+.usage-chart-card,
+.usage-table-wrap,
+.account-usage-card {
+  background: rgba(10, 10, 10, 0.78);
+  border-color: var(--line);
+  box-shadow: none;
+}
+
+.usage-table {
+  background: transparent;
+}
+
+.dashboard-card-head strong {
+  font-family: var(--font-head);
+}
+
+.chart-grid line {
+  stroke: rgba(255, 255, 255, 0.08);
+}
+
+.chart-area {
+  fill: rgba(255, 255, 255, 0.06);
+}
+
+.chart-line {
+  stroke: #ffffff;
+}
+
+.chart-points circle {
+  fill: #ffffff;
+}
+
+.chart-labels text {
+  fill: var(--muted);
+}
+
+.usage-bar-track {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.usage-bar-fill {
+  background: linear-gradient(90deg, #ffffff, #b8b8b8);
+}
+
+/* --- Discussions --------------------------------------------------- */
+.discussion-row {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: none;
+}
+
+.discussion-row:hover {
+  border-color: rgba(255, 255, 255, 0.28);
+  box-shadow: var(--eh-glow);
+  transform: translateY(-1px);
+}
+
+.discussion-search,
+.discussion-target {
+  background: var(--panel);
+  border-color: var(--line);
+  box-shadow: none;
+}
+
+.discussion-search:focus-within {
+  border-color: var(--muted);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
+}
+
+.discussion-title,
+.discussion-group-head strong {
+  font-family: var(--font-head);
+}
+
+/* --- Historique des prompts ---------------------------------------- */
+.prompt-row {
+  background: var(--panel);
+  border-color: var(--line);
+  border-radius: 2px;
+}
+
+.prompt-text {
+  color: var(--text);
+}
+
+.prompt-text mark {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--text);
+}
+
+.prompt-meta,
+.prompt-more {
+  color: var(--muted);
+}
+
+/* --- Salon d'agents (Agent Room) ----------------------------------- */
+.room-panel h2 {
+  font-family: var(--font-head);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.room-panel .panel-sub,
+.room-hint {
+  color: var(--muted);
+}
+
+.room-hint {
+  border-color: var(--line);
+}
+
+.room-agents,
+.room-feed {
+  border-color: var(--line);
+  background: rgba(10, 10, 10, 0.6);
+  border-radius: 2px;
+}
+
+.room-agent {
+  border-bottom-color: var(--line);
+}
+
+.room-msg {
+  background: var(--panel);
+  border-color: var(--line);
+  border-radius: 2px;
+}
+
+.room-msg.dm {
+  border-color: rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.room-msg.system {
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+}
+
+.room-msg-head {
+  color: var(--muted);
+  font-family: var(--font-head);
+}
+
+.room-tag {
+  color: var(--text);
+  border-color: var(--line);
+  border-radius: 2px;
+}
+
+.room-composer #roomText {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.room-composer #roomText:focus {
+  border-color: var(--muted);
+  outline: none;
+}
+
+/* --- Terminal (hote xterm) ----------------------------------------- */
+#terminal {
+  background: #000000;
+  border-color: var(--line);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+}
+
+/* --- Modales ------------------------------------------------------- */
+.modal-backdrop {
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.modal {
+  background: var(--app-bg-soft);
+  border-color: var(--line);
+  border-radius: 2px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+}
+
+.modal-head h2 {
+  font-family: var(--font-head);
+}
+
+/* --- Anti-chevauchement : la topbar entiere passe a la ligne si la
+   rangee d'actions ne tient pas a cote du titre de session (jamais de
+   superposition, quelle que soit la largeur). ------------------------ */
+.topbar {
+  flex-wrap: wrap;
+  row-gap: 10px;
+}
+
+.session-title {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
+.actions {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* ==================================================================== */
+/* COQUE MOBILE — client Android / navigateur telephone.                */
+/* Reorganise l'app desktop en application mobile : barre haute compacte,*/
+/* navigation basse (5 onglets) + feuille "Menu", liste des terminaux en */
+/* tiroir lateral. Injectee par main.ts (.m-chrome) hors de #app.        */
+/* ==================================================================== */
+:root {
+  --m-topbar-h: 52px;
+  --m-bottomnav-h: 58px;
+}
+
+/* Masquee sur desktop ; activee sous 860px (voir media query). */
+.m-chrome {
+  display: none;
+}
+
+@media (max-width: 860px) {
+  html,
+  body,
+  #app {
+    height: 100vh;
+    height: 100dvh;
+  }
+
+  body {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  /* --- Chrome mobile visible --- */
+  .m-chrome {
+    display: block;
+  }
+
+  .m-topbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 70;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: calc(var(--m-topbar-h) + env(safe-area-inset-top));
+    padding: env(safe-area-inset-top) max(8px, env(safe-area-inset-left)) 0
+      max(8px, env(safe-area-inset-right));
+    background: rgba(5, 5, 5, 0.92);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .m-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: center;
+  }
+
+  .m-title strong {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-head);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--text);
+  }
+
+  .m-icon {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .m-icon:active {
+    background: var(--panel-muted);
+  }
+
+  .m-icon svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  /* --- Navigation basse (5 onglets) --- */
+  .m-bottomnav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 70;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    height: calc(var(--m-bottomnav-h) + env(safe-area-inset-bottom));
+    padding-bottom: env(safe-area-inset-bottom);
+    background: rgba(5, 5, 5, 0.94);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid var(--line);
+  }
+
+  .m-tab {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+    color: var(--muted);
+    font-family: var(--font-head);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }
+
+  .m-tab svg {
+    width: 21px;
+    height: 21px;
+  }
+
+  .m-tab.active {
+    color: var(--text);
+  }
+
+  .m-tab.active svg {
+    color: var(--accent);
+    filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.25));
+  }
+
+  .m-tab:active {
+    background: rgba(255, 255, 255, 0.05);
+  }
+
+  /* --- Scrim commun (tiroir + feuille) --- */
+  .m-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: rgba(0, 0, 0, 0.55);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.2s ease, visibility 0.2s ease;
+  }
+
+  body.m-drawer-open .m-scrim,
+  body.m-sheet-open .m-scrim {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  /* --- Layout en une colonne, place pour les barres fixes --- */
+  .layout {
+    display: block !important;
+    height: 100dvh;
+    border: 0;
+    box-shadow: none;
+    padding-top: calc(var(--m-topbar-h) + env(safe-area-inset-top));
+    padding-bottom: calc(var(--m-bottomnav-h) + env(safe-area-inset-bottom));
+  }
+
+  /* --- Liste des terminaux -> tiroir lateral gauche --- */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 60;
+    width: min(86vw, 330px);
+    grid-template-rows: auto minmax(0, 1fr) !important;
+    border-right: 1px solid var(--line);
+    transform: translateX(-100%);
+    transition: transform 0.24s ease;
+    padding-top: calc(env(safe-area-inset-top) + 6px);
+    padding-bottom: calc(env(safe-area-inset-bottom) + 6px);
+    box-shadow: 0 0 46px rgba(0, 0, 0, 0.65);
+  }
+
+  body.m-drawer-open .sidebar {
+    transform: translateX(0);
+  }
+
+  .workspace {
+    display: flex !important;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+
+  /* La topbar desktop et la barre d'etat sont remplacees par la coque. */
+  .workspace > .topbar,
+  .workspace > .statusbar {
+    display: none !important;
+  }
+
+  .terminal-shell {
+    display: flex !important;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .terminal-shell > * {
+    min-height: 0;
+  }
+
+  #terminal {
+    flex: 1 1 auto;
+    height: auto !important;
+    min-height: 0;
+    border-radius: var(--radius);
+  }
+
+  /* Onglets terminaux : scroll horizontal interne plutot que debordement. */
+  .terminal-tabs {
+    flex: 0 0 auto;
+  }
+
+  /* Panneaux : occupent l'espace + defilement tactile. */
+  .terminal-shell > .panel,
+  .pool-panel,
+  .limits-panel,
+  .dashboard-panel,
+  .discussions-panel,
+  .room-panel,
+  .skills-panel,
+  .audit-panel,
+  .kombai-panel,
+  .history-panel {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Grilles multi-colonnes -> empilage. */
+  .kombai-meta,
+  .accounts-layout,
+  .limit-summary,
+  .dashboard-metrics,
+  .dashboard-grid,
+  .pool-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Tableaux larges : scroll horizontal dans leur conteneur, jamais la page. */
+  .dashboard-table-wrap,
+  .table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table {
+    max-width: 100%;
+  }
+
+  /* --- Feuille "Menu" (actions secondaires) --- */
+  .m-sheet {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 65;
+    transform: translateY(110%);
+    transition: transform 0.26s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  body.m-sheet-open .m-sheet {
+    transform: translateY(0);
+  }
+
+  .m-sheet-panel {
+    background: #0b0b0b;
+    border-top: 1px solid var(--line);
+    border-radius: 18px 18px 0 0;
+    padding: 6px 14px calc(18px + var(--m-bottomnav-h) + env(safe-area-inset-bottom));
+    box-shadow: 0 -22px 60px rgba(0, 0, 0, 0.6);
+  }
+
+  .m-sheet-handle {
+    width: 40px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--muted);
+    opacity: 0.5;
+    margin: 6px auto 14px;
+  }
+
+  .m-sheet-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+
+  .m-sheet-grid button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 78px;
+    padding: 10px 6px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    color: var(--text);
+    font-family: var(--font-head);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: center;
+  }
+
+  .m-sheet-grid button:active {
+    background: var(--panel-muted);
+  }
+
+  .m-sheet-grid button svg {
+    width: 22px;
+    height: 22px;
+    color: var(--accent);
+  }
+
+  /* --- Modales : plein ecran sur mobile --- */
+  .modal-backdrop {
+    padding: 0 !important;
+    align-items: stretch !important;
+  }
+
+  .modal {
+    width: 100% !important;
+    max-width: 100% !important;
+    height: 100dvh;
+    max-height: 100dvh !important;
+    border-radius: 0 !important;
+    padding-top: calc(12px + env(safe-area-inset-top));
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  }
+
+  /* --- Confort tactile --- */
+  .tool-button,
+  .icon-button {
+    height: 40px;
+  }
+
+  /* >=16px : empeche le zoom automatique au focus d'un champ. */
+  input,
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+
+  /* Fond anime coupe sur mobile (batterie + lisibilite). */
+  .eh-bg {
+    display: none !important;
+  }
+
+  /* Ecran de connexion : marges de securite (encoche / barre systeme). */
+  .remote-login {
+    padding: max(20px, env(safe-area-inset-top)) 16px
+      max(20px, env(safe-area-inset-bottom));
+  }
+}
+
+/* Avant connexion (login) ou pendant le boot : pas de coque par-dessus. */
+body:has(.remote-login) .m-chrome,
+body:has(.boot) .m-chrome {
+  display: none !important;
 }

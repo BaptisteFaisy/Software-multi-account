@@ -20,6 +20,11 @@
 //!   explicite d'une discussion.
 //!
 //! INVARIANTS (revus de facon adverse) :
+//! - Les rollouts de **sous-agents** multi-agent v2 (`thread_source ==
+//!   "subagent"`) sont exclus du tableau de bord et de l'historique : ils ne
+//!   sont pas reprenables (`turn/start` rejete par l'app-server) et usurpent le
+//!   `session_id` du parent (cf. `is_subagent_rollout`). La cible de reprise est
+//!   donc toujours un thread utilisateur.
 //! - Seul `delete_discussion` retire/deplace un rollout ; aucun autre chemin ne
 //!   supprime ni ne tronque de fichier.
 //! - `copy_discussion_to_account` n'ouvre JAMAIS la source en ecriture : la
@@ -58,6 +63,7 @@ pub struct DiscussionsDashboard {
 pub struct DiscussionAccountGroup {
     pub account_id: String,
     pub label: String,
+    pub provider: settings::Provider,
     pub codex_home: String,
     pub has_tokens: bool,
     pub discussion_count: u64,
@@ -79,6 +85,9 @@ pub struct DiscussionSummary {
     /// Nombre de fichiers rollout regroupes sous ce `session_id` (1 = jamais
     /// repris ; N = N-1 reprises/forks). Sert d'indicateur dans l'UI.
     pub fork_count: u64,
+    /// Fournisseur d'origine de la discussion (Codex ou Claude Code). Permet a
+    /// l'UI d'afficher un badge et de router la reprise/continuation.
+    pub provider: settings::Provider,
     pub account_id: String,
     pub account_label: String,
     pub codex_home: String,
@@ -151,12 +160,13 @@ fn build(settings: &AppSettings) -> DiscussionsDashboard {
 fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
     let has_tokens = settings::account_has_auth_tokens(account);
 
-    let dir = match expand_home(&account.codex_home) {
-        Ok(home) => home.join("sessions"),
+    let home = match expand_home(&account.codex_home) {
+        Ok(home) => home,
         Err(error) => {
             return DiscussionAccountGroup {
                 account_id: account.id.clone(),
                 label: account.label.clone(),
+                provider: account.provider,
                 codex_home: account.codex_home.clone(),
                 has_tokens,
                 discussion_count: 0,
@@ -166,23 +176,10 @@ fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
         }
     };
 
-    let mut discussions = Vec::new();
-    if dir.is_dir() {
-        let mut files = Vec::new();
-        collect_rollouts(&dir, &mut files);
-        for file in &files {
-            if let Some(summary) = scan_discussion_file(file, account) {
-                discussions.push(summary);
-            }
-        }
-    }
-
-    // Regroupe les reprises/forks : Codex ecrit un NOUVEAU fichier rollout a
-    // chaque `resume` (nouveau nom + nouveau `payload.id`) mais conserve le meme
-    // `payload.session_id`. Sans regroupement, une meme conversation apparait
-    // autant de fois qu'elle a ete reprise (les "doublons" observes). On garde
-    // une entree par `session_id`.
-    let mut discussions = collapse_forks(discussions);
+    let mut discussions = match account.provider {
+        settings::Provider::Codex => scan_codex_discussions(&home, account),
+        settings::Provider::Claude => scan_claude_discussions(&home, account),
+    };
 
     // Les plus recemment actives d'abord (le HEAD porte le dernier `mtime`).
     discussions.sort_by(|a, b| {
@@ -195,6 +192,7 @@ fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
     DiscussionAccountGroup {
         account_id: account.id.clone(),
         label: account.label.clone(),
+        provider: account.provider,
         codex_home: account.codex_home.clone(),
         has_tokens,
         discussion_count,
@@ -203,10 +201,249 @@ fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
     }
 }
 
+/// Scan **Codex** : `<home>/sessions/AAAA/MM/JJ/rollout-*.jsonl`, puis
+/// regroupement des reprises/forks par `payload.session_id` (Codex ecrit un
+/// nouveau fichier a chaque `resume`, meme session_id ; sans regroupement une
+/// conversation apparaitrait autant de fois qu'elle a ete reprise).
+fn scan_codex_discussions(home: &Path, account: &AccountProfile) -> Vec<DiscussionSummary> {
+    let dir = home.join("sessions");
+    let mut discussions = Vec::new();
+    if dir.is_dir() {
+        let mut files = Vec::new();
+        collect_rollouts(&dir, &mut files);
+        for file in &files {
+            if let Some(summary) = scan_discussion_file(file, account) {
+                discussions.push(summary);
+            }
+        }
+    }
+    collapse_forks(discussions)
+}
+
+/// Scan **Claude Code** : `<home>/projects/<cwd-echappe>/<uuid>.jsonl`. Une
+/// session = un fichier (pas de forks facon Codex). On ne prend que les `.jsonl`
+/// DIRECTEMENT sous chaque dossier projet : les sous-dossiers `<uuid>/`
+/// contiennent des sidechains/sous-agents, pas la conversation principale.
+fn scan_claude_discussions(home: &Path, account: &AccountProfile) -> Vec<DiscussionSummary> {
+    let projects = home.join("projects");
+    let mut discussions = Vec::new();
+    let Ok(entries) = fs::read_dir(&projects) else {
+        return discussions;
+    };
+    for entry in entries.flatten() {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&project_dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            let is_jsonl = path.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
+            if is_jsonl && path.is_file() {
+                if let Some(summary) = scan_claude_session_file(&path, account) {
+                    discussions.push(summary);
+                }
+            }
+        }
+    }
+    discussions
+}
+
+/// Parse un fichier de session Claude Code en `DiscussionSummary`. Schema (verifie
+/// sur disque) : chaque ligne est un objet portant `type` (user/assistant/...),
+/// `sessionId`, `cwd`, `timestamp`, `version` ; les lignes `assistant` portent
+/// `message.model` + `message.usage` (usage INCREMENTAL par message => on somme).
+fn scan_claude_session_file(path: &Path, account: &AccountProfile) -> Option<DiscussionSummary> {
+    let mtime = fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64);
+
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let session_id_from_name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(ToString::to_string);
+
+    let mut session_id: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut started_at: Option<i64> = None;
+    let mut cli_version: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut preview: Option<String> = None;
+    let mut message_count: u64 = 0;
+    let mut total_tokens: u64 = 0;
+    let mut saw_tokens = false;
+
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if session_id.is_none() {
+            session_id = value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+        if cwd.is_none() {
+            cwd = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+        if started_at.is_none() {
+            started_at = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_secs);
+        }
+        if cli_version.is_none() {
+            cli_version = value
+                .get("version")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+
+        match line_type {
+            "user" => {
+                if let Some(text) = claude_message_text(&value) {
+                    let msg = text.trim();
+                    if !msg.is_empty() {
+                        message_count += 1;
+                        if title.is_none() && !is_synthetic_prompt(msg) {
+                            let first_line = msg.lines().next().unwrap_or(msg).trim();
+                            title = Some(truncate_chars(first_line, TITLE_MAX_CHARS));
+                            preview = Some(truncate_chars(msg, PREVIEW_MAX_CHARS));
+                        }
+                    }
+                }
+            }
+            "assistant" => {
+                message_count += 1;
+                if let Some(usage) = value.pointer("/message/usage") {
+                    saw_tokens = true;
+                    total_tokens += claude_usage_total(usage);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Session vide / avortee (aucun message reel) : on la filtre.
+    if message_count == 0 {
+        return None;
+    }
+
+    let session_id = session_id
+        .or(session_id_from_name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let started_at = started_at.or(mtime).unwrap_or(0);
+    let last_activity = mtime.unwrap_or(started_at);
+
+    Some(DiscussionSummary {
+        session_id: session_id.clone(),
+        // Claude reprend par identifiant de session (pas de fichier HEAD distinct
+        // comme Codex) : rollout_id == session_id.
+        rollout_id: session_id,
+        fork_count: 1,
+        provider: settings::Provider::Claude,
+        account_id: account.id.clone(),
+        account_label: account.label.clone(),
+        codex_home: account.codex_home.clone(),
+        file_path: path.to_string_lossy().to_string(),
+        cwd,
+        started_at,
+        last_activity,
+        title,
+        preview,
+        message_count,
+        total_tokens: if saw_tokens { Some(total_tokens) } else { None },
+        cli_version,
+    })
+}
+
+/// Texte d'un message Claude : `message.content` est soit une chaine (prompt
+/// tape), soit un tableau de blocs. On ne concatene que les blocs `text` (on
+/// ignore `tool_use`/`tool_result`/`thinking`). None si aucun texte utile.
+fn claude_message_text(line: &Value) -> Option<String> {
+    match line.pointer("/message/content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let mut out = String::new();
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(text);
+                    }
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Total de tokens d'un bloc `message.usage` Claude. Contrairement a OpenAI,
+/// l'input EXCLUT les tokens caches (reportes separement) : on additionne donc
+/// input + output + cache_read + cache_creation.
+fn claude_usage_total(usage: &Value) -> u64 {
+    [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .filter_map(|key| usage.get(*key).and_then(json_u64))
+    .sum()
+}
+
+/// Un rollout de **sous-agent** multi-agent v2 : sa ligne `session_meta` porte
+/// `thread_source == "subagent"` (et un `parent_thread_id` non vide). Ces threads
+/// ne sont PAS des conversations reprenables : `codex resume <id>` charge bien le
+/// thread, mais l'app-server rejette ensuite `turn/start` avec
+/// « direct app-server input is not allowed for multi-agent v2 sub-agents » —
+/// c'est exactement l'erreur « turn/start failed » remontee par le TUI.
+///
+/// Piege : ces fichiers portent le `session_id` de leur thread PARENT. Sans ce
+/// filtre, `collapse_forks` les regroupe avec la conversation parente et, comme
+/// ils demarrent APRES le parent, `merge_fork_group` les elit HEAD — donc cible
+/// de reprise. On les exclut donc du tableau de bord ET de l'historique des
+/// prompts : la cible de reprise redevient toujours le thread utilisateur (dont
+/// `codex resume` accepte le `turn/start`).
+///
+/// Un `fork` utilisateur (`codex fork`) reste `thread_source == "user"` et porte
+/// son propre `session_id` : il n'est donc jamais capte par ce filtre.
+fn is_subagent_rollout(meta: &Value) -> bool {
+    meta.pointer("/payload/thread_source").and_then(Value::as_str) == Some("subagent")
+        || matches!(
+            meta.pointer("/payload/parent_thread_id").and_then(Value::as_str),
+            Some(parent) if !parent.is_empty()
+        )
+}
+
 /// Scan d'un rollout. La ligne 1 (`session_meta`) est volumineuse mais parsee
 /// une seule fois ; les lignes suivantes ne sont parsees que si un filtre
 /// `contains` (peu couteux) matche. Renvoie `None` si la session est vide/
-/// avortee (aucun message).
+/// avortee (aucun message) ou s'il s'agit d'un rollout de sous-agent
+/// (non reprenable, cf. `is_subagent_rollout`).
 fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<DiscussionSummary> {
     // mtime = derniere activite (secondes unix). Facultatif : on retombera sur
     // started_at si indisponible.
@@ -224,6 +461,13 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
     reader.read_line(&mut first_line).ok()?;
     let meta: Value = serde_json::from_str(first_line.trim_end()).ok()?;
     if meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+
+    // Les rollouts de sous-agents (multi-agent v2) ne sont pas reprenables et
+    // usurpent le `session_id` du parent : on les ecarte entierement du tableau
+    // de bord (cf. `is_subagent_rollout`).
+    if is_subagent_rollout(&meta) {
         return None;
     }
 
@@ -321,6 +565,7 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
         session_id,
         rollout_id,
         fork_count: 1,
+        provider: settings::Provider::Codex,
         account_id: account.id.clone(),
         account_label: account.label.clone(),
         codex_home: account.codex_home.clone(),
@@ -548,6 +793,18 @@ pub fn copy_discussion_between(
         .cloned()
         .ok_or_else(|| "Compte cible introuvable".to_string())?;
 
+    // `copy_discussion` duplique FIDELEMENT le fichier de rollout Codex (reecrit
+    // l'uuid) : ce chemin n'a de sens que Codex -> Codex. Toute reprise
+    // inter-provider (ou impliquant Claude) passe par l'export de transcript +
+    // amorce (`export_discussion_transcript`), pas par une copie de fichier.
+    if source.provider != settings::Provider::Codex || target.provider != settings::Provider::Codex
+    {
+        return Err(
+            "Copie fidele reservee a Codex -> Codex. Pour continuer entre providers, utilisez la continuation par transcript (export_discussion_transcript)."
+                .to_string(),
+        );
+    }
+
     copy_discussion(session_id, source, target)
 }
 
@@ -645,6 +902,7 @@ fn copy_discussion(
         session_id: new_id.clone(),
         rollout_id: new_id,
         fork_count: 1,
+        provider: settings::Provider::Codex,
         account_id: target.id.clone(),
         account_label: target.label.clone(),
         codex_home: target.codex_home.clone(),
@@ -695,7 +953,70 @@ pub fn delete_discussion_for_account(
         .cloned()
         .ok_or_else(|| "Compte introuvable".to_string())?;
 
-    delete_discussion_impl(account.codex_home, session_id, archive)
+    match account.provider {
+        settings::Provider::Codex => delete_discussion_impl(account.codex_home, session_id, archive),
+        settings::Provider::Claude => {
+            delete_claude_discussion_impl(account.codex_home, session_id, archive)
+        }
+    }
+}
+
+/// Suppression/archivage d'une session Claude : un fichier unique
+/// `<home>/projects/<projet>/<session_id>.jsonl` (le nom == sessionId). L'archive
+/// va sous `<home>/projects-archive/<projet>/...`.
+fn delete_claude_discussion_impl(
+    codex_home: String,
+    session_id: String,
+    archive: bool,
+) -> Result<DeleteDiscussionResult, String> {
+    let home = expand_home(&codex_home)?;
+    let projects = home.join("projects");
+    let target = find_claude_session_file(&projects, &session_id)
+        .ok_or_else(|| "Discussion introuvable".to_string())?;
+
+    let final_path = if archive {
+        let rel = target
+            .strip_prefix(&projects)
+            .map_err(|error| error.to_string())?;
+        let mut dest = home.join("projects-archive").join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        if dest.exists() {
+            dest = append_suffix_before_ext(&dest, metrics::now_ts());
+        }
+        if fs::rename(&target, &dest).is_err() {
+            fs::copy(&target, &dest).map_err(|error| error.to_string())?;
+            fs::remove_file(&target).map_err(|error| error.to_string())?;
+        }
+        dest
+    } else {
+        fs::remove_file(&target).map_err(|error| error.to_string())?;
+        target.clone()
+    };
+
+    Ok(DeleteDiscussionResult {
+        archived: archive,
+        count: 1,
+        path: final_path.to_string_lossy().to_string(),
+    })
+}
+
+/// Localise le fichier de session Claude `<session_id>.jsonl` sous l'un des
+/// dossiers projet (`projects/<projet>/`).
+fn find_claude_session_file(projects: &Path, session_id: &str) -> Option<PathBuf> {
+    let file_name = format!("{session_id}.jsonl");
+    for entry in fs::read_dir(projects).ok()?.flatten() {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let candidate = project_dir.join(&file_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn delete_discussion_impl(
@@ -778,6 +1099,168 @@ fn find_all_rollouts_for(sessions_dir: &Path, id: &str) -> Vec<PathBuf> {
             by_name || line0_session_id(file).as_deref() == Some(id)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// (e-bis) export_discussion_transcript — reprise INTER-PROVIDER (seed-as-prompt)
+// ---------------------------------------------------------------------------
+//
+// Extrait le transcript SEMANTIQUE (tours utilisateur/assistant, sans tool-calls
+// ni raisonnement -- non portables entre providers) d'une discussion Codex OU
+// Claude, et le formate en une amorce injectable telle quelle dans une session
+// NEUVE du provider cible. C'est l'approche retenue pour la reprise
+// inter-provider : robuste (aucun fichier de session natif a synthetiser, donc
+// aucun piege parentUuid / appariement tool_use / cwd-echappe / signature) et
+// sans perte de ce qui etait reellement transferable.
+
+const TRANSCRIPT_MAX_CHARS: usize = 100_000;
+
+#[tauri::command]
+pub async fn export_discussion_transcript(
+    account_id: String,
+    session_id: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_transcript_for_account(account_id, session_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Variante synchrone reutilisable hors du runtime Tauri (serveur SaaS).
+pub fn export_transcript_for_account(
+    account_id: String,
+    session_id: String,
+) -> Result<String, String> {
+    if !is_uuid_shaped(&session_id) {
+        return Err("Identifiant de session invalide".to_string());
+    }
+    let settings = settings::load_settings_for_terminal()?;
+    let account = settings
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .cloned()
+        .ok_or_else(|| "Compte introuvable".to_string())?;
+    let home = expand_home(&account.codex_home)?;
+
+    let turns = match account.provider {
+        settings::Provider::Codex => {
+            let file = find_rollout_by_id(&home.join("sessions"), &session_id)
+                .ok_or_else(|| "Discussion introuvable".to_string())?;
+            extract_codex_transcript(&file)
+        }
+        settings::Provider::Claude => {
+            let file = find_claude_session_file(&home.join("projects"), &session_id)
+                .ok_or_else(|| "Discussion introuvable".to_string())?;
+            extract_claude_transcript(&file)
+        }
+    };
+
+    if turns.is_empty() {
+        return Err("Aucun message a exporter dans cette discussion".to_string());
+    }
+    Ok(format_transcript(&turns))
+}
+
+/// Codex : `event_msg.user_message.message` (hors messages synthetiques) et
+/// `event_msg.agent_message.message`, dans l'ordre du fichier.
+fn extract_codex_transcript(path: &Path) -> Vec<(&'static str, String)> {
+    let mut turns = Vec::new();
+    let Ok(file) = fs::File::open(path) else {
+        return turns;
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        let is_user = line.contains("\"type\":\"user_message\"");
+        let is_agent = line.contains("\"type\":\"agent_message\"");
+        if !is_user && !is_agent {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(message) = value.pointer("/payload/message").and_then(Value::as_str) else {
+            continue;
+        };
+        let msg = message.trim();
+        if msg.is_empty() {
+            continue;
+        }
+        if is_user {
+            if is_synthetic_prompt(msg) {
+                continue;
+            }
+            turns.push(("user", msg.to_string()));
+        } else {
+            turns.push(("assistant", msg.to_string()));
+        }
+    }
+    turns
+}
+
+/// Claude : lignes `user`/`assistant`, texte extrait de `message.content`
+/// (blocs `text` uniquement ; tool_use/tool_result/thinking ignores).
+fn extract_claude_transcript(path: &Path) -> Vec<(&'static str, String)> {
+    let mut turns = Vec::new();
+    let Ok(file) = fs::File::open(path) else {
+        return turns;
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let role = match value.get("type").and_then(Value::as_str) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        let Some(text) = claude_message_text(&value) else {
+            continue;
+        };
+        let msg = text.trim();
+        if msg.is_empty() {
+            continue;
+        }
+        if role == "user" && is_synthetic_prompt(msg) {
+            continue;
+        }
+        turns.push((role, msg.to_string()));
+    }
+    turns
+}
+
+/// Formate les tours en une amorce injectable, tronquee a `TRANSCRIPT_MAX_CHARS`
+/// en conservant la FIN de la conversation (la plus pertinente pour continuer).
+fn format_transcript(turns: &[(&'static str, String)]) -> String {
+    let mut body = String::new();
+    for (role, text) in turns {
+        let speaker = if *role == "user" {
+            "UTILISATEUR"
+        } else {
+            "ASSISTANT"
+        };
+        body.push_str(speaker);
+        body.push_str(": ");
+        body.push_str(text);
+        body.push_str("\n\n");
+    }
+
+    let body = if body.chars().count() > TRANSCRIPT_MAX_CHARS {
+        let skip = body.chars().count() - TRANSCRIPT_MAX_CHARS;
+        let kept: String = body.chars().skip(skip).collect();
+        format!("[... debut de la conversation tronque ...]\n\n{kept}")
+    } else {
+        body
+    };
+
+    format!(
+        "[Reprise d'une conversation menee avec un autre assistant. Voici l'historique ; poursuis a partir du dernier echange en tenant compte de ce contexte.]\n\n{body}[Fin de l'historique. Continue.]"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1405,13 @@ fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptE
         return;
     };
     if meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return;
+    }
+
+    // Un rollout de sous-agent ne contient que les instructions synthetiques
+    // envoyees au sous-agent, pas de vraies demandes utilisateur : on l'ignore
+    // (cf. `is_subagent_rollout`), comme pour le tableau de bord.
+    if is_subagent_rollout(&meta) {
         return;
     }
 
@@ -1148,12 +1638,15 @@ mod tests {
         AccountProfile {
             id: id.to_string(),
             label: format!("Compte {id}"),
+            provider: settings::Provider::Codex,
             codex_home: home.to_string_lossy().to_string(),
             project_dir: None,
             proxy_id: None,
             startup_command: None,
             limits: Default::default(),
             bypass: true,
+            model: None,
+            reasoning_effort: None,
         }
     }
 
@@ -1304,6 +1797,139 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// Ecrit un rollout complet (session_meta + 1 user_message) en controlant les
+    /// champs `session_id`/`id`/`thread_source`/`parent_thread_id` du meta.
+    fn write_rollout_meta(
+        dir: &Path,
+        ts: &str,
+        file_uuid: &str,
+        session_id: &str,
+        rollout_id: &str,
+        thread_source: &str,
+        parent_thread_id: Option<&str>,
+    ) -> PathBuf {
+        let path = dir.join(format!("rollout-{ts}-{file_uuid}.jsonl"));
+        let parent = match parent_thread_id {
+            Some(id) => format!(",\"parent_thread_id\":\"{id}\""),
+            None => String::new(),
+        };
+        let line0 = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{session_id}\",\"id\":\"{rollout_id}\",\"cwd\":\"C:\\\\proj\",\"thread_source\":\"{thread_source}\"{parent}}}}}"
+        );
+        let line1 = "{\"type\":\"user_message\",\"payload\":{\"message\":\"demande reelle\"}}";
+        fs::write(&path, format!("{line0}\n{line1}")).unwrap();
+        path
+    }
+
+    #[test]
+    fn scan_discussion_file_skips_subagent_rollouts() {
+        let dir = fresh_dir();
+        let account = test_account("acc", &dir);
+
+        let user_uuid = "019f0000-0000-7000-8000-0000000000a1";
+        let user = write_rollout_meta(
+            &dir,
+            "2026-07-07T10-00-00",
+            user_uuid,
+            user_uuid,
+            user_uuid,
+            "user",
+            None,
+        );
+        assert!(
+            scan_discussion_file(&user, &account).is_some(),
+            "un thread utilisateur doit apparaitre"
+        );
+
+        // Sous-agent : thread_source=subagent, session_id usurpe = parent.
+        let child_uuid = "019f0000-0000-7000-8000-0000000000b2";
+        let sub = write_rollout_meta(
+            &dir,
+            "2026-07-07T11-00-00",
+            child_uuid,
+            user_uuid, // usurpe le session_id du parent
+            child_uuid,
+            "subagent",
+            Some(user_uuid),
+        );
+        assert!(
+            scan_discussion_file(&sub, &account).is_none(),
+            "un sous-agent ne doit jamais apparaitre comme discussion"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_target_is_user_thread_not_newer_subagent() {
+        // Reproduit le bug « turn/start failed » : un parent utilisateur + ses
+        // sous-agents (plus recents) partagent le meme session_id. La cible de
+        // reprise doit rester le thread utilisateur, pas le sous-agent HEAD.
+        let base = fresh_dir();
+        let home = base.join("home");
+        let sessions = home.join("sessions").join("2026").join("07").join("07");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let parent_uuid = "019f0000-0000-7000-8000-0000000000c1";
+        let child_uuid = "019f0000-0000-7000-8000-0000000000c2";
+        // Parent (10h) puis sous-agent plus recent (12h), meme session_id.
+        write_rollout_meta(
+            &sessions,
+            "2026-07-07T10-00-00",
+            parent_uuid,
+            parent_uuid,
+            parent_uuid,
+            "user",
+            None,
+        );
+        write_rollout_meta(
+            &sessions,
+            "2026-07-07T12-00-00",
+            child_uuid,
+            parent_uuid,
+            child_uuid,
+            "subagent",
+            Some(parent_uuid),
+        );
+
+        let account = test_account("acc", &home);
+        let group = scan_account(&account);
+
+        assert_eq!(group.discussion_count, 1, "une seule conversation attendue");
+        let head = &group.discussions[0];
+        assert_eq!(head.session_id, parent_uuid);
+        assert_eq!(
+            head.rollout_id, parent_uuid,
+            "la cible de reprise doit etre le thread utilisateur, pas le sous-agent"
+        );
+        assert_eq!(head.fork_count, 1, "le sous-agent ne doit pas gonfler le compte");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prompt_history_skips_subagent_rollouts() {
+        let dir = fresh_dir();
+        let account = test_account("acc", &dir);
+
+        let child_uuid = "019f0000-0000-7000-8000-0000000000d3";
+        let sub = write_rollout_meta(
+            &dir,
+            "2026-07-07T11-00-00",
+            child_uuid,
+            "019f0000-0000-7000-8000-0000000000d0",
+            child_uuid,
+            "subagent",
+            Some("019f0000-0000-7000-8000-0000000000d0"),
+        );
+
+        let mut out = Vec::new();
+        scan_prompt_file(&sub, &account, &mut out);
+        assert!(out.is_empty(), "les prompts d'un sous-agent doivent etre ignores");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn delete_archive_moves_file_into_archive() {
         let base = fresh_dir();
@@ -1445,6 +2071,7 @@ mod tests {
             session_id: session_id.to_string(),
             rollout_id: rollout_id.to_string(),
             fork_count: 1,
+            provider: settings::Provider::Codex,
             account_id: "acc".to_string(),
             account_label: "Acc".to_string(),
             codex_home: "home".to_string(),
