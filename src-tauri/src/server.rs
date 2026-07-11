@@ -221,6 +221,13 @@ struct DeleteDiscussionRequest {
     archive: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportDiscussionRequest {
+    account_id: String,
+    session_id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceView {
@@ -674,9 +681,11 @@ pub async fn run_from_env() -> Result<(), String> {
         .route("/usage", get(api_usage))
         .route("/account-usage", get(api_account_usage))
         .route("/discussions", get(api_list_discussions))
+        .route("/discussions/transcript", get(api_discussion_transcript))
         .route("/discussions/copy", post(api_copy_discussion))
         .route("/discussions/claim", post(api_claim_session))
         .route("/discussions/delete", post(api_delete_discussion))
+        .route("/discussions/export", post(api_export_discussion_transcript))
         .route("/pool/status", get(api_pool_status))
         .route("/pool/start", post(api_pool_status))
         .route("/pool/stop", post(api_pool_stop))
@@ -1097,6 +1106,23 @@ async fn api_list_discussions(State(state): State<Arc<ServerState>>, headers: He
     })
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptQuery {
+    account_id: String,
+    session_id: String,
+}
+
+async fn api_discussion_transcript(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<TranscriptQuery>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        discussions::transcript_for_account(query.account_id, query.session_id).map(json_response)
+    })
+}
+
 async fn api_copy_discussion(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -1140,6 +1166,20 @@ async fn api_delete_discussion(
             request.archive,
         )
         .map(json_response)
+    })
+}
+
+/// Continuation INTER-PROVIDER (mode web) : renvoie le transcript semantique
+/// (chaine JSON) d'une discussion Codex ou Claude, a injecter comme amorce dans
+/// une session neuve du provider cible cote client.
+async fn api_export_discussion_transcript(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<ExportDiscussionRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        discussions::export_transcript_for_account(request.account_id, request.session_id)
+            .map(json_response)
     })
 }
 

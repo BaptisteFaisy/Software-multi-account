@@ -132,6 +132,7 @@ pub fn run() {
             discussions::claim_session_for_terminal,
             discussions::copy_discussion_to_account,
             discussions::export_discussion_transcript,
+            discussions::get_discussion_transcript,
             discussions::delete_discussion,
             terminal::start_terminal,
             terminal::write_terminal,

@@ -1115,6 +1115,24 @@ fn find_all_rollouts_for(sessions_dir: &Path, id: &str) -> Vec<PathBuf> {
 
 const TRANSCRIPT_MAX_CHARS: usize = 100_000;
 
+/// Role d'un tour de conversation extrait d'un fichier de session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscriptRole {
+    User,
+    Assistant,
+}
+
+/// Tour de conversation pret a afficher (vue conversation, export inter-provider).
+/// `timestamp` en secondes unix ; 0 si la ligne n'en portait pas.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptMessage {
+    pub role: TranscriptRole,
+    pub text: String,
+    pub timestamp: i64,
+}
+
 #[tauri::command]
 pub async fn export_discussion_transcript(
     account_id: String,
@@ -1132,7 +1150,20 @@ pub fn export_transcript_for_account(
     account_id: String,
     session_id: String,
 ) -> Result<String, String> {
-    if !is_uuid_shaped(&session_id) {
+    let turns = collect_transcript_turns(&account_id, &session_id)?;
+    if turns.is_empty() {
+        return Err("Aucun message a exporter dans cette discussion".to_string());
+    }
+    Ok(format_transcript(&turns))
+}
+
+/// Resout le compte + le fichier de session (Codex ou Claude) et en extrait
+/// les tours utilisateur/assistant, dans l'ordre du fichier.
+fn collect_transcript_turns(
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<TranscriptMessage>, String> {
+    if !is_uuid_shaped(session_id) {
         return Err("Identifiant de session invalide".to_string());
     }
     let settings = settings::load_settings_for_terminal()?;
@@ -1144,28 +1175,23 @@ pub fn export_transcript_for_account(
         .ok_or_else(|| "Compte introuvable".to_string())?;
     let home = expand_home(&account.codex_home)?;
 
-    let turns = match account.provider {
+    Ok(match account.provider {
         settings::Provider::Codex => {
-            let file = find_rollout_by_id(&home.join("sessions"), &session_id)
+            let file = find_rollout_by_id(&home.join("sessions"), session_id)
                 .ok_or_else(|| "Discussion introuvable".to_string())?;
             extract_codex_transcript(&file)
         }
         settings::Provider::Claude => {
-            let file = find_claude_session_file(&home.join("projects"), &session_id)
+            let file = find_claude_session_file(&home.join("projects"), session_id)
                 .ok_or_else(|| "Discussion introuvable".to_string())?;
             extract_claude_transcript(&file)
         }
-    };
-
-    if turns.is_empty() {
-        return Err("Aucun message a exporter dans cette discussion".to_string());
-    }
-    Ok(format_transcript(&turns))
+    })
 }
 
 /// Codex : `event_msg.user_message.message` (hors messages synthetiques) et
 /// `event_msg.agent_message.message`, dans l'ordre du fichier.
-fn extract_codex_transcript(path: &Path) -> Vec<(&'static str, String)> {
+fn extract_codex_transcript(path: &Path) -> Vec<TranscriptMessage> {
     let mut turns = Vec::new();
     let Ok(file) = fs::File::open(path) else {
         return turns;
@@ -1191,17 +1217,31 @@ fn extract_codex_transcript(path: &Path) -> Vec<(&'static str, String)> {
             if is_synthetic_prompt(msg) {
                 continue;
             }
-            turns.push(("user", msg.to_string()));
+            turns.push(transcript_message(TranscriptRole::User, msg, &value));
         } else {
-            turns.push(("assistant", msg.to_string()));
+            turns.push(transcript_message(TranscriptRole::Assistant, msg, &value));
         }
     }
     turns
 }
 
+/// Construit un tour en recuperant l'horodatage de la ligne, commun aux deux
+/// formats (champ racine `timestamp` en RFC3339).
+fn transcript_message(role: TranscriptRole, text: &str, line: &Value) -> TranscriptMessage {
+    TranscriptMessage {
+        role,
+        text: text.to_string(),
+        timestamp: line
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_secs)
+            .unwrap_or(0),
+    }
+}
+
 /// Claude : lignes `user`/`assistant`, texte extrait de `message.content`
 /// (blocs `text` uniquement ; tool_use/tool_result/thinking ignores).
-fn extract_claude_transcript(path: &Path) -> Vec<(&'static str, String)> {
+fn extract_claude_transcript(path: &Path) -> Vec<TranscriptMessage> {
     let mut turns = Vec::new();
     let Ok(file) = fs::File::open(path) else {
         return turns;
@@ -1215,8 +1255,8 @@ fn extract_claude_transcript(path: &Path) -> Vec<(&'static str, String)> {
             continue;
         };
         let role = match value.get("type").and_then(Value::as_str) {
-            Some("user") => "user",
-            Some("assistant") => "assistant",
+            Some("user") => TranscriptRole::User,
+            Some("assistant") => TranscriptRole::Assistant,
             _ => continue,
         };
         let Some(text) = claude_message_text(&value) else {
@@ -1226,27 +1266,26 @@ fn extract_claude_transcript(path: &Path) -> Vec<(&'static str, String)> {
         if msg.is_empty() {
             continue;
         }
-        if role == "user" && is_synthetic_prompt(msg) {
+        if role == TranscriptRole::User && is_synthetic_prompt(msg) {
             continue;
         }
-        turns.push((role, msg.to_string()));
+        turns.push(transcript_message(role, msg, &value));
     }
     turns
 }
 
 /// Formate les tours en une amorce injectable, tronquee a `TRANSCRIPT_MAX_CHARS`
 /// en conservant la FIN de la conversation (la plus pertinente pour continuer).
-fn format_transcript(turns: &[(&'static str, String)]) -> String {
+fn format_transcript(turns: &[TranscriptMessage]) -> String {
     let mut body = String::new();
-    for (role, text) in turns {
-        let speaker = if *role == "user" {
-            "UTILISATEUR"
-        } else {
-            "ASSISTANT"
+    for turn in turns {
+        let speaker = match turn.role {
+            TranscriptRole::User => "UTILISATEUR",
+            TranscriptRole::Assistant => "ASSISTANT",
         };
         body.push_str(speaker);
         body.push_str(": ");
-        body.push_str(text);
+        body.push_str(&turn.text);
         body.push_str("\n\n");
     }
 
@@ -1261,6 +1300,51 @@ fn format_transcript(turns: &[(&'static str, String)]) -> String {
     format!(
         "[Reprise d'une conversation menee avec un autre assistant. Voici l'historique ; poursuis a partir du dernier echange en tenant compte de ce contexte.]\n\n{body}[Fin de l'historique. Continue.]"
     )
+}
+
+// ---------------------------------------------------------------------------
+// (e-ter) get_discussion_transcript — transcript STRUCTURE pour la vue
+// conversation (bulles user/assistant), tous providers.
+// ---------------------------------------------------------------------------
+
+/// Nombre maximal de messages renvoyes a la vue conversation. Au-dela on garde
+/// la FIN de la discussion (la plus pertinente) et on signale la troncature.
+const TRANSCRIPT_MAX_MESSAGES: usize = 2000;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionTranscript {
+    pub session_id: String,
+    pub messages: Vec<TranscriptMessage>,
+    pub truncated: bool,
+}
+
+#[tauri::command]
+pub async fn get_discussion_transcript(
+    account_id: String,
+    session_id: String,
+) -> Result<DiscussionTranscript, String> {
+    tauri::async_runtime::spawn_blocking(move || transcript_for_account(account_id, session_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// Variante synchrone reutilisable hors du runtime Tauri (serveur SaaS).
+pub fn transcript_for_account(
+    account_id: String,
+    session_id: String,
+) -> Result<DiscussionTranscript, String> {
+    let mut messages = collect_transcript_turns(&account_id, &session_id)?;
+    let truncated = messages.len() > TRANSCRIPT_MAX_MESSAGES;
+    if truncated {
+        let skip = messages.len() - TRANSCRIPT_MAX_MESSAGES;
+        messages.drain(..skip);
+    }
+    Ok(DiscussionTranscript {
+        session_id,
+        messages,
+        truncated,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2165,5 +2249,54 @@ mod tests {
         assert_eq!(archived.len(), 3, "3 rollouts archives");
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn codex_transcript_extracts_roles_timestamps_and_skips_synthetic() {
+        let dir = fresh_dir();
+        let uuid = "019f4bb2-0000-7000-8000-00000000cafe";
+        let path = dir.join(format!("rollout-2026-07-07T16-11-28-{uuid}.jsonl"));
+        let lines = [
+            format!("{{\"timestamp\":\"2026-07-07T16:11:28.000Z\",\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{uuid}\",\"id\":\"{uuid}\"}}}}"),
+            "{\"timestamp\":\"2026-07-07T16:11:29.000Z\",\"type\":\"user_message\",\"payload\":{\"message\":\"<environment_context>ignore</environment_context>\"}}".to_string(),
+            "{\"timestamp\":\"2026-07-07T16:11:30.000Z\",\"type\":\"user_message\",\"payload\":{\"message\":\"premiere demande\"}}".to_string(),
+            "{\"timestamp\":\"2026-07-07T16:11:31.000Z\",\"type\":\"agent_message\",\"payload\":{\"message\":\"une reponse **markdown**\"}}".to_string(),
+            // Ligne sans horodatage : le tour doit sortir avec timestamp 0.
+            "{\"type\":\"agent_message\",\"payload\":{\"message\":\"suite\"}}".to_string(),
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let turns = extract_codex_transcript(&path);
+        assert_eq!(turns.len(), 3, "le message synthetique est filtre");
+        assert_eq!(turns[0].role, TranscriptRole::User);
+        assert_eq!(turns[0].text, "premiere demande");
+        assert!(turns[0].timestamp > 0);
+        assert_eq!(turns[1].role, TranscriptRole::Assistant);
+        assert!(turns[1].timestamp > turns[0].timestamp);
+        assert_eq!(turns[2].timestamp, 0, "ligne sans champ timestamp");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_transcript_extracts_text_blocks_only() {
+        let dir = fresh_dir();
+        let path = dir.join("session.jsonl");
+        let lines = [
+            "{\"timestamp\":\"2026-07-07T10:00:00.000Z\",\"type\":\"user\",\"message\":{\"content\":\"bonjour\"}}",
+            "{\"timestamp\":\"2026-07-07T10:00:05.000Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"thinking\",\"thinking\":\"prive\"},{\"type\":\"text\",\"text\":\"salut !\"}]}}",
+            "{\"timestamp\":\"2026-07-07T10:00:06.000Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}",
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        let turns = extract_claude_transcript(&path);
+        assert_eq!(turns.len(), 2, "la ligne tool_use sans texte est ignoree");
+        assert_eq!(turns[0].role, TranscriptRole::User);
+        assert_eq!(turns[0].text, "bonjour");
+        assert_eq!(turns[1].role, TranscriptRole::Assistant);
+        assert_eq!(turns[1].text, "salut !");
+        assert!(turns[1].timestamp > turns[0].timestamp);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

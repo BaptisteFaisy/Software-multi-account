@@ -4251,3 +4251,258 @@ body:has(.remote-login) .m-chrome,
 body:has(.boot) .m-chrome {
   display: none !important;
 }
+
+/* ======================================================================
+   VUE CONVERSATION (chat) — phase 1 : transcript en bulles.
+   Construit sur les tokens du theme Event Horizon (--panel/--line/--text) ;
+   les phases suivantes (streaming app-server, composer) etendront ce bloc.
+   ====================================================================== */
+
+.chat-panel {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-head-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-title {
+  font-family: var(--font-head);
+  font-size: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-sub {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-provider {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.chat-feed {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 2px;
+}
+
+.chat-empty,
+.chat-error,
+.chat-notice {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 18px 8px;
+}
+
+.chat-error {
+  color: var(--danger);
+}
+
+.chat-notice {
+  padding: 6px 8px;
+  font-size: 12px;
+  border-bottom: 1px dashed var(--line);
+}
+
+/* --- Bulles ---------------------------------------------------------- */
+
+.chat-msg {
+  max-width: 76%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel-muted);
+  padding: 8px 12px;
+  align-self: flex-start;
+}
+
+.chat-msg--user {
+  align-self: flex-end;
+  background: var(--accent-soft);
+}
+
+.chat-msg-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--font-head);
+}
+
+.chat-msg-time {
+  font-size: 10px;
+  color: var(--muted-2);
+}
+
+.chat-msg-body {
+  font-size: 13px;
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.chat-msg-body p {
+  margin: 0 0 8px;
+}
+
+.chat-msg-body p:last-child,
+.chat-msg-body .chat-md-list:last-child,
+.chat-msg-body .chat-code:last-child {
+  margin-bottom: 0;
+}
+
+.chat-msg-body a {
+  color: var(--info);
+}
+
+.chat-msg-body code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: rgba(127, 127, 127, 0.18);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+/* --- Markdown (blocs) -------------------------------------------------- */
+
+.chat-md-list {
+  margin: 0 0 8px;
+  padding-left: 20px;
+}
+
+.chat-md-list li {
+  margin: 2px 0;
+}
+
+.chat-md-h {
+  font-family: var(--font-head);
+  margin: 4px 0 6px;
+}
+
+.chat-md-h1 {
+  font-size: 15px;
+}
+
+.chat-md-h2 {
+  font-size: 14px;
+}
+
+.chat-md-h3 {
+  font-size: 13px;
+}
+
+.chat-md-quote {
+  margin: 0 0 8px;
+  padding: 4px 10px;
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+}
+
+/* --- Blocs de code ----------------------------------------------------- */
+
+.chat-code {
+  margin: 0 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+
+.chat-code-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-code-lang {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.chat-code-copy {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 2px;
+  display: inline-flex;
+}
+
+.chat-code-copy:hover {
+  color: var(--text);
+}
+
+.chat-code-copy.copied {
+  color: var(--success);
+}
+
+.chat-code-copy svg {
+  width: 14px;
+  height: 14px;
+}
+
+.chat-code pre {
+  margin: 0;
+  padding: 10px;
+  overflow-x: auto;
+}
+
+.chat-code pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+}
+
+/* Bulles pleine largeur sur petits ecrans. */
+@media (max-width: 700px) {
+  .chat-msg {
+    max-width: 94%;
+  }
+}
