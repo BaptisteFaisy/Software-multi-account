@@ -193,7 +193,11 @@ pub fn ensure_claude_account_config(
             obj.insert("model".to_string(), Value::String(model.to_string()));
         }
 
-        let mode = if bypass { "bypassPermissions" } else { "default" };
+        let mode = if bypass {
+            "bypassPermissions"
+        } else {
+            "default"
+        };
         let permissions = obj
             .entry("permissions".to_string())
             .or_insert_with(|| Value::Object(Map::new()));
@@ -258,12 +262,8 @@ mod tests {
     #[test]
     fn sessions_root_points_at_each_store() {
         let home = Path::new("/home/x");
-        assert!(Provider::Codex
-            .sessions_root(home)
-            .ends_with("sessions"));
-        assert!(Provider::Claude
-            .sessions_root(home)
-            .ends_with("projects"));
+        assert!(Provider::Codex.sessions_root(home).ends_with("sessions"));
+        assert!(Provider::Claude.sessions_root(home).ends_with("projects"));
     }
 
     #[test]
@@ -310,7 +310,10 @@ mod tests {
         ensure_claude_account_config(&home, true, Some("opus")).unwrap();
         let once = fs::read_to_string(home.join("settings.json")).unwrap();
         let value: Value = serde_json::from_str(&once).unwrap();
-        assert_eq!(value.pointer("/model").and_then(Value::as_str), Some("opus"));
+        assert_eq!(
+            value.pointer("/model").and_then(Value::as_str),
+            Some("opus")
+        );
         assert_eq!(
             value
                 .pointer("/permissions/defaultMode")
@@ -350,7 +353,9 @@ mod tests {
             Some("default")
         );
         assert_eq!(
-            value.pointer("/permissions/allow/0").and_then(Value::as_str),
+            value
+                .pointer("/permissions/allow/0")
+                .and_then(Value::as_str),
             Some("Bash")
         );
         assert_eq!(

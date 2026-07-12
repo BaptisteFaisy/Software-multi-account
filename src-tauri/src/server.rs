@@ -12,9 +12,10 @@ use crate::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, Query, State,
+        Path as AxumPath, Query, Request, State,
     },
-    http::{HeaderMap, StatusCode},
+    http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -445,10 +446,7 @@ impl RemoteTerminalManager {
         } else {
             let repo_url = request.repo_url.as_deref().unwrap_or("").trim();
             if repo_url.is_empty() {
-                (
-                    worktrees.prepare_local(&agent_id, &canonical_home, None)?,
-                    "workspace vide".to_string(),
-                )
+                return Err("Environnement obligatoire avant d'ouvrir un terminal".to_string());
             } else {
                 let repo_url = validate_repo_url(repo_url)?;
                 let fetch_url = authenticated_repo_url(&repo_url, &config.git_pat);
@@ -553,7 +551,7 @@ impl RemoteTerminalManager {
                     room_token = Some(token);
                 }
                 Err(error) => {
-                    eprintln!("[agent_room] provisioning ignore (SaaS): {error}");
+                    eprintln!("[workspace_collab] provisioning ignore (SaaS): {error}");
                 }
             }
         }
@@ -641,7 +639,7 @@ impl RemoteTerminalManager {
         });
 
         let banner = format!(
-            "\r\n[Codex Switch Terminal SaaS] session #{id} | compte: {} | repo: {} | workspace: {}\r\n\r\n",
+            "\r\n[Codex Switch Terminal SaaS] session #{id} | compte: {} | repo: {} | dossier: {}\r\n\r\n",
             account.label,
             repo_label,
             repo_dir.to_string_lossy()
@@ -751,6 +749,22 @@ fn finish_session(session: &Arc<RemoteTerminalSession>) {
     );
 }
 
+async fn prevent_stale_frontend(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    if !path.starts_with("/api/")
+        && !path.starts_with("/ws/")
+        && !path.starts_with("/mcp")
+        && path != "/healthz"
+    {
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+        );
+    }
+    response
+}
+
 pub async fn run_from_env() -> Result<(), String> {
     let config = ServerConfig::from_env()?;
     fs::create_dir_all(config.data_dir.join("workspaces")).map_err(|error| error.to_string())?;
@@ -793,7 +807,10 @@ pub async fn run_from_env() -> Result<(), String> {
         .route("/discussions/move", post(api_move_discussion))
         .route("/discussions/claim", post(api_claim_session))
         .route("/discussions/delete", post(api_delete_discussion))
-        .route("/discussions/export", post(api_export_discussion_transcript))
+        .route(
+            "/discussions/export",
+            post(api_export_discussion_transcript),
+        )
         .route("/chat/models", get(api_chat_models))
         .route("/chat/turns", post(api_start_chat_turn))
         .route(
@@ -844,6 +861,7 @@ pub async fn run_from_env() -> Result<(), String> {
         .merge(pool::router(pool_manager, Some(config.admin_token.clone())))
         .merge(agent_room::router(room))
         .fallback_service(static_service)
+        .layer(middleware::from_fn(prevent_stale_frontend))
         .layer(CorsLayer::very_permissive());
 
     let addr: SocketAddr = config
@@ -1021,8 +1039,8 @@ fn resolve_within_root(root: &Path, requested: &str) -> Result<PathBuf, String> 
             root.join(path)
         }
     };
-    let canonical = fs::canonicalize(&candidate)
-        .map_err(|_| format!("dossier introuvable: {requested}"))?;
+    let canonical =
+        fs::canonicalize(&candidate).map_err(|_| format!("dossier introuvable: {requested}"))?;
     // Comparaison sur les formes nettoyees pour eviter tout desaccord de prefixe
     // (`\\?\`) entre la racine et le candidat.
     let root_norm = strip_extended_prefix(root);
@@ -1216,7 +1234,10 @@ async fn api_account_usage(State(state): State<Arc<ServerState>>, headers: Heade
     })
 }
 
-async fn api_list_discussions(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
+async fn api_list_discussions(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
     auth_or(&state, &headers, || {
         discussions::list_discussions_dashboard().map(json_response)
     })
@@ -1378,7 +1399,7 @@ async fn api_start_terminal(
 async fn api_start_chat_turn(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
-    Json(request): Json<StartChatTurnRequest>,
+    Json(mut request): Json<StartChatTurnRequest>,
 ) -> Response {
     if let Err(response) = check_admin_header(&state, &headers) {
         return response;
@@ -1389,6 +1410,18 @@ async fn api_start_chat_turn(
             "noeud en drain: nouveaux messages refusés",
             &state.config,
         );
+    }
+    if let Some(raw) = request
+        .project_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let resolved = match resolve_within_root(&state.config.workspaces_root, raw) {
+            Ok(path) => path,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        };
+        request.project_dir = Some(resolved.to_string_lossy().to_string());
     }
     let port = state
         .config
@@ -1452,7 +1485,9 @@ async fn api_chat_turn_status(
     headers: HeaderMap,
     AxumPath(id): AxumPath<u64>,
 ) -> Response {
-    auth_or(&state, &headers, || state.chat.status(id).map(json_response))
+    auth_or(&state, &headers, || {
+        state.chat.status(id).map(json_response)
+    })
 }
 
 async fn api_stop_chat_turn(
@@ -1466,6 +1501,14 @@ async fn api_stop_chat_turn(
 #[derive(Debug, Deserialize)]
 struct RoomMessagesQuery {
     since: Option<u64>,
+    #[serde(rename = "workspacePath")]
+    workspace_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoomScopeQuery {
+    #[serde(rename = "workspacePath")]
+    workspace_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1473,13 +1516,19 @@ struct RoomMessagesQuery {
 struct RoomSendRequest {
     text: String,
     to: Option<String>,
+    workspace_path: Option<String>,
 }
 
-async fn api_room_status(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
+async fn api_room_status(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<RoomScopeQuery>,
+) -> Response {
     auth_or(&state, &headers, || {
+        let room_id = server_room_id(&state.config, query.workspace_path.as_deref())?;
         Ok(json_response(json!({
             "running": true,
-            "snapshot": state.room.snapshot(),
+            "snapshot": state.room.snapshot_for_room(&room_id),
         })))
     })
 }
@@ -1491,9 +1540,14 @@ async fn api_room_messages(
 ) -> Response {
     auth_or(&state, &headers, || {
         let since = query.since.unwrap_or(0);
-        let messages = state.room.messages_for(agent_room::OPERATOR_IDENT, since);
+        let room_id = server_room_id(&state.config, query.workspace_path.as_deref())?;
+        let messages = state
+            .room
+            .messages_for_room(&room_id, agent_room::OPERATOR_IDENT, since);
         let cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
-        Ok(json_response(json!({ "messages": messages, "cursor": cursor })))
+        Ok(json_response(
+            json!({ "messages": messages, "cursor": cursor }),
+        ))
     })
 }
 
@@ -1507,8 +1561,27 @@ async fn api_room_send(
         if text.is_empty() {
             return Err("message vide".to_string());
         }
-        Ok(json_response(state.room.operator_post(request.to, text)))
+        let room_id = server_room_id(&state.config, request.workspace_path.as_deref())?;
+        if let Some(target) = request.to.as_deref() {
+            if !state.room.ident_exists_in_room(&room_id, target) {
+                return Err("destinataire absent du dossier actif".to_string());
+            }
+        }
+        Ok(json_response(
+            state.room.operator_post_in_room(&room_id, request.to, text),
+        ))
     })
+}
+
+fn server_room_id(config: &ServerConfig, workspace_path: Option<&str>) -> Result<String, String> {
+    let Some(raw) = workspace_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(agent_room::DEFAULT_ROOM_ID.to_string());
+    };
+    let path = resolve_within_root(&config.workspaces_root, raw)?;
+    Ok(crate::worktree::room_id_for_local_path(&path))
 }
 
 async fn api_write_terminal(
@@ -1624,7 +1697,12 @@ async fn api_fs_list(
 ) -> Response {
     auth_or(&state, &headers, || {
         let root = &state.config.workspaces_root;
-        let dir = match query.path.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        let dir = match query
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             Some(path) => resolve_within_root(root, path)?,
             None => strip_extended_prefix(root),
         };
@@ -1633,7 +1711,8 @@ async fn api_fs_list(
         let parent = if dir_display == root_display {
             None
         } else {
-            dir.parent().map(|parent| parent.to_string_lossy().to_string())
+            dir.parent()
+                .map(|parent| parent.to_string_lossy().to_string())
         };
         let entries = list_subdirs(&dir)?;
         Ok(json_response(FsListResponse {
@@ -2127,7 +2206,10 @@ fn cleanup_legacy_workspaces(data_dir: &Path) -> Result<(), String> {
 
 fn list_workspaces(data_dir: &Path) -> Result<Vec<WorkspaceView>, String> {
     let mut views = Vec::new();
-    for root in [data_dir.join("agents").join("workspaces"), data_dir.join("workspaces")] {
+    for root in [
+        data_dir.join("agents").join("workspaces"),
+        data_dir.join("workspaces"),
+    ] {
         if !root.is_dir() {
             continue;
         }
@@ -2150,16 +2232,12 @@ fn list_workspaces(data_dir: &Path) -> Result<Vec<WorkspaceView>, String> {
     Ok(views)
 }
 
-fn delete_workspace(
-    data_dir: &Path,
-    id: &str,
-    active: &HashSet<String>,
-) -> Result<(), String> {
+fn delete_workspace(data_dir: &Path, id: &str, active: &HashSet<String>) -> Result<(), String> {
     if id.contains(['/', '\\']) || id == "." || id == ".." {
-        return Err("workspace id invalide".to_string());
+        return Err("identifiant de dossier invalide".to_string());
     }
     if active.contains(id) {
-        return Err("workspace encore utilise par un agent vivant".to_string());
+        return Err("dossier encore utilise par un agent actif".to_string());
     }
     for target in [
         data_dir.join("agents").join("workspaces").join(id),
@@ -2169,7 +2247,7 @@ fn delete_workspace(
             let root = target
                 .parent()
                 .and_then(|parent| parent.canonicalize().ok())
-                .ok_or_else(|| "racine workspace invalide".to_string())?;
+                .ok_or_else(|| "racine des dossiers invalide".to_string())?;
             let resolved = target.canonicalize().map_err(|error| error.to_string())?;
             if resolved.starts_with(&root) && resolved != root {
                 fs::remove_dir_all(&resolved).map_err(|error| error.to_string())?;

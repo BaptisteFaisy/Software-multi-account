@@ -6,7 +6,7 @@
 
 use crate::{
     agent_room::{AgentMeta, RoomState},
-    metrics,
+    discussions, metrics,
     settings::{self, AccountProfile, AppSettings, Provider},
     worktree::{AgentWorkspace, WorktreeManager},
 };
@@ -148,6 +148,12 @@ impl ChatTurnManager {
             .find(|candidate| candidate.id == request.account_id)
             .cloned()
             .ok_or_else(|| "Compte introuvable".to_string())?;
+        if !settings::account_has_auth_tokens(&account) {
+            return Err(format!(
+                "Compte non authentifie : {}. Ouvre un terminal de connexion pour ce compte avant de lancer un chat.",
+                account.label
+            ));
+        }
         let model = selected_model(request.model.as_deref(), account.model.as_deref())?;
         let reasoning_effort = selected_reasoning_effort(
             account.provider,
@@ -205,17 +211,11 @@ impl ChatTurnManager {
             command.env("CST_BASE_SHA", base_sha);
         }
         let mut room_token = None;
-        // En SaaS (`room_url` present), le salon est natif et toujours actif.
-        // Le toggle historique reste respecte uniquement sur le desktop local.
-        if app_settings.agent_room.enabled || room_url.is_some() {
-            let url = room_url
-                .map(ToString::to_string)
-                .unwrap_or_else(|| {
-                    format!(
-                        "http://127.0.0.1:{}/mcp",
-                        app_settings.agent_room.port
-                    )
-                });
+        // Collaboration workspace native sur desktop comme en SaaS.
+        {
+            let url = room_url.map(ToString::to_string).unwrap_or_else(|| {
+                format!("http://127.0.0.1:{}/mcp", app_settings.agent_room.port)
+            });
             let cli_bin = settings::command_for_provider(&app_settings, account.provider);
             match room.provision_home(account.provider, &cli_bin, &account_home, &url) {
                 Ok(()) => {
@@ -232,7 +232,7 @@ impl ChatTurnManager {
                     command.env("CST_ROOM_TOKEN", &token);
                     room_token = Some(token);
                 }
-                Err(error) => eprintln!("[agent_room] provisioning chat ignore: {error}"),
+                Err(error) => eprintln!("[workspace_collab] provisioning chat ignore: {error}"),
             }
         }
         command
@@ -323,6 +323,9 @@ impl ChatTurnManager {
         let supervisor_turn = turn.clone();
         let account_id = account.id.clone();
         let account_label = account.label.clone();
+        let logical_project_dir = source_project_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
         let supervisor_room = room.clone();
         thread::spawn(move || {
             let exit = wait_for_child(&supervisor_turn);
@@ -339,6 +342,26 @@ impl ChatTurnManager {
             // l'etat terminal, puis nettoie le home et le worktree isoles.
             if let Ok(mut workspace) = supervisor_turn.workspace.lock() {
                 drop(workspace.take());
+            }
+            // Le provider a ecrit le cwd du worktree physique dans son JSONL.
+            // Une fois le transcript fusionne dans le home canonique, remplace
+            // ce chemin ephemere par le dossier logique choisi dans l'UI. La
+            // prochaine reprise recreera ainsi un workspace dans la meme room.
+            let completed_session_id = supervisor_turn
+                .snapshot
+                .lock()
+                .ok()
+                .and_then(|snapshot| snapshot.session_id.clone());
+            if let (Some(folder), Some(session_id)) =
+                (logical_project_dir.as_deref(), completed_session_id)
+            {
+                if let Err(error) = discussions::move_discussion_for_account(
+                    account_id.clone(),
+                    session_id,
+                    folder.to_string(),
+                ) {
+                    eprintln!("[chat] dossier logique du transcript non restaure: {error}");
+                }
             }
             if let Some(token) = room_token.as_deref() {
                 supervisor_room.deregister(token);
@@ -675,7 +698,7 @@ fn resolve_project_dir(
     };
     let path = settings::expand_home(raw)?;
     if !path.is_dir() {
-        return Err(format!("Workspace introuvable : {raw}"));
+        return Err(format!("Dossier introuvable : {raw}"));
     }
     Ok(Some(path))
 }

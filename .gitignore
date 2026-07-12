@@ -6,6 +6,10 @@ src-tauri/gen
 android/.gradle
 android/local.properties
 android/app/build
+ios/build
+ios/DerivedData
+ios/*.xcworkspace/xcuserdata
+ios/*.xcodeproj/xcuserdata
 *.log
 .DS_Store
 

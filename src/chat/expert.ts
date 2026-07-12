@@ -1,13 +1,15 @@
 export type ExpertGridLayout = "auto" | "2" | "3" | "4";
 
-export const EXPERT_CHAT_PAGE_SIZES = [6, 9] as const;
+export const EXPERT_CHAT_PAGE_SIZES = [6, 9, 12, 16] as const;
 export type ExpertChatPageSize = (typeof EXPERT_CHAT_PAGE_SIZES)[number];
 
 export const DEFAULT_EXPERT_CHAT_PAGE_SIZE: ExpertChatPageSize = 6;
-export const EXPERT_CHAT_COLUMN_COUNT = 3;
-
 export const normalizeExpertChatPageSize = (value: unknown): ExpertChatPageSize =>
-  Number(value) === 9 ? 9 : DEFAULT_EXPERT_CHAT_PAGE_SIZE;
+  EXPERT_CHAT_PAGE_SIZES.find((pageSize) => pageSize === Number(value))
+  ?? DEFAULT_EXPERT_CHAT_PAGE_SIZE;
+
+export const expertChatColumnCount = (pageSize: ExpertChatPageSize): number =>
+  pageSize === 16 ? 4 : 3;
 
 const normalizeCount = (value: number): number =>
   Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
@@ -43,4 +45,4 @@ export const expertChatsOnPage = <T>(
 };
 
 export const expertChatRowCount = (pageSize: ExpertChatPageSize): number =>
-  pageSize / EXPERT_CHAT_COLUMN_COUNT;
+  pageSize / expertChatColumnCount(pageSize);

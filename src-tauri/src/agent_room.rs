@@ -1,11 +1,11 @@
-//! **Agent Room** — un salon de communication inter-agents.
+//! **Workspace Collaboration** — communication inter-agents cloisonnee par workspace.
 //!
 //! Chaque terminal/chat lance un agent isole (worktree + home provider propres).
 //! Ce module expose un petit **serveur MCP en HTTP streamable** que
-//! tous les agents rejoignent (via une entree `[mcp_servers.agent_room]` dans
+//! les agents rejoignent (via une entree `[mcp_servers.workspace_collab]` dans
 //! leur `config.toml`, cf. `codex mcp add`). Les agents peuvent alors :
 //! - se voir (`list_agents`, `whoami`),
-//! - poster dans le salon commun (`send_message`),
+//! - poster dans le salon de leur workspace (`send_message`),
 //! - s'envoyer des messages prives (`send_message` avec `to`),
 //! - lire ce qui les concerne (`read_messages`, `wait_for_messages`).
 //!
@@ -24,6 +24,11 @@
 //! `tools/list`, `tools/call`. Pas de SSE cote serveur (les reponses tiennent en
 //! une requete), donc pas de dependance MCP externe.
 
+use crate::{
+    merge_queue::{MergeQueue, MergeQueueSnapshot, MergeStatus},
+    settings::Provider,
+    worktree::MergeContext,
+};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -31,11 +36,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
     Router,
-};
-use crate::{
-    merge_queue::{MergeQueue, MergeQueueSnapshot, MergeStatus},
-    settings::Provider,
-    worktree::MergeContext,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -74,6 +74,8 @@ const LOG_MEMORY_MAX: usize = 20_000;
 const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
 const LOG_SEGMENTS_MAX: usize = 8;
 const AGENT_HISTORY_MAX: usize = 2_000;
+const COLLAB_MCP_NAME: &str = "workspace_collab";
+const LEGACY_MCP_NAME: &str = "agent_room";
 
 fn now_ts() -> i64 {
     SystemTime::now()
@@ -246,7 +248,7 @@ impl RoomState {
             Ok(owner) => owner,
             Err(error) => {
                 eprintln!(
-                    "[agent_room] store deja possede par un autre processus ({}): {error}; repli memoire seule",
+                    "[workspace_collab] store deja possede par un autre processus ({}): {error}; repli memoire seule",
                     dir.display()
                 );
                 return Self::build(None, None);
@@ -319,7 +321,7 @@ impl RoomState {
     }
 
     /// Provisionne un `CODEX_HOME` (idempotent, avec cache par session) : ajoute
-    /// l'entree `[mcp_servers.agent_room]` via `codex mcp add` si absente.
+    /// l'entree `[mcp_servers.workspace_collab]` via `codex mcp add` si absente.
     pub fn provision_home(
         &self,
         provider: Provider,
@@ -329,7 +331,11 @@ impl RoomState {
     ) -> Result<(), String> {
         // Cle de cache = (provider, home) : Codex et Claude ecrivent des configs
         // differentes, et leurs homes sont de toute facon distincts.
-        let key = format!("{}:{}", provider.as_str(), home.to_string_lossy().to_lowercase());
+        let key = format!(
+            "{}:{}",
+            provider.as_str(),
+            home.to_string_lossy().to_lowercase()
+        );
         let (slot, leader) = {
             let mut slots = self
                 .inner
@@ -355,7 +361,10 @@ impl RoomState {
             // du registre afin qu'un prochain lancement puisse retenter.
             if result.is_err() {
                 if let Ok(mut slots) = self.inner.provisioned.lock() {
-                    if slots.get(&key).is_some_and(|known| Arc::ptr_eq(known, &slot)) {
+                    if slots
+                        .get(&key)
+                        .is_some_and(|known| Arc::ptr_eq(known, &slot))
+                    {
                         slots.remove(&key);
                     }
                 }
@@ -381,7 +390,11 @@ impl RoomState {
 
     /// Retire l'entree du salon d'un home de compte et oublie le cache associe.
     pub fn deprovision_home(&self, provider: Provider, cli_bin: &str, home: &Path) {
-        let key = format!("{}:{}", provider.as_str(), home.to_string_lossy().to_lowercase());
+        let key = format!(
+            "{}:{}",
+            provider.as_str(),
+            home.to_string_lossy().to_lowercase()
+        );
         if let Ok(mut slots) = self.inner.provisioned.lock() {
             slots.remove(&key);
         }
@@ -403,7 +416,9 @@ impl RoomState {
         let mut max_id = 0_u64;
         let mut restored = Vec::new();
         for path in paths {
-            let Ok(file) = fs::File::open(path) else { continue };
+            let Ok(file) = fs::File::open(path) else {
+                continue;
+            };
             for line in BufReader::new(file).lines().map_while(Result::ok) {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -534,7 +549,7 @@ impl RoomState {
             &label,
             None,
             MsgKind::System,
-            format!("{label} a rejoint le salon"),
+            format!("{label} a rejoint le dossier"),
         );
         token
     }
@@ -546,11 +561,7 @@ impl RoomState {
                 Some(info) if info.present => {
                     info.present = false;
                     info.last_seen = now_ts();
-                    Some((
-                        info.room_id.clone(),
-                        info.ident.clone(),
-                        info.label.clone(),
-                    ))
+                    Some((info.room_id.clone(), info.ident.clone(), info.label.clone()))
                 }
                 _ => None,
             }
@@ -564,7 +575,7 @@ impl RoomState {
                 &label,
                 None,
                 MsgKind::System,
-                format!("{label} a quitte le salon"),
+                format!("{label} a quitte le dossier"),
             );
         }
     }
@@ -774,7 +785,11 @@ impl RoomState {
         to: Option<String>,
         text: String,
     ) -> RoomMessage {
-        let kind = if to.is_some() { MsgKind::Dm } else { MsgKind::Room };
+        let kind = if to.is_some() {
+            MsgKind::Dm
+        } else {
+            MsgKind::Room
+        };
         self.post_in_room(room_id, OPERATOR_IDENT, "Operateur", to, kind, text)
     }
 
@@ -785,14 +800,10 @@ impl RoomState {
         self.messages_for_room(DEFAULT_ROOM_ID, ident, since)
     }
 
-    pub fn messages_for_room(
-        &self,
-        room_id: &str,
-        ident: &str,
-        since: u64,
-    ) -> Vec<RoomMessage> {
+    pub fn messages_for_room(&self, room_id: &str, ident: &str, since: u64) -> Vec<RoomMessage> {
         let room_id = normalize_room_id(room_id);
-        let messages: Vec<RoomMessage> = self.inner
+        let messages: Vec<RoomMessage> = self
+            .inner
             .log
             .lock()
             .map(|log| {
@@ -808,7 +819,11 @@ impl RoomState {
                     .collect()
             })
             .unwrap_or_default();
-        let cursor = messages.iter().map(|message| message.id).max().unwrap_or(since);
+        let cursor = messages
+            .iter()
+            .map(|message| message.id)
+            .max()
+            .unwrap_or(since);
         if let Ok(mut cursors) = self.inner.read_cursors.lock() {
             cursors.insert(format!("{room_id}\0{ident}"), cursor);
         }
@@ -931,7 +946,10 @@ fn bearer_token(headers: &HeaderMap) -> String {
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    raw.strip_prefix("Bearer ").unwrap_or(raw).trim().to_string()
+    raw.strip_prefix("Bearer ")
+        .unwrap_or(raw)
+        .trim()
+        .to_string()
 }
 
 async fn mcp_post(State(state): State<RoomState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -992,7 +1010,10 @@ fn wait_call(msg: &Value) -> Option<(Value, Value)> {
         return None;
     }
     let id = msg.get("id").cloned()?;
-    let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+    let args = msg
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or(json!({}));
     Some((id, args))
 }
 
@@ -1029,10 +1050,7 @@ fn handle_one(state: &RoomState, agent: &AgentInfo, token: &str, msg: &Value) ->
 
     match method {
         "initialize" => {
-            state
-                .inner
-                .initialize_count
-                .fetch_add(1, Ordering::Relaxed);
+            state.inner.initialize_count.fetch_add(1, Ordering::Relaxed);
             let protocol = msg
                 .pointer("/params/protocolVersion")
                 .and_then(Value::as_str)
@@ -1043,7 +1061,7 @@ fn handle_one(state: &RoomState, agent: &AgentInfo, token: &str, msg: &Value) ->
                 json!({
                     "protocolVersion": protocol,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "codex-switch-agent-room", "version": env!("CARGO_PKG_VERSION") }
+                    "serverInfo": { "name": "codex-switch-workspace-collab", "version": env!("CARGO_PKG_VERSION") }
                 }),
             ))
         }
@@ -1074,22 +1092,22 @@ fn tools_schema() -> Value {
     json!([
         {
             "name": "whoami",
-            "description": "Renvoie ta propre identite dans le salon (ton ident public, ton label, ton compte) et le nombre d'agents presents.",
+            "description": "Renvoie ta propre identite dans la collaboration du dossier et le nombre d'agents presents dans ce meme dossier.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "list_agents",
-            "description": "Liste les autres agents actuellement presents dans le salon (ident public a utiliser pour un message prive, label, dossier de travail).",
+            "description": "Liste uniquement les autres agents presents dans ton dossier logique.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {
             "name": "send_message",
-            "description": "Envoie un message. Sans 'to', il est diffuse a tout le salon. Avec 'to' (un ident public renvoye par list_agents), c'est un message prive a cet agent.",
+            "description": "Envoie un message. Sans 'to', il est diffuse aux agents de ton dossier. Avec 'to', c'est un message prive a un agent du meme dossier.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "Le contenu du message." },
-                    "to": { "type": "string", "description": "Ident public du destinataire pour un message prive. Omets pour diffuser au salon." }
+                    "to": { "type": "string", "description": "Ident public du destinataire dans le meme dossier. Omets pour diffuser au dossier." }
                 },
                 "required": ["text"],
                 "additionalProperties": false
@@ -1097,7 +1115,7 @@ fn tools_schema() -> Value {
         },
         {
             "name": "read_messages",
-            "description": "Lit les messages qui te concernent (diffusions du salon + messages prives pour toi) posterieurs au curseur 'since'. Renvoie aussi un nouveau curseur a reutiliser.",
+            "description": "Lit les messages de ton dossier qui te concernent, posterieurs au curseur 'since'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1213,25 +1231,20 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
             tool_ok(json!({ "agents": others }))
         }
         "claim_task" => {
-            let task_id = args
-                .get("taskId")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
             let description = args.get("description").and_then(Value::as_str);
-            match state
-                .inner
-                .merge_queue
-                .claim_task(&agent.room_id, task_id, description, &agent.ident)
-            {
+            match state.inner.merge_queue.claim_task(
+                &agent.room_id,
+                task_id,
+                description,
+                &agent.ident,
+            ) {
                 Ok(task) => tool_ok(json!(task)),
                 Err(error) => tool_err(&error),
             }
         }
         "complete_task" => {
-            let task_id = args
-                .get("taskId")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
             match state
                 .inner
                 .merge_queue
@@ -1278,7 +1291,11 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
             }))
         }
         "send_message" => {
-            let text = args.get("text").and_then(Value::as_str).unwrap_or("").trim();
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             if text.is_empty() {
                 return tool_err("le champ 'text' est requis et non vide");
             }
@@ -1303,7 +1320,11 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
                     ));
                 }
             }
-            let kind = if to.is_some() { MsgKind::Dm } else { MsgKind::Room };
+            let kind = if to.is_some() {
+                MsgKind::Dm
+            } else {
+                MsgKind::Room
+            };
             let message = state.post_in_room(
                 &agent.room_id,
                 &agent.ident,
@@ -1314,7 +1335,7 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
             );
             tool_ok(json!({
                 "id": message.id,
-                "deliveredTo": to.unwrap_or_else(|| "room".to_string()),
+                "deliveredTo": to.unwrap_or_else(|| "workspace".to_string()),
             }))
         }
         "read_messages" => {
@@ -1395,12 +1416,12 @@ fn accepted() -> Response {
 // Provisioning de la config MCP par compte (via le CLI du provider, merge-safe)
 // ---------------------------------------------------------------------------
 
-/// Idempotent : verifie via `<cli> mcp get agent_room` ; si absent (ou URL
+/// Idempotent : verifie via `<cli> mcp get workspace_collab` ; si absent (ou URL
 /// differente), (re)ajoute l'entree. Chaque CLI fusionne dans sa propre config
 /// sans ecraser les autres entrees :
 /// - **Codex** : `codex mcp add ... --url <url> --bearer-token-env-var
 ///   CST_ROOM_TOKEN` (le token reste hors du config.toml).
-/// - **Claude** : `claude mcp add --transport http agent_room <url> --header
+/// - **Claude** : `claude mcp add --transport http workspace_collab <url> --header
 ///   "Authorization: Bearer ${CST_ROOM_TOKEN}" --scope user`. Claude n'a pas de
 ///   flag `--bearer-token-env-var` ; on passe le token par **expansion
 ///   d'environnement** (`${CST_ROOM_TOKEN}`) pour qu'il reste hors du fichier et
@@ -1408,8 +1429,12 @@ fn accepted() -> Response {
 pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> Result<(), String> {
     let home_env = provider.home_env_var();
 
+    // Migration transparente : l'ancien nom n'est retire que du home isole de
+    // ce process, jamais du home canonique de l'utilisateur.
+    remove_mcp(provider, cli_bin, home, LEGACY_MCP_NAME);
+
     let get = Command::new(cli_bin)
-        .args(["mcp", "get", "agent_room"])
+        .args(["mcp", "get", COLLAB_MCP_NAME])
         .env(home_env, home)
         .output();
 
@@ -1432,7 +1457,7 @@ pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> R
             add.args([
                 "mcp",
                 "add",
-                "agent_room",
+                COLLAB_MCP_NAME,
                 "--url",
                 url,
                 "--bearer-token-env-var",
@@ -1445,7 +1470,7 @@ pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> R
                 "add",
                 "--transport",
                 "http",
-                "agent_room",
+                COLLAB_MCP_NAME,
                 url,
                 "--header",
                 "Authorization: Bearer ${CST_ROOM_TOKEN}",
@@ -1472,8 +1497,13 @@ pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> R
 /// Retire l'entree du salon (best-effort : un retrait d'une entree absente
 /// n'est pas une erreur bloquante).
 pub fn deprovision(provider: Provider, cli_bin: &str, home: &Path) {
+    remove_mcp(provider, cli_bin, home, COLLAB_MCP_NAME);
+    remove_mcp(provider, cli_bin, home, LEGACY_MCP_NAME);
+}
+
+fn remove_mcp(provider: Provider, cli_bin: &str, home: &Path, name: &str) {
     let _ = Command::new(cli_bin)
-        .args(["mcp", "remove", "agent_room"])
+        .args(["mcp", "remove", name])
         .env(provider.home_env_var(), home)
         .output();
 }
@@ -1483,7 +1513,7 @@ fn unauthorized() -> Response {
         .status(StatusCode::UNAUTHORIZED)
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "error": "token de salon inconnu (agent non enregistre)" }).to_string(),
+            json!({ "error": "token de collaboration inconnu (agent non enregistre)" }).to_string(),
         ))
         .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response())
 }
@@ -1595,9 +1625,19 @@ mod tests {
         let ident_b = state.lookup(&b).unwrap().ident;
 
         // A diffuse au salon.
-        call(&state, &a, "send_message", json!({ "text": "coucou salon" }));
+        call(
+            &state,
+            &a,
+            "send_message",
+            json!({ "text": "coucou salon" }),
+        );
         // A envoie un DM a B.
-        call(&state, &a, "send_message", json!({ "text": "prive B", "to": ident_b }));
+        call(
+            &state,
+            &a,
+            "send_message",
+            json!({ "text": "prive B", "to": ident_b }),
+        );
 
         let read = |token: &str| -> Vec<String> {
             let result = call(&state, token, "read_messages", json!({ "since": 0 }));
@@ -1672,7 +1712,12 @@ mod tests {
         // Au-dela de la capacite du bucket, au moins un envoi (avec textes
         // distincts pour eviter la dedup) doit etre refuse.
         for i in 0..(SEND_BUCKET_CAPACITY as usize + 5) {
-            let result = call(&state, &a, "send_message", json!({ "text": format!("m{i}") }));
+            let result = call(
+                &state,
+                &a,
+                "send_message",
+                json!({ "text": format!("m{i}") }),
+            );
             if result["isError"] == true {
                 blocked = true;
                 break;
@@ -1687,7 +1732,12 @@ mod tests {
         {
             let state = RoomState::with_data_dir(dir.clone());
             let a = state.register(meta("A"));
-            call(&state, &a, "send_message", json!({ "text": "persiste-moi" }));
+            call(
+                &state,
+                &a,
+                "send_message",
+                json!({ "text": "persiste-moi" }),
+            );
         }
         // Nouveau salon sur le meme repertoire : l'historique est recharge.
         let reloaded = RoomState::with_data_dir(dir.clone());
@@ -1695,7 +1745,12 @@ mod tests {
         assert!(all.iter().any(|m| m.text == "persiste-moi"));
         // next_id reprend apres le max charge : le prochain post a un id superieur.
         let b = reloaded.register(meta("B"));
-        let posted = call(&reloaded, &b, "send_message", json!({ "text": "apres-reload" }));
+        let posted = call(
+            &reloaded,
+            &b,
+            "send_message",
+            json!({ "text": "apres-reload" }),
+        );
         let new_id = tool_json(&posted)["id"].as_u64().unwrap();
         assert!(new_id > all.iter().map(|m| m.id).max().unwrap());
         let _ = fs::remove_dir_all(&dir);
@@ -1747,18 +1802,83 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        state.post("operator", "Operateur", None, MsgKind::Room, "broadcast-100");
+        state.post(
+            "operator",
+            "Operateur",
+            None,
+            MsgKind::Room,
+            "broadcast-100",
+        );
         for waiter in waiters {
             let messages = waiter.await.unwrap();
-            assert!(messages.iter().any(|message| message.text == "broadcast-100"));
+            assert!(messages
+                .iter()
+                .any(|message| message.text == "broadcast-100"));
         }
+    }
+
+    #[test]
+    fn workspace_rooms_are_strictly_isolated() {
+        let state = RoomState::new();
+        let mut meta_a1 = meta("A1");
+        meta_a1.room_id = "workspace-a".to_string();
+        let mut meta_a2 = meta("A2");
+        meta_a2.room_id = "workspace-a".to_string();
+        let mut meta_b = meta("B");
+        meta_b.room_id = "workspace-b".to_string();
+
+        let token_a1 = state.register(meta_a1);
+        let token_a2 = state.register(meta_a2);
+        let token_b = state.register(meta_b);
+        let a1 = state.lookup(&token_a1).unwrap();
+        let a2 = state.lookup(&token_a2).unwrap();
+        let b = state.lookup(&token_b).unwrap();
+
+        assert_eq!(state.present_agents_in_room("workspace-a").len(), 2);
+        assert_eq!(state.present_agents_in_room("workspace-b").len(), 1);
+        assert!(state.ident_exists_in_room("workspace-a", &a2.ident));
+        assert!(!state.ident_exists_in_room("workspace-a", &b.ident));
+
+        state.post_in_room(
+            "workspace-a",
+            &a1.ident,
+            &a1.label,
+            None,
+            MsgKind::Room,
+            "visible seulement dans A",
+        );
+        assert!(state
+            .messages_for_room("workspace-a", &a2.ident, 0)
+            .iter()
+            .any(|message| message.text == "visible seulement dans A"));
+        assert!(!state
+            .messages_for_room("workspace-b", &b.ident, 0)
+            .iter()
+            .any(|message| message.text == "visible seulement dans A"));
+
+        let rejected = call_tool(
+            &state,
+            &a1,
+            &token_a1,
+            "send_message",
+            &json!({ "to": b.ident, "text": "tentative cross-workspace" }),
+        );
+        assert_eq!(rejected.get("isError").and_then(Value::as_bool), Some(true));
+        assert_eq!(state.snapshot_for_room("workspace-a").present, 2);
+        assert_eq!(state.snapshot_for_room("workspace-b").present, 1);
     }
 
     #[test]
     fn in_memory_log_is_bounded_and_cursor_lookup_keeps_the_tail() {
         let state = RoomState::new();
         for index in 0..(LOG_MEMORY_MAX + 17) {
-            state.post("system", "System", None, MsgKind::System, format!("m-{index}"));
+            state.post(
+                "system",
+                "System",
+                None,
+                MsgKind::System,
+                format!("m-{index}"),
+            );
         }
         let snapshot = state.snapshot();
         assert_eq!(snapshot.total_messages, LOG_MEMORY_MAX);
@@ -1785,6 +1905,9 @@ mod tests {
             .iter()
             .map(|a| a["ident"].as_str().unwrap().to_string())
             .collect();
-        assert!(idents.is_empty(), "B est parti, la liste pour A doit etre vide");
+        assert!(
+            idents.is_empty(),
+            "B est parti, la liste pour A doit etre vide"
+        );
     }
 }

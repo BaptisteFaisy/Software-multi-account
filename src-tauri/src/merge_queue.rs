@@ -372,9 +372,11 @@ impl MergeQueue {
                     .filter(|job| {
                         job.room_id == room_id
                             && matches!(
-                            job.status,
-                            MergeStatus::Conflict | MergeStatus::VerifyFailed | MergeStatus::Failed
-                        )
+                                job.status,
+                                MergeStatus::Conflict
+                                    | MergeStatus::VerifyFailed
+                                    | MergeStatus::Failed
+                            )
                     })
                     .count();
                 let recent_landed = jobs
@@ -1131,6 +1133,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wait_terminal(&queue, first.id).status, MergeStatus::Landed);
+        assert!(queue.status("other-room", first.id).is_err());
         assert_eq!(wait_terminal(&queue, second.id).status, MergeStatus::Landed);
         assert_eq!(queue.list_landed(ROOM, 10).len(), 2);
         let target = git_output(
@@ -1170,19 +1173,21 @@ mod tests {
             .claim_task(ROOM, "M1-1", Some("isoler"), "agent-a")
             .unwrap();
         assert_eq!(task.claimed_by, "agent-a");
-        assert!(queue
-            .claim_task(ROOM, "M1-1", None, "agent-b")
-            .is_err());
+        assert!(queue.claim_task(ROOM, "M1-1", None, "agent-b").is_err());
         assert_eq!(
-            queue
-                .complete_task(ROOM, "M1-1", "agent-a")
-                .unwrap()
-                .status,
+            queue.complete_task(ROOM, "M1-1", "agent-a").unwrap().status,
             TaskStatus::Completed
         );
+        let other = queue
+            .claim_task("other-room", "M1-1", Some("autre repo"), "agent-b")
+            .unwrap();
+        assert_eq!(other.claimed_by, "agent-b");
+        assert_eq!(queue.list_tasks(ROOM).len(), 1);
+        assert_eq!(queue.list_tasks("other-room").len(), 1);
         drop(queue);
         let reloaded = MergeQueue::with_data_dir(root.clone());
         assert_eq!(reloaded.list_tasks(ROOM).len(), 1);
+        assert_eq!(reloaded.list_tasks("other-room").len(), 1);
         drop(reloaded);
         let _ = fs::remove_dir_all(root);
     }

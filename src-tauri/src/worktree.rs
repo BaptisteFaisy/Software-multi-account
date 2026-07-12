@@ -962,7 +962,7 @@ fn inject_agent_conventions(home: &Path) -> Result<(), String> {
 ## Codex Switch Terminal: isolated agent
 
 This process has a private worktree and provider home. Stay inside the current
-working directory. Use the agent_room MCP tools to coordinate real work:
+working directory. Use the workspace_collab MCP tools to coordinate real work:
 
 - claim_task before starting shared work;
 - commit a clean, focused change before submit_for_merge;
@@ -1274,6 +1274,7 @@ mod tests {
             .unwrap();
         assert_ne!(a.cwd(), b.cwd());
         assert_ne!(a.home(), b.home());
+        assert_eq!(a.room_id(), b.room_id());
         assert_eq!(a.base_sha(), b.base_sha());
         assert_eq!(manager.active_count(), 2);
         assert!(manager
@@ -1440,6 +1441,35 @@ mod tests {
 
         drop(first);
         assert!(WorktreeManager::new(runtime, 100).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn room_id_is_stable_per_logical_workspace_and_private_without_one() {
+        let root = temp("room-scope");
+        let first = root.join("first");
+        let second = root.join("second");
+        let home = root.join("home");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::create_dir_all(&home).unwrap();
+
+        assert_eq!(
+            room_id_for_local_path(&first),
+            room_id_for_local_path(&first)
+        );
+        assert_ne!(
+            room_id_for_local_path(&first),
+            room_id_for_local_path(&second)
+        );
+
+        let manager = WorktreeManager::unlimited(root.join("runtime")).unwrap();
+        let private_a = manager.prepare_local("private-a", &home, None).unwrap();
+        let private_b = manager.prepare_local("private-b", &home, None).unwrap();
+        assert_ne!(private_a.room_id(), private_b.room_id());
+        drop(private_a);
+        drop(private_b);
+        drop(manager);
         let _ = fs::remove_dir_all(root);
     }
 }

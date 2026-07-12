@@ -229,16 +229,20 @@ pub struct AppSettings {
     /// localStorage cote client.
     #[serde(default)]
     pub workspaces: Vec<WorkspaceProfile>,
+    /// Identites normalisees des workspaces explicitement fermes. Elles
+    /// empechent une ancienne discussion ou le MRU d'un autre appareil de les
+    /// recreer automatiquement ; une ouverture explicite retire le tombstone.
+    #[serde(default)]
+    pub closed_workspace_ids: Vec<String>,
 }
 
-/// Reglages du salon d'agents (« Agent Room »). Desactive par defaut : tant que
-/// `enabled` est faux, l'app n'ecrit RIEN dans les `CODEX_HOME` et ne demarre
-/// aucun serveur.
+/// Reglages historiques du transport MCP. `enabled` est conserve uniquement
+/// pour relire les anciens settings ; la collaboration workspace est desormais
+/// native et toujours disponible dans les homes isoles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRoomConfig {
-    /// Active le salon : demarrage du serveur MCP + provisioning des agents
-    /// (ecriture d'une entree `[mcp_servers.agent_room]` mergee dans config.toml).
+    /// Champ de compatibilite, ignore par le runtime natif.
     #[serde(default)]
     pub enabled: bool,
     /// Port loopback du serveur MCP du salon (desktop).
@@ -580,7 +584,7 @@ fn guard_deletable_codex_home(path: &Path) -> Result<(), String> {
     let has_marker = path.join("auth.json").is_file()      // Codex
         || path.join("config.toml").is_file()              // Codex
         || path.join(".credentials.json").is_file()        // Claude
-        || path.join(".claude.json").is_file();            // Claude
+        || path.join(".claude.json").is_file(); // Claude
 
     if !(looks_like_home || under_homes || has_marker) {
         return Err(format!(
@@ -918,7 +922,8 @@ mod tests {
 
     #[test]
     fn upsert_ignores_same_key_inside_a_table_and_comments() {
-        let existing = "# approval_policy = \"never\"\n[profiles.x]\napproval_policy = \"untrusted\"\n";
+        let existing =
+            "# approval_policy = \"never\"\n[profiles.x]\napproval_policy = \"untrusted\"\n";
         let out = upsert_top_level_string(existing, "approval_policy", "never");
         // La cle sous [profiles.x] et la ligne commentee ne sont pas touchees ;
         // la cle racine est prefixee.
@@ -1006,6 +1011,7 @@ mod tests {
             codex_bypass: true,
             auto_discover_accounts: false,
             workspaces: Vec::new(),
+            closed_workspace_ids: Vec::new(),
         }
     }
 
@@ -1057,6 +1063,26 @@ mod tests {
         assert_eq!(ws.id, "c:/projects/éire");
         // Label vide comble par le nom du dossier (UTF-8 safe).
         assert_eq!(ws.label, "Éire");
+    }
+
+    #[test]
+    fn ensure_workspaces_keeps_closed_workspaces_closed() {
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.workspaces = vec![WorkspaceProfile {
+            id: "ancien-id".to_string(),
+            label: "Projet".to_string(),
+            path: "C:\\Projects\\Projet".to_string(),
+        }];
+        settings.closed_workspace_ids = vec![
+            " C:\\Projects\\Projet\\ ".to_string(),
+            "c:/projects/projet".to_string(),
+        ];
+
+        let changed = ensure_workspaces(&mut settings);
+
+        assert!(changed);
+        assert!(settings.workspaces.is_empty());
+        assert_eq!(settings.closed_workspace_ids, vec!["c:/projects/projet"]);
     }
 
     #[test]
@@ -1179,6 +1205,93 @@ mod tests {
     }
 
     #[test]
+    fn rollout_rate_limit_snapshot_parses_codex_snake_case() {
+        let home = fresh_account_home("rate-limit-rollout");
+        let archive = home
+            .join("sessions-archive")
+            .join("2026")
+            .join("07")
+            .join("12");
+        fs::create_dir_all(&archive).unwrap();
+        let rollout =
+            archive.join("rollout-2026-07-12T20-00-00-019f5701-fb46-7503-9abb-004a5316894b.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"timestamp\":\"2026-07-12T19:13:41.754Z\",",
+                "\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",",
+                "\"rate_limits\":{\"limit_id\":\"codex\",\"plan_type\":\"plus\",",
+                "\"primary\":{\"used_percent\":54.0,\"window_minutes\":10080,",
+                "\"resets_at\":4102444800},\"secondary\":null}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let snapshot = scan_rollout_rate_limit_snapshot(&rollout).expect("quota snapshot");
+        assert_eq!(snapshot.buckets.len(), 1);
+        assert_eq!(snapshot.buckets[0].window_duration_mins, 10080);
+        assert_eq!(snapshot.buckets[0].used_percent, Some(54.0));
+        assert_eq!(snapshot.buckets[0].plan_type.as_deref(), Some("plus"));
+        assert!(snapshot.observed_at > 0);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn local_rate_limit_snapshot_prevents_false_zero_regression() {
+        let server = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 5000,
+            used_percent: Some(0.0),
+            rate_limit_reached_type: None,
+            plan_type: Some("plus".to_string()),
+        }];
+        let local = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 4000,
+            used_percent: Some(54.0),
+            rate_limit_reached_type: None,
+            plan_type: Some("plus".to_string()),
+        }];
+
+        let (merged, used_local) = merge_rate_limit_buckets(server, Some(&local), 1000);
+
+        assert!(used_local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].used_percent, Some(54.0));
+        assert_eq!(merged[0].resets_at, 4000);
+    }
+
+    #[test]
+    fn expired_local_rate_limit_snapshot_does_not_override_server() {
+        let server = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 5000,
+            used_percent: Some(0.0),
+            rate_limit_reached_type: None,
+            plan_type: None,
+        }];
+        let mut local = server.clone();
+        local[0].resets_at = 900;
+        local[0].used_percent = Some(99.0);
+
+        let (merged, used_local) = merge_rate_limit_buckets(server, Some(&local), 1000);
+
+        assert!(!used_local);
+        assert_eq!(merged[0].used_percent, Some(0.0));
+        assert_eq!(merged[0].resets_at, 5000);
+    }
+
+    #[test]
     fn model_catalog_preserves_model_specific_max_and_ultra_efforts() {
         let models = parse_account_model_catalog(&json!({
             "data": [{
@@ -1244,9 +1357,7 @@ pub fn agent_room_data_dir() -> Result<PathBuf, String> {
     } else {
         home_dir()?.join(".config")
     };
-    Ok(base
-        .join("codex-switch-terminal")
-        .join("agent-room"))
+    Ok(base.join("codex-switch-terminal").join("agent-room"))
 }
 
 /// Racine des donnees runtime (worktrees, homes isoles, merge queue). Elle suit
@@ -1275,6 +1386,7 @@ fn discover_initial_settings() -> Result<AppSettings, String> {
         codex_bypass: true,
         auto_discover_accounts: false,
         workspaces: Vec::new(),
+        closed_workspace_ids: Vec::new(),
     };
 
     if env::var_os("CST_DATA_DIR").is_none() {
@@ -1408,15 +1520,10 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
 /// retrait des slashes finaux, `\\` -> `/`, puis minuscule UNIQUEMENT pour les
 /// chemins Windows (`X:/...`) et UNC (`//...`), insensibles a la casse.
 fn normalize_workspace_path(path: &str) -> String {
-    let trimmed = path
-        .trim()
-        .trim_end_matches(['\\', '/'])
-        .replace('\\', "/");
+    let trimmed = path.trim().trim_end_matches(['\\', '/']).replace('\\', "/");
     let bytes = trimmed.as_bytes();
-    let is_windows_drive = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && bytes[2] == b'/';
+    let is_windows_drive =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
     if is_windows_drive || trimmed.starts_with("//") {
         trimmed.to_lowercase()
     } else {
@@ -1452,9 +1559,28 @@ fn workspace_base_name(path: &str) -> String {
 /// - retire les entrees a chemin vide ;
 /// - recalcule un `id` manquant/incoherent depuis le chemin normalise ;
 /// - deduplique par `id` (premiere occurrence gardee) ;
-/// - complete un `label` vide par le nom du dossier.
+/// - complete un `label` vide par le nom du dossier ;
+/// - normalise les tombstones et leur donne priorite sur le registre ouvert.
 fn ensure_workspaces(settings: &mut AppSettings) -> bool {
     let mut changed = false;
+    let mut closed_seen: HashSet<String> = HashSet::new();
+    let mut closed_ids: Vec<String> = Vec::with_capacity(settings.closed_workspace_ids.len());
+    for raw_id in &settings.closed_workspace_ids {
+        let id = normalize_workspace_path(raw_id);
+        if id.is_empty() || !closed_seen.insert(id.clone()) {
+            changed = true;
+            continue;
+        }
+        if raw_id != &id {
+            changed = true;
+        }
+        closed_ids.push(id);
+    }
+    if closed_ids != settings.closed_workspace_ids {
+        changed = true;
+    }
+    settings.closed_workspace_ids = closed_ids;
+
     let mut seen: HashSet<String> = HashSet::new();
     let mut deduped: Vec<WorkspaceProfile> = Vec::with_capacity(settings.workspaces.len());
 
@@ -1468,6 +1594,10 @@ fn ensure_workspaces(settings: &mut AppSettings) -> bool {
         // incoherent ne doit jamais permettre a deux chemins equivalents de
         // survivre comme deux workspaces distincts.
         let id = normalize_workspace_path(&path);
+        if closed_seen.contains(&id) {
+            changed = true;
+            continue;
+        }
         if !seen.insert(id.clone()) {
             changed = true;
             continue;
@@ -1723,15 +1853,46 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
     let mut buckets = Vec::new();
     let mut refreshed_at = None;
     let mut error = None;
+    let mut source = "none";
 
     if has_tokens {
+        let local_snapshot = read_local_rate_limit_snapshot(account).ok().flatten();
         match read_server_rate_limits(account, settings) {
             Ok(server_buckets) => {
-                buckets = server_buckets;
-                refreshed_at = Some(now);
+                let (merged, used_local_snapshot) = merge_rate_limit_buckets(
+                    server_buckets,
+                    local_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.buckets.as_slice()),
+                    now,
+                );
+                buckets = merged;
+                if used_local_snapshot {
+                    refreshed_at = local_snapshot.as_ref().map(|snapshot| snapshot.observed_at);
+                    source = "session";
+                } else {
+                    refreshed_at = Some(now);
+                    source = if buckets.is_empty() {
+                        "server-empty"
+                    } else {
+                        "server"
+                    };
+                }
             }
             Err(message) => {
-                error = Some(message);
+                if let Some(snapshot) = local_snapshot {
+                    buckets = valid_local_rate_limit_buckets(&snapshot.buckets, now);
+                    if buckets.is_empty() {
+                        error = Some(message);
+                        source = "unavailable";
+                    } else {
+                        refreshed_at = Some(snapshot.observed_at);
+                        source = "session";
+                    }
+                } else {
+                    error = Some(message);
+                    source = "unavailable";
+                }
             }
         }
     }
@@ -1740,16 +1901,6 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
     let weekly_bucket = bucket_for_window(&buckets, WEEKLY_LIMIT_MINS);
     let session_reset_at = session_bucket.map(|bucket| bucket.resets_at);
     let weekly_reset_at = weekly_bucket.map(|bucket| bucket.resets_at);
-    let source = if !has_tokens {
-        "none"
-    } else if error.is_some() {
-        "unavailable"
-    } else if buckets.is_empty() {
-        "server-empty"
-    } else {
-        "server"
-    };
-
     AccountLimitView {
         id: account.id.clone(),
         label: account.label.clone(),
@@ -2013,6 +2164,169 @@ fn parse_account_model_catalog(value: &Value) -> Vec<AccountModelView> {
         .collect()
 }
 
+#[derive(Debug)]
+struct LocalRateLimitSnapshot {
+    buckets: Vec<AccountRateLimitBucketView>,
+    observed_at: i64,
+}
+
+/// Codex ecrit la mesure de quota effectivement appliquee a chaque tour dans
+/// ses rollouts. Cette mesure est indispensable en secours : certaines
+/// versions de `account/rateLimits/read` peuvent renvoyer momentanement une
+/// nouvelle fenetre vide (`0 %`) alors qu'une session active recoit encore la
+/// vraie consommation du compte.
+fn read_local_rate_limit_snapshot(
+    account: &AccountProfile,
+) -> Result<Option<LocalRateLimitSnapshot>, String> {
+    let codex_home = expand_home(&account.codex_home)?;
+    let mut files = Vec::new();
+    collect_rate_limit_rollouts(&codex_home.join("sessions"), &mut files);
+    collect_rate_limit_rollouts(&codex_home.join("sessions-archive"), &mut files);
+
+    let mut latest = None;
+    for path in files {
+        let Some(snapshot) = scan_rollout_rate_limit_snapshot(&path) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .map(|current: &LocalRateLimitSnapshot| snapshot.observed_at > current.observed_at)
+            .unwrap_or(true)
+        {
+            latest = Some(snapshot);
+        }
+    }
+
+    Ok(latest)
+}
+
+fn collect_rate_limit_rollouts(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rate_limit_rollouts(&path, files);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            .unwrap_or(false)
+        {
+            files.push(path);
+        }
+    }
+}
+
+fn scan_rollout_rate_limit_snapshot(path: &Path) -> Option<LocalRateLimitSnapshot> {
+    let file = fs::File::open(path).ok()?;
+    let fallback_timestamp = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let mut latest = None;
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("\"rate_limits\"") && !line.contains("\"rateLimits\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(limit) = value
+            .pointer("/payload/rate_limits")
+            .or_else(|| value.pointer("/payload/rateLimits"))
+            .filter(|limit| !limit.is_null())
+        else {
+            continue;
+        };
+
+        let mut buckets = Vec::new();
+        collect_rate_limit_object(limit, &mut buckets);
+        normalize_rate_limit_buckets(&mut buckets);
+        if buckets.is_empty() {
+            continue;
+        }
+
+        let observed_at = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+            .map(|timestamp| timestamp.timestamp())
+            .unwrap_or(fallback_timestamp);
+        if latest
+            .as_ref()
+            .map(|current: &LocalRateLimitSnapshot| observed_at > current.observed_at)
+            .unwrap_or(true)
+        {
+            latest = Some(LocalRateLimitSnapshot {
+                buckets,
+                observed_at,
+            });
+        }
+    }
+
+    latest
+}
+
+fn valid_local_rate_limit_buckets(
+    buckets: &[AccountRateLimitBucketView],
+    now: i64,
+) -> Vec<AccountRateLimitBucketView> {
+    let mut valid = buckets
+        .iter()
+        .filter(|bucket| bucket.resets_at > now)
+        .cloned()
+        .collect::<Vec<_>>();
+    normalize_rate_limit_buckets(&mut valid);
+    valid
+}
+
+/// Fusion monotone : tant que la fenetre locale n'est pas expiree, une lecture
+/// reseau a 0 % ne doit jamais effacer une consommation positive observee par
+/// une vraie session Codex. Les nouvelles fenetres absentes de la reponse
+/// serveur (notamment la fenetre courte) sont egalement conservees.
+fn merge_rate_limit_buckets(
+    mut server_buckets: Vec<AccountRateLimitBucketView>,
+    local_buckets: Option<&[AccountRateLimitBucketView]>,
+    now: i64,
+) -> (Vec<AccountRateLimitBucketView>, bool) {
+    let mut used_local_snapshot = false;
+
+    for local in local_buckets
+        .into_iter()
+        .flatten()
+        .filter(|bucket| bucket.resets_at > now)
+    {
+        let matching = server_buckets.iter().position(|server| {
+            server.limit_id == local.limit_id
+                && server.bucket == local.bucket
+                && server.window_duration_mins == local.window_duration_mins
+        });
+        match matching {
+            Some(index) => {
+                let server_used = server_buckets[index].used_percent.unwrap_or(-1.0);
+                let local_used = local.used_percent.unwrap_or(-1.0);
+                if local_used > server_used {
+                    server_buckets[index] = local.clone();
+                    used_local_snapshot = true;
+                }
+            }
+            None => {
+                server_buckets.push(local.clone());
+                used_local_snapshot = true;
+            }
+        }
+    }
+
+    normalize_rate_limit_buckets(&mut server_buckets);
+    (server_buckets, used_local_snapshot)
+}
+
 fn read_server_rate_limits(
     account: &AccountProfile,
     settings: &AppSettings,
@@ -2133,6 +2447,12 @@ fn read_server_rate_limits(
         .get("result")
         .ok_or_else(|| "reponse app-server sans result".to_string())?;
     let mut buckets = extract_rate_limit_buckets(result);
+    normalize_rate_limit_buckets(&mut buckets);
+
+    Ok(buckets)
+}
+
+fn normalize_rate_limit_buckets(buckets: &mut Vec<AccountRateLimitBucketView>) {
     buckets.sort_by(|a, b| {
         (
             a.limit_id.as_str(),
@@ -2153,8 +2473,6 @@ fn read_server_rate_limits(
             && a.window_duration_mins == b.window_duration_mins
             && a.resets_at == b.resets_at
     });
-
-    Ok(buckets)
 }
 
 fn codex_app_server_command(settings: &AppSettings) -> Command {
@@ -2200,11 +2518,18 @@ fn proxy_url_for_account(account: &AccountProfile, settings: &AppSettings) -> Op
 fn extract_rate_limit_buckets(result: &Value) -> Vec<AccountRateLimitBucketView> {
     let mut buckets = Vec::new();
 
-    if let Some(limit) = result.get("rateLimits") {
+    if let Some(limit) = result
+        .get("rateLimits")
+        .or_else(|| result.get("rate_limits"))
+    {
         collect_rate_limit_object(limit, &mut buckets);
     }
 
-    if let Some(map) = result.get("rateLimitsByLimitId").and_then(Value::as_object) {
+    if let Some(map) = result
+        .get("rateLimitsByLimitId")
+        .or_else(|| result.get("rate_limits_by_limit_id"))
+        .and_then(Value::as_object)
+    {
         for limit in map.values() {
             collect_rate_limit_object(limit, &mut buckets);
         }
@@ -2216,19 +2541,23 @@ fn extract_rate_limit_buckets(result: &Value) -> Vec<AccountRateLimitBucketView>
 fn collect_rate_limit_object(limit: &Value, buckets: &mut Vec<AccountRateLimitBucketView>) {
     let limit_id = limit
         .get("limitId")
+        .or_else(|| limit.get("limit_id"))
         .and_then(Value::as_str)
         .unwrap_or("codex")
         .to_string();
     let limit_name = limit
         .get("limitName")
+        .or_else(|| limit.get("limit_name"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
     let reached_type = limit
         .get("rateLimitReachedType")
+        .or_else(|| limit.get("rate_limit_reached_type"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
     let plan_type = limit
         .get("planType")
+        .or_else(|| limit.get("plan_type"))
         .and_then(Value::as_str)
         .map(ToString::to_string);
 
@@ -2240,11 +2569,18 @@ fn collect_rate_limit_object(limit: &Value, buckets: &mut Vec<AccountRateLimitBu
             continue;
         }
 
-        let Some(window_duration_mins) = bucket.get("windowDurationMins").and_then(Value::as_i64)
+        let Some(window_duration_mins) = bucket
+            .get("windowDurationMins")
+            .or_else(|| bucket.get("window_minutes"))
+            .and_then(Value::as_i64)
         else {
             continue;
         };
-        let Some(resets_at) = bucket.get("resetsAt").and_then(Value::as_i64) else {
+        let Some(resets_at) = bucket
+            .get("resetsAt")
+            .or_else(|| bucket.get("resets_at"))
+            .and_then(Value::as_i64)
+        else {
             continue;
         };
 
@@ -2254,7 +2590,10 @@ fn collect_rate_limit_object(limit: &Value, buckets: &mut Vec<AccountRateLimitBu
             bucket: bucket_name.to_string(),
             window_duration_mins,
             resets_at,
-            used_percent: bucket.get("usedPercent").and_then(json_f64),
+            used_percent: bucket
+                .get("usedPercent")
+                .or_else(|| bucket.get("used_percent"))
+                .and_then(json_f64),
             rate_limit_reached_type: reached_type.clone(),
             plan_type: plan_type.clone(),
         });

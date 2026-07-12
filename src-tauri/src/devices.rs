@@ -315,8 +315,7 @@ impl DeviceStore {
         let mut state = self.state.lock().ok()?;
         let device = state.devices.iter_mut().find(|d| {
             !d.revoked
-                && d
-                    .session
+                && d.session
                     .as_ref()
                     .map(|s| {
                         s.access_expires_at > ts
@@ -349,8 +348,7 @@ impl DeviceStore {
                 .iter_mut()
                 .find(|d| {
                     !d.revoked
-                        && d
-                            .session
+                        && d.session
                             .as_ref()
                             .map(|s| {
                                 s.refresh_expires_at > ts
@@ -548,9 +546,13 @@ mod tests {
     fn pairing_then_claim_yields_working_session() {
         let store = temp_store();
         let challenge = store.create_pairing_code("Pixel 8", &scopes()).unwrap();
-        let session = store.claim_pairing_code(&challenge.code, "Pixel 8").unwrap();
+        let session = store
+            .claim_pairing_code(&challenge.code, "Pixel 8")
+            .unwrap();
 
-        let ctx = store.verify_access(&session.access_token).expect("access ok");
+        let ctx = store
+            .verify_access(&session.access_token)
+            .expect("access ok");
         assert_eq!(ctx.device_id, session.device_id);
         assert!(ctx.has_scope("terminal:control"));
         assert!(!ctx.has_scope("approval:respond"));
@@ -620,7 +622,9 @@ mod tests {
         let challenge = store.create_pairing_code("dev", &scopes()).unwrap();
         let session = store.claim_pairing_code(&challenge.code, "dev").unwrap();
 
-        let ticket = store.mint_ws_ticket(&session.device_id, "terminal-42").unwrap();
+        let ticket = store
+            .mint_ws_ticket(&session.device_id, "terminal-42")
+            .unwrap();
         // Mauvaise cible -> refusé.
         assert!(store.consume_ws_ticket(&ticket, "terminal-99").is_err());
         // Bonne cible -> ok.
@@ -657,7 +661,9 @@ mod tests {
         }
         // Réouverture depuis le disque.
         let reopened = DeviceStore::open(path);
-        let ctx = reopened.verify_access(&access_token).expect("session persistée");
+        let ctx = reopened
+            .verify_access(&access_token)
+            .expect("session persistée");
         assert_eq!(ctx.device_id, device_id);
     }
 

@@ -527,7 +527,9 @@ fn claude_usage_total(usage: &Value) -> u64 {
 /// Un `fork` utilisateur (`codex fork`) reste `thread_source == "user"` et porte
 /// son propre `session_id` : il n'est donc jamais capte par ce filtre.
 fn is_subagent_rollout(meta: &Value) -> bool {
-    meta.pointer("/payload/thread_source").and_then(Value::as_str) == Some("subagent")
+    meta.pointer("/payload/thread_source")
+        .and_then(Value::as_str)
+        == Some("subagent")
         || matches!(
             meta.pointer("/payload/parent_thread_id").and_then(Value::as_str),
             Some(parent) if !parent.is_empty()
@@ -764,7 +766,12 @@ pub async fn claim_session_for_terminal(
     match_session_id: Option<String>,
 ) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        claim_session_for_account(account_id, after_unix, exclude_session_ids, match_session_id)
+        claim_session_for_account(
+            account_id,
+            after_unix,
+            exclude_session_ids,
+            match_session_id,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1045,17 +1052,17 @@ pub fn move_discussion_for_account(
 
     let workspace_path = workspace_path.trim();
     if workspace_path.is_empty() {
-        return Err("Le workspace cible est vide".to_string());
+        return Err("Le dossier cible est vide".to_string());
     }
     if workspace_path.len() > 4096 {
-        return Err("Le chemin du workspace est trop long".to_string());
+        return Err("Le chemin du dossier est trop long".to_string());
     }
     let workspace = Path::new(workspace_path);
     if !workspace.is_absolute() {
-        return Err("Le workspace cible doit etre un chemin absolu".to_string());
+        return Err("Le dossier cible doit etre un chemin absolu".to_string());
     }
     if !workspace.is_dir() {
-        return Err(format!("Workspace introuvable: {workspace_path}"));
+        return Err(format!("Dossier introuvable: {workspace_path}"));
     }
 
     let settings = settings::load_settings_for_terminal()?;
@@ -1101,7 +1108,10 @@ fn move_codex_discussion_impl(
         }
     }
     if rewrites.is_empty() {
-        return Err("Aucun rollout utilisateur deplacable".to_string());
+        return scan_codex_discussions(&home, account)
+            .into_iter()
+            .find(|summary| summary.session_id == session_id || summary.rollout_id == session_id)
+            .ok_or_else(|| "Aucun rollout utilisateur deplacable".to_string());
     }
 
     for index in 0..rewrites.len() {
@@ -1145,6 +1155,9 @@ fn rewrite_codex_rollout_cwd(
         .get_mut("payload")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| "Payload session_meta invalide".to_string())?;
+    if payload.get("cwd").and_then(Value::as_str) == Some(workspace_path) {
+        return Ok(None);
+    }
     payload.insert("cwd".to_string(), Value::String(workspace_path.to_string()));
     let line0 = serde_json::to_string(&meta).map_err(|error| error.to_string())?;
     Ok(Some(match rest {
@@ -1181,7 +1194,7 @@ fn move_claude_discussion_impl(
         fs::create_dir_all(&destination_dir).map_err(|error| error.to_string())?;
         if destination.exists() {
             return Err(
-                "Une conversation de meme identite existe deja dans ce workspace".to_string(),
+                "Une conversation de meme identite existe deja dans ce dossier".to_string(),
             );
         }
 
@@ -1304,7 +1317,9 @@ pub fn delete_discussion_for_account(
         .ok_or_else(|| "Compte introuvable".to_string())?;
 
     match account.provider {
-        settings::Provider::Codex => delete_discussion_impl(account.codex_home, session_id, archive),
+        settings::Provider::Codex => {
+            delete_discussion_impl(account.codex_home, session_id, archive)
+        }
         settings::Provider::Claude => {
             delete_claude_discussion_impl(account.codex_home, session_id, archive)
         }
@@ -1438,6 +1453,22 @@ fn find_all_rollouts_for(sessions_dir: &Path, id: &str) -> Vec<PathBuf> {
     collect_rollouts(sessions_dir, &mut files);
 
     let suffix = format!("-{id}.jsonl");
+    // `id` peut etre l'identite logique partagee OU l'id de n'importe quel
+    // rollout de la chaine (notamment celui conserve par un terminal repris).
+    // Dans ce second cas, remonte d'abord au session_id logique pour inclure
+    // tous les forks de la discussion.
+    let logical_id = files
+        .iter()
+        .find(|file| {
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(&suffix))
+                .unwrap_or(false)
+        })
+        .and_then(|file| line0_session_id(file))
+        .filter(|session_id| is_uuid_shaped(session_id))
+        .unwrap_or_else(|| id.to_string());
+
     files
         .into_iter()
         .filter(|file| {
@@ -1446,7 +1477,7 @@ fn find_all_rollouts_for(sessions_dir: &Path, id: &str) -> Vec<PathBuf> {
                 .and_then(|name| name.to_str())
                 .map(|name| name.ends_with(&suffix))
                 .unwrap_or(false);
-            by_name || line0_session_id(file).as_deref() == Some(id)
+            by_name || line0_session_id(file).as_deref() == Some(logical_id.as_str())
         })
         .collect()
 }
@@ -2423,7 +2454,10 @@ mod tests {
             head.rollout_id, parent_uuid,
             "la cible de reprise doit etre le thread utilisateur, pas le sous-agent"
         );
-        assert_eq!(head.fork_count, 1, "le sous-agent ne doit pas gonfler le compte");
+        assert_eq!(
+            head.fork_count, 1,
+            "le sous-agent ne doit pas gonfler le compte"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -2446,7 +2480,10 @@ mod tests {
 
         let mut out = Vec::new();
         scan_prompt_file(&sub, &account, &mut out);
-        assert!(out.is_empty(), "les prompts d'un sous-agent doivent etre ignores");
+        assert!(
+            out.is_empty(),
+            "les prompts d'un sous-agent doivent etre ignores"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2684,6 +2721,39 @@ mod tests {
         let mut archived = Vec::new();
         collect_rollouts(&home.join("sessions-archive"), &mut archived);
         assert_eq!(archived.len(), 3, "3 rollouts archives");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_from_an_old_rollout_archives_the_whole_discussion() {
+        let base = fresh_dir();
+        let home = base.join("home");
+        let sessions = home.join("sessions").join("2026").join("07").join("07");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let sid = "019f4bb2-0000-7000-8000-000000000011";
+        let old_rollout = "019f4bbc-0000-7000-8000-0000000000cc";
+        let current_rollout = "019f4bbc-0000-7000-8000-0000000000dd";
+        for (i, file_uuid) in [sid, old_rollout, current_rollout].iter().enumerate() {
+            let name = format!("rollout-2026-07-07T17-11-2{i}-{file_uuid}.jsonl");
+            let content = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{sid}\",\"id\":\"{file_uuid}\"}}}}\n"
+            );
+            fs::write(sessions.join(name), content).unwrap();
+        }
+
+        let result = delete_discussion_impl(
+            home.to_string_lossy().to_string(),
+            old_rollout.to_string(),
+            true,
+        )
+        .expect("archive from an old rollout should succeed");
+        assert_eq!(result.count, 3, "toute la chaine doit etre archivee");
+
+        let mut remaining = Vec::new();
+        collect_rollouts(&home.join("sessions"), &mut remaining);
+        assert!(remaining.is_empty(), "aucun fork ne doit rester actif");
 
         let _ = fs::remove_dir_all(&base);
     }

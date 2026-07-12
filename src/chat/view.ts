@@ -37,6 +37,13 @@ export type ChatSelectOption = {
   label: string;
 };
 
+export type ChatQuotaSuggestion = {
+  accountId: string;
+  accountLabel: string;
+  remainingPercent: number;
+  busy: boolean;
+};
+
 export type ChatSyncState =
   | "connecting"
   | "live"
@@ -57,6 +64,7 @@ export type ChatPanelModel = {
   activities: ChatActivity[];
   turnStatus: ChatTurnStatus;
   turnError: string | null;
+  quotaSuggestion: ChatQuotaSuggestion | null;
   accounts: ChatAccountOption[];
   selectedAccountId: string;
   selectedModel: string;
@@ -74,8 +82,9 @@ export type ChatPanelModel = {
 export type ChatPanelRenderOptions = {
   instanceId?: string;
   paneIndex?: number;
-  closeable?: boolean;
   active?: boolean;
+  compact?: boolean;
+  fullscreen?: boolean;
 };
 
 export const chatSyncLabel = (state: ChatSyncState): string => {
@@ -159,7 +168,7 @@ const renderWelcome = (): string => `
   <div class="chat-welcome">
     <span class="chat-welcome-mark"><i data-lucide="sparkles"></i></span>
     <h1>Que voulez-vous construire ?</h1>
-    <p>Decrivez le resultat attendu. L'agent explore le workspace, modifie les fichiers et vous repond ici.</p>
+    <p>Decrivez le resultat attendu. L'agent explore l'environnement, modifie les fichiers et vous repond ici.</p>
     <div class="chat-starters">
       <button type="button" data-chat-starter="Analyse ce projet et explique-moi clairement son architecture.">
         <strong>Comprendre le projet</strong><span>Architecture, flux et points d'entree</span>
@@ -199,22 +208,31 @@ export const renderChatFeedInner = (model: ChatPanelModel, instanceId = ""): str
   const thinking = shouldShowThinking
     ? `<article class="chat-msg chat-msg--assistant chat-msg--thinking">
         <div class="chat-msg-meta"><span class="chat-msg-avatar assistant">S</span><span class="chat-msg-role">${escapeHtml(model.providerLabel || "Assistant")}</span></div>
-        <div class="chat-thinking"><span></span><span></span><span></span><em>travaille dans le workspace</em></div>
+        <div class="chat-thinking"><span></span><span></span><span></span><em>travaille dans l'environnement</em></div>
       </article>`
     : "";
   const turnError = model.turnError
     ? `<div class="chat-error chat-turn-error">${escapeHtml(model.turnError)}</div>`
     : "";
-  return notice + messages + renderActivities(model.activities) + thinking + turnError;
+  const quotaSuggestion = model.quotaSuggestion
+    ? `<div class="chat-quota-suggestion">
+        <span>
+          <strong>${escapeHtml(model.quotaSuggestion.accountLabel)}</strong> est le compte compatible
+          qui possède le plus de quota (${Math.round(model.quotaSuggestion.remainingPercent)} % disponible).
+        </span>
+        <button
+          type="button"
+          class="tool-button primary"
+          data-chat-action="quota-switch"
+          data-quota-account="${escapeHtml(model.quotaSuggestion.accountId)}"
+          ${model.quotaSuggestion.busy ? "disabled" : ""}
+        >
+          ${model.quotaSuggestion.busy ? "Déplacement…" : "Déplacer + continuer"}
+        </button>
+      </div>`
+    : "";
+  return notice + messages + renderActivities(model.activities) + thinking + turnError + quotaSuggestion;
 };
-
-const accountOptions = (model: ChatPanelModel): string =>
-  model.accounts
-    .map(
-      (account) =>
-        `<option value="${escapeHtml(account.id)}" ${account.id === model.selectedAccountId ? "selected" : ""}>${escapeHtml(account.label)} · ${escapeHtml(account.providerLabel)}</option>`,
-    )
-    .join("");
 
 const modelSuggestions = (model: ChatPanelModel): string =>
   Array.from(new Set([model.selectedModel, ...model.modelSuggestions].filter(Boolean)))
@@ -278,38 +296,43 @@ export const renderChatPanel = (
   const userMessageCount = model.messages.filter((message) => message.role === "user").length;
   const instanceId = (options.instanceId ?? "").replace(/[^a-zA-Z0-9_-]/g, "-");
   const id = (base: string) => instanceId ? `${base}-${instanceId}` : base;
+  const compact = options.compact === true;
+  const fullscreen = options.fullscreen === true;
   const expertClass = instanceId
-    ? `chat-panel--expert ${options.active ? "active" : ""}`
+    ? `chat-panel--expert ${options.active ? "active" : ""} ${compact ? "chat-panel--compact" : ""} ${fullscreen ? "is-fullscreen" : ""}`
     : "";
   return `
   <section id="${id("chatPanel")}" data-chat-panel="${instanceId}" class="chat-panel ${expertClass} ${model.newConversation ? "chat-panel--new" : ""} ${model.historyOpen ? "chat-panel--history" : ""}">
     <header class="chat-head">
-      <button id="${id("chatBack")}" data-chat-action="back" class="icon-button wide" title="Toutes les conversations" aria-label="Toutes les conversations">
+      ${compact ? "" : `<button id="${id("chatBack")}" data-chat-action="back" class="icon-button wide" title="Toutes les conversations" aria-label="Toutes les conversations">
         <i data-lucide="arrow-left"></i>
-      </button>
-      ${options.paneIndex ? `<span class="expert-chat-pane-index" title="Chat ${options.paneIndex}">${options.paneIndex}</span>` : ""}
+      </button>`}
+      ${!compact && options.paneIndex ? `<span class="expert-chat-pane-index" title="Chat ${options.paneIndex}">${options.paneIndex}</span>` : ""}
       <div class="chat-head-main">
         <strong class="chat-title" title="${escapeHtml(model.title)}">${escapeHtml(model.title)}</strong>
-        <span id="${id("chatSubtitle")}" data-chat-control="subtitle" class="chat-sub">${escapeHtml(model.subtitle)}</span>
+        ${compact ? "" : `<span id="${id("chatSubtitle")}" data-chat-control="subtitle" class="chat-sub">${escapeHtml(model.subtitle)}</span>`}
       </div>
       <div class="chat-head-actions">
-        <span id="${id("chatSync")}" data-chat-control="sync" class="chat-sync chat-sync--${model.syncState}" aria-live="polite">
+        ${compact ? "" : `<span id="${id("chatSync")}" data-chat-control="sync" class="chat-sync chat-sync--${model.syncState}" aria-live="polite">
           <span class="chat-sync-dot" aria-hidden="true"></span>
           <span data-chat-sync-label>${escapeHtml(chatSyncLabel(model.syncState))}</span>
         </span>
         <span class="chat-provider">${escapeHtml(model.providerLabel)}</span>
+        <button id="${id("chatResume")}" type="button" data-open-discussions class="tool-button chat-resume-button" title="Choisir une discussion a reprendre" aria-label="Reprendre une discussion">
+          <i data-lucide="messages-square"></i><span>Reprendre une discussion</span>
+        </button>
         <button id="${id("chatHistoryToggle")}" data-chat-action="history-toggle" class="tool-button chat-history-button ${model.historyOpen ? "primary" : ""}" title="Afficher les messages envoyes dans ce chat" aria-label="Historique de ce chat" aria-expanded="${model.historyOpen}">
           <i data-lucide="history"></i><span>Historique</span><small>${userMessageCount}</small>
         </button>
-        <button id="${id("chatRefresh")}" data-chat-action="refresh" class="icon-button wide" title="Actualiser" aria-label="Actualiser">
-          <i data-lucide="refresh-ccw"></i>
-        </button>
-        <button id="${id("chatNew")}" data-chat-action="new" class="tool-button primary chat-new-button" title="Nouvelle conversation">
+         <button id="${id("chatRefresh")}" data-chat-action="refresh" class="icon-button wide" title="Actualiser" aria-label="Actualiser">
+           <i data-lucide="refresh-ccw"></i>
+         </button>`}
+        ${compact && fullscreen ? `<button id="${id("chatHistoryToggle")}" data-chat-action="history-toggle" class="tool-button chat-history-button ${model.historyOpen ? "primary" : ""}" title="Afficher les messages envoyes dans ce chat" aria-label="Historique de ce chat" aria-expanded="${model.historyOpen}">
+          <i data-lucide="history"></i><span>Historique</span><small>${userMessageCount}</small>
+        </button>` : ""}
+        ${compact ? "" : `<button id="${id("chatNew")}" data-chat-action="new" class="tool-button primary chat-new-button" title="Nouvelle conversation">
           <i data-lucide="plus"></i><span>Nouveau chat</span>
-        </button>
-        ${options.closeable
-          ? `<button id="${id("chatClose")}" data-chat-action="close" class="icon-button wide expert-chat-close" title="${running ? "Arretez la reponse avant de fermer ce chat" : "Fermer ce chat"}" aria-label="Fermer ce chat" ${running ? "disabled" : ""}><i data-lucide="x"></i></button>`
-          : ""}
+        </button>`}
       </div>
     </header>
     <div class="chat-conversation-body">
@@ -321,12 +344,6 @@ export const renderChatPanel = (
         <textarea id="${id("chatPrompt")}" data-chat-control="prompt" rows="1" placeholder="Demandez a ${escapeHtml(model.providerLabel || "l'agent")} de construire quelque chose…" ${running ? "disabled" : ""}>${escapeHtml(model.draft)}</textarea>
         <div class="chat-composer-toolbar">
           <div class="chat-composer-context">
-            <label class="chat-account-select" title="Compte utilise pour cette conversation">
-              <i data-lucide="bot"></i>
-              <select id="${id("chatAccount")}" data-chat-control="account" ${running || !model.newConversation ? "disabled" : ""} aria-label="Compte agent">
-                ${accountOptions(model)}
-              </select>
-            </label>
             <label class="chat-mode-select" title="Mode de travail">
               <i data-lucide="sparkles"></i>
               <select id="${id("chatMode")}" data-chat-control="mode" ${running ? "disabled" : ""} aria-label="Mode de travail">

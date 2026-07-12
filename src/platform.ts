@@ -1,6 +1,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { TerminalInputBuffer, terminalTransportErrorMessage } from "./terminal-transport";
 
 export type UnlistenFn = () => void;
 
@@ -63,7 +64,7 @@ type ClientStartupConfig = {
   token?: string | null;
 };
 
-type AndroidBridge = {
+type MobileBridge = {
   getBaseUrl?: () => string;
   getToken?: () => string;
   setConfig?: (baseUrl: string, token: string) => void;
@@ -78,6 +79,13 @@ const REMOTE_NODES_KEY = "codex-switch-terminal.remote.nodes";
 const listeners = new Map<string, Set<Listener<any>>>();
 const remoteSockets = new Map<number, WebSocket>();
 const remoteTerminalRoutes = new Map<number, RemoteTerminalRoute>();
+const remoteStartingTerminals = new Set<number>();
+const remotePendingTerminalInput = new TerminalInputBuffer();
+const remoteTerminalReconnectTimers = new Map<number, number>();
+const remoteTerminalReconnectAttempts = new Map<number, number>();
+const remoteStoppingTerminals = new Set<number>();
+
+const REMOTE_TERMINAL_MAX_RECONNECTS = 6;
 
 const viteRemoteBase =
   (typeof import.meta !== "undefined" && import.meta.env?.VITE_CST_API_BASE_URL
@@ -110,13 +118,17 @@ export const remoteNodesText = () =>
 
 export const hasRemoteAuth = () => !isRemoteMode() || remoteToken().length > 0;
 
-const androidBridge = (): AndroidBridge | null => {
+const mobileBridge = (): MobileBridge | null => {
   if (typeof window === "undefined") return null;
-  return ((window as Window & { CstAndroid?: AndroidBridge }).CstAndroid ?? null);
+  const nativeWindow = window as Window & {
+    CstAndroid?: MobileBridge;
+    CstIOS?: MobileBridge;
+  };
+  return nativeWindow.CstIOS ?? nativeWindow.CstAndroid ?? null;
 };
 
-const readAndroidBridgeConfig = () => {
-  const bridge = androidBridge();
+const readMobileBridgeConfig = () => {
+  const bridge = mobileBridge();
   if (!bridge) return null;
 
   try {
@@ -145,21 +157,21 @@ export const saveRemoteConfig = (baseUrl: string, token: string, nodesText?: str
   }
 
   try {
-    androidBridge()?.setConfig?.(normalizedBaseUrl, normalizedToken);
+    mobileBridge()?.setConfig?.(normalizedBaseUrl, normalizedToken);
   } catch {
-    // The Android bridge is optional; localStorage remains the source of truth for web.
+    // Les ponts Android/iOS sont optionnels ; localStorage reste la source web.
   }
 };
 
 export const initializePlatform = async () => {
-  const androidConfig = readAndroidBridgeConfig();
-  if (androidConfig?.baseUrl || androidConfig?.token) {
+  const mobileConfig = readMobileBridgeConfig();
+  if (mobileConfig?.baseUrl || mobileConfig?.token) {
     localStorage.setItem(REMOTE_ENABLED_KEY, "1");
-    if (androidConfig.baseUrl) {
-      localStorage.setItem(REMOTE_BASE_URL_KEY, androidConfig.baseUrl.replace(/\/+$/, ""));
+    if (mobileConfig.baseUrl) {
+      localStorage.setItem(REMOTE_BASE_URL_KEY, mobileConfig.baseUrl.replace(/\/+$/, ""));
     }
-    if (androidConfig.token) {
-      localStorage.setItem(REMOTE_TOKEN_KEY, androidConfig.token);
+    if (mobileConfig.token) {
+      localStorage.setItem(REMOTE_TOKEN_KEY, mobileConfig.token);
     }
   }
 
@@ -167,7 +179,13 @@ export const initializePlatform = async () => {
 
   try {
     const config = await tauriInvoke<ClientStartupConfig>("client_startup_config");
-    if (!config.remoteMode) return;
+    if (!config.remoteMode) {
+      // L'application locale et l'application Cloud partagent le meme profil
+      // WebView. Un ancien lancement Cloud ne doit pas forcer les lancements
+      // locaux suivants a continuer d'utiliser fetch() vers ce serveur.
+      localStorage.removeItem(REMOTE_ENABLED_KEY);
+      return;
+    }
 
     localStorage.setItem(REMOTE_ENABLED_KEY, "1");
     if (config.baseUrl?.trim()) {
@@ -183,6 +201,11 @@ export const initializePlatform = async () => {
 
 export const clearRemoteConfig = () => {
   localStorage.removeItem(REMOTE_TOKEN_KEY);
+  try {
+    mobileBridge()?.setConfig?.(remoteBaseUrl(), "");
+  } catch {
+    // La deconnexion web reste effective meme si le pont natif est indisponible.
+  }
 };
 
 const tauriWindow = isTauriRuntime() ? getCurrentWindow() : null;
@@ -442,7 +465,7 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       resizeRemoteTerminal(args.id, args.cols, args.rows);
       return undefined as T;
     case "stop_terminal":
-      stopRemoteTerminal(args.id);
+      await stopRemoteTerminal(args.id);
       return undefined as T;
     case "pick_project_dir":
       return null as T;
@@ -516,19 +539,23 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         archive: args.archive,
       });
     case "room_status":
-      return api<T>("GET", "/api/room/status");
-    case "room_messages":
       return api<T>(
         "GET",
-        `/api/room/messages${args.since ? `?since=${encodeURIComponent(args.since)}` : ""}`,
+        `/api/room/status${args.workspacePath ? `?workspacePath=${encodeURIComponent(args.workspacePath)}` : ""}`,
       );
+    case "room_messages":
+      {
+        const query = new URLSearchParams();
+        if (args.since) query.set("since", String(args.since));
+        if (args.workspacePath) query.set("workspacePath", String(args.workspacePath));
+        return api<T>("GET", `/api/room/messages${query.size ? `?${query}` : ""}`);
+      }
     case "room_send":
-      return api<T>("POST", "/api/room/send", { text: args.text, to: args.to ?? null });
-    // En SaaS le salon est toujours actif (monte dans le serveur) : enable/disable
-    // cote client sont des no-op qui renvoient l'etat courant.
-    case "room_enable":
-    case "room_disable":
-      return api<T>("GET", "/api/room/status");
+      return api<T>("POST", "/api/room/send", {
+        text: args.text,
+        to: args.to ?? null,
+        workspacePath: args.workspacePath ?? null,
+      });
     default:
       throw new Error(`Commande remote non supportee: ${command}`);
   }
@@ -696,6 +723,9 @@ async function pickRemotePoolAccount<T>() {
 }
 
 async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
+  const requestedId = Number(args.id);
+  if (Number.isFinite(requestedId)) remoteStartingTerminals.add(requestedId);
+
   const payload = {
     id: args.id,
     accountId: args.accountId,
@@ -707,43 +737,74 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
     command: args.command,
     agentId: args.agentId,
   };
-  const candidates = await terminalNodeCandidates();
   let lastError: unknown = null;
 
-  for (const route of candidates) {
-    try {
-      const response = await apiAt<RemoteStartResponse>(route, "POST", "/api/terminals", payload);
-      remoteTerminalRoutes.set(response.id, route);
-      emit("pty-data", {
-        id: response.id,
-        data: `\r\n[Route] Terminal sur ${route.label} (${route.baseUrl})\r\n`,
-      });
-      openTerminalSocket(response.id, route);
-      return response.id as T;
-    } catch (error) {
-      lastError = error;
+  try {
+    const candidates = await terminalNodeCandidates();
+    for (const route of candidates) {
+      try {
+        const response = await apiAt<RemoteStartResponse>(route, "POST", "/api/terminals", payload);
+        if (Number.isFinite(requestedId) && requestedId !== response.id) {
+          movePendingTerminalInput(requestedId, response.id);
+        }
+        remoteTerminalRoutes.set(response.id, route);
+        emit("pty-data", {
+          id: response.id,
+          data: `\r\n[Route] Terminal sur ${route.label} (${route.baseUrl})\r\n`,
+        });
+        openTerminalSocket(response.id, route);
+        return response as T;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError ?? new Error("Aucun noeud terminal disponible.");
+  } finally {
+    if (Number.isFinite(requestedId)) {
+      remoteStartingTerminals.delete(requestedId);
+      if (!remoteTerminalRoutes.has(requestedId)) remotePendingTerminalInput.clear(requestedId);
     }
   }
-
-  throw lastError ?? new Error("Aucun noeud terminal disponible.");
 }
 
 function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute()) {
-  remoteSockets.get(id)?.close();
+  clearRemoteTerminalReconnectTimer(id);
+  const previous = remoteSockets.get(id);
+  if (previous && previous.readyState !== WebSocket.CLOSED) previous.close();
+
   const base = route.baseUrl;
   const wsBase = base.startsWith("https://")
     ? base.replace(/^https:\/\//, "wss://")
     : base.replace(/^http:\/\//, "ws://");
-  const socket = new WebSocket(`${wsBase}/ws/terminals/${id}?token=${encodeURIComponent(route.token)}`);
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(`${wsBase}/ws/terminals/${id}?token=${encodeURIComponent(route.token)}`);
+  } catch (error) {
+    emitTerminalTransportError(id, route, error);
+    scheduleRemoteTerminalReconnect(id, route);
+    return;
+  }
   remoteSockets.set(id, socket);
 
+  socket.addEventListener("open", () => {
+    if (remoteSockets.get(id) !== socket) return;
+    remoteTerminalReconnectAttempts.delete(id);
+    const pending = takePendingTerminalInput(id);
+    if (pending) socket.send(JSON.stringify({ type: "input", data: pending }));
+  });
+
   socket.addEventListener("message", (event) => {
+    if (remoteSockets.get(id) !== socket) return;
     const message = JSON.parse(String(event.data)) as RemoteWsMessage;
     if (message.type === "data") {
       emit("pty-data", { id: message.id, data: message.data });
     } else if (message.type === "exit") {
       remoteSockets.delete(message.id);
       remoteTerminalRoutes.delete(message.id);
+      clearRemoteTerminalReconnectTimer(message.id);
+      remoteTerminalReconnectAttempts.delete(message.id);
+      remotePendingTerminalInput.clear(message.id);
       emit("pty-exit", { id: message.id });
     } else if (message.type === "error") {
       emit("pty-data", { id: message.id, data: `\r\n${message.message}\r\n` });
@@ -755,7 +816,18 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
   });
 
   socket.addEventListener("close", () => {
+    if (remoteSockets.get(id) !== socket) return;
     remoteSockets.delete(id);
+    if (remoteStoppingTerminals.has(id) || !remoteTerminalRoutes.has(id)) return;
+    scheduleRemoteTerminalReconnect(id, route);
+  });
+
+  socket.addEventListener("error", () => {
+    try {
+      socket.close();
+    } catch {
+      scheduleRemoteTerminalReconnect(id, route);
+    }
   });
 }
 
@@ -765,9 +837,23 @@ function writeRemoteTerminal(id: number, data: string) {
     socket.send(JSON.stringify({ type: "input", data }));
     return;
   }
+
+  if (socket?.readyState === WebSocket.CONNECTING || remoteStartingTerminals.has(id)) {
+    queuePendingTerminalInput(id, data);
+    return;
+  }
+
   const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
   void apiAt(route, "POST", `/api/terminals/${id}/write`, { data }).catch((error) => {
-    emit("pty-data", { id, data: `\r\n${String(error)}\r\n` });
+    const message = terminalTransportErrorMessage(route.baseUrl, error);
+    emit("pty-data", { id, data: `\r\n${message}\r\n` });
+    if (/session terminal introuvable/i.test(String(error))) {
+      remoteTerminalRoutes.delete(id);
+      clearRemoteTerminalReconnectTimer(id);
+      remoteTerminalReconnectAttempts.delete(id);
+      remotePendingTerminalInput.clear(id);
+      emit("pty-exit", { id });
+    }
   });
 }
 
@@ -777,19 +863,85 @@ function resizeRemoteTerminal(id: number, cols: number, rows: number) {
     socket.send(JSON.stringify({ type: "resize", cols, rows }));
     return;
   }
+  if (socket?.readyState === WebSocket.CONNECTING || remoteStartingTerminals.has(id)) return;
   const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
   void apiAt(route, "POST", `/api/terminals/${id}/resize`, { cols, rows }).catch(() => undefined);
 }
 
-function stopRemoteTerminal(id: number) {
+async function stopRemoteTerminal(id: number) {
+  const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
+  remoteStoppingTerminals.add(id);
+  clearRemoteTerminalReconnectTimer(id);
+  remoteTerminalReconnectAttempts.delete(id);
+  remotePendingTerminalInput.clear(id);
   const socket = remoteSockets.get(id);
   if (socket?.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "stop" }));
-    socket.close();
   }
-  const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
-  void apiAt(route, "DELETE", `/api/terminals/${id}`).catch(() => undefined);
+  socket?.close();
+  remoteSockets.delete(id);
   remoteTerminalRoutes.delete(id);
+  try {
+    await apiAt(route, "DELETE", `/api/terminals/${id}`);
+  } catch {
+    // La fermeture locale reste effective meme si le noeud est deja parti.
+  } finally {
+    remoteStoppingTerminals.delete(id);
+  }
+}
+
+function queuePendingTerminalInput(id: number, data: string) {
+  remotePendingTerminalInput.append(id, data);
+}
+
+function takePendingTerminalInput(id: number) {
+  return remotePendingTerminalInput.take(id);
+}
+
+function movePendingTerminalInput(from: number, to: number) {
+  remotePendingTerminalInput.move(from, to);
+}
+
+function clearRemoteTerminalReconnectTimer(id: number) {
+  const timer = remoteTerminalReconnectTimers.get(id);
+  if (timer !== undefined) window.clearTimeout(timer);
+  remoteTerminalReconnectTimers.delete(id);
+}
+
+function scheduleRemoteTerminalReconnect(id: number, route: RemoteTerminalRoute) {
+  if (
+    remoteStoppingTerminals.has(id) ||
+    !remoteTerminalRoutes.has(id) ||
+    remoteTerminalReconnectTimers.has(id)
+  ) {
+    return;
+  }
+
+  const attempt = (remoteTerminalReconnectAttempts.get(id) ?? 0) + 1;
+  remoteTerminalReconnectAttempts.set(id, attempt);
+  if (attempt > REMOTE_TERMINAL_MAX_RECONNECTS) {
+    remoteTerminalRoutes.delete(id);
+    remotePendingTerminalInput.clear(id);
+    emit("pty-data", {
+      id,
+      data: "\r\nConnexion au terminal perdue. Ouvre un nouveau terminal pour continuer.\r\n",
+    });
+    emit("pty-exit", { id });
+    return;
+  }
+
+  const delay = Math.min(5_000, 250 * 2 ** (attempt - 1));
+  const timer = window.setTimeout(() => {
+    remoteTerminalReconnectTimers.delete(id);
+    if (!remoteTerminalRoutes.has(id) || remoteStoppingTerminals.has(id)) return;
+    openTerminalSocket(id, remoteTerminalRoutes.get(id) ?? route);
+  }, delay);
+  remoteTerminalReconnectTimers.set(id, timer);
+}
+
+function emitTerminalTransportError(id: number, route: RemoteTerminalRoute, error: unknown) {
+  const message = terminalTransportErrorMessage(route.baseUrl, error);
+  emit("pty-data", { id, data: `\r\n${message}\r\n` });
 }
 
 function emit<T>(event: string, payload: T) {

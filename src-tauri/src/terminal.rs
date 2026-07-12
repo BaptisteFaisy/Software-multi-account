@@ -125,6 +125,15 @@ struct PtyExitEvent {
     id: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartTerminalResponse {
+    id: u64,
+    workspace_id: String,
+    room_id: String,
+    workspace_path: String,
+}
+
 #[tauri::command]
 pub fn start_terminal(
     app: AppHandle,
@@ -137,7 +146,7 @@ pub fn start_terminal(
     rows: u16,
     command: Option<String>,
     project_dir: Option<String>,
-) -> Result<u64, String> {
+) -> Result<StartTerminalResponse, String> {
     let settings = load_settings_for_terminal()?;
     let account = settings
         .accounts
@@ -162,33 +171,23 @@ pub fn start_terminal(
     let id_reservation = state.reserve_id(id)?;
     let id = id_reservation.id;
 
-    // Workspace choisi dans l'UI (dossier de travail global) : prioritaire sur le
-    // `project_dir` par defaut du compte. Sinon, on retombe sur le comportement
-    // historique (dossier projet du compte).
-    let source_project_dir = match project_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(raw) => {
-            let path = expand_home(raw)?;
-            if !path.is_dir() {
-                return Err(format!("Dossier workspace introuvable: {raw}"));
-            }
-            Some(path)
-        }
-        None => resolve_project_dir(&account)?,
-    };
+    // Le dossier est une frontiere de session, pas un simple defaut de compte.
+    // Refuser ici les anciens clients qui tenteraient encore un demarrage sans
+    // selection empeche tout cwd implicite ou melange entre deux projets.
+    let source_project_dir = resolve_terminal_environment(project_dir.as_deref())?;
 
     let canonical_home = expand_home(&account.codex_home)?;
     std::fs::create_dir_all(&canonical_home).map_err(|error| error.to_string())?;
     let workspace = worktrees.prepare_local(
         &format!("desktop-terminal-{id}"),
         &canonical_home,
-        source_project_dir.as_deref(),
+        Some(&source_project_dir),
     )?;
     let account_home = workspace.home().to_path_buf();
     let project_dir = Some(workspace.cwd().to_path_buf());
+    let workspace_id = workspace.workspace_id().to_string();
+    let room_id = workspace.room_id().to_string();
+    let workspace_path = workspace.cwd().to_string_lossy().to_string();
 
     // La configuration est ecrite dans le home ISOLE, jamais dans celui qu'un
     // autre agent utilise simultanement.
@@ -250,12 +249,10 @@ pub fn start_terminal(
         }
     }
 
-    // Salon d'agents : si active, on provisionne l'entree MCP dans le home du
-    // compte (via le CLI du provider) puis on injecte un token UNIQUE par
-    // terminal pour que le serveur distingue cet agent des autres (meme s'ils
-    // partagent un home).
+    // Collaboration workspace native : provisionnee dans le home ISOLE puis
+    // authentifiee par un token unique a ce terminal.
     let mut room_token: Option<String> = None;
-    if settings.agent_room.enabled {
+    {
         let url = format!("http://127.0.0.1:{}/mcp", settings.agent_room.port);
         let cli_bin = crate::settings::command_for_provider(&settings, provider);
         match room.provision_home(provider, &cli_bin, &account_home, &url) {
@@ -275,11 +272,11 @@ pub fn start_terminal(
                 builder.env("CST_ROOM_TOKEN", token.clone());
                 room_token = Some(token);
             }
-            // Non bloquant : le terminal demarre sans salon si le provisioning
+            // Non bloquant : le terminal demarre sans collaboration si le provisioning
             // echoue (ex. binaire CLI introuvable depuis ce process).
             Err(error) => {
                 eprintln!(
-                    "[agent_room] provisioning ignore pour {}: {error}",
+                    "[workspace_collab] provisioning ignore pour {}: {error}",
                     account.label
                 );
             }
@@ -348,7 +345,7 @@ pub fn start_terminal(
         if let Some(session) = ended {
             finish_session(&session);
         }
-        // Le PTY s'est ferme (fin naturelle ou kill) : on retire l'agent du salon.
+        // Le PTY s'est ferme (fin naturelle ou kill) : on retire l'agent du workspace.
         if let Some(token) = &room_token_thread {
             room_state.deregister(token);
         }
@@ -372,7 +369,12 @@ pub fn start_terminal(
             .map_err(|error| error.to_string())?;
     }
 
-    Ok(id)
+    Ok(StartTerminalResponse {
+        id,
+        workspace_id,
+        room_id,
+        workspace_path,
+    })
 }
 
 #[tauri::command]
@@ -481,22 +483,17 @@ fn shell_command(settings: &AppSettings) -> CommandBuilder {
     builder
 }
 
-fn resolve_project_dir(account: &AccountProfile) -> Result<Option<PathBuf>, String> {
-    let Some(raw) = account
-        .project_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
+fn resolve_terminal_environment(raw: Option<&str>) -> Result<PathBuf, String> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err("Environnement obligatoire avant d'ouvrir un terminal".to_string());
     };
 
     let project_dir = expand_home(raw)?;
     if !project_dir.is_dir() {
-        return Err(format!("Dossier projet introuvable: {raw}"));
+        return Err(format!("Environnement introuvable: {raw}"));
     }
 
-    Ok(Some(project_dir))
+    Ok(project_dir)
 }
 
 fn emit_banner(
@@ -613,5 +610,32 @@ mod tests {
         assert!(manager.reserve_id(Some(42)).is_err());
         drop(reservation);
         assert!(manager.reserve_id(Some(42)).is_ok());
+    }
+
+    #[test]
+    fn start_response_distinguishes_terminal_and_physical_workspace() {
+        let value = serde_json::to_value(StartTerminalResponse {
+            id: 42,
+            workspace_id: "ws-agent-a".to_string(),
+            room_id: "room-folder".to_string(),
+            workspace_path: "C:/runtime/workspaces/ws-agent-a/repo".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(value["id"], 42);
+        assert_eq!(value["workspaceId"], "ws-agent-a");
+        assert_eq!(value["roomId"], "room-folder");
+        assert_eq!(
+            value["workspacePath"],
+            "C:/runtime/workspaces/ws-agent-a/repo"
+        );
+    }
+
+    #[test]
+    fn terminal_environment_is_mandatory() {
+        assert!(resolve_terminal_environment(None).is_err());
+        assert!(resolve_terminal_environment(Some("   ")).is_err());
+        let temp = std::env::temp_dir();
+        assert_eq!(resolve_terminal_environment(temp.to_str()).unwrap(), temp);
     }
 }

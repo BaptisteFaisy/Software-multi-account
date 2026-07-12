@@ -14,6 +14,11 @@ import {
   type UnlistenFn,
 } from "./platform";
 import { initDesktopUpdater } from "./updater";
+import { initPwaSupport } from "./pwa";
+import {
+  chatHoverShortcutAction,
+  type ChatHoverShortcutAction,
+} from "./chat/shortcuts";
 import {
   chatSyncLabel,
   renderChatFeedInner,
@@ -22,9 +27,11 @@ import {
   type ChatMode,
   type ChatMessage,
   type ChatPanelModel,
+  type ChatQuotaSuggestion,
   type ChatSyncState,
   type ChatTurnStatus,
 } from "./chat/view";
+import { bestQuotaAccount, isQuotaExhaustionError } from "./chat/quota";
 import {
   CHAT_SIDEBAR_DEFAULT_WIDTH,
   CHAT_SIDEBAR_MAX_WIDTH,
@@ -35,8 +42,8 @@ import {
 } from "./chat/sidebar";
 import {
   DEFAULT_EXPERT_CHAT_PAGE_SIZE,
-  EXPERT_CHAT_COLUMN_COUNT,
   clampExpertChatPage,
+  expertChatColumnCount,
   expertChatPageCount,
   expertChatPageForIndex,
   expertChatRowCount,
@@ -46,10 +53,18 @@ import {
   type ExpertGridLayout,
 } from "./chat/expert";
 import {
+  closeWorkspaceRegistry,
+  draftEnvironmentChatPanes,
+  isEphemeralChatWorkspacePath,
+  mergeClosedWorkspaceIds,
   mergeWorkspaceProfiles,
   normalizeWorkspacePath,
+  openWorkspaceRegistry,
+  terminalsForFolder,
+  userEnvironmentPath,
   workspaceBaseName,
   workspaceIdForPath,
+  workspacePathBreadcrumbs,
   type WorkspaceProfile,
 } from "./workspace";
 import { FitAddon } from "@xterm/addon-fit";
@@ -101,7 +116,10 @@ import {
   Settings,
   Folder,
   FolderPlus,
+  Folders,
   ChevronsUpDown,
+  PanelLeftClose,
+  PanelLeftOpen,
   createIcons,
 } from "lucide";
 import "@xterm/xterm/css/xterm.css";
@@ -258,6 +276,9 @@ type AppSettings = {
   // Le workspace ACTIF reste local a l'appareil (WORKSPACE_STORAGE_KEY) : seule
   // la LISTE se synchronise entre appareils.
   workspaces?: WorkspaceProfile[];
+  // Tombstones synchronises : une ancienne discussion ne doit pas rouvrir un
+  // workspace que l'utilisateur a explicitement ferme.
+  closedWorkspaceIds?: string[];
 };
 
 type RoomAgent = {
@@ -290,6 +311,7 @@ type RoomTask = {
 type RoomMessage = {
   id: number;
   ts: number;
+  roomId: string;
   from: string;
   fromLabel: string;
   to?: string | null;
@@ -302,6 +324,7 @@ type RoomStatus = {
   port: number;
   url: string;
   snapshot: {
+    roomId: string;
     agents: RoomAgent[];
     present: number;
     totalMessages: number;
@@ -468,15 +491,24 @@ type PtyExitEvent = {
   id: number;
 };
 
+type TerminalStartResponse = {
+  id: number;
+  workspaceId: string;
+  workspacePath: string;
+  roomId?: string;
+};
+
 type TerminalSession = {
   key: string;
   ptyId: number | null;
   accountId: string;
   agentId: string;
   title: string;
-  // Workspace immuable de cette session. Il est capture a la creation afin
-  // qu'un changement de workspace global ne deplace pas le prochain PTY en
-  // cours de demarrage.
+  // Dossier logique choisi par l'utilisateur. Plusieurs agents/terminaux
+  // partagent ce dossier tout en travaillant dans des workspaces physiques
+  // differents, crees par le gestionnaire de worktrees.
+  folderPath: string | null;
+  workspaceId: string | null;
   workspacePath: string | null;
   projectDir: string | null;
   proxySummary: string;
@@ -495,12 +527,14 @@ type PersistedTerminalRecord = {
   accountId: string;
   agentId: string;
   codexSessionId?: string | null;
+  folderPath?: string | null;
+  workspaceId?: string | null;
   workspacePath?: string | null;
   projectDir?: string | null;
 };
 
 type PersistedTerminalState = {
-  v: 3;
+  v: 4;
   activeKey: string | null;
   terminals: PersistedTerminalRecord[];
 };
@@ -519,8 +553,6 @@ type AppView =
   | "settings"
   | "chat";
 
-type InterfaceMode = "simple" | "expert";
-
 type DiscussionSummary = {
   // Identite LOGIQUE de la conversation (stable a travers les reprises/forks).
   // Sert de cle de regroupement et de suppression.
@@ -536,6 +568,9 @@ type DiscussionSummary = {
   accountLabel: string;
   codexHome: string;
   filePath: string;
+  // Dossier logique restaure par l'UI. Le backend persiste ensuite cette
+  // valeur dans `cwd`, qui peut initialement viser un worktree ephemere.
+  folderPath?: string | null;
   cwd: string | null;
   startedAt: number;
   lastActivity: number;
@@ -677,9 +712,16 @@ ensureEventHorizonBackground();
 let settings: AppSettings | null = null;
 let selectedAccountId: string | null = null;
 let activeTerminalKey: string | null = null;
+let lastPointerClientX: number | null = null;
+let lastPointerClientY: number | null = null;
+let expertTerminalFullscreenKey: string | null = null;
 let statusText = "Pret";
 let ptyIdSeed = Date.now();
 let terminalSessions: TerminalSession[] = [];
+// Dossier dont la session est actuellement ouverte. `null` signifie qu'aucun
+// environnement n'a encore ete choisi : on affiche alors le sas de selection,
+// jamais les terminaux de plusieurs projets dans un meme mur.
+let terminalFolderFilter: string | null = null;
 // Creations de terminaux en vol (pas encore poussees dans terminalSessions) :
 // permet de faire respecter la limite EXPERT_MAX_TERMINALS malgre les await
 // (deux creations concurrentes ne peuvent plus reserver le meme dernier slot).
@@ -689,18 +731,16 @@ let pendingTerminalCreations = 0;
 // perdre les frappes lors d'un re-render incident (ex: sortie d'un PTY voisin).
 let focusedTerminalKeyBeforeRender: string | null = null;
 // Terminal a focaliser volontairement au prochain montage (nouveau terminal,
-// selection dans la liste, entree en mode expert).
+// selection dans la liste, affichage du mur de terminaux).
 let requestTerminalFocusKey: string | null = null;
 let globalMobileListenersBound = false;
 let mobileRefitTimer = 0;
 let unlistenData: UnlistenFn | null = null;
 let unlistenExit: UnlistenFn | null = null;
 let activeView: AppView = "chat";
-let interfaceMode: InterfaceMode = "simple";
 let expertGridLayout: ExpertGridLayout = "auto";
 let expertChatsPerPage: ExpertChatPageSize = DEFAULT_EXPERT_CHAT_PAGE_SIZE;
 let expertChatPage = 0;
-let interfaceModeRequestId = 0;
 let terminalRestoreAttempted = false;
 let terminalRestorePromise: Promise<void> | null = null;
 let poolStatus: PoolStatus | null = null;
@@ -734,6 +774,13 @@ let newTerminalAccountProvider: Provider = "codex";
 let newTerminalAccountBypass = true;
 let newTerminalAccountModel = DEFAULT_CODEX_MODEL;
 let newTerminalAccountReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+// Fenetre "nouveau chat" : on choisit le compte, le modele et le mode avant
+// d'ouvrir reellement le pane (tous les points d'entree "nouveau chat" y passent).
+let newChatModalOpen = false;
+let newChatAccountId: string | null = null;
+let newChatMode: ChatMode = "build";
+let newChatModel = "";
+let newChatPendingWorkspace: string | null = null;
 let agentsModalOpen = false;
 let discussions: DiscussionsView | null = null;
 let discussionsLoaded = false;
@@ -779,6 +826,7 @@ const chatModelCatalogs = new Map<string, AccountModelView[]>();
 const chatModelCatalogLoads = new Set<string>();
 let expertChatPanes: ExpertChatPane[] = [];
 let activeExpertChatKey: string | null = null;
+let expertChatFullscreenKey: string | null = null;
 let expertChatsRestored = false;
 let promptHistory: PromptHistoryView | null = null;
 let promptHistoryLoaded = false;
@@ -786,7 +834,8 @@ let promptSearch = "";
 let roomStatus: RoomStatus | null = null;
 let roomMessages: RoomMessage[] = [];
 let roomPoll: number | null = null;
-// Destinataire choisi dans le composer : "" = diffusion salon, sinon ident d'un
+let workspaceLiveGraphOpen = false;
+// Destinataire choisi dans le composer : "" = diffusion workspace, sinon ident d'un
 // agent (DM). Conserve entre les rendus complets.
 let roomComposeTarget = "";
 // Selecteur de workspace (mode web) : modale de navigation de dossiers serveur.
@@ -796,6 +845,7 @@ let workspacePickerTarget: WorkspacePickerTarget = "active";
 let workspaceBrowse: FsListResponse | null = null;
 let workspaceBrowseLoading = false;
 let workspaceBrowseError = "";
+let terminalEnvironmentMenuOpen = false;
 
 // --- Audit design (détecteur Impeccable) -----------------------------------
 // Un finding = un anti-pattern détecté sur un élément de la page courante.
@@ -878,21 +928,24 @@ const lucideIcons = {
   Settings,
   Folder,
   FolderPlus,
+  Folders,
   ChevronsUpDown,
+  PanelLeftClose,
+  PanelLeftOpen,
 };
 
-const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v3";
-const LEGACY_OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v2";
-const INTERFACE_MODE_STORAGE_KEY = "codex-switch-terminal.interface-mode.v1";
+const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v4";
+const LEGACY_OPEN_TERMINALS_STORAGE_KEYS = [
+  "codex-switch-terminal.open-terminals.v3",
+  "codex-switch-terminal.open-terminals.v2",
+] as const;
 const EXPERT_GRID_LAYOUT_STORAGE_KEY = "codex-switch-terminal.expert-grid-layout.v1";
 const EXPERT_CHATS_PER_PAGE_STORAGE_KEY = "codex-switch-terminal.expert-chats-per-page.v1";
 const EXPERT_MAX_TERMINALS = 16;
 const EXPERT_OPEN_CHATS_STORAGE_KEY = "codex-switch-terminal.expert-open-chats.v1";
 const CHAT_SIDEBAR_WIDTH_STORAGE_KEY = "codex-switch-terminal.chat-sidebar-width.v1";
 const CHAT_SIDEBAR_SNAP_CLOSED_WIDTH = 48;
-
-const loadInterfaceMode = (): InterfaceMode =>
-  localStorage.getItem(INTERFACE_MODE_STORAGE_KEY) === "expert" ? "expert" : "simple";
+const LIMIT_POLL_INTERVAL_MS = 30_000;
 
 const loadExpertGridLayout = (): ExpertGridLayout => {
   const value = localStorage.getItem(EXPERT_GRID_LAYOUT_STORAGE_KEY);
@@ -1005,33 +1058,53 @@ const loadWorkspacePaths = (): string[] => {
     const parsed = JSON.parse(localStorage.getItem(WORKSPACES_STORAGE_KEY) ?? "[]");
     if (!Array.isArray(parsed)) return [];
     const seen = new Set<string>();
-    return parsed
+    const sanitized = parsed
       .filter((path): path is string => typeof path === "string" && path.trim().length > 0)
-      .map((path) => path.trim())
+      .map((path) => userEnvironmentPath(path))
+      .filter((path): path is string => !!path)
       .filter((path) => {
         const key = normalizeWorkspacePath(path);
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
       });
+    if (JSON.stringify(parsed) !== JSON.stringify(sanitized)) {
+      localStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify(sanitized));
+    }
+    return sanitized;
   } catch {
     return [];
   }
 };
 
+const storeWorkspacePaths = (paths: readonly string[]) => {
+  localStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify(paths));
+};
+
 const rememberWorkspace = (path: string) => {
-  const trimmed = path.trim();
+  const trimmed = userEnvironmentPath(path);
   if (!trimmed) return;
   const key = normalizeWorkspacePath(trimmed);
   const paths = loadWorkspacePaths().filter((item) => normalizeWorkspacePath(item) !== key);
-  localStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify([trimmed, ...paths].slice(0, 12)));
+  storeWorkspacePaths([trimmed, ...paths].slice(0, 12));
 };
 
-const currentWorkspace = (): string | null =>
-  localStorage.getItem(WORKSPACE_STORAGE_KEY)?.trim() || null;
+const forgetWorkspace = (path: string) => {
+  const id = workspaceIdForPath(path);
+  storeWorkspacePaths(
+    loadWorkspacePaths().filter((item) => workspaceIdForPath(item) !== id),
+  );
+};
+
+const currentWorkspace = (): string | null => {
+  const stored = localStorage.getItem(WORKSPACE_STORAGE_KEY);
+  const environment = userEnvironmentPath(stored);
+  if (stored?.trim() && !environment) localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+  return environment;
+};
 
 const setCurrentWorkspace = (path: string | null) => {
-  const trimmed = path?.trim();
+  const trimmed = userEnvironmentPath(path);
   if (trimmed) {
     rememberWorkspace(trimmed);
     localStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
@@ -1051,8 +1124,14 @@ const CHAT_WS_FILTER_KEY = "codex-switch-terminal.chat-workspace-filter";
 
 const chatWorkspaceFilterRaw = (): string | null =>
   localStorage.getItem(CHAT_WS_FILTER_KEY);
-const activeChatWorkspaceFilter = (): string =>
-  chatWorkspaceFilterRaw() || WORKSPACE_ALL;
+const activeChatWorkspaceFilter = (): string => {
+  const stored = chatWorkspaceFilterRaw();
+  if (stored && isEphemeralChatWorkspacePath(stored)) {
+    localStorage.setItem(CHAT_WS_FILTER_KEY, WORKSPACE_ALL);
+    return WORKSPACE_ALL;
+  }
+  return stored || WORKSPACE_ALL;
+};
 const setChatWorkspaceFilter = (value: string) => {
   localStorage.setItem(CHAT_WS_FILTER_KEY, value);
 };
@@ -1061,30 +1140,75 @@ const setChatWorkspaceFilter = (value: string) => {
 // dossier d'un chat cree dans le workspace X reste X meme si l'utilisateur
 // change de workspace avant d'envoyer le premier message.
 let pendingChatWorkspace: string | null = null;
+let workspaceClosingId: string | null = null;
+
+const closedWorkspaceIds = (): Set<string> =>
+  new Set(mergeClosedWorkspaceIds(settings?.closedWorkspaceIds ?? []));
+
+const workspaceIsClosed = (path: string): boolean =>
+  closedWorkspaceIds().has(workspaceIdForPath(path));
+
+// Un transcript enregistre le cwd physique de l'agent. Tant que l'association
+// terminal est connue (y compris apres restauration v4), on le rattache au
+// Dossier logique au lieu de creer un faux Dossier par worktree.
+const folderPathForRuntimePath = (rawPath: string | null | undefined): string | null => {
+  const path = rawPath?.trim();
+  if (!path) return null;
+  const linkedTerminal = terminalSessions.find(
+    (session) =>
+      session.workspacePath &&
+      normalizeWorkspacePath(session.workspacePath) === normalizeWorkspacePath(path),
+  );
+  return userEnvironmentPath(linkedTerminal?.folderPath) ?? userEnvironmentPath(path);
+};
+
+const discussionFolderPath = (
+  discussion: DiscussionSummary | null | undefined,
+): string | null =>
+  userEnvironmentPath(discussion?.folderPath) ?? folderPathForRuntimePath(discussion?.cwd);
+
+// Une reouverture explicite restaure aussi le contexte global du dossier : la
+// room, le mur de terminaux et les prochains messages pointent tous au meme
+// dossier logique, jamais au worktree physique de l'ancien agent.
+const activateDiscussionFolder = (discussion: DiscussionSummary): string | null => {
+  const folderPath = discussionFolderPath(discussion);
+  if (!folderPath) return null;
+  discussion.folderPath = folderPath;
+  setCurrentWorkspace(folderPath);
+  setChatWorkspaceFilter(workspaceIdForPath(folderPath));
+  terminalFolderFilter = folderPath;
+  void upsertWorkspaceRegistry(folderPath);
+  return folderPath;
+};
 
 // Enumeration des workspaces connus : union du registre synchronise, du MRU
 // local, du workspace actif, et des cwd distincts des discussions. Trie : actif
 // d'abord, puis par activite la plus recente, puis alphabetique.
 const knownWorkspaces = (): WorkspaceProfile[] => {
   const byId = new Map<string, WorkspaceProfile>();
+  const closedIds = closedWorkspaceIds();
   const add = (rawPath: string | null | undefined) => {
-    const path = rawPath?.trim();
+    const path = userEnvironmentPath(rawPath);
     if (!path) return;
     const id = workspaceIdForPath(path);
+    if (closedIds.has(id)) return;
     if (!byId.has(id)) byId.set(id, { id, label: workspaceBaseName(path), path });
   };
 
   mergeWorkspaceProfiles(settings?.workspaces ?? []).workspaces.forEach((ws) => {
+    if (closedIds.has(ws.id)) return;
     if (!byId.has(ws.id)) byId.set(ws.id, ws);
   });
   add(currentWorkspace());
   loadWorkspacePaths().forEach(add);
-  allDiscussions().forEach((discussion) => add(discussion.cwd));
+  terminalSessions.forEach((session) => add(session.folderPath));
+  allDiscussions().forEach((discussion) => add(discussionFolderPath(discussion)));
 
   const lastActivity = new Map<string, number>();
   allDiscussions().forEach((discussion) => {
-    if (!discussion.cwd?.trim()) return;
-    const id = workspaceIdForPath(discussion.cwd);
+    const folderPath = discussionFolderPath(discussion);
+    if (!folderPath) return;
+    const id = workspaceIdForPath(folderPath);
     lastActivity.set(id, Math.max(lastActivity.get(id) ?? 0, discussion.lastActivity));
   });
 
@@ -1102,16 +1226,17 @@ const knownWorkspaces = (): WorkspaceProfile[] => {
 // Ajoute un dossier au registre synchronise s'il en est absent, puis persiste.
 const upsertWorkspaceRegistry = async (path: string): Promise<void> => {
   if (!settings) return;
-  const trimmed = path.trim();
+  const trimmed = userEnvironmentPath(path);
   if (!trimmed) return;
-  const id = workspaceIdForPath(trimmed);
-  const list = (settings.workspaces ??= []);
-  const merged = mergeWorkspaceProfiles(list);
-  if (merged.workspaces.some((ws) => ws.id === id) && !merged.changed) return;
-  settings.workspaces = merged.workspaces;
-  if (!settings.workspaces.some((ws) => ws.id === id)) {
-    settings.workspaces.push({ id, label: workspaceBaseName(trimmed), path: trimmed });
-  }
+  rememberWorkspace(trimmed);
+  const update = openWorkspaceRegistry(
+    settings.workspaces ?? [],
+    settings.closedWorkspaceIds ?? [],
+    trimmed,
+  );
+  if (!update.changed) return;
+  settings.workspaces = update.workspaces;
+  settings.closedWorkspaceIds = update.closedWorkspaceIds;
   try {
     settings = await invoke<AppSettings>("save_settings", { settings });
   } catch (error) {
@@ -1124,23 +1249,49 @@ const upsertWorkspaceRegistry = async (path: string): Promise<void> => {
 // MRU local (nouvel appareil), puis fixe un filtre par defaut pour cet appareil.
 const syncWorkspaceRegistry = async (): Promise<void> => {
   if (!settings) return;
+  const storedClosedIds = settings.closedWorkspaceIds ?? [];
+  const normalizedClosedIds = mergeClosedWorkspaceIds(storedClosedIds);
+  const closedIds = new Set(normalizedClosedIds);
   const merged = mergeWorkspaceProfiles(settings.workspaces ?? []);
+  const openProfiles = merged.workspaces.filter((workspace) => !closedIds.has(workspace.id));
   const byId = new Map<string, WorkspaceProfile>(
-    merged.workspaces.map((ws) => [ws.id, ws]),
+    openProfiles.map((ws) => [ws.id, ws]),
   );
-  let changed = merged.changed;
+  let changed =
+    merged.changed ||
+    openProfiles.length !== merged.workspaces.length ||
+    normalizedClosedIds.length !== storedClosedIds.length ||
+    normalizedClosedIds.some(
+      (closedId, index) => closedId !== storedClosedIds[index],
+    );
+
+  settings.closedWorkspaceIds = normalizedClosedIds;
+
+  const rememberedPaths = loadWorkspacePaths();
+  const openRememberedPaths = rememberedPaths.filter(
+    (path) => !closedIds.has(workspaceIdForPath(path)),
+  );
+  if (openRememberedPaths.length !== rememberedPaths.length) {
+    storeWorkspacePaths(openRememberedPaths);
+  }
+  const activePath = currentWorkspace();
+  if (activePath && closedIds.has(workspaceIdForPath(activePath))) {
+    setCurrentWorkspace(null);
+    setChatWorkspaceFilter(WORKSPACE_ALL);
+  }
 
   const seed = (rawPath: string | null | undefined) => {
     const path = rawPath?.trim();
     if (!path) return;
     const id = workspaceIdForPath(path);
+    if (closedIds.has(id)) return;
     if (!byId.has(id)) {
       byId.set(id, { id, label: workspaceBaseName(path), path });
       changed = true;
     }
   };
   seed(currentWorkspace());
-  loadWorkspacePaths().forEach(seed);
+  openRememberedPaths.forEach(seed);
 
   // Miroir inverse : rend les workspaces synchronises visibles sur cet appareil.
   byId.forEach((ws) => rememberWorkspace(ws.path));
@@ -1164,16 +1315,19 @@ const syncWorkspaceRegistry = async (): Promise<void> => {
 const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
-const EMPTY_TERMINAL_STATE: PersistedTerminalState = { v: 3, activeKey: null, terminals: [] };
+const EMPTY_TERMINAL_STATE: PersistedTerminalState = { v: 4, activeKey: null, terminals: [] };
 
 const loadOpenTerminalRecords = (): PersistedTerminalState => {
   try {
     const raw =
       localStorage.getItem(OPEN_TERMINALS_STORAGE_KEY) ??
-      localStorage.getItem(LEGACY_OPEN_TERMINALS_STORAGE_KEY);
+      LEGACY_OPEN_TERMINALS_STORAGE_KEYS
+        .map((key) => localStorage.getItem(key))
+        .find((value): value is string => value !== null);
     if (!raw) return { ...EMPTY_TERMINAL_STATE };
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.terminals)) return { ...EMPTY_TERMINAL_STATE };
+    const legacyWorkspaceWasFolder = Number(parsed.v ?? 3) < 4;
 
     const terminals = parsed.terminals
       .map((item: any): PersistedTerminalRecord | null => {
@@ -1185,14 +1339,24 @@ const loadOpenTerminalRecords = (): PersistedTerminalState => {
           accountId: item.accountId,
           agentId: typeof item.agentId === "string" ? item.agentId : "codex",
           codexSessionId: typeof item.codexSessionId === "string" ? item.codexSessionId : null,
-          workspacePath: typeof item.workspacePath === "string" ? item.workspacePath : null,
+          folderPath:
+            typeof item.folderPath === "string"
+              ? item.folderPath
+              : legacyWorkspaceWasFolder && typeof item.workspacePath === "string"
+                ? item.workspacePath
+                : null,
+          workspaceId: typeof item.workspaceId === "string" ? item.workspaceId : null,
+          workspacePath:
+            !legacyWorkspaceWasFolder && typeof item.workspacePath === "string"
+              ? item.workspacePath
+              : null,
           projectDir: typeof item.projectDir === "string" ? item.projectDir : null,
         };
       })
       .filter((item: PersistedTerminalRecord | null): item is PersistedTerminalRecord => item !== null);
 
     return {
-      v: 3,
+      v: 4,
       activeKey: typeof parsed.activeKey === "string" ? parsed.activeKey : null,
       terminals,
     };
@@ -1203,15 +1367,15 @@ const loadOpenTerminalRecords = (): PersistedTerminalState => {
 
 const saveOpenTerminalRecords = (state: PersistedTerminalState) => {
   localStorage.setItem(OPEN_TERMINALS_STORAGE_KEY, JSON.stringify(state));
-  localStorage.removeItem(LEGACY_OPEN_TERMINALS_STORAGE_KEY);
+  LEGACY_OPEN_TERMINALS_STORAGE_KEYS.forEach((key) => localStorage.removeItem(key));
 };
 
 const persistTerminalSessions = () => {
-  // En mode simple les PTY sont charges paresseusement. Ne jamais ecraser leur
-  // etat persiste par une liste vide tant que le mode expert n'a pas ete ouvert.
+  // Les PTY sont charges paresseusement. Ne jamais ecraser leur etat persiste
+  // par une liste vide tant que le mur de terminaux n'a pas ete ouvert.
   if (!terminalRestoreAttempted && terminalSessions.length === 0) return;
   saveOpenTerminalRecords({
-    v: 3,
+    v: 4,
     activeKey: activeTerminalKey,
     terminals: terminalSessions
       .filter((session) => session.status !== "Ferme")
@@ -1220,6 +1384,8 @@ const persistTerminalSessions = () => {
         accountId: session.accountId,
         agentId: session.agentId,
         codexSessionId: session.codexSessionId,
+        folderPath: session.folderPath,
+        workspaceId: session.workspaceId,
         workspacePath: session.workspacePath,
         projectDir: session.projectDir,
       })),
@@ -1240,6 +1406,14 @@ const buildResumeCommand = (id: string, account: AccountProfile | null | undefin
   const base = agentRunCommand(agentById(providerAgentId(provider)), account);
   return provider === "claude" ? `${base} --resume ${id}` : `${base} resume ${id}`;
 };
+
+// Une reprise interactive restaure seulement le contexte puis attend une
+// saisie. Lors d'un deplacement explicite, ce premier message fait repartir
+// l'agent sans demander a l'utilisateur de taper « continue ».
+const buildResumeAndContinueCommand = (
+  id: string,
+  account: AccountProfile | null | undefined = null,
+) => `${buildResumeCommand(id, account)} continue`;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const SESSION_CAPTURE_DELAYS_MS = [1200, 2000, 3000, 4500, 7000, 10000];
@@ -1468,10 +1642,9 @@ const loadChatModelCatalog = async (accountId: string | null | undefined) => {
     // Les valeurs de secours restent utilisables avec un ancien backend/CLI.
   } finally {
     chatModelCatalogLoads.delete(accountId);
-    const accountIsVisible =
-      interfaceMode === "expert"
-        ? expertChatPanes.some((pane) => expertChatSelectedAccount(pane)?.id === accountId)
-        : chatSelectedAccount()?.id === accountId;
+    const accountIsVisible = expertChatPanes.some(
+      (pane) => expertChatSelectedAccount(pane)?.id === accountId,
+    );
     if (activeView === "chat" && accountIsVisible) render();
   }
 };
@@ -1565,7 +1738,13 @@ const selectedProxy = () => proxyForAccount(selectedAccount());
 const activeTerminal = () =>
   terminalSessions.find((session) => session.key === activeTerminalKey) ?? null;
 
-const expertTerminalSessions = () => terminalSessions.slice(0, EXPERT_MAX_TERMINALS);
+const terminalSessionsForFolder = (folderPath: string | null | undefined) =>
+  terminalsForFolder(terminalSessions, folderPath);
+
+const expertTerminalSessions = () =>
+  terminalFolderFilter === null
+    ? []
+    : terminalSessionsForFolder(terminalFolderFilter).slice(0, EXPERT_MAX_TERMINALS);
 
 const expertGridSlotCount = () => Math.max(2, expertTerminalSessions().length);
 
@@ -1595,13 +1774,13 @@ const workspaceKeyForPath = (path: string) => `workspace:${normalizeWorkspacePat
 const terminalWorkspaceDescriptor = (
   session: TerminalSession,
 ): Omit<TerminalWorkspaceGroup, "sessions"> => {
-  const workspacePath = session.workspacePath?.trim();
-  if (workspacePath) {
+  const folderPath = session.folderPath?.trim();
+  if (folderPath) {
     return {
-      key: workspaceKeyForPath(workspacePath),
-      path: workspacePath,
-      label: workspaceBaseName(workspacePath),
-      detail: workspacePath,
+      key: workspaceKeyForPath(folderPath),
+      path: folderPath,
+      label: workspaceBaseName(folderPath),
+      detail: folderPath,
       selectable: true,
     };
   }
@@ -1623,8 +1802,8 @@ const terminalWorkspaceDescriptor = (
   return {
     key: DEFAULT_WORKSPACE_KEY,
     path: null,
-    label: "Sans workspace",
-    detail: isRemoteMode() ? "Workspace genere par le serveur" : "Dossier par defaut",
+    label: "Sans environnement",
+    detail: isRemoteMode() ? "Environnement genere par le serveur" : "Environnement non selectionne",
     selectable: true,
   };
 };
@@ -1666,8 +1845,8 @@ const terminalWorkspaceGroups = (): TerminalWorkspaceGroup[] => {
     groups.set(DEFAULT_WORKSPACE_KEY, {
       key: DEFAULT_WORKSPACE_KEY,
       path: null,
-      label: "Sans workspace",
-      detail: isRemoteMode() ? "Workspace genere par le serveur" : "Dossier par defaut",
+      label: "Sans environnement",
+      detail: isRemoteMode() ? "Environnement genere par le serveur" : "Environnement non selectionne",
       selectable: true,
       sessions: [],
     });
@@ -1676,13 +1855,86 @@ const terminalWorkspaceGroups = (): TerminalWorkspaceGroup[] => {
   return Array.from(groups.values());
 };
 
+type TerminalEnvironmentGroup = TerminalWorkspaceGroup & { path: string };
+
+const terminalEnvironmentGroups = (): TerminalEnvironmentGroup[] =>
+  terminalWorkspaceGroups().filter((group): group is TerminalEnvironmentGroup => {
+    const path = userEnvironmentPath(group.path);
+    return !!path && !workspaceIsClosed(path);
+  }).sort(
+    (left, right) =>
+      left.label.localeCompare(right.label) ||
+      normalizeWorkspacePath(left.path).localeCompare(normalizeWorkspacePath(right.path)),
+  );
+
+// L'environnement est le contexte global de travail : conversations, agents,
+// collaboration et terminaux suivent tous cette selection unique.
+const selectEnvironment = (path: string): void => {
+  const environmentPath = userEnvironmentPath(path);
+  if (!environmentPath) {
+    statusText = "Les workspaces techniques des agents ne peuvent pas devenir des environnements";
+    terminalEnvironmentMenuOpen = false;
+    render();
+    return;
+  }
+  setCurrentWorkspace(environmentPath);
+  setChatWorkspaceFilter(workspaceIdForPath(environmentPath));
+  pendingChatWorkspace = null;
+  terminalFolderFilter = environmentPath;
+  terminalEnvironmentMenuOpen = false;
+  expertChatFullscreenKey = null;
+  expertTerminalFullscreenKey = null;
+  roomStatus = null;
+  roomMessages = [];
+  void upsertWorkspaceRegistry(environmentPath);
+  expertChatPage = 0;
+  reconcileExpertChatPage();
+  setActiveView("chat");
+};
+
+const openTerminalEnvironmentMenu = () => {
+  if (!settings) return;
+  terminalEnvironmentMenuOpen = true;
+  statusText = "Menu des environnements";
+  render();
+};
+
+const closeTerminalEnvironmentMenu = () => {
+  if (!terminalEnvironmentMenuOpen) return;
+  terminalEnvironmentMenuOpen = false;
+  render();
+};
+
+const toggleTerminalEnvironmentMenu = () => {
+  if (terminalEnvironmentMenuOpen) closeTerminalEnvironmentMenu();
+  else openTerminalEnvironmentMenu();
+};
+
 const activateTerminalSession = (session: TerminalSession) => {
   activeTerminalKey = session.key;
   selectedAccountId = session.accountId;
-  setCurrentWorkspace(session.workspacePath);
+  // Un terminal deja ouvert reste utilisable apres fermeture de son dossier,
+  // sans le rouvrir implicitement. Seule une action explicite sur le groupe ou
+  // le selecteur retire le tombstone synchronise.
+  if (!session.folderPath || !workspaceIsClosed(session.folderPath)) {
+    setCurrentWorkspace(session.folderPath);
+  }
+  terminalFolderFilter = session.folderPath;
   if (settings && session.agentId && settings.agents.some((agent) => agent.id === session.agentId)) {
     settings.activeAgentId = session.agentId;
   }
+};
+
+const toggleExpertTerminalFullscreen = (session: TerminalSession) => {
+  if (!terminalSessions.includes(session)) return;
+  expertTerminalFullscreenKey =
+    expertTerminalFullscreenKey === session.key ? null : session.key;
+  activateTerminalSession(session);
+  requestTerminalFocusKey = session.key;
+  statusText = expertTerminalFullscreenKey
+    ? `Terminal en plein ecran: ${terminalTitle(session)}`
+    : "Mur de terminaux";
+  render();
 };
 
 const fitAndResizeTerminal = (session: TerminalSession) => {
@@ -1722,11 +1974,11 @@ const fitAndResizeVisibleTerminals = () => {
   }
 };
 
-const projectFieldLabel = () => (isRemoteMode() ? "Repo Git optionnel" : "Dossier projet");
+const projectFieldLabel = () => (isRemoteMode() ? "Repo Git optionnel" : "Environnement projet");
 const projectFieldPlaceholder = () =>
   isRemoteMode() ? "https://github.com/org/repo.git" : "C:\\chemin\\vers\\projet";
 const displayProjectDir = (projectDir?: string | null) =>
-  projectDir?.trim() || (isRemoteMode() ? "workspace vide" : "dossier par defaut");
+  projectDir?.trim() || (isRemoteMode() ? "environnement vide" : "environnement non selectionne");
 
 const maskProxy = (value: string) =>
   value.replace(/:\/\/([^:@/]+):([^@/]+)@/, "://$1:***@");
@@ -1862,7 +2114,7 @@ const stopPoolPoll = () => {
 };
 
 // ---------------------------------------------------------------------------
-// Salon d'agents (Agent Room)
+// Collaboration native entre agents du workspace actif
 // ---------------------------------------------------------------------------
 
 const roomPresentAgents = (): RoomAgent[] =>
@@ -2277,32 +2529,16 @@ const applySkill = async (id: string): Promise<void> => {
     return;
   }
 
-  // Les deux modes de l'interface utilisent le composer du chat. En expert,
-  // l'injection cible le panneau actif.
-  // composer du chat. On le place avant le brouillon existant afin que les
-  // instructions du skill encadrent bien la demande déjà saisie.
-  if (interfaceMode === "expert") {
-    const pane = activeExpertChatPane();
-    if (!pane) return;
-    const existingDraft = pane.draft.trim();
-    pane.draft = existingDraft ? `${content}\n\n${existingDraft}` : content;
-    setActiveView("chat");
-    statusText = `Skill « ${skill.name} » ajouté au chat`;
-    window.setTimeout(() => {
-      const input = expertChatPaneRoot(pane)?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
-      if (!input) return;
-      input.focus();
-      input.setSelectionRange(input.value.length, input.value.length);
-    }, 0);
-    return;
-  }
-
-  const existingDraft = chatDraft.trim();
-  chatDraft = existingDraft ? `${content}\n\n${existingDraft}` : content;
+  // L'injection cible le panneau actif et précède le brouillon existant afin
+  // que les instructions du skill encadrent bien la demande déjà saisie.
+  const pane = activeExpertChatPane();
+  if (!pane) return;
+  const existingDraft = pane.draft.trim();
+  pane.draft = existingDraft ? `${content}\n\n${existingDraft}` : content;
   setActiveView("chat");
   statusText = `Skill « ${skill.name} » ajouté au chat`;
   window.setTimeout(() => {
-    const input = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+    const input = expertChatPaneRoot(pane)?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
     if (!input) return;
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
@@ -2397,31 +2633,21 @@ const renderSkillsPanel = (): string => {
 };
 
 const renderRoomPanel = (): string => {
-  const enabled = settings?.agentRoom?.enabled ?? false;
   const running = roomStatus?.running ?? false;
   const present = roomStatus?.snapshot.present ?? 0;
-  const sub = enabled
-    ? `${running ? `Actif · ${escapeHtml(roomStatus?.url ?? "")}` : "Serveur arrêté"} · ${present} agent(s) présent(s)${roomStatus?.snapshot.storeOwner === false ? " · store passif" : ""}`
-    : "Désactivé";
+  const workspace = currentWorkspace();
+  const sub = `${running ? "Active automatiquement" : "Service indisponible"} · ${present} agent(s) présent(s) · ${workspace ? escapeHtml(workspaceBaseName(workspace)) : "aucun environnement actif"}${roomStatus?.snapshot.storeOwner === false ? " · store passif" : ""}`;
   return `
     <div class="panel room-panel">
       <div class="panel-head">
         <div>
-          <h2>Salon d'agents</h2>
+          <h2>Collaboration de l'environnement</h2>
           <p class="panel-sub">${sub}</p>
         </div>
         <div class="panel-actions">
           <button id="roomRefresh" class="icon-button wide" title="Rafraîchir"><i data-lucide="refresh-ccw"></i></button>
-          <button id="roomToggleEnabled" class="tool-button ${enabled ? "primary" : ""}" title="${enabled ? "Désactiver le salon" : "Activer le salon"}">
-            <i data-lucide="power"></i><span>${enabled ? "Activé" : "Désactivé"}</span>
-          </button>
         </div>
       </div>
-      ${
-        enabled
-          ? ""
-          : `<div class="room-hint">Active le salon pour que les agents se parlent et coordonnent leurs tâches/merges (outils MCP <code>list_agents</code>, <code>claim_task</code>, <code>submit_for_merge</code>). L'app ajoute une entrée <code>agent_room</code> dans le home isolé de chaque agent.</div>`
-      }
       <section id="roomCoordination" class="room-coordination">${renderRoomCoordinationInner()}</section>
       <div class="room-grid">
         <aside class="room-agents">
@@ -2432,7 +2658,7 @@ const renderRoomPanel = (): string => {
           <div id="roomFeed" class="room-feed">${renderRoomFeedInner()}</div>
           <form id="roomComposer" class="room-composer">
             <select id="roomTarget" class="agent-select" title="Destinataire" aria-label="Destinataire">
-              <option value="">Salon (tous)</option>
+              <option value="">Environnement (tous)</option>
               ${roomTargetOptions()}
             </select>
             <input id="roomText" type="text" placeholder="Message en tant qu'opérateur…" autocomplete="off" />
@@ -2443,6 +2669,143 @@ const renderRoomPanel = (): string => {
     </div>`;
 };
 
+const renderWorkspaceLiveGraphContent = (): string => {
+  const workspace = currentWorkspace();
+  const agents = roomPresentAgents();
+  const coordination = roomStatus?.snapshot.coordination;
+  const tasks = coordination?.tasks ?? [];
+  const landed = coordination?.recentLanded ?? [];
+  const queued = coordination?.queued ?? 0;
+  const running = coordination?.running ?? 0;
+  const attention = coordination?.attention ?? 0;
+  const recentMessages = roomMessages.slice(-8).reverse();
+  const roomId = roomStatus?.snapshot.roomId ?? "";
+
+  const agentNodes = agents.length
+    ? agents
+        .slice(0, 12)
+        .map(
+          (agent) => `<div class="workspace-live-agent-node">
+            <span class="live-dot on"></span>
+            <span><strong>${escapeHtml(agent.label)}</strong><small>${escapeHtml(agent.ident)}</small></span>
+          </div>`,
+        )
+        .join("") +
+      (agents.length > 12
+        ? `<div class="workspace-live-overflow">+${agents.length - 12} autres</div>`
+        : "")
+    : `<div class="workspace-live-empty">Aucun agent actif</div>`;
+
+  const taskItems = tasks.length
+    ? tasks
+        .slice(0, 6)
+        .map(
+          (task) => `<span class="workspace-live-task ${task.status}">
+            <b>${escapeHtml(task.id)}</b><small>${escapeHtml(task.claimedBy)}</small>
+          </span>`,
+        )
+        .join("")
+    : `<span class="workspace-live-empty">Aucune tâche</span>`;
+
+  const messageItems = recentMessages.length
+    ? recentMessages
+        .map((message) => {
+          const target = message.to ? ` → ${roomAgentLabel(message.to)}` : " → environnement";
+          const time = new Date(message.ts * 1000).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          });
+          return `<div class="workspace-live-event ${message.kind}">
+            <span class="workspace-live-event-time">${escapeHtml(time)}</span>
+            <strong>${escapeHtml(message.fromLabel)}</strong>
+            <span>${escapeHtml(target)}</span>
+            <p>${escapeHtml(message.text)}</p>
+          </div>`;
+        })
+        .join("")
+    : `<div class="workspace-live-empty">Aucun événement récent</div>`;
+
+  return `
+    <div class="workspace-live-kpis">
+      <span><b>${agents.length}</b> agents</span>
+      <span><b>${tasks.filter((task) => task.status === "claimed").length}</b> tâches actives</span>
+      <span><b>${queued}</b> en attente</span>
+      <span class="${running ? "is-running" : ""}"><b>${running}</b> en intégration</span>
+      <span class="${attention ? "needs-attention" : ""}"><b>${attention}</b> à reprendre</span>
+    </div>
+    <div class="workspace-live-topology">
+      <section class="workspace-live-stage workspace-live-agents">
+        <header><i data-lucide="bot"></i><span>Agents actifs</span></header>
+        <div class="workspace-live-agent-list">${agentNodes}</div>
+      </section>
+      <div class="workspace-live-link ${agents.length ? "active" : ""}"><i data-lucide="arrow-right"></i></div>
+      <section class="workspace-live-core ${agents.length ? "active" : ""}">
+        <span class="workspace-live-core-icon"><i data-lucide="folder-git-2"></i></span>
+        <strong>${escapeHtml(workspace ? workspaceBaseName(workspace) : "Environnement")}</strong>
+        <small>${escapeHtml(roomId ? roomId.slice(0, 18) : "scope indisponible")}</small>
+        <em>${agents.length ? "synchronisation active" : "en attente d'agents"}</em>
+      </section>
+      <div class="workspace-live-link ${tasks.length || queued || running ? "active" : ""}"><i data-lucide="arrow-right"></i></div>
+      <section class="workspace-live-pipeline">
+        <div class="workspace-live-pipeline-node">
+          <header><i data-lucide="list-checks"></i><span>Task board</span><b>${tasks.length}</b></header>
+          <div class="workspace-live-task-list">${taskItems}</div>
+        </div>
+        <div class="workspace-live-pipeline-arrow"><i data-lucide="chevron-down"></i></div>
+        <div class="workspace-live-pipeline-node ${running ? "running" : ""}">
+          <header><i data-lucide="git-merge"></i><span>Merge queue</span><b>${queued + running}</b></header>
+          <small>${running ? `${running} intégration(s) en cours` : queued ? `${queued} soumission(s) en attente` : "File vide"}</small>
+        </div>
+        <div class="workspace-live-pipeline-arrow"><i data-lucide="chevron-down"></i></div>
+        <div class="workspace-live-pipeline-node landed">
+          <header><i data-lucide="git-commit-horizontal"></i><span>Intégrés</span><b>${coordination?.landed ?? 0}</b></header>
+          <small>${landed[0]?.landedSha ? `Dernier ${escapeHtml(landed[0].landedSha!.slice(0, 10))}` : "Aucun merge récent"}</small>
+        </div>
+      </section>
+    </div>
+    <section class="workspace-live-events">
+      <header><span><i data-lucide="radio"></i> Événements temps réel</span><small>Actualisation 1 s</small></header>
+      <div class="workspace-live-event-list">${messageItems}</div>
+    </section>`;
+};
+
+const renderWorkspaceLiveGraphModal = (): string => {
+  if (!workspaceLiveGraphOpen) return "";
+  const workspace = currentWorkspace();
+  return `<div class="modal-backdrop workspace-live-backdrop" id="workspaceLiveGraphBackdrop">
+    <section class="modal workspace-live-modal" role="dialog" aria-modal="true" aria-labelledby="workspaceLiveGraphTitle">
+      <header class="modal-head workspace-live-head">
+        <div>
+          <span class="workspace-live-eyebrow"><i data-lucide="activity"></i> Temps réel</span>
+          <h2 id="workspaceLiveGraphTitle">Activité de l'environnement</h2>
+          <p>${escapeHtml(workspace ?? "Aucun environnement actif")}</p>
+        </div>
+        <button class="icon-button" id="closeWorkspaceLiveGraph" title="Fermer"><i data-lucide="x"></i></button>
+      </header>
+      <div class="workspace-live-content" id="workspaceLiveGraphContent">${renderWorkspaceLiveGraphContent()}</div>
+    </section>
+  </div>`;
+};
+
+const openWorkspaceLiveGraph = () => {
+  if (!currentWorkspace()) {
+    statusText = "Choisis d'abord un environnement";
+    render();
+    return;
+  }
+  workspaceLiveGraphOpen = true;
+  render();
+  startRoomPoll();
+  void refreshRoom();
+};
+
+const closeWorkspaceLiveGraph = () => {
+  workspaceLiveGraphOpen = false;
+  if (activeView !== "room") stopRoomPoll();
+  render();
+};
+
 const syncRoomTargetOptions = () => {
   const select = document.querySelector<HTMLSelectElement>("#roomTarget");
   if (!select) return;
@@ -2450,23 +2813,31 @@ const syncRoomTargetOptions = () => {
   // selection en cours d'ouverture a chaque poll).
   if (select.options.length - 1 === roomPresentAgents().length) return;
   const current = select.value;
-  select.innerHTML = `<option value="">Salon (tous)</option>${roomTargetOptions()}`;
+  select.innerHTML = `<option value="">Environnement (tous)</option>${roomTargetOptions()}`;
   select.value = current;
 };
 
 const refreshRoom = async () => {
   try {
-    roomStatus = await invoke<RoomStatus>("room_status");
+    roomStatus = await invoke<RoomStatus>("room_status", {
+      workspacePath: currentWorkspace(),
+    });
   } catch {
     return;
   }
   try {
     const result = await invoke<{ messages: RoomMessage[]; cursor: number }>("room_messages", {
       since: 0,
+      workspacePath: currentWorkspace(),
     });
     roomMessages = result.messages ?? [];
   } catch {
     // le fil reste tel quel
+  }
+  const liveGraph = document.querySelector<HTMLElement>("#workspaceLiveGraphContent");
+  if (liveGraph) {
+    liveGraph.innerHTML = renderWorkspaceLiveGraphContent();
+    createIcons({ icons: lucideIcons });
   }
   if (activeView !== "room") return;
   const agentsEl = document.querySelector<HTMLDivElement>("#roomAgents");
@@ -2487,7 +2858,7 @@ const refreshRoom = async () => {
 
 const startRoomPoll = () => {
   stopRoomPoll();
-  roomPoll = window.setInterval(() => void refreshRoom(), 2000);
+  roomPoll = window.setInterval(() => void refreshRoom(), 1000);
 };
 
 const stopRoomPoll = () => {
@@ -2497,30 +2868,6 @@ const stopRoomPoll = () => {
   }
 };
 
-const enableRoom = async () => {
-  try {
-    await invoke("room_enable", {});
-    if (settings) settings.agentRoom.enabled = true;
-    statusText = "Salon activé";
-  } catch (error) {
-    statusText = String(error);
-  }
-  await refreshRoom();
-  render();
-};
-
-const disableRoom = async () => {
-  try {
-    await invoke("room_disable");
-    if (settings) settings.agentRoom.enabled = false;
-    statusText = "Salon désactivé";
-  } catch (error) {
-    statusText = String(error);
-  }
-  await refreshRoom();
-  render();
-};
-
 const sendRoomMessage = async () => {
   const input = document.querySelector<HTMLInputElement>("#roomText");
   const target = document.querySelector<HTMLSelectElement>("#roomTarget");
@@ -2528,7 +2875,7 @@ const sendRoomMessage = async () => {
   if (!text) return;
   const to = target?.value || null;
   try {
-    await invoke("room_send", { text, to });
+    await invoke("room_send", { text, to, workspacePath: currentWorkspace() });
     if (input) input.value = "";
   } catch (error) {
     statusText = String(error);
@@ -2556,7 +2903,7 @@ const removeAccount = async (id: string | null, deleteFiles = false) => {
       poolStatus = await invoke<PoolStatus>("pool_status");
     }
     statusText = deleteFiles
-      ? `Compte « ${account.label} » supprimé (dossier effacé du disque)`
+      ? `Compte « ${account.label} » supprimé (environnement effacé du disque)`
       : `Compte « ${account.label} » retiré du pool`;
   } catch (error) {
     statusText = String(error);
@@ -2579,52 +2926,10 @@ const ensureTerminalsRestored = async () => {
   }
 };
 
-const setInterfaceMode = async (mode: InterfaceMode) => {
-  const previousMode = interfaceMode;
-  ++interfaceModeRequestId;
-  if (previousMode === "simple" && mode === "expert") {
-    captureChatFeedScroll();
-    stopChatSync();
-    stopChatTurnPoll();
-    mergeSimpleChatIntoExpert();
-  } else if (previousMode === "expert" && mode === "simple") {
-    captureAllExpertChatScroll();
-    stopAllExpertChatWork();
-    copyExpertChatIntoSimple();
-  }
-  interfaceMode = mode;
-  localStorage.setItem(INTERFACE_MODE_STORAGE_KEY, mode);
-  closeMobileOverlays();
-  document.body.classList.remove("chat-sidebar-open");
-
-  stopLimitPoll();
-  stopUsagePoll();
-  stopKombaiPoll();
-  stopRoomPoll();
-
-  if (mode === "simple") {
-    activeView = "chat";
-    statusText = "Mode simple";
-    startDiscussionsPoll();
-    startChatSync();
-    if (chatTurn?.status === "running" && chatTurn.id !== 0) startChatTurnPoll();
-    render();
-    void loadChatModelCatalog(chatAccountId);
-    if (!discussionsLoaded) void refreshDiscussions();
-    return;
-  }
-
-  activeView = "chat";
-  restoreExpertChats();
-  startDiscussionsPoll();
-  statusText = expertChatStatusText();
-  render();
-  startAllExpertChatWork();
-  expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
-  if (!discussionsLoaded) void refreshDiscussions();
-};
-
 const setActiveView = (view: AppView) => {
+  if (view === "terminal" && !userEnvironmentPath(terminalFolderFilter)) {
+    terminalFolderFilter = userEnvironmentPath(currentWorkspace());
+  }
   activeView = view;
   statusText =
     activeView === "pool"
@@ -2640,7 +2945,7 @@ const setActiveView = (view: AppView) => {
               : activeView === "history"
                 ? "Vue historique"
                 : activeView === "room"
-                  ? "Vue salon"
+                  ? "Vue collaboration"
                   : activeView === "audit"
                     ? "Audit design"
                     : activeView === "skills"
@@ -2649,7 +2954,9 @@ const setActiveView = (view: AppView) => {
                         ? "Paramètres"
                         : activeView === "chat"
                           ? "Vue conversation"
-                          : "Mur de terminaux";
+                          : terminalFolderFilter
+                            ? `Session terminal: ${workspaceBaseName(terminalFolderFilter)}`
+                            : "Choisis un environnement terminal";
 
   if (activeView === "limits") {
     startLimitPoll();
@@ -2681,12 +2988,7 @@ const setActiveView = (view: AppView) => {
     stopDiscussionsPoll();
   }
 
-  if (activeView === "chat") {
-    if (interfaceMode === "expert") startAllExpertChatWork();
-    else startChatSync();
-  } else if (interfaceMode === "simple") {
-    stopChatSync();
-  }
+  if (activeView === "chat") startAllExpertChatWork();
 
   render();
 
@@ -2703,16 +3005,16 @@ const setActiveView = (view: AppView) => {
   if (activeView === "skills") void refreshSkills();
 };
 
-const refreshLimitStatus = async () => {
-  if (activeView === "limits") {
+const refreshLimitStatus = async (silent = false) => {
+  if (!silent && activeView === "limits") {
     statusText = "Lecture des limites serveur";
   }
   try {
     limitStatus = await invoke<AccountLimitView[]>("account_limit_status");
     limitStatusLoaded = true;
-    statusText = "Limites serveur actualisees";
+    if (!silent) statusText = "Limites serveur actualisees";
   } catch (error) {
-    statusText = String(error);
+    if (!silent) statusText = String(error);
     limitStatusLoaded = true;
   }
 
@@ -2721,9 +3023,44 @@ const refreshLimitStatus = async () => {
   }
 };
 
+// Ouvre un terminal interactif `codex login` (ou l'equivalent du provider) pour
+// le compte cible : c'est la seule facon de regenerer une session revoquee /
+// expiree, sans laquelle la vue Limites ne peut relire aucun quota. On reutilise
+// la machinerie terminal existante (meme CODEX_HOME/agent que le compte).
+const reloginAccount = async (accountId: string) => {
+  if (!settings) return;
+  const account = settings.accounts.find((candidate) => candidate.id === accountId);
+  if (!account) {
+    statusText = "Compte introuvable";
+    render();
+    return;
+  }
+  const provider = accountProvider(account);
+  const agentId = providerAgentId(provider);
+  const agent = agentById(agentId);
+  const loginSub = agent?.loginCommand?.trim() || "login";
+  const environmentPath =
+    userEnvironmentPath(currentWorkspace()) ?? loadWorkspacePaths()[0] ?? null;
+  if (!environmentPath) {
+    statusText = "Choisis d'abord un environnement (onglet Terminal) pour ouvrir la connexion";
+    render();
+    return;
+  }
+  setCurrentWorkspace(environmentPath);
+  statusText = `Ouverture de la connexion ${providerLabel(provider)} pour ${account.label}…`;
+  await createNewTerminal(
+    accountId,
+    true,
+    agentSubcommand(agent, loginSub),
+    agentId,
+    null,
+    environmentPath,
+  );
+};
+
 const startLimitPoll = () => {
   stopLimitPoll();
-  limitPoll = window.setInterval(() => void refreshLimitStatus(), 300000);
+  limitPoll = window.setInterval(() => void refreshLimitStatus(), LIMIT_POLL_INTERVAL_MS);
 };
 
 const stopLimitPoll = () => {
@@ -2906,11 +3243,82 @@ const findDiscussion = (id: string | null | undefined) =>
 const discussionMatches = (discussion: DiscussionSummary, label: string) => {
   const query = discussionSearch.trim().toLowerCase();
   if (!query) return true;
-  return [discussion.title ?? "", discussion.preview ?? "", discussion.cwd ?? "", discussion.sessionId, label]
+  return [discussion.title ?? "", discussion.preview ?? "", discussionFolderPath(discussion) ?? "", discussion.sessionId, label]
     .some((field) => field.toLowerCase().includes(query));
 };
 
-const resumeSessionInTerminal = async (accountId: string, sessionId: string) => {
+const persistDiscussionFolder = async (
+  discussion: DiscussionSummary,
+  folderPath: string,
+): Promise<DiscussionSummary> => {
+  discussion.folderPath = folderPath;
+  if (
+    discussion.cwd?.trim() &&
+    normalizeWorkspacePath(discussion.cwd) === normalizeWorkspacePath(folderPath)
+  ) {
+    return discussion;
+  }
+  const moved = await invoke<DiscussionSummary>("move_discussion", {
+    accountId: discussion.accountId,
+    sessionId: discussion.sessionId,
+    workspacePath: folderPath,
+  });
+  moved.folderPath = folderPath;
+  Object.assign(discussion, moved);
+  return discussion;
+};
+
+const restoreDiscussionFolder = async (
+  discussion: DiscussionSummary,
+): Promise<string | null> => {
+  const folderPath = activateDiscussionFolder(discussion);
+  if (!folderPath) return null;
+  await persistDiscussionFolder(discussion, folderPath);
+  return folderPath;
+};
+
+// Quand un terminal isole se ferme, son transcript vient d'etre fusionne dans
+// le home canonique avec le cwd du worktree. On le retrouve par son id (ou par
+// ce cwd pour une nouvelle session), puis on persiste le dossier logique afin
+// que la prochaine reprise retrouve la meme room.
+const persistTerminalDiscussionFolder = async (session: TerminalSession): Promise<void> => {
+  const folderPath = session.folderPath?.trim();
+  if (!folderPath) return;
+  const linkedIds = new Set(
+    [session.codexSessionId, session.resumeSessionId].filter(
+      (id): id is string => !!id,
+    ),
+  );
+
+  for (const delay of [0, 200, 600]) {
+    if (delay) await sleep(delay);
+    await refreshDiscussions();
+    const discussion = allDiscussions().find(
+      (candidate) =>
+        candidate.accountId === session.accountId &&
+        (linkedIds.has(candidate.sessionId) || linkedIds.has(candidate.rolloutId)),
+    ) ?? allDiscussions()
+      .filter(
+        (candidate) =>
+          candidate.accountId === session.accountId &&
+          !!candidate.cwd &&
+          !!session.workspacePath &&
+          normalizeWorkspacePath(candidate.cwd) === normalizeWorkspacePath(session.workspacePath) &&
+          candidate.lastActivity >= (session.startedAtUnix ?? 0) - 5,
+      )
+      .sort((left, right) => right.lastActivity - left.lastActivity)[0];
+    if (!discussion) continue;
+    await persistDiscussionFolder(discussion, folderPath);
+    await refreshDiscussions();
+    return;
+  }
+};
+
+const resumeSessionInTerminal = async (
+  accountId: string,
+  sessionId: string,
+  folderPath: string | null,
+) => {
   if (!settings || !settings.accounts.some((account) => account.id === accountId)) {
     statusText = "Compte introuvable pour cette discussion";
     render();
@@ -2918,6 +3326,12 @@ const resumeSessionInTerminal = async (accountId: string, sessionId: string) => 
   }
   if (!isPlausibleSessionId(sessionId)) {
     statusText = "Identifiant de session invalide";
+    render();
+    return;
+  }
+  const environmentPath = userEnvironmentPath(folderPath);
+  if (!environmentPath) {
+    statusText = "Reprise bloquee: cette discussion n'a pas d'environnement associe";
     render();
     return;
   }
@@ -2933,13 +3347,25 @@ const resumeSessionInTerminal = async (accountId: string, sessionId: string) => 
     buildResumeCommand(sessionId, accountById(accountId)),
     providerAgentId(accountProvider(accountById(accountId))),
     sessionId,
+    environmentPath,
   );
 };
 
 // Reprise dans le compte D'ORIGINE : on relance le fichier rollout HEAD (le
 // plus recent de la chaine) via son `rolloutId`, non ambigu.
-const resumeDiscussion = (discussion: DiscussionSummary) =>
-  resumeSessionInTerminal(discussion.accountId, discussion.rolloutId || discussion.sessionId);
+const resumeDiscussion = async (discussion: DiscussionSummary) => {
+  try {
+    const folderPath = await restoreDiscussionFolder(discussion);
+    await resumeSessionInTerminal(
+      discussion.accountId,
+      discussion.rolloutId || discussion.sessionId,
+      folderPath,
+    );
+  } catch (error) {
+    statusText = `Impossible de restaurer l'environnement de la discussion : ${String(error)}`;
+    render();
+  }
+};
 
 // Delai (ms) avant d'injecter le transcript dans une session inter-provider
 // fraichement lancee, le temps que le CLI cible ait affiche son invite.
@@ -2971,11 +3397,9 @@ const transferredTerminal = (
 const transferredDiscussionStatus = (
   target: AccountProfile,
   archivedCount: number,
-  transcriptNeedsSubmit = false,
 ) => {
   const forkNote = archivedCount > 1 ? ` (${archivedCount} anciennes reprises archivees)` : "";
-  const submitNote = transcriptNeedsSubmit ? " — relis le transcript puis appuie sur Entree" : "";
-  return `Discussion deplacee vers « ${target.label} »${forkNote}${submitNote}`;
+  return `Discussion deplacee vers « ${target.label} »${forkNote} et reprise automatiquement`;
 };
 
 // Reprise dans un AUTRE compte = deplacement, pas duplication. Deux cas :
@@ -2988,6 +3412,7 @@ const transferredDiscussionStatus = (
 // demarre (et, pour un transcript, l'injection reussie). Un echec conserve donc
 // l'ancienne discussion dans la liste.
 const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccountId: string) => {
+  if (discussionBusyId) return;
   if (!settings || !targetAccountId || targetAccountId === discussion.accountId) return;
   const target = accountById(targetAccountId);
   if (!target) return;
@@ -2996,6 +3421,10 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
   discussionBusyId = discussion.sessionId;
   render();
   try {
+    const folderPath = userEnvironmentPath(await restoreDiscussionFolder(discussion));
+    if (!folderPath) {
+      throw new Error("la discussion n'a pas d'environnement associe");
+    }
     if (sourceProvider === "codex" && targetProvider === "codex") {
       const copied = await invoke<DiscussionSummary>("copy_discussion_to_account", {
         sessionId: discussion.rolloutId || discussion.sessionId,
@@ -3012,9 +3441,10 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
       const resumed = await createNewTerminal(
         targetAccountId,
         true,
-        buildResumeCommand(resumeId, target),
+        buildResumeAndContinueCommand(resumeId, target),
         providerAgentId("codex"),
         resumeId,
+        folderPath,
       );
       if (!transferredTerminal(resumed, targetAccountId)) {
         discussionBusyId = null;
@@ -3044,6 +3474,7 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
       agentRunCommand(agentById(providerAgentId(targetProvider)), target),
       providerAgentId(targetProvider),
       null,
+      folderPath,
     );
     const seeded = transferredTerminal(started, targetAccountId);
     if (!seeded) {
@@ -3055,7 +3486,7 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
     await seedSessionWithTranscript(seeded, transcript);
     const archivedCount = await archiveTransferredDiscussion(discussion);
     discussionBusyId = null;
-    statusText = transferredDiscussionStatus(target, archivedCount, true);
+    statusText = transferredDiscussionStatus(target, archivedCount);
     render();
     await refreshDiscussions();
   } catch (error) {
@@ -3065,9 +3496,8 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
   }
 };
 
-// Injecte le transcript exporte dans une session fraichement lancee, apres un
-// court delai (boot du CLI). Collage entre crochets NON soumis : l'utilisateur
-// relit puis appuie sur Entree — meme mecanique que l'injection de skills.
+// Injecte puis soumet le transcript exporte dans une session fraichement
+// lancee, apres un court delai (boot du CLI).
 const seedSessionWithTranscript = async (
   session: (typeof terminalSessions)[number] | null,
   transcript: string,
@@ -3079,7 +3509,7 @@ const seedSessionWithTranscript = async (
   }
   await invoke("write_terminal", {
     id: session.ptyId,
-    data: `\x1b[200~${transcript}\x1b[201~`,
+    data: `\x1b[200~${transcript}\x1b[201~\r`,
   });
 };
 
@@ -3104,8 +3534,8 @@ const moveDiscussionToWorkspace = async (
     return;
   }
   if (
-    discussion.cwd?.trim() &&
-    normalizeWorkspacePath(discussion.cwd) === normalizeWorkspacePath(workspace.path)
+    discussionFolderPath(discussion) &&
+    normalizeWorkspacePath(discussionFolderPath(discussion)!) === normalizeWorkspacePath(workspace.path)
   ) {
     statusText = `La conversation est deja dans ${workspace.label}`;
     return;
@@ -3121,6 +3551,7 @@ const moveDiscussionToWorkspace = async (
       sessionId: discussion.sessionId,
       workspacePath: workspace.path,
     });
+    moved.folderPath = workspace.path;
     Object.assign(discussion, moved);
     if (chatDiscussion?.sessionId === moved.sessionId) {
       Object.assign(chatDiscussion, moved);
@@ -3128,7 +3559,7 @@ const moveDiscussionToWorkspace = async (
     expertChatPanes.forEach((pane) => {
       if (pane.discussion?.sessionId === moved.sessionId) {
         Object.assign(pane.discussion, moved);
-        pane.pendingWorkspace = moved.cwd;
+        pane.pendingWorkspace = workspace.path;
       }
     });
     discussionBusyId = null;
@@ -3140,6 +3571,53 @@ const moveDiscussionToWorkspace = async (
     statusText = `Deplacement impossible : ${String(error)}`;
     render();
   }
+};
+
+const discussionMatchesAnyId = (
+  discussion: DiscussionSummary | null | undefined,
+  ids: ReadonlySet<string>,
+): boolean => !!discussion && (ids.has(discussion.sessionId) || ids.has(discussion.rolloutId));
+
+const removeArchivedDiscussionFromUi = (ids: ReadonlySet<string>) => {
+  ids.forEach((id) => discussionTargetSel.delete(id));
+  const closedExpertPanes = expertChatPanes.filter((pane) =>
+    discussionMatchesAnyId(pane.discussion, ids),
+  );
+  closedExpertPanes.forEach((pane) => {
+    stopExpertChatSync(pane);
+    stopExpertChatTurnPoll(pane);
+  });
+  expertChatPanes = expertChatPanes.filter(
+    (pane) => !discussionMatchesAnyId(pane.discussion, ids),
+  );
+  if (expertChatsRestored && !expertChatPanes.length) expertChatPanes.push(createExpertChatPane());
+  if (closedExpertPanes.some((pane) => pane.key === activeExpertChatKey)) {
+    activeExpertChatKey = expertChatPanes[0]?.key ?? null;
+  }
+  reconcileExpertChatPage();
+  if (closedExpertPanes.length) persistExpertChats();
+  if (discussionMatchesAnyId(chatDiscussion, ids)) {
+    chatDiscussion = null;
+    chatMessages = [];
+    chatTurn = null;
+    chatError = null;
+    chatLoading = false;
+    chatTruncated = false;
+  }
+};
+
+const archiveDiscussionById = async (
+  accountId: string,
+  archiveId: string,
+  relatedIds: readonly string[] = [],
+): Promise<number> => {
+  const result = await invoke<{ count?: number }>("delete_discussion", {
+    accountId,
+    sessionId: archiveId,
+    archive: true,
+  });
+  removeArchivedDiscussionFromUi(new Set([archiveId, ...relatedIds]));
+  return result?.count ?? 1;
 };
 
 const deleteDiscussion = async (discussion: DiscussionSummary) => {
@@ -3154,37 +3632,11 @@ const deleteDiscussion = async (discussion: DiscussionSummary) => {
   discussionBusyId = discussion.sessionId;
   render();
   try {
-    const result = await invoke<{ count?: number }>("delete_discussion", {
-      accountId: discussion.accountId,
-      sessionId: discussion.sessionId,
-      archive: true,
-    });
-    discussionTargetSel.delete(discussion.sessionId);
-    const closedExpertPanes = expertChatPanes.filter(
-      (pane) => pane.discussion?.sessionId === discussion.sessionId,
+    const count = await archiveDiscussionById(
+      discussion.accountId,
+      discussion.sessionId,
+      [discussion.rolloutId],
     );
-    closedExpertPanes.forEach((pane) => {
-      stopExpertChatSync(pane);
-      stopExpertChatTurnPoll(pane);
-    });
-    expertChatPanes = expertChatPanes.filter(
-      (pane) => pane.discussion?.sessionId !== discussion.sessionId,
-    );
-    if (expertChatsRestored && !expertChatPanes.length) expertChatPanes.push(createExpertChatPane());
-    if (closedExpertPanes.some((pane) => pane.key === activeExpertChatKey)) {
-      activeExpertChatKey = expertChatPanes[0]?.key ?? null;
-    }
-    reconcileExpertChatPage();
-    if (closedExpertPanes.length) persistExpertChats();
-    if (chatDiscussion?.sessionId === discussion.sessionId) {
-      chatDiscussion = null;
-      chatMessages = [];
-      chatTurn = null;
-      chatError = null;
-      chatLoading = false;
-      chatTruncated = false;
-    }
-    const count = result?.count ?? 1;
     statusText = count > 1 ? `Discussion archivee (${count} fichiers)` : "Discussion archivee";
   } catch (error) {
     statusText = String(error);
@@ -3222,6 +3674,51 @@ const discussionSubtitle = (discussion: DiscussionSummary): string => {
 const chatSelectedAccount = (): AccountProfile | null => {
   const preferred = chatDiscussion?.accountId ?? chatAccountId ?? settings?.defaultAccountId;
   return accountById(preferred) ?? settings?.accounts[0] ?? null;
+};
+
+const quotaSuggestionFor = (
+  turn: ChatTurnSnapshot | null,
+  discussion: DiscussionSummary | null,
+): ChatQuotaSuggestion | null => {
+  if (
+    !turn ||
+    turn.status !== "failed" ||
+    !isQuotaExhaustionError(turn.error) ||
+    !discussion ||
+    !settings
+  ) {
+    return null;
+  }
+
+  const current = accountById(turn.accountId);
+  if (!current) return null;
+  const provider = accountProvider(current);
+  const eligibleAccountIds = settings.accounts
+    .filter(
+      (account) => account.id !== current.id && accountProvider(account) === provider,
+    )
+    .map((account) => account.id);
+  const best = bestQuotaAccount(limitStatus, current.id, eligibleAccountIds);
+  if (!best) return null;
+
+  return {
+    accountId: best.account.id,
+    accountLabel: best.account.label,
+    remainingPercent: best.remainingPercent,
+    busy: discussionBusyId === discussion.sessionId,
+  };
+};
+
+let quotaAlternativeRefresh: Promise<void> | null = null;
+const refreshQuotaAlternatives = () => {
+  if (quotaAlternativeRefresh) return;
+  quotaAlternativeRefresh = refreshLimitStatus(true).finally(() => {
+    quotaAlternativeRefresh = null;
+    if (activeView !== "chat") return;
+    expertChatPanes
+      .filter((pane) => isQuotaExhaustionError(pane.turn?.error))
+      .forEach((pane) => refreshExpertChatPane(pane));
+  });
 };
 
 const readChatPreferences = (account: AccountProfile, root: ParentNode = document) => {
@@ -3262,8 +3759,8 @@ const readChatPreferences = (account: AccountProfile, root: ParentNode = documen
   };
 };
 
-// Les controles du mode simple deviennent aussi les valeurs par defaut du
-// compte. Les sauvegardes sont serialisees pour qu'un changement rapide de
+// Les controles du chat deviennent aussi les valeurs par defaut du compte.
+// Les sauvegardes sont serialisees pour qu'un changement rapide de
 // modele puis d'intensite ne puisse pas s'ecraser dans settings.json.
 const persistChatPreferences = (accountId: string) => {
   chatPreferencesSave = chatPreferencesSave
@@ -3286,14 +3783,14 @@ const chatPanelModel = (): ChatPanelModel => {
   const selectedModel = accountModel(account);
   const catalog = account ? chatModelCatalogs.get(account.id) : undefined;
   const workspace =
-    discussion?.cwd ?? pendingChatWorkspace ?? currentWorkspace() ?? account?.projectDir ?? null;
+    discussionFolderPath(discussion) ?? pendingChatWorkspace ?? currentWorkspace() ?? account?.projectDir ?? null;
   const metaParts = discussion
     ? [
         discussion.accountLabel,
-        discussion.cwd ? displayProjectDir(discussion.cwd) : "",
+        workspace ? displayProjectDir(workspace) : "",
         `${chatMessages.length || discussion.messageCount} message(s)`,
       ].filter(Boolean)
-    : [account?.label ?? "Choisissez un compte", workspace ? displayProjectDir(workspace) : "Workspace a choisir"];
+    : [account?.label ?? "Choisissez un compte", workspace ? displayProjectDir(workspace) : "Environnement a choisir"];
   return {
     title: discussion?.title?.trim() || "Nouvelle conversation",
     subtitle: metaParts.join(" \u00b7 "),
@@ -3306,6 +3803,7 @@ const chatPanelModel = (): ChatPanelModel => {
     activities: chatTurn?.activities ?? [],
     turnStatus: chatTurn?.status ?? "idle",
     turnError: chatTurn?.status === "failed" ? (chatTurn.error ?? "La reponse a echoue") : null,
+    quotaSuggestion: quotaSuggestionFor(chatTurn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
       id: candidate.id,
       label: candidate.label,
@@ -3328,7 +3826,7 @@ const chatPanelModel = (): ChatPanelModel => {
     mode: chatMode,
     draft: chatDraft,
     newConversation: !discussion,
-    workspaceLabel: workspace ? displayProjectDir(workspace) : "Workspace",
+    workspaceLabel: workspace ? displayProjectDir(workspace) : "Environnement",
     historyOpen: chatHistoryOpen,
   };
 };
@@ -3479,21 +3977,23 @@ const attachCreatedChat = async (sessionId: string): Promise<boolean> => {
 };
 
 const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
-  if (interfaceMode === "expert") {
-    const pane = expertChatPanes.find(
-      (candidate) =>
-        candidate.turn?.status === "running" &&
-        (candidate.turn.id === 0 || candidate.turn.id === snapshot.id) &&
-        candidate.turn.accountId === snapshot.accountId,
-    ) ?? activeExpertChatPane();
-    if (pane?.turn?.status === "running") {
-      await applyExpertChatTurnSnapshot(pane, snapshot);
-      return;
-    }
+  const pane = expertChatPanes.find(
+    (candidate) =>
+      candidate.turn?.status === "running" &&
+      (candidate.turn.id === 0 || candidate.turn.id === snapshot.id) &&
+      candidate.turn.accountId === snapshot.accountId,
+  ) ?? activeExpertChatPane();
+  if (pane?.turn?.status === "running") {
+    await applyExpertChatTurnSnapshot(pane, snapshot);
+    return;
   }
   if (chatTurn && chatTurn.id !== 0 && snapshot.id !== chatTurn.id) return;
   const previousStatus = chatTurn?.status;
   chatTurn = snapshot;
+  const quotaExhausted =
+    snapshot.status === "failed" &&
+    previousStatus !== "failed" &&
+    isQuotaExhaustionError(snapshot.error);
   const attached = snapshot.sessionId ? await attachCreatedChat(snapshot.sessionId) : !!chatDiscussion;
 
   if (snapshot.status === "completed") {
@@ -3516,6 +4016,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     if (previousStatus !== snapshot.status) render();
     else refreshChatFeed();
   }
+  if (quotaExhausted) refreshQuotaAlternatives();
 };
 
 const pollChatTurn = async () => {
@@ -3589,47 +4090,44 @@ const sendChatMessage = async () => {
       sessionId: chatDiscussion?.rolloutId ?? chatDiscussion?.sessionId ?? null,
       prompt,
       projectDir:
-        chatDiscussion?.cwd ?? pendingChatWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
+        discussionFolderPath(chatDiscussion) ?? pendingChatWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
       mode: chatMode,
       model: preferences.model,
       reasoningEffort: preferences.reasoningEffort,
     });
-    if (interfaceMode === "expert") {
-      const pane = expertChatPanes.find(
-        (candidate) =>
-          candidate.turn?.status === "running" &&
-          candidate.turn.id === 0 &&
-          candidate.turn.accountId === snapshot.accountId,
-      );
-      if (pane) {
-        pane.turn = snapshot;
-        startExpertChatTurnPoll(pane);
-        await applyExpertChatTurnSnapshot(pane, snapshot);
-        return;
-      }
+    const pane = expertChatPanes.find(
+      (candidate) =>
+        candidate.turn?.status === "running" &&
+        candidate.turn.id === 0 &&
+        candidate.turn.accountId === snapshot.accountId,
+    );
+    if (pane) {
+      pane.turn = snapshot;
+      startExpertChatTurnPoll(pane);
+      await applyExpertChatTurnSnapshot(pane, snapshot);
+      return;
     }
     chatTurn = snapshot;
     startChatTurnPoll();
     await applyChatTurnSnapshot(snapshot);
   } catch (error) {
-    if (interfaceMode === "expert") {
-      const pane = expertChatPanes.find(
-        (candidate) =>
-          candidate.turn?.status === "running" &&
-          candidate.turn.id === 0 &&
-          candidate.turn.accountId === account.id,
-      );
-      if (pane) {
-        pane.turn = {
-          ...pane.turn!,
-          status: "failed",
-          finishedAt: Math.floor(Date.now() / 1000),
-          error: String(error),
-        };
-        statusText = String(error);
-        refreshExpertChatPane(pane);
-        return;
-      }
+    const pane = expertChatPanes.find(
+      (candidate) =>
+        candidate.turn?.status === "running" &&
+        candidate.turn.id === 0 &&
+        candidate.turn.accountId === account.id,
+    );
+    if (pane) {
+      pane.turn = {
+        ...pane.turn!,
+        status: "failed",
+        finishedAt: Math.floor(Date.now() / 1000),
+        error: String(error),
+      };
+      statusText = String(error);
+      refreshExpertChatPane(pane);
+      if (isQuotaExhaustionError(String(error))) refreshQuotaAlternatives();
+      return;
     }
     chatTurn = {
       ...chatTurn,
@@ -3640,7 +4138,81 @@ const sendChatMessage = async () => {
     } as ChatTurnSnapshot;
     statusText = String(error);
     render();
+    if (isQuotaExhaustionError(String(error))) refreshQuotaAlternatives();
   }
+};
+
+const closeWorkspace = async (
+  workspace: WorkspaceProfile,
+  removedFromEnvironmentMenu = false,
+): Promise<void> => {
+  if (!settings || workspaceClosingId) return;
+  const id = workspaceIdForPath(workspace.path);
+  const terminalCount = terminalSessions.filter(
+    (session) => session.folderPath && workspaceIdForPath(session.folderPath) === id,
+  ).length;
+
+  workspaceClosingId = id;
+  const previousWorkspaces = settings.workspaces;
+  const previousClosedIds = settings.closedWorkspaceIds;
+  const update = closeWorkspaceRegistry(
+    settings.workspaces ?? [],
+    settings.closedWorkspaceIds ?? [],
+    workspace.path,
+  );
+  settings.workspaces = update.workspaces;
+  settings.closedWorkspaceIds = update.closedWorkspaceIds;
+
+  try {
+    settings = await invoke<AppSettings>("save_settings", { settings });
+  } catch (error) {
+    settings.workspaces = previousWorkspaces;
+    settings.closedWorkspaceIds = previousClosedIds;
+    workspaceClosingId = null;
+    statusText = `Fermeture impossible : ${String(error)}`;
+    render();
+    return;
+  }
+
+  forgetWorkspace(workspace.path);
+  const activePath = currentWorkspace();
+  const closedActiveWorkspace = !!activePath && workspaceIdForPath(activePath) === id;
+  if (closedActiveWorkspace) {
+    setCurrentWorkspace(null);
+    workspaceLiveGraphOpen = false;
+    roomStatus = null;
+    roomMessages = [];
+    stopRoomPoll();
+  }
+  if (terminalFolderFilter && workspaceIdForPath(terminalFolderFilter) === id) {
+    terminalFolderFilter = null;
+  }
+  if (activeChatWorkspaceFilter() === id) setChatWorkspaceFilter(WORKSPACE_ALL);
+  if (pendingChatWorkspace && workspaceIdForPath(pendingChatWorkspace) === id) {
+    pendingChatWorkspace = null;
+  }
+  if (newTerminalWorkspacePath && workspaceIdForPath(newTerminalWorkspacePath) === id) {
+    newTerminalWorkspacePath = null;
+  }
+  let expertChatsChanged = false;
+  expertChatPanes.forEach((pane) => {
+    if (
+      !pane.discussion &&
+      pane.pendingWorkspace &&
+      workspaceIdForPath(pane.pendingWorkspace) === id
+    ) {
+      pane.pendingWorkspace = null;
+      expertChatsChanged = true;
+    }
+  });
+  if (expertChatsChanged) persistExpertChats();
+
+  workspaceClosingId = null;
+  const action = removedFromEnvironmentMenu ? "supprime de Switch" : "ferme";
+  statusText = terminalCount
+    ? `Environnement « ${workspace.label} » ${action} · ${terminalCount} terminal${terminalCount > 1 ? "s restent" : " reste"} ouvert${terminalCount > 1 ? "s" : ""}`
+    : `Environnement « ${workspace.label} » ${action}`;
+  render();
 };
 
 const stopCurrentChatTurn = async () => {
@@ -3661,45 +4233,7 @@ const stopCurrentChatTurn = async () => {
 };
 
 const openNewChat = () => {
-  if (interfaceMode === "expert") {
-    addExpertChatPane();
-    return;
-  }
-  if (chatTurn?.status === "running") {
-    statusText = "Arretez la reponse en cours avant d'ouvrir un nouveau chat";
-    return;
-  }
-  stopChatSync();
-  stopChatTurnPoll();
-  chatDiscussion = null;
-  chatMessages = [];
-  chatLoading = false;
-  chatError = null;
-  chatTruncated = false;
-  chatTurn = null;
-  chatDraft = "";
-  chatHistoryOpen = false;
-  // Fixe le dossier du nouveau chat au workspace actif de l'appareil : le
-  // premier message sera cree dans ce dossier (cf. sendChatMessage).
-  pendingChatWorkspace = currentWorkspace();
-  chatAccountId = selectedAccountId ?? settings?.defaultAccountId ?? settings?.accounts[0]?.id ?? null;
-  void loadChatModelCatalog(chatAccountId);
-  // Aligne le filtre de la barre laterale pour que le futur chat y soit visible
-  // apres son premier message. Le dossier resolu doit correspondre a celui
-  // envoye a start_chat_turn (pendingChatWorkspace ?? account.projectDir).
-  const newChatPath =
-    pendingChatWorkspace ?? accountById(chatAccountId)?.projectDir?.trim() ?? null;
-  const newChatFilter = newChatPath ? workspaceIdForPath(newChatPath) : WORKSPACE_UNKNOWN;
-  const currentFilter = activeChatWorkspaceFilter();
-  if (currentFilter !== WORKSPACE_ALL && currentFilter !== newChatFilter) {
-    setChatWorkspaceFilter(newChatFilter);
-  }
-  activeView = "chat";
-  document.body.classList.remove("chat-sidebar-open");
-  statusText = "Nouveau chat";
-  resetChatFeedScroll();
-  render();
-  window.setTimeout(() => document.querySelector<HTMLTextAreaElement>("#chatPrompt")?.focus(), 0);
+  openNewChatModal();
 };
 
 const sameChatMessages = (left: ChatMessage[], right: ChatMessage[]) =>
@@ -3819,95 +4353,105 @@ const startChatSync = () => {
   }, 2000);
 };
 
-const openDiscussionChat = (discussion: DiscussionSummary) => {
-  if (interfaceMode === "expert") {
+const openDiscussionChat = async (discussion: DiscussionSummary) => {
+  try {
+    await restoreDiscussionFolder(discussion);
     openDiscussionInExpert(discussion);
-    return;
-  }
-  if (chatTurn?.status === "running") {
-    statusText = "Arretez la reponse en cours avant de changer de conversation";
-    return;
-  }
-  stopChatTurnPoll();
-  resetChatFeedScroll();
-  chatDiscussion = discussion;
-  chatAccountId = discussion.accountId;
-  void loadChatModelCatalog(chatAccountId);
-  chatMessages = [];
-  chatError = null;
-  chatTruncated = false;
-  chatLoading = true;
-  chatTurn = null;
-  chatDraft = "";
-  chatHistoryOpen = false;
-  document.body.classList.remove("chat-sidebar-open");
-  if (activeView !== "chat") {
-    setActiveView("chat"); // rend la coquille avec l'etat \u00ab chargement \u00bb
-  } else {
-    startChatSync();
+  } catch (error) {
+    statusText = `Environnement de la discussion non restaure : ${String(error)}`;
     render();
   }
-  void loadChatTranscript();
 };
 
-// --- Mode expert : le meme chat que le mode simple, en plusieurs panneaux ---
+// --- Grille de chats persistants, indépendants et paginés -------------------
 
 const createExpertChatPane = (
   discussion: DiscussionSummary | null = null,
   persisted: Partial<PersistedExpertChatPane> = {},
-): ExpertChatPane => ({
-  key: persisted.key || uid("chat-pane"),
-  discussion,
-  messages: [],
-  loading: !!discussion,
-  error: null,
-  truncated: false,
-  syncState: "closed",
-  liveUnlisten: null,
-  fallbackPoll: null,
-  loadInFlight: false,
-  turn: null,
-  turnPoll: null,
-  turnPollInFlight: false,
-  draft: persisted.draft ?? "",
-  mode:
-    persisted.mode === "plan" || persisted.mode === "ask" ? persisted.mode : "build",
-  accountId:
-    discussion?.accountId ??
-    persisted.accountId ??
-    selectedAccountId ??
-    settings?.defaultAccountId ??
-    settings?.accounts[0]?.id ??
-    null,
-  historyOpen: false,
-  pendingWorkspace:
-    discussion?.cwd ??
-    persisted.pendingWorkspace ??
-    currentWorkspace(),
-  followLatest: true,
-  scrollTop: 0,
-});
+): ExpertChatPane => {
+  const capturedWorkspace = userEnvironmentPath(persisted.pendingWorkspace);
+  if (
+    discussion &&
+    capturedWorkspace &&
+    isEphemeralChatWorkspacePath(discussion.cwd)
+  ) {
+    discussion.folderPath = capturedWorkspace;
+  }
+
+  return {
+    key: persisted.key || uid("chat-pane"),
+    discussion,
+    messages: [],
+    loading: !!discussion,
+    error: null,
+    truncated: false,
+    syncState: "closed",
+    liveUnlisten: null,
+    fallbackPoll: null,
+    loadInFlight: false,
+    turn: null,
+    turnPoll: null,
+    turnPollInFlight: false,
+    draft: persisted.draft ?? "",
+    mode:
+      persisted.mode === "plan" || persisted.mode === "ask" ? persisted.mode : "build",
+    accountId:
+      discussion?.accountId ??
+      persisted.accountId ??
+      selectedAccountId ??
+      settings?.defaultAccountId ??
+      settings?.accounts[0]?.id ??
+      null,
+    historyOpen: false,
+    pendingWorkspace:
+      discussionFolderPath(discussion) ?? capturedWorkspace ?? currentWorkspace(),
+    followLatest: true,
+    scrollTop: 0,
+  };
+};
+
+const expertChatPaneEnvironmentPath = (pane: ExpertChatPane): string | null =>
+  userEnvironmentPath(
+    discussionFolderPath(pane.discussion) ?? pane.pendingWorkspace,
+  );
+
+const expertChatPanesForCurrentEnvironment = (): ExpertChatPane[] => {
+  const environmentPath = userEnvironmentPath(currentWorkspace());
+  if (!environmentPath) return [];
+  const environmentId = workspaceIdForPath(environmentPath);
+  return expertChatPanes.filter((pane) => {
+    const panePath = expertChatPaneEnvironmentPath(pane);
+    return !!panePath && workspaceIdForPath(panePath) === environmentId;
+  });
+};
 
 const activeExpertChatPane = (): ExpertChatPane | null =>
-  expertChatPanes.find((pane) => pane.key === activeExpertChatKey) ?? expertChatPanes[0] ?? null;
+  expertChatPanesForCurrentEnvironment().find((pane) => pane.key === activeExpertChatKey) ??
+  expertChatPanesForCurrentEnvironment()[0] ??
+  null;
 
 const expertChatPageTotal = (): number =>
-  expertChatPageCount(expertChatPanes.length, expertChatsPerPage);
+  expertChatPageCount(expertChatPanesForCurrentEnvironment().length, expertChatsPerPage);
 
 const visibleExpertChatPanes = (): ExpertChatPane[] =>
-  expertChatsOnPage(expertChatPanes, expertChatPage, expertChatsPerPage);
+  expertChatsOnPage(
+    expertChatPanesForCurrentEnvironment(),
+    expertChatPage,
+    expertChatsPerPage,
+  );
 
 const expertChatStatusText = (): string => {
-  const count = expertChatPanes.length;
+  const count = expertChatPanesForCurrentEnvironment().length;
   const totalPages = expertChatPageTotal();
-  return `${count} chat${count > 1 ? "s" : ""} ouvert${count > 1 ? "s" : ""} · page ${expertChatPage + 1}/${totalPages}`;
+  return `${count} chat${count > 1 ? "s" : ""} dans cet environnement · page ${expertChatPage + 1}/${totalPages}`;
 };
 
 const moveExpertChatPageToPane = (pane: ExpertChatPane | null) => {
-  const index = pane ? expertChatPanes.indexOf(pane) : -1;
+  const panes = expertChatPanesForCurrentEnvironment();
+  const index = pane ? panes.indexOf(pane) : -1;
   expertChatPage = index >= 0
     ? expertChatPageForIndex(index, expertChatsPerPage)
-    : clampExpertChatPage(expertChatPage, expertChatPanes.length, expertChatsPerPage);
+    : clampExpertChatPage(expertChatPage, panes.length, expertChatsPerPage);
 };
 
 const reconcileExpertChatPage = () => {
@@ -3919,7 +4463,7 @@ const reconcileExpertChatPage = () => {
   }
   expertChatPage = clampExpertChatPage(
     expertChatPage,
-    expertChatPanes.length,
+    expertChatPanesForCurrentEnvironment().length,
     expertChatsPerPage,
   );
 };
@@ -3939,14 +4483,14 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
   const selectedModel = accountModel(account);
   const catalog = account ? chatModelCatalogs.get(account.id) : undefined;
   const workspace =
-    discussion?.cwd ?? pane.pendingWorkspace ?? currentWorkspace() ?? account?.projectDir ?? null;
+    discussionFolderPath(discussion) ?? pane.pendingWorkspace ?? currentWorkspace() ?? account?.projectDir ?? null;
   const metaParts = discussion
     ? [
         discussion.accountLabel,
-        discussion.cwd ? displayProjectDir(discussion.cwd) : "",
+        workspace ? displayProjectDir(workspace) : "",
         `${pane.messages.length || discussion.messageCount} message(s)`,
       ].filter(Boolean)
-    : [account?.label ?? "Choisissez un compte", workspace ? displayProjectDir(workspace) : "Workspace a choisir"];
+    : [account?.label ?? "Choisissez un compte", workspace ? displayProjectDir(workspace) : "Environnement a choisir"];
   return {
     title: discussion?.title?.trim() || "Nouvelle conversation",
     subtitle: metaParts.join(" \u00b7 "),
@@ -3959,6 +4503,7 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     activities: pane.turn?.activities ?? [],
     turnStatus: pane.turn?.status ?? "idle",
     turnError: pane.turn?.status === "failed" ? (pane.turn.error ?? "La reponse a echoue") : null,
+    quotaSuggestion: quotaSuggestionFor(pane.turn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
       id: candidate.id,
       label: candidate.label,
@@ -3981,14 +4526,13 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     mode: pane.mode,
     draft: pane.draft,
     newConversation: !discussion,
-    workspaceLabel: workspace ? displayProjectDir(workspace) : "Workspace",
+    workspaceLabel: workspace ? displayProjectDir(workspace) : "Environnement",
     historyOpen: pane.historyOpen,
   };
 };
 
 const persistExpertChats = () => {
-  // Le mode simple charge les panneaux Expert paresseusement. Ne pas ecraser
-  // leur etat local par une liste vide tant qu'ils n'ont pas ete restaures.
+  // Ne pas ecraser l'etat local par une liste vide avant sa restauration.
   if (!expertChatsRestored && expertChatPanes.length === 0) return;
   const state: PersistedExpertChats = {
     v: 1,
@@ -4059,8 +4603,9 @@ const renderExpertChatPane = (pane: ExpertChatPane): string =>
   renderChatPanel(expertChatPanelModel(pane), {
     instanceId: pane.key,
     paneIndex: expertChatPanes.indexOf(pane) + 1,
-    closeable: true,
     active: pane.key === activeExpertChatKey,
+    compact: true,
+    fullscreen: pane.key === expertChatFullscreenKey,
   });
 
 const refreshExpertChatSyncIndicator = (pane: ExpertChatPane) => {
@@ -4138,10 +4683,10 @@ const applyExpertChatTranscript = (
   pane.truncated = transcript.truncated;
   pane.loading = false;
   pane.error = null;
-  if (interfaceMode === "expert" && activeView === "chat" && (changed || truncationChanged || wasLoading)) {
+  if (activeView === "chat" && (changed || truncationChanged || wasLoading)) {
     if (pane.historyOpen && changed) refreshExpertChatPane(pane);
     else refreshExpertChatFeed(pane);
-  } else if (interfaceMode === "expert" && activeView === "chat") {
+  } else if (activeView === "chat") {
     refreshExpertChatSyncIndicator(pane);
   }
 };
@@ -4165,7 +4710,7 @@ const loadExpertChatTranscript = async (pane: ExpertChatPane) => {
     pane.loading = false;
     if (pane.messages.length === 0) pane.error = String(error);
     statusText = `Conversation : ${String(error)}`;
-    if (interfaceMode === "expert" && activeView === "chat") refreshExpertChatPane(pane);
+    if (activeView === "chat") refreshExpertChatPane(pane);
   } finally {
     pane.loadInFlight = false;
   }
@@ -4174,7 +4719,7 @@ const loadExpertChatTranscript = async (pane: ExpertChatPane) => {
 const startExpertChatSync = (pane: ExpertChatPane) => {
   stopExpertChatSync(pane);
   const discussion = pane.discussion;
-  if (!discussion || interfaceMode !== "expert") return;
+  if (!discussion) return;
 
   if (!isRemoteMode()) {
     pane.syncState = "polling";
@@ -4198,13 +4743,13 @@ const startExpertChatSync = (pane: ExpertChatPane) => {
         pane.loading = false;
         if (pane.messages.length === 0) pane.error = message.message;
         statusText = `Conversation : ${message.message}`;
-        if (interfaceMode === "expert" && activeView === "chat") refreshExpertChatPane(pane);
+        if (activeView === "chat") refreshExpertChatPane(pane);
       }
     },
     (state: RealtimeConnectionState) => {
       if (!expertChatPanes.includes(pane) || pane.discussion !== discussion) return;
       pane.syncState = state;
-      if (interfaceMode === "expert" && activeView === "chat") refreshExpertChatSyncIndicator(pane);
+      if (activeView === "chat") refreshExpertChatSyncIndicator(pane);
     },
   );
   pane.fallbackPoll = window.setInterval(() => {
@@ -4223,6 +4768,14 @@ const attachCreatedExpertChat = async (
     discussion = findDiscussionByRollout(sessionId);
   }
   if (!discussion || !expertChatPanes.includes(pane)) return false;
+  const capturedWorkspace = userEnvironmentPath(pane.pendingWorkspace);
+  if (capturedWorkspace) {
+    // Le premier snapshot pointe encore vers le worktree physique. Conserver
+    // l'environnement capture a la creation empeche le panneau de disparaitre
+    // de la grille pendant que le backend restaure le cwd logique du JSONL.
+    discussion.folderPath = capturedWorkspace;
+    pane.pendingWorkspace = capturedWorkspace;
+  }
   pane.discussion = discussion;
   pane.accountId = discussion.accountId;
   pane.loading = false;
@@ -4242,6 +4795,10 @@ const applyExpertChatTurnSnapshot = async (
   if (pane.turn && pane.turn.id !== 0 && snapshot.id !== pane.turn.id) return;
   const previousStatus = pane.turn?.status;
   pane.turn = snapshot;
+  const quotaExhausted =
+    snapshot.status === "failed" &&
+    previousStatus !== "failed" &&
+    isQuotaExhaustionError(snapshot.error);
   const attached = snapshot.sessionId
     ? await attachCreatedExpertChat(pane, snapshot.sessionId)
     : !!pane.discussion;
@@ -4260,10 +4817,11 @@ const applyExpertChatTurnSnapshot = async (
     statusText = `${expertChatPanelModel(pane).providerLabel} travaille…`;
   }
 
-  if (interfaceMode === "expert" && activeView === "chat") {
+  if (activeView === "chat") {
     if (previousStatus !== snapshot.status) refreshExpertChatPane(pane);
     else refreshExpertChatFeed(pane);
   }
+  if (quotaExhausted) refreshQuotaAlternatives();
 };
 
 const pollExpertChatTurn = async (pane: ExpertChatPane) => {
@@ -4339,20 +4897,13 @@ const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) =>
       sessionId: pane.discussion?.rolloutId ?? pane.discussion?.sessionId ?? null,
       prompt,
       projectDir:
-        pane.discussion?.cwd ?? pane.pendingWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
+        discussionFolderPath(pane.discussion) ?? pane.pendingWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
       mode: pane.mode,
       model: preferences.model,
       reasoningEffort: preferences.reasoningEffort,
     });
     if (!expertChatPanes.includes(pane)) return;
     pane.turn = snapshot;
-    if (interfaceMode === "simple" && pane.key === activeExpertChatKey && chatTurn?.status === "running") {
-      chatTurn = snapshot;
-      startChatTurnPoll();
-      await applyChatTurnSnapshot(snapshot);
-      return;
-    }
-    if (interfaceMode !== "expert") return;
     startExpertChatTurnPoll(pane);
     await applyExpertChatTurnSnapshot(pane, snapshot);
   } catch (error) {
@@ -4365,11 +4916,7 @@ const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) =>
       error: String(error),
     } as ChatTurnSnapshot;
     statusText = String(error);
-    if (interfaceMode === "simple" && pane.key === activeExpertChatKey) {
-      chatTurn = pane.turn;
-      render();
-      return;
-    }
+    if (isQuotaExhaustionError(String(error))) refreshQuotaAlternatives();
     refreshExpertChatPane(pane);
   }
 };
@@ -4419,9 +4966,10 @@ const activateExpertChatPane = (pane: ExpertChatPane, focusPrompt = false) => {
 
 const setExpertChatPage = (requestedPage: number) => {
   captureAllExpertChatScroll();
+  const environmentPanes = expertChatPanesForCurrentEnvironment();
   expertChatPage = clampExpertChatPage(
     requestedPage,
-    expertChatPanes.length,
+    environmentPanes.length,
     expertChatsPerPage,
   );
   const panes = visibleExpertChatPanes();
@@ -4433,8 +4981,20 @@ const setExpertChatPage = (requestedPage: number) => {
   render();
 };
 
-const addExpertChatPane = () => {
-  const pane = createExpertChatPane();
+const addExpertChatPane = (
+  accountId: string | null = null,
+  options: { mode?: ChatMode; pendingWorkspace?: string | null } = {},
+) => {
+  const environmentPath = userEnvironmentPath(options.pendingWorkspace ?? currentWorkspace());
+  if (!environmentPath) {
+    openTerminalEnvironmentMenu();
+    return null;
+  }
+  const pane = createExpertChatPane(null, {
+    accountId: accountId ?? selectedAccountId ?? settings?.defaultAccountId ?? null,
+    pendingWorkspace: environmentPath,
+    mode: options.mode,
+  });
   expertChatPanes.push(pane);
   activeExpertChatKey = pane.key;
   moveExpertChatPageToPane(pane);
@@ -4470,6 +5030,20 @@ const openDiscussionInExpert = (discussion: DiscussionSummary) => {
   void loadExpertChatTranscript(pane);
 };
 
+const toggleExpertChatFullscreen = (pane: ExpertChatPane) => {
+  if (!expertChatPanes.includes(pane)) return;
+  expertChatFullscreenKey = expertChatFullscreenKey === pane.key ? null : pane.key;
+  if (expertChatFullscreenKey) activeExpertChatKey = pane.key;
+  render();
+  if (expertChatFullscreenKey) {
+    window.requestAnimationFrame(() => {
+      expertChatPaneRoot(pane)
+        ?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']")
+        ?.focus();
+    });
+  }
+};
+
 const closeExpertChatPane = (pane: ExpertChatPane) => {
   if (pane.turn?.status === "running") {
     statusText = "Arretez la reponse avant de fermer ce chat";
@@ -4480,71 +5054,15 @@ const closeExpertChatPane = (pane: ExpertChatPane) => {
   stopExpertChatSync(pane);
   stopExpertChatTurnPoll(pane);
   expertChatPanes.splice(index, 1);
-  if (!expertChatPanes.length) expertChatPanes.push(createExpertChatPane());
+  const environmentPanes = expertChatPanesForCurrentEnvironment();
   if (activeExpertChatKey === pane.key) {
-    activeExpertChatKey = expertChatPanes[Math.min(index, expertChatPanes.length - 1)]?.key ?? null;
+    activeExpertChatKey = environmentPanes[0]?.key ?? null;
   }
+  if (expertChatFullscreenKey === pane.key) expertChatFullscreenKey = null;
   reconcileExpertChatPage();
   statusText = expertChatStatusText();
   persistExpertChats();
   render();
-};
-
-const copySimpleChatIntoExpertPane = (pane: ExpertChatPane) => {
-  stopExpertChatSync(pane);
-  stopExpertChatTurnPoll(pane);
-  pane.discussion = chatDiscussion;
-  pane.messages = [...chatMessages];
-  pane.loading = chatLoading;
-  pane.error = chatError;
-  pane.truncated = chatTruncated;
-  pane.syncState = "closed";
-  pane.loadInFlight = false;
-  pane.turn = chatTurn ? { ...chatTurn, activities: [...chatTurn.activities] } : null;
-  pane.draft = chatDraft;
-  pane.mode = chatMode;
-  pane.accountId = chatAccountId;
-  pane.historyOpen = chatHistoryOpen;
-  pane.pendingWorkspace = pendingChatWorkspace;
-  pane.followLatest = chatFollowLatest;
-  pane.scrollTop = chatScrollTop;
-};
-
-const mergeSimpleChatIntoExpert = () => {
-  restoreExpertChats();
-  const pane = chatDiscussion
-    ? expertChatPanes.find((candidate) => candidate.discussion?.sessionId === chatDiscussion?.sessionId)
-    : expertChatPanes.find((candidate) => !candidate.discussion && candidate.messages.length === 0);
-  let target = pane ?? null;
-  if (!target) {
-    target = createExpertChatPane();
-    expertChatPanes.push(target);
-  }
-  if (!expertChatPanes.includes(target)) expertChatPanes.push(target);
-  copySimpleChatIntoExpertPane(target);
-  activeExpertChatKey = target.key;
-  moveExpertChatPageToPane(target);
-  persistExpertChats();
-};
-
-const copyExpertChatIntoSimple = () => {
-  const pane = activeExpertChatPane();
-  if (!pane) return;
-  chatDiscussion = pane.discussion;
-  chatMessages = [...pane.messages];
-  chatLoading = pane.loading;
-  chatError = pane.error;
-  chatTruncated = pane.truncated;
-  chatSyncState = "closed";
-  chatLoadInFlight = false;
-  chatTurn = pane.turn ? { ...pane.turn, activities: [...pane.turn.activities] } : null;
-  chatDraft = pane.draft;
-  chatMode = pane.mode;
-  chatAccountId = pane.accountId;
-  chatHistoryOpen = pane.historyOpen;
-  pendingChatWorkspace = pane.pendingWorkspace;
-  chatFollowLatest = pane.followLatest;
-  chatScrollTop = pane.scrollTop;
 };
 
 const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
@@ -4559,8 +5077,9 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
       setActiveView("discussions");
     }
   });
-  root.querySelector<HTMLButtonElement>("[data-chat-action='new']")?.addEventListener("click", addExpertChatPane);
+  root.querySelector<HTMLButtonElement>("[data-chat-action='new']")?.addEventListener("click", () => openNewChatModal());
   root.querySelector<HTMLButtonElement>("[data-chat-action='close']")?.addEventListener("click", () => closeExpertChatPane(pane));
+  root.querySelector<HTMLButtonElement>("[data-chat-action='fullscreen']")?.addEventListener("click", () => toggleExpertChatFullscreen(pane));
   root.querySelector<HTMLButtonElement>("[data-chat-action='refresh']")?.addEventListener("click", () => {
     if (pane.discussion) void loadExpertChatTranscript(pane);
     else void refreshDiscussions();
@@ -4599,6 +5118,15 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   root.querySelector<HTMLButtonElement>("[data-chat-action='stop']")?.addEventListener("click", () => {
     void stopExpertChatTurn(pane);
   });
+  root
+    .querySelector<HTMLButtonElement>("[data-chat-action='quota-switch'][data-quota-account]")
+    ?.addEventListener("click", (event) => {
+      const targetAccountId = (event.currentTarget as HTMLButtonElement).dataset.quotaAccount;
+      if (pane.discussion && targetAccountId) {
+        activeExpertChatKey = pane.key;
+        void continueDiscussionWith(pane.discussion, targetAccountId);
+      }
+    });
 
   const prompt = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
   const resizePrompt = () => {
@@ -4620,13 +5148,6 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   root.querySelector<HTMLFormElement>("[data-chat-control='composer']")?.addEventListener("submit", (event) => {
     event.preventDefault();
     void sendExpertChatMessage(pane, root);
-  });
-  root.querySelector<HTMLSelectElement>("[data-chat-control='account']")?.addEventListener("change", (event) => {
-    pane.accountId = (event.currentTarget as HTMLSelectElement).value;
-    selectedAccountId = pane.accountId;
-    persistExpertChats();
-    refreshExpertChatPane(pane);
-    void loadChatModelCatalog(pane.accountId);
   });
   root.querySelector<HTMLSelectElement>("[data-chat-control='mode']")?.addEventListener("change", (event) => {
     pane.mode = (event.currentTarget as HTMLSelectElement).value as ChatMode;
@@ -4704,10 +5225,11 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
   const title = discussion.title?.trim() || "(sans titre)";
   const subtitle = discussionSubtitle(discussion);
   const provider = discussion.provider ?? "codex";
+  const folderPath = discussionFolderPath(discussion);
   const meta = [
     `<span class="discussion-badge prov-${provider}" title="Fournisseur d'origine"><i data-lucide="cpu"></i>${escapeHtml(providerLabel(provider))}</span>`,
-    discussion.cwd
-      ? `<span title="${escapeAttr(discussion.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(discussion.cwd))}</span>`
+    folderPath
+      ? `<span title="${escapeAttr(folderPath)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(folderPath))}</span>`
       : "",
     `<span><i data-lucide="clock-3"></i>${escapeHtml(formatTimestamp(discussion.lastActivity))}</span>`,
     discussion.totalTokens
@@ -4751,8 +5273,8 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
             ${options}
           </select>
         </label>
-        <button class="tool-button" data-resume-session="${escapeAttr(discussion.sessionId)}" title="${willCopy ? "Copier la discussion dans le compte choisi puis la reprendre" : "Reprendre dans un terminal"}">
-          <i data-lucide="${willCopy ? "copy" : "play"}"></i><span data-resume-label>${willCopy ? "Copier + reprendre" : "Reprendre"}</span>
+        <button class="tool-button" data-resume-session="${escapeAttr(discussion.sessionId)}" title="${willCopy ? "Déplacer la discussion dans le compte choisi puis la reprendre automatiquement" : "Reprendre dans un terminal"}">
+          <i data-lucide="${willCopy ? "copy" : "play"}"></i><span data-resume-label>${willCopy ? "Déplacer + reprendre" : "Reprendre"}</span>
         </button>
         <button class="tool-button primary" data-open-chat="${escapeAttr(discussion.sessionId)}" title="Ouvrir cette conversation dans le chat">
           <i data-lucide="messages-square"></i><span>Ouvrir le chat</span>
@@ -4809,7 +5331,7 @@ const renderDiscussionsPanel = () => {
         <div class="discussions-tools">
           <label class="discussion-search">
             <i data-lucide="search"></i>
-            <input id="discussionSearch" type="search" placeholder="Rechercher (titre, dossier, id)" value="${escapeAttr(discussionSearch)}" />
+            <input id="discussionSearch" type="search" placeholder="Rechercher (titre, environnement, id)" value="${escapeAttr(discussionSearch)}" />
           </label>
           <button id="refreshDiscussions" class="tool-button" title="Actualiser">
             <i data-lucide="refresh-ccw"></i><span>Actualiser</span>
@@ -4843,10 +5365,34 @@ const clearChatDragUi = () => {
 // Attache les gestionnaires de la liste de workspaces. Le root optionnel permet
 // de rebinder seulement les groupes remplaces par un rafraichissement cible.
 const bindWorkspaceSwitcherUi = (root: ParentNode = document) => {
+  root.querySelector<HTMLButtonElement>("#chooseEnvironmentFromSidebar")?.addEventListener(
+    "click",
+    openTerminalEnvironmentMenu,
+  );
   root.querySelectorAll<HTMLButtonElement>("[data-ws-select]").forEach((button) => {
     button.addEventListener("click", () => {
       const value = button.dataset.wsSelect;
-      if (value) selectWorkspaceFilter(value);
+      if (value) void openFolderTerminals(value);
+    });
+  });
+  root.querySelectorAll<HTMLButtonElement>("[data-open-folder-terminal]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const session = terminalSessions.find(
+        (candidate) => candidate.key === button.dataset.openFolderTerminal,
+      );
+      if (!session) return;
+      activateTerminalSession(session);
+      requestTerminalFocusKey = session.key;
+      activeView = "terminal";
+      stopLimitPoll();
+      stopUsagePoll();
+      stopKombaiPoll();
+      stopDiscussionsPoll();
+      stopRoomPoll();
+      stopChatSync();
+      statusText = `Terminal actif: ${terminalTitle(session)}`;
+      render();
+      persistTerminalSessions();
     });
   });
   root.querySelectorAll<HTMLButtonElement>("[data-new-chat-workspace]").forEach((button) => {
@@ -4862,8 +5408,19 @@ const bindWorkspaceSwitcherUi = (root: ParentNode = document) => {
       openNewChat();
     });
   });
+  root.querySelectorAll<HTMLButtonElement>("[data-close-workspace]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = button.dataset.closeWorkspace;
+      const workspace = knownWorkspaces().find((candidate) => candidate.id === id);
+      if (workspace) void closeWorkspace(workspace);
+    });
+  });
   root.querySelector<HTMLButtonElement>("#wsOpenFolder")?.addEventListener("click", () => {
-    void openWorkspacePicker("active");
+    openTerminalEnvironmentMenu();
+  });
+  root.querySelector<HTMLButtonElement>("#workspaceLiveGraph")?.addEventListener("click", () => {
+    openWorkspaceLiveGraph();
   });
 
   root
@@ -4898,10 +5455,8 @@ const bindWorkspaceSwitcherUi = (root: ParentNode = document) => {
       if (!discussion || !workspace || discussionBusyId || discussionHasRunningTurn(discussion)) {
         return null;
       }
-      if (
-        discussion.cwd?.trim() &&
-        normalizeWorkspacePath(discussion.cwd) === normalizeWorkspacePath(workspace.path)
-      ) {
+      const folderPath = discussionFolderPath(discussion);
+      if (folderPath && normalizeWorkspacePath(folderPath) === normalizeWorkspacePath(workspace.path)) {
         return null;
       }
       return { discussion, workspace };
@@ -4961,8 +5516,26 @@ const bindDiscussionRowUi = () => {
       if (discussion) openDiscussionChat(discussion);
     });
   });
+  // Rangees de brouillons (chats ouverts sans discussion listee) : activees et
+  // fermees par cle de pane, faute de sessionId a resoudre.
+  document.querySelectorAll<HTMLButtonElement>("[data-open-pane]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const pane = expertChatPanes.find((item) => item.key === button.dataset.openPane);
+      if (!pane) return;
+      activeView = "chat";
+      activateExpertChatPane(pane, true);
+      statusText = expertChatStatusText();
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-close-pane]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const pane = expertChatPanes.find((item) => item.key === button.dataset.closePane);
+      if (pane) closeExpertChatPane(pane);
+    });
+  });
   // Changement de compte cible : on memorise le choix et on met a jour, sans
-  // re-render complet, le libelle/icone du bouton (Reprendre <-> Copier +
+  // re-render complet, le libelle/icone du bouton (Reprendre <-> Deplacer +
   // reprendre) pour ne pas voler le focus du select.
   document.querySelectorAll<HTMLSelectElement>(".discussion-target[data-target-for]").forEach((select) => {
     select.addEventListener("change", () => {
@@ -4974,10 +5547,10 @@ const bindDiscussionRowUi = () => {
       const row = select.closest(".discussion-row");
       const button = row?.querySelector<HTMLButtonElement>("[data-resume-session]");
       const label = button?.querySelector<HTMLElement>("[data-resume-label]");
-      if (label) label.textContent = willCopy ? "Copier + reprendre" : "Reprendre";
+      if (label) label.textContent = willCopy ? "Déplacer + reprendre" : "Reprendre";
       if (button) {
         button.title = willCopy
-          ? "Copier la discussion dans le compte choisi puis la reprendre"
+          ? "Déplacer la discussion dans le compte choisi puis la reprendre automatiquement"
           : "Reprendre dans un terminal";
       }
     });
@@ -5218,11 +5791,16 @@ const bindPromptRowUi = () => {
 const restoreTerminals = async () => {
   if (!settings) return;
   const state = loadOpenTerminalRecords();
-  const eligibleRecords = state.terminals.filter((record) =>
-    settings!.accounts.some((account) => account.id === record.accountId),
+  const eligibleRecords = state.terminals.filter(
+    (record) =>
+      settings!.accounts.some((account) => account.id === record.accountId) &&
+      !!userEnvironmentPath(record.folderPath),
   );
   const records = eligibleRecords.slice(0, EXPERT_MAX_TERMINALS);
-  if (records.length === 0) return;
+  if (records.length === 0) {
+    if (state.terminals.length > 0) persistTerminalSessions();
+    return;
+  }
 
   const restored: TerminalSession[] = [];
   for (const record of records) {
@@ -5232,17 +5810,19 @@ const restoreTerminals = async () => {
       record.agentId && settings.agents.some((agent) => agent.id === record.agentId)
         ? record.agentId
         : codexAgentId();
-    const restoredWorkspace =
-      record.workspacePath ?? (!isRemoteMode() ? record.projectDir?.trim() || null : null);
+    const restoredFolder = userEnvironmentPath(record.folderPath);
+    if (!restoredFolder) continue;
     const session = createTerminalSession(
       account,
       proxyForAccount(account),
       agentId,
-      restoredWorkspace,
+      restoredFolder,
     );
     session.key = record.key;
     session.codexSessionId = record.codexSessionId ?? null;
     session.resumeSessionId = record.codexSessionId ?? null;
+    session.workspaceId = record.workspaceId?.trim() || null;
+    session.workspacePath = record.workspacePath?.trim() || null;
     session.projectDir = record.projectDir?.trim() || account.projectDir?.trim() || null;
     if (session.codexSessionId) claimedSessionIds.add(session.codexSessionId);
     terminalSessions.push(session);
@@ -5336,9 +5916,11 @@ const testPool = async () => {
       return;
     }
 
-    statusText = "Ouverture d'un terminal de test";
+    selectedAccountId = accountId;
+    openNewTerminalModal(null);
+    statusText = "Choisis l'environnement du terminal de test, puis relance le test";
     render();
-    await createNewTerminal(accountId, true, null, codexAgentId());
+    return;
   }
 
   const base = poolStatus?.baseUrl ?? `http://localhost:${settings?.pool.port ?? 8787}`;
@@ -5450,7 +6032,7 @@ const pickProjectDir = async () => {
     syncSessionsForAccount(account);
     settings.defaultAccountId = selectedAccountId;
     settings = await invoke<AppSettings>("save_settings", { settings });
-    statusText = "Dossier projet associe";
+    statusText = "Environnement projet associe";
   } catch (error) {
     statusText = String(error);
   }
@@ -5459,34 +6041,43 @@ const pickProjectDir = async () => {
 };
 
 // --- Selecteur de workspace ----------------------------------------------
-// Ouvre le choix du dossier de travail actif ou celui du terminal en cours de
+// Ouvre le choix de l'environnement actif ou celui du terminal en cours de
 // creation. Desktop : dialogue natif. Web : navigateur de dossiers du serveur.
 const workspacePickerPath = () =>
-  workspacePickerTarget === "new-terminal" ? newTerminalWorkspacePath : currentWorkspace();
+  userEnvironmentPath(
+    workspacePickerTarget === "new-terminal" ? newTerminalWorkspacePath : currentWorkspace(),
+  );
 
 const chooseWorkspace = (
   path: string | null,
   target: WorkspacePickerTarget = workspacePickerTarget,
 ) => {
-  const trimmed = path?.trim() || null;
+  const requested = path?.trim() || null;
+  const trimmed = userEnvironmentPath(requested);
+  if (requested && !trimmed) {
+    statusText = "Ce dossier est un workspace technique temporaire et ne peut pas etre ajoute";
+    render();
+    return;
+  }
   if (target === "new-terminal") {
     newTerminalWorkspacePath = trimmed;
     if (trimmed) rememberWorkspace(trimmed);
     statusText = trimmed
-      ? `Workspace du nouveau terminal: ${trimmed}`
-      : "Le nouveau terminal utilisera le dossier par defaut";
+      ? `Environnement du nouveau terminal: ${trimmed}`
+      : "Choisis un environnement: aucun terminal ne peut utiliser un contexte implicite";
   } else {
-    setCurrentWorkspace(trimmed);
-    setChatWorkspaceFilter(trimmed ? workspaceIdForPath(trimmed) : WORKSPACE_ALL);
+    if (trimmed) {
+      workspaceModalOpen = false;
+      void selectEnvironment(trimmed);
+      return;
+    }
+    setCurrentWorkspace(null);
+    setChatWorkspaceFilter(WORKSPACE_ALL);
     pendingChatWorkspace = null;
-    if (trimmed) void upsertWorkspaceRegistry(trimmed);
+    terminalFolderFilter = null;
     activeView = "chat";
-    stopLimitPoll();
-    stopUsagePoll();
-    stopKombaiPoll();
-    stopRoomPoll();
     startDiscussionsPoll();
-    statusText = trimmed ? `Workspace actif: ${trimmed}` : "Workspace actif retire";
+    statusText = "Choisis un environnement pour commencer";
   }
   workspaceModalOpen = false;
   render();
@@ -5494,6 +6085,74 @@ const chooseWorkspace = (
 
 // Selectionne le workspace cible depuis son groupe lateral. Tous les groupes
 // restent affiches ; un workspace reel devient le cwd des prochains chats.
+const openFolderTerminals = async (value: string): Promise<void> => {
+  const workspace = knownWorkspaces().find((candidate) => candidate.id === value);
+  if (!workspace) return;
+
+  setChatWorkspaceFilter(workspace.id);
+  setCurrentWorkspace(workspace.path);
+  pendingChatWorkspace = null;
+  terminalFolderFilter = workspace.path;
+  void upsertWorkspaceRegistry(workspace.path);
+  activeView = "terminal";
+  stopLimitPoll();
+  stopUsagePoll();
+  stopKombaiPoll();
+  stopDiscussionsPoll();
+  stopRoomPoll();
+  stopChatSync();
+  statusText = `Ouverture de l'environnement ${workspace.label}`;
+  render();
+
+  await ensureTerminalsRestored();
+  const sessions = terminalSessionsForFolder(workspace.path);
+  const current = sessions.find((session) => session.key === activeTerminalKey) ?? sessions[0];
+  if (current) activateTerminalSession(current);
+  else activeTerminalKey = null;
+  terminalFolderFilter = workspace.path;
+  const terminalLabel = sessions.length === 1 ? "1 terminal associe" : `${sessions.length} terminaux associes`;
+  statusText = `${workspace.label} · ${terminalLabel}`;
+  render();
+};
+
+const closeExpertChatAndDiscussion = async (pane: ExpertChatPane) => {
+  if (!expertChatPanes.includes(pane)) return;
+  if (pane.turn?.status === "running") {
+    statusText = "Arretez la reponse avant de fermer ce chat";
+    render();
+    return;
+  }
+  const discussion = pane.discussion;
+  if (!discussion) {
+    closeExpertChatPane(pane);
+    return;
+  }
+  if (discussionHasRunningTurn(discussion)) {
+    statusText = "Arretez la reponse avant de supprimer cette discussion";
+    render();
+    return;
+  }
+
+  discussionBusyId = discussion.sessionId;
+  let finalStatus: string;
+  try {
+    const count = await archiveDiscussionById(
+      discussion.accountId,
+      discussion.sessionId,
+      [discussion.rolloutId],
+    );
+    finalStatus = count > 1
+      ? `Chat ferme et discussion archivee (${count} fichiers)`
+      : "Chat ferme et discussion archivee";
+  } catch (error) {
+    finalStatus = `Suppression du chat impossible : ${String(error)}`;
+  }
+  discussionBusyId = null;
+  await refreshDiscussions();
+  statusText = finalStatus;
+  render();
+};
+
 const selectWorkspaceFilter = (value: string) => {
   setChatWorkspaceFilter(value);
   pendingChatWorkspace = null;
@@ -5502,11 +6161,11 @@ const selectWorkspaceFilter = (value: string) => {
     if (workspace) {
       setCurrentWorkspace(workspace.path);
       void upsertWorkspaceRegistry(workspace.path);
-      statusText = `Workspace actif: ${workspace.label}`;
+      statusText = `Environnement actif: ${workspace.label}`;
     }
   } else {
     statusText =
-      value === WORKSPACE_UNKNOWN ? "Chats sans dossier" : "Toutes les conversations";
+      value === WORKSPACE_UNKNOWN ? "Chats sans environnement" : "Toutes les conversations";
   }
   if (activeView !== "chat") {
     setActiveView("chat");
@@ -5574,13 +6233,9 @@ const createPoolTerminal = async () => {
     const picked = await invoke<AccountProfile>("pool_pick_terminal_account");
     settings = await invoke<AppSettings>("load_settings");
     selectedAccountId = picked.id;
-    activeView = "terminal";
-    stopLimitPoll();
-    stopUsagePoll();
-    stopChatSync();
-    statusText = `Pool -> ${picked.label}`;
+    openNewTerminalModal(null);
+    statusText = `Pool -> ${picked.label} · choisis l'environnement avant de demarrer`;
     render();
-    await createNewTerminal(undefined, false, null, codexAgentId());
   } catch (error) {
     statusText = String(error);
     render();
@@ -5600,7 +6255,7 @@ const renderPoolRow = (account: PoolAccountView) => {
         <button class="icon-button danger" data-remove-account-confirm="${escapeAttr(account.id)}" title="Retirer du pool (garder les fichiers sur le disque)">
           <i data-lucide="check"></i>
         </button>
-        <button class="icon-button danger" data-remove-account-purge="${escapeAttr(account.id)}" title="Retirer ET supprimer le dossier du disque (irréversible)">
+        <button class="icon-button danger" data-remove-account-purge="${escapeAttr(account.id)}" title="Retirer ET supprimer l'environnement du disque (irréversible)">
           <i data-lucide="folder-x"></i>
         </button>
         <button class="icon-button" data-remove-account-cancel="${escapeAttr(account.id)}" title="Annuler">
@@ -5707,7 +6362,7 @@ const bindGlobalMobileListeners = () => {
   document.addEventListener("click", (event) => {
     if (
       (event.target as HTMLElement).closest(
-        "[data-terminal-key],[data-close-terminal],[data-workspace-key],[data-new-terminal-workspace],#newTerminalSide,#workspaceAddSide",
+        "[data-terminal-key],[data-close-terminal],[data-workspace-key],[data-new-terminal-workspace],[data-close-workspace],#newTerminalSide,#workspaceAddSide",
       )
     ) {
       document.body.classList.remove("m-drawer-open");
@@ -5829,30 +6484,34 @@ type ChatWorkspaceSidebarGroup = {
   id: string;
   label: string;
   path: string | null;
+  terminals: TerminalSession[];
   discussions: DiscussionSummary[];
 };
 
-// Les deux modes partagent la meme lecture des workspaces : tous les dossiers
-// restent visibles et leurs conversations sont rangees juste dessous.
+// Tous les dossiers restent visibles et leurs conversations sont rangees juste
+// dessous.
 const chatWorkspaceSidebarGroups = (): ChatWorkspaceSidebarGroup[] => {
   const groups = new Map<string, ChatWorkspaceSidebarGroup>();
+  const closedIds = closedWorkspaceIds();
   knownWorkspaces().forEach((workspace) => {
     groups.set(workspace.id, {
       id: workspace.id,
       label: workspace.label,
       path: workspace.path,
+      terminals: [],
       discussions: [],
     });
   });
 
   let unknown: ChatWorkspaceSidebarGroup | null = null;
   allDiscussions().forEach((discussion) => {
-    const path = discussion.cwd?.trim();
+    const path = discussionFolderPath(discussion);
     if (!path) {
       unknown ??= {
         id: WORKSPACE_UNKNOWN,
-        label: "Sans workspace",
+        label: "Sans environnement",
         path: null,
+        terminals: [],
         discussions: [],
       };
       unknown.discussions.push(discussion);
@@ -5860,12 +6519,14 @@ const chatWorkspaceSidebarGroups = (): ChatWorkspaceSidebarGroup[] => {
     }
 
     const id = workspaceIdForPath(path);
+    if (closedIds.has(id)) return;
     let group = groups.get(id);
     if (!group) {
       group = {
         id,
         label: workspaceBaseName(path),
         path,
+        terminals: [],
         discussions: [],
       };
       groups.set(id, group);
@@ -5873,115 +6534,198 @@ const chatWorkspaceSidebarGroups = (): ChatWorkspaceSidebarGroup[] => {
     group.discussions.push(discussion);
   });
 
+  terminalSessions.forEach((session) => {
+    const path = session.folderPath?.trim();
+    if (!path) {
+      unknown ??= {
+        id: WORKSPACE_UNKNOWN,
+        label: "Sans environnement",
+        path: null,
+        terminals: [],
+        discussions: [],
+      };
+      unknown.terminals.push(session);
+      return;
+    }
+
+    const id = workspaceIdForPath(path);
+    if (closedIds.has(id)) return;
+    let group = groups.get(id);
+    if (!group) {
+      group = {
+        id,
+        label: workspaceBaseName(path),
+        path,
+        terminals: [],
+        discussions: [],
+      };
+      groups.set(id, group);
+    }
+    group.terminals.push(session);
+  });
+
   const result = [...groups.values()];
   if (unknown) result.push(unknown);
   return result;
 };
 
+const compactWorkspaceId = (session: TerminalSession): string => {
+  const id = session.workspaceId?.trim();
+  if (!id) return session.running ? "preparation" : "en attente";
+  return id.length > 12 ? id.slice(-8) : id;
+};
+
+const terminalSearchValues = (session: TerminalSession): string[] => {
+  const agent = agentById(session.agentId);
+  const account = accountById(session.accountId);
+  return [
+    terminalTitle(session),
+    session.status,
+    agent?.label ?? session.agentId,
+    account?.label ?? session.accountId,
+    session.folderPath ?? "",
+    session.workspaceId ?? "",
+    session.workspacePath ?? "",
+  ];
+};
+
+const renderFolderTerminalGroups = (sessions: TerminalSession[]): string => {
+  if (!sessions.length) return `<div class="chat-workspace-empty">Aucun terminal</div>`;
+  const byAgent = new Map<string, TerminalSession[]>();
+  sessions.forEach((session) => {
+    const list = byAgent.get(session.agentId) ?? [];
+    list.push(session);
+    byAgent.set(session.agentId, list);
+  });
+
+  return [...byAgent.entries()]
+    .map(([agentId, agentSessions]) => {
+      const agentLabel = agentById(agentId)?.label ?? agentId;
+      const items = agentSessions
+        .sort((left, right) => (right.startedAtUnix ?? 0) - (left.startedAtUnix ?? 0))
+        .map((session) => {
+          const workspaceDetail = session.workspacePath ?? "Workspace physique en preparation";
+          return `<button type="button" class="chat-folder-terminal ${session.key === activeTerminalKey ? "active" : ""}" data-open-folder-terminal="${escapeAttr(session.key)}" title="${escapeAttr(workspaceDetail)}">
+            <span class="live-dot ${session.running ? "on" : ""}"></span>
+            <span class="chat-folder-terminal-copy">
+              <strong>${escapeHtml(terminalTitle(session))}</strong>
+              <small>${escapeHtml(session.status)} · WS ${escapeHtml(compactWorkspaceId(session))}</small>
+            </span>
+            <i data-lucide="square-terminal"></i>
+          </button>`;
+        })
+        .join("");
+      return `<section class="chat-folder-agent-group">
+        <header><span><i data-lucide="bot"></i>${escapeHtml(agentLabel)}</span><b>${agentSessions.length}</b></header>
+        ${items}
+      </section>`;
+    })
+    .join("");
+};
+
 const renderChatSidebarConversations = (): string => {
   const query = chatSidebarSearch.trim().toLocaleLowerCase();
-  const activeWorkspacePath = currentWorkspace();
-  const activeWorkspaceId = activeWorkspacePath
-    ? workspaceIdForPath(activeWorkspacePath)
-    : null;
-  const sidebarDiscussion = interfaceMode === "expert"
-    ? activeExpertChatPane()?.discussion ?? null
-    : chatDiscussion;
-  const activeDiscussionWorkspaceId = sidebarDiscussion?.cwd?.trim()
-    ? workspaceIdForPath(sidebarDiscussion.cwd)
-    : sidebarDiscussion
-      ? WORKSPACE_UNKNOWN
-      : null;
+  const environmentPath = userEnvironmentPath(currentWorkspace());
 
-  if (!discussionsLoaded) {
+  if (!environmentPath) {
+    return `<button type="button" class="chat-side-empty chat-side-choose-environment" id="chooseEnvironmentFromSidebar">
+      <i data-lucide="folders"></i>
+      <strong>Choisir un environnement</strong>
+      <small>Les chats et les agents apparaitront ici.</small>
+    </button>`;
+  }
+
+  if (!discussionsLoaded && terminalSessions.length === 0) {
     return `<div class="chat-side-empty"><span class="chat-loader"></span>Chargement…</div>`;
   }
 
-  const renderedGroups = chatWorkspaceSidebarGroups()
-    .map((group) => {
-      const groupMatches = query
-        ? [group.label, group.path ?? ""].some((value) =>
-            value.toLocaleLowerCase().includes(query),
-          )
-        : false;
-      const discussions = group.discussions
-        .filter((discussion) => {
-          if (!query || groupMatches) return true;
-          return [
-            discussion.title ?? "",
-            discussion.preview ?? "",
-            discussion.cwd ?? "",
-            discussion.accountLabel,
-            providerLabel(discussion.provider ?? "codex"),
-          ].some((value) => value.toLocaleLowerCase().includes(query));
-        })
-        .sort((left, right) => right.lastActivity - left.lastActivity);
+  const environmentId = workspaceIdForPath(environmentPath);
+  const discussions = allDiscussions()
+    .filter((discussion) => {
+      const path = discussionFolderPath(discussion);
+      return !!path && workspaceIdForPath(path) === environmentId;
+    })
+    .filter((discussion) => {
+      if (!query) return true;
+      return [
+        discussion.title ?? "",
+        discussion.preview ?? "",
+        discussion.accountLabel,
+        providerLabel(discussion.provider ?? "codex"),
+      ].some((value) => value.toLocaleLowerCase().includes(query));
+    })
+    .sort((left, right) => right.lastActivity - left.lastActivity);
 
-      if (query && !groupMatches && !discussions.length) return "";
-
-      const isWorkspaceActive = group.id === activeWorkspaceId;
-      const containsActiveDiscussion = group.id === activeDiscussionWorkspaceId;
-      const detail = group.path ?? "Conversations sans dossier";
-      const workspaceHead = group.path
-        ? `<button type="button" class="chat-workspace-select" data-ws-select="${escapeAttr(group.id)}" title="Activer ${escapeAttr(detail)}">
-            <span class="chat-workspace-mark"><i data-lucide="folder-open"></i></span>
-            <span class="chat-workspace-copy"><strong>${escapeHtml(group.label)}</strong><small>${escapeHtml(detail)}</small></span>
-            <span class="chat-workspace-count">${group.discussions.length}</span>
-          </button>
-          <button type="button" class="chat-workspace-new" data-new-chat-workspace="${escapeAttr(group.id)}" title="Nouvelle conversation dans ${escapeAttr(group.label)}" aria-label="Nouvelle conversation dans ${escapeAttr(group.label)}">
-            <i data-lucide="plus"></i>
-          </button>`
-        : `<div class="chat-workspace-select chat-workspace-select-static" title="${escapeAttr(detail)}">
-            <span class="chat-workspace-mark"><i data-lucide="folder-x"></i></span>
-            <span class="chat-workspace-copy"><strong>${escapeHtml(group.label)}</strong><small>${escapeHtml(detail)}</small></span>
-            <span class="chat-workspace-count">${group.discussions.length}</span>
-          </div>`;
-
-      const terminals = discussions.length
-        ? discussions
-            .map((discussion) => {
-            const openedPane =
-              interfaceMode === "expert"
-                ? expertChatPanes.find((pane) => pane.discussion?.sessionId === discussion.sessionId)
-                : null;
-            const active = interfaceMode === "expert"
-              ? !!openedPane
-              : chatDiscussion?.sessionId === discussion.sessionId;
-            const current = interfaceMode === "expert"
-              ? openedPane?.key === activeExpertChatKey
-              : active;
-            const title = discussion.title?.trim() || "Conversation sans titre";
-            const busy = discussionBusyId === discussion.sessionId;
-            const draggable = !busy && !discussionHasRunningTurn(discussion);
-            return `
-              <div class="chat-side-item ${active ? "active" : ""} ${current ? "current" : ""} ${busy ? "moving" : ""}" draggable="${draggable}" data-drag-chat="${escapeAttr(discussion.sessionId)}" aria-busy="${busy}">
-                  <span class="chat-side-drag-handle" title="Glisser vers un autre workspace" aria-hidden="true"><i data-lucide="grip-vertical"></i></span>
-                  <button type="button" class="chat-side-open" data-open-chat="${escapeAttr(discussion.sessionId)}" title="${escapeAttr(title)}">
-                    <span class="chat-side-active"></span>
-                    <i class="chat-side-terminal-icon" data-lucide="message-square"></i>
-                    <span class="chat-side-copy">
-                      <strong>${escapeHtml(title)}</strong>
-                      <small>${escapeHtml(discussion.accountLabel)} · ${escapeHtml(providerLabel(discussion.provider ?? "codex"))}</small>
-                    </span>
-                  </button>
-                  <button type="button" class="chat-side-delete" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Supprimer la conversation" aria-label="Supprimer ${escapeAttr(title)}">
-                    <i data-lucide="trash-2"></i>
-                  </button>
-                </div>`;
-            })
-            .join("")
-        : `<div class="chat-workspace-empty">Aucune conversation</div>`;
-
-      return `
-        <section class="chat-workspace-group ${isWorkspaceActive ? "active" : ""} ${containsActiveDiscussion ? "contains-active" : ""}" ${group.path ? `data-chat-drop-workspace="${escapeAttr(group.id)}"` : ""}>
-          <div class="chat-workspace-head">${workspaceHead}</div>
-          <div class="chat-workspace-terminals">${terminals}</div>
-        </section>`;
+  const conversationItems = discussions
+    .map((discussion) => {
+      const openedPane = expertChatPanes.find(
+        (pane) => pane.discussion?.sessionId === discussion.sessionId,
+      );
+      const current = openedPane?.key === activeExpertChatKey;
+      const title = discussion.title?.trim() || "Conversation sans titre";
+      const busy = discussionBusyId === discussion.sessionId;
+      return `<div class="chat-side-item ${openedPane ? "active" : ""} ${current ? "current" : ""} ${busy ? "moving" : ""}" aria-busy="${busy}">
+        <button type="button" class="chat-side-open" data-open-chat="${escapeAttr(discussion.sessionId)}" title="${escapeAttr(title)}">
+          <span class="chat-side-active"></span>
+          <i class="chat-side-terminal-icon" data-lucide="message-square"></i>
+          <span class="chat-side-copy">
+            <strong>${escapeHtml(title)}</strong>
+            <small>${escapeHtml(discussion.accountLabel)} · ${escapeHtml(providerLabel(discussion.provider ?? "codex"))}</small>
+          </span>
+        </button>
+        <button type="button" class="chat-side-delete" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Supprimer la conversation" aria-label="Supprimer ${escapeAttr(title)}">
+          <i data-lucide="trash-2"></i>
+        </button>
+      </div>`;
     })
     .join("");
 
-  if (renderedGroups) return renderedGroups;
-  return `<div class="chat-side-empty">${query ? "Aucun resultat" : "Aucun workspace — ouvrez un dossier pour commencer"}</div>`;
+  // La grille de chats compte chaque pane ouvert de l'environnement (y compris
+  // un nouveau chat sans premier message, ou un chat dont la discussion n'a pas
+  // de dossier resolu). La barre laterale doit refleter la meme source de verite
+  // sinon elle affiche « Aucun chat » alors qu'un chat est bien actif. La
+  // recherche ne cible que les discussions persistees : un brouillon n'a pas
+  // encore de texte a filtrer.
+  const draftPanes = query
+    ? []
+    : draftEnvironmentChatPanes(
+        expertChatPanesForCurrentEnvironment(),
+        discussions.map((discussion) => discussion.sessionId),
+      );
+
+  const draftItems = draftPanes
+    .map((pane) => {
+      const current = pane.key === activeExpertChatKey;
+      const account = expertChatSelectedAccount(pane);
+      const title = pane.discussion?.title?.trim() || "Nouveau chat";
+      const subtitle = account
+        ? `${account.label} · ${providerLabel(accountProvider(account))}`
+        : "Choisissez un agent";
+      return `<div class="chat-side-item active ${current ? "current" : ""}">
+        <button type="button" class="chat-side-open" data-open-pane="${escapeAttr(pane.key)}" title="${escapeAttr(title)}">
+          <span class="chat-side-active"></span>
+          <i class="chat-side-terminal-icon" data-lucide="message-square-plus"></i>
+          <span class="chat-side-copy">
+            <strong>${escapeHtml(title)}</strong>
+            <small>${escapeHtml(subtitle)}</small>
+          </span>
+        </button>
+        <button type="button" class="chat-side-delete" data-close-pane="${escapeAttr(pane.key)}" title="Fermer ce chat" aria-label="Fermer ${escapeAttr(title)}">
+          <i data-lucide="x"></i>
+        </button>
+      </div>`;
+    })
+    .join("");
+
+  const totalCount = discussions.length + draftPanes.length;
+  const listItems = `${draftItems}${conversationItems}`;
+
+  return `<section class="chat-workspace-group active chat-current-environment-chats">
+    <div class="chat-folder-section-label"><span>Chats de cet environnement</span><b>${totalCount}</b></div>
+    <div class="chat-workspace-terminals">
+      ${listItems || `<div class="chat-workspace-empty">${query ? "Aucun resultat" : "Aucun chat. Ouvrez-en un avec l'agent de votre choix."}</div>`}
+    </div>
+  </section>`;
 };
 
 // Signature legere de l'en-tete : evite tout churn DOM au poll quand les
@@ -5990,40 +6734,57 @@ const workspaceSwitcherSignature = (): string => {
   const all = allDiscussions();
   const counts = new Map<string, number>();
   all.forEach((discussion) => {
-    if (discussion.cwd?.trim()) {
-      const id = workspaceIdForPath(discussion.cwd);
+    const folderPath = discussionFolderPath(discussion);
+    if (folderPath) {
+      const id = workspaceIdForPath(folderPath);
       counts.set(id, (counts.get(id) ?? 0) + 1);
     }
   });
   const ws = knownWorkspaces()
     .map((workspace) => `${workspace.id}:${counts.get(workspace.id) ?? 0}`)
     .join(",");
-  return `${all.length}|${ws}`;
+  const terminals = terminalSessions
+    .map((session) => `${session.key}:${session.folderPath ?? ""}:${session.status}:${session.workspaceId ?? ""}`)
+    .join(",");
+  return `${all.length}|${ws}|${terminals}`;
 };
 
-// En-tete compact de la liste. Les workspaces eux-memes ne sont plus caches
-// dans un menu : ils sont tous affiches dans renderChatSidebarConversations().
+// Le seul point d'entree pour changer de contexte : le menu d'environnement
+// reste separe des conversations de l'environnement actif.
 const renderWorkspaceSwitcher = (): string => {
-  const workspaces = knownWorkspaces();
-  const all = allDiscussions();
-  const workspaceLabel = workspaces.length === 1 ? "1 workspace" : `${workspaces.length} workspaces`;
-  const conversationLabel = all.length === 1 ? "1 conversation" : `${all.length} conversations`;
+  const environmentPath = userEnvironmentPath(currentWorkspace());
+  const environment = environmentPath
+    ? knownWorkspaces().find((workspace) => workspace.id === workspaceIdForPath(environmentPath))
+    : null;
+  const label = environment?.label ?? (environmentPath ? workspaceBaseName(environmentPath) : "Choisir un environnement");
+  const detail = environmentPath ?? "Chats, agents et collaboration";
 
   return `
     <section class="chat-workspace-overview" id="chatWsSwitcher" data-ws-sig="${escapeAttr(workspaceSwitcherSignature())}">
-      <span class="chat-workspace-overview-mark"><i data-lucide="folders"></i></span>
-      <span class="chat-workspace-overview-copy">
-        <strong>Workspaces</strong>
-        <small>${escapeHtml(`${workspaceLabel} · ${conversationLabel}`)}</small>
-      </span>
-      <button type="button" id="wsOpenFolder" class="chat-workspace-add" title="Choisir ou ajouter un workspace" aria-label="Choisir ou ajouter un workspace">
-        <i data-lucide="folder-plus"></i>
+      <button type="button" id="wsOpenFolder" class="chat-environment-selector" title="Changer d'environnement avec la touche accent grave" aria-label="Choisir un environnement">
+        <span class="chat-workspace-overview-mark"><i data-lucide="folders"></i></span>
+        <span class="chat-workspace-overview-copy">
+          <small>Environnement</small>
+          <strong>${escapeHtml(label)}</strong>
+          <small>${escapeHtml(detail)}</small>
+        </span>
+        <kbd aria-label="Raccourci accent grave">&#96;</kbd>
+        <i data-lucide="chevrons-up-down"></i>
       </button>
+      ${environmentPath
+        ? `<button type="button" id="workspaceLiveGraph" class="chat-workspace-add workspace-live-launch" title="Voir l'activité temps réel de l'environnement" aria-label="Activité temps réel de l'environnement">
+          <i data-lucide="activity"></i>
+        </button>`
+        : ""}
     </section>`;
 };
 
 const appViewTitle = (view: AppView): string => {
   switch (view) {
+    case "terminal":
+      return terminalFolderFilter
+        ? `Terminaux · ${workspaceBaseName(terminalFolderFilter)}`
+        : "Choisir un environnement";
     case "pool":
       return "Comptes et pool";
     case "limits":
@@ -6037,7 +6798,7 @@ const appViewTitle = (view: AppView): string => {
     case "history":
       return "Historique";
     case "room":
-      return "Salon d'agents";
+      return "Collaboration de l'environnement";
     case "audit":
       return "Audit de l'interface";
     case "skills":
@@ -6088,7 +6849,7 @@ const renderActiveAppPanel = (): string => {
     case "terminal":
       return renderExpertTerminalGrid();
     case "pool":
-      return renderPoolPanel();
+      return renderAccountsAndPool();
     case "limits":
       return renderLimitsPanel();
     case "dashboard":
@@ -6112,42 +6873,143 @@ const renderActiveAppPanel = (): string => {
   }
 };
 
-const renderInterfaceModeSwitch = (extraClass = "") => `
-  <div class="interface-mode-switch ${extraClass}" role="group" aria-label="Mode d'interface">
-    <button type="button" data-interface-mode="simple" class="${interfaceMode === "simple" ? "active" : ""}" aria-pressed="${interfaceMode === "simple"}">
-      <i data-lucide="app-window"></i><span>Simple</span>
-    </button>
-    <button type="button" data-interface-mode="expert" class="${interfaceMode === "expert" ? "active" : ""}" aria-pressed="${interfaceMode === "expert"}">
-      <i data-lucide="messages-square"></i><span>Expert</span><small>16</small>
-    </button>
-  </div>
-`;
+const renderTerminalEnvironmentMenu = (): string => {
+  if (!terminalEnvironmentMenuOpen) return "";
+  const activePath = userEnvironmentPath(currentWorkspace());
+  const activeId = activePath ? workspaceIdForPath(activePath) : null;
+  const sidebarGroups = chatWorkspaceSidebarGroups();
+  const environments = terminalEnvironmentGroups()
+    .map((group) => {
+      const id = workspaceIdForPath(group.path);
+      const active = id === activeId;
+      const discussionCount = sidebarGroups.find((candidate) => candidate.id === id)?.discussions.length ?? 0;
+      const draftPanes = expertChatPanes.filter((pane) => {
+        const panePath = expertChatPaneEnvironmentPath(pane);
+        return !pane.discussion && !!panePath && workspaceIdForPath(panePath) === id;
+      });
+      const agentIds = new Set([
+        ...(sidebarGroups.find((candidate) => candidate.id === id)?.discussions.map((discussion) => discussion.accountId) ?? []),
+        ...draftPanes.map((pane) => pane.accountId).filter((accountId): accountId is string => !!accountId),
+        ...group.sessions.map((session) => session.accountId),
+      ]);
+      const chatCount = discussionCount + draftPanes.length;
+      const deleting = workspaceClosingId === id;
+      return `<div class="terminal-environment-menu-row">
+        <button
+          type="button"
+          class="terminal-environment-menu-item ${active ? "active" : ""}"
+          data-environment-menu-id="${escapeAttr(id)}"
+          aria-current="${active ? "true" : "false"}"
+          title="${escapeAttr(group.path)}"
+        >
+          <span class="terminal-environment-menu-icon"><i data-lucide="folder${active ? "-open" : ""}"></i></span>
+          <span class="terminal-environment-menu-copy">
+            <strong>${escapeHtml(group.label)}</strong>
+            <small>${escapeHtml(group.path)}</small>
+          </span>
+          <span class="terminal-environment-menu-state">
+            <b>${chatCount} chat${chatCount > 1 ? "s" : ""}</b>
+            <small>${agentIds.size} agent${agentIds.size > 1 ? "s" : ""}</small>
+          </span>
+          <i data-lucide="chevron-right"></i>
+        </button>
+        <button
+          type="button"
+          class="terminal-environment-menu-delete"
+          data-delete-environment-id="${escapeAttr(id)}"
+          title="Supprimer l'environnement ${escapeAttr(group.label)} de Switch"
+          aria-label="Supprimer l'environnement ${escapeAttr(group.label)}"
+          ${deleting ? "disabled" : ""}
+        >
+          <i data-lucide="trash-2"></i>
+        </button>
+      </div>`;
+    })
+    .join("");
+
+  return `<div class="modal-backdrop terminal-environment-menu-backdrop" id="terminalEnvironmentMenuBackdrop">
+    <section class="terminal-environment-menu" role="dialog" aria-modal="true" aria-labelledby="terminalEnvironmentMenuTitle">
+      <header class="terminal-environment-menu-head">
+        <span class="terminal-environment-menu-mark"><i data-lucide="folders"></i></span>
+        <span>
+          <h2 id="terminalEnvironmentMenuTitle">Choisir un environnement</h2>
+          <p>Un environnement regroupe ses chats, ses agents et leur collaboration.</p>
+        </span>
+        <kbd aria-label="Raccourci accent grave">&#96;</kbd>
+        <button type="button" class="icon-button" id="closeTerminalEnvironmentMenu" title="Fermer le menu" aria-label="Fermer le menu">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <div class="terminal-environment-menu-list">
+        ${environments || `<div class="terminal-environment-menu-empty"><i data-lucide="folder-open"></i><strong>Aucun environnement</strong><small>Parcourez les dossiers pour choisir votre premier environnement.</small></div>`}
+      </div>
+      <footer class="terminal-environment-menu-actions">
+        <span><i data-lucide="folder-open"></i>Selectionnez un dossier existant sur votre machine</span>
+        <button type="button" class="tool-button primary" id="createEnvironmentFromMenu" title="Afficher les dossiers et parcourir l'arborescence">
+          <i data-lucide="folder-open"></i><span>Parcourir les dossiers</span>
+        </button>
+      </footer>
+    </section>
+  </div>`;
+};
 
 const renderExpertTerminalGrid = () => {
+  const folderPath = userEnvironmentPath(terminalFolderFilter);
+  if (!folderPath) {
+    return `<section class="terminal-environment-gate" data-folder-terminal-view="unselected">
+      <div class="terminal-environment-gate-card">
+        <span class="terminal-environment-gate-icon"><i data-lucide="folders"></i></span>
+        <strong>Choisis d'abord un environnement</strong>
+        <p>Les terminaux s'ouvriront ensuite dans l'environnement actif.</p>
+        <button type="button" id="chooseTerminalEnvironment" class="tool-button primary">
+          <i data-lucide="folder-open"></i><span>Choisir l'environnement</span>
+        </button>
+      </div>
+    </section>`;
+  }
+
   const sessions = expertTerminalSessions();
+  const folderProfile = folderPath
+    ? knownWorkspaces().find((workspace) => workspace.id === workspaceIdForPath(folderPath))
+    : null;
+  const folderLabel = folderProfile?.label ?? workspaceBaseName(folderPath);
+  const agentCounts = new Map<string, number>();
+  sessions.forEach((session) => {
+    agentCounts.set(session.agentId, (agentCounts.get(session.agentId) ?? 0) + 1);
+  });
+  const agentChips = [...agentCounts.entries()]
+    .map(([agentId, count]) => `<span><i data-lucide="bot"></i>${escapeHtml(agentById(agentId)?.label ?? agentId)} <b>${count}</b></span>`)
+    .join("");
+  if (expertTerminalFullscreenKey && !sessions.some((session) => session.key === expertTerminalFullscreenKey)) {
+    expertTerminalFullscreenKey = null;
+  }
   const slotCount = Math.max(2, sessions.length);
   const columns = expertGridColumnCount(slotCount);
   const rows = Math.ceil(slotCount / columns);
+  const chatSidebarHidden = displayedChatSidebarWidth() === 0;
   const panes = sessions
     .map((session, index) => {
       const sessionAgentLabel = agentById(session.agentId)?.label ?? session.agentId;
-      const workspaceLabel = session.workspacePath
-        ? workspaceBaseName(session.workspacePath)
-        : session.projectDir
-          ? workspaceBaseName(session.projectDir)
-          : "Dossier par defaut";
+      const workspaceLabel = `WS ${compactWorkspaceId(session)}`;
+      const workspaceDetail = session.workspacePath ?? "Workspace physique en preparation";
       return `
-        <article class="expert-terminal-pane ${session.key === activeTerminalKey ? "active" : ""} ${session.running ? "running" : ""}" data-expert-terminal-pane="${escapeAttr(session.key)}">
+        <article class="expert-terminal-pane ${session.key === activeTerminalKey ? "active" : ""} ${session.running ? "running" : ""} ${session.key === expertTerminalFullscreenKey ? "is-fullscreen" : ""}" data-expert-terminal-pane="${escapeAttr(session.key)}">
           <header class="expert-terminal-pane-head">
-            <button type="button" class="expert-pane-identity" data-focus-terminal="${escapeAttr(session.key)}" title="Activer ${escapeAttr(terminalTitle(session))}">
+            <button type="button" class="expert-pane-identity" data-focus-terminal="${escapeAttr(session.key)}" title="${escapeAttr(`${workspaceDetail} · Survolez puis appuyez sur la barre d'espace pour agrandir`)}">
               <span class="expert-pane-index">${index + 1}</span>
               <span class="live-dot ${session.running ? "on" : ""}"></span>
               <span class="expert-pane-copy">
                 <strong>${escapeHtml(terminalTitle(session))}</strong>
-                <small>${escapeHtml(`${workspaceLabel} · ${sessionAgentLabel}`)}</small>
+                <small>${escapeHtml(`${sessionAgentLabel} · ${workspaceLabel}`)}</small>
               </span>
             </button>
             <span class="expert-pane-status">${escapeHtml(session.ptyId ? `PTY ${session.ptyId}` : session.status)}</span>
+            <button type="button" class="expert-pane-toggle-chat" data-toggle-chat-sidebar title="${chatSidebarHidden ? "Afficher la fenêtre de chat" : "Masquer la fenêtre de chat"}" aria-label="${chatSidebarHidden ? "Afficher la fenêtre de chat" : "Masquer la fenêtre de chat"}" aria-pressed="${!chatSidebarHidden}">
+              <i data-lucide="${chatSidebarHidden ? "panel-left-open" : "panel-left-close"}"></i>
+            </button>
+            <button type="button" class="expert-pane-fullscreen" data-toggle-terminal-fullscreen="${escapeAttr(session.key)}" title="${session.key === expertTerminalFullscreenKey ? "Quitter le plein ecran" : "Afficher ce terminal en plein ecran"}" aria-label="${session.key === expertTerminalFullscreenKey ? "Quitter le plein ecran" : "Afficher ce terminal en plein ecran"}" aria-pressed="${session.key === expertTerminalFullscreenKey}">
+              <i data-lucide="${session.key === expertTerminalFullscreenKey ? "minimize-2" : "maximize-2"}"></i>
+            </button>
             <button type="button" class="expert-pane-close" data-close-terminal="${escapeAttr(session.key)}" title="Fermer ce terminal" aria-label="Fermer ${escapeAttr(terminalTitle(session))}">
               <i data-lucide="x"></i>
             </button>
@@ -6161,39 +7023,79 @@ const renderExpertTerminalGrid = () => {
     <button type="button" class="expert-terminal-empty" data-add-expert-terminal ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
       <span class="expert-empty-icon"><i data-lucide="plus"></i></span>
       <strong>${sessions.length === 0 && index === 0 ? "Ouvrir le premier terminal" : "Ajouter un terminal"}</strong>
-      <small>Compte, agent et workspace au choix</small>
+      <small>Agent au choix dans cet environnement</small>
     </button>
   `).join("");
 
   return `
-    <div class="expert-terminal-wall" style="--expert-columns: ${columns}; --expert-rows: ${rows}" aria-label="Mur de ${sessions.length} terminaux">
-      ${panes}${emptySlots}
-    </div>
+    <section class="folder-terminal-panel" data-folder-terminal-view="${escapeAttr(folderPath)}">
+      <header class="folder-terminal-head">
+        <span class="folder-terminal-mark"><i data-lucide="folder-open"></i></span>
+        <span class="folder-terminal-copy">
+          <strong>${escapeHtml(folderLabel)}</strong>
+          <small>${escapeHtml(folderPath ?? "Tous les environnements ouverts")}</small>
+        </span>
+        <span class="folder-terminal-stats">
+          <b>${sessions.length}</b> terminaux · <b>${agentCounts.size}</b> agents
+        </span>
+        <span class="folder-terminal-actions">
+          <button type="button" id="folderNewChat" class="tool-button" title="Nouvelle conversation dans cet environnement"><i data-lucide="messages-square"></i><span>Chat</span></button>
+          <button type="button" id="folderNewTerminal" class="tool-button primary" title="Nouveau terminal dans ${escapeAttr(folderLabel)}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}><i data-lucide="square-terminal"></i><span>Terminal</span></button>
+        </span>
+      </header>
+      <div class="folder-agent-summary">
+        <span class="folder-isolation-chip"><i data-lucide="folder-open"></i>Environnement actif</span>
+        ${agentChips}
+      </div>
+      <div class="expert-terminal-wall" style="--expert-columns: ${columns}; --expert-rows: ${rows}" aria-label="Mur de ${sessions.length} terminaux">
+        ${panes}${emptySlots}
+      </div>
+    </section>
   `;
 };
 
 const renderExpertChatGrid = () => {
-  const count = expertChatPanes.length;
+  const environmentPath = userEnvironmentPath(currentWorkspace());
+  if (!environmentPath) {
+    return `<section class="chat-environment-gate">
+      <span><i data-lucide="folders"></i></span>
+      <h2>Choisissez un environnement</h2>
+      <p>Vous pourrez ensuite y ouvrir plusieurs chats avec des agents differents.</p>
+      <button type="button" id="chooseEnvironmentFromChat" class="tool-button primary">
+        <i data-lucide="chevrons-up-down"></i><span>Choisir un environnement</span>
+      </button>
+    </section>`;
+  }
+  const environmentPanes = expertChatPanesForCurrentEnvironment();
+  const count = environmentPanes.length;
   expertChatPage = clampExpertChatPage(expertChatPage, count, expertChatsPerPage);
   const totalPages = expertChatPageTotal();
   const pagePanes = visibleExpertChatPanes();
+  const columns = expertChatColumnCount(expertChatsPerPage);
   const rows = expertChatRowCount(expertChatsPerPage);
   const firstVisible = count ? expertChatPage * expertChatsPerPage + 1 : 0;
   const lastVisible = expertChatPage * expertChatsPerPage + pagePanes.length;
+  const environment = knownWorkspaces().find(
+    (workspace) => workspace.id === workspaceIdForPath(environmentPath),
+  );
+  const environmentLabel = environment?.label ?? workspaceBaseName(environmentPath);
+  const hasAccounts = (settings?.accounts?.length ?? 0) > 0;
   return `
-    <section class="expert-chat-workspace" aria-label="${count} chats ouverts, page ${expertChatPage + 1} sur ${totalPages}">
+    <section class="expert-chat-workspace" aria-label="${count} chats ouverts, page ${expertChatPage + 1} sur ${totalPages}" title="Dans un chat : Retour arrière : fermer · Suppr : fermer avec la discussion">
       <header class="expert-chat-toolbar">
         <div>
-          <span class="expert-chat-toolbar-mark"><i data-lucide="messages-square"></i></span>
-          <span><strong>Chats ouverts</strong><small>Cliquez sur un chat pour afficher sa zone de saisie</small></span>
+          <span class="expert-chat-toolbar-mark"><i data-lucide="folder-open"></i></span>
+          <span><strong>${escapeHtml(environmentLabel)}</strong><small>${escapeHtml(environmentPath)}</small></span>
         </div>
         <div class="expert-chat-toolbar-actions">
-          <span class="expert-chat-count" title="Aucun plafond logiciel"><strong>${count}</strong> chat${count > 1 ? "s" : ""}</span>
+          <span class="expert-chat-count"><strong>${count}</strong> chat${count > 1 ? "s" : ""}</span>
           <label class="expert-grid-control expert-page-size-control" title="Nombre de chats affiches sur chaque page">
             <span><i data-lucide="app-window"></i><small>Par page</small></span>
             <select id="expertChatPageSize" aria-label="Nombre de chats par page">
               <option value="6" ${expertChatsPerPage === 6 ? "selected" : ""}>6 chats</option>
               <option value="9" ${expertChatsPerPage === 9 ? "selected" : ""}>9 chats</option>
+              <option value="12" ${expertChatsPerPage === 12 ? "selected" : ""}>12 chats</option>
+              <option value="16" ${expertChatsPerPage === 16 ? "selected" : ""}>16 chats</option>
             </select>
           </label>
           <nav class="expert-chat-pagination" aria-label="Pages de chats">
@@ -6205,38 +7107,43 @@ const renderExpertChatGrid = () => {
               <i data-lucide="chevron-right"></i>
             </button>
           </nav>
-          <button id="addExpertChat" type="button" class="tool-button primary" title="Ajouter un chat a la fin">
-            <i data-lucide="plus"></i><span>Nouveau chat</span>
+          <button type="button" data-open-discussions class="tool-button resume-discussion-button" title="Choisir une discussion a reprendre">
+            <i data-lucide="messages-square"></i><span>Reprendre une discussion</span>
+          </button>
+          <button id="openEnvironmentCollaboration" type="button" class="tool-button" title="Ouvrir l'espace ou les agents de cet environnement se parlent">
+            <i data-lucide="users"></i><span>Collaboration</span>
+          </button>
+          <button id="addExpertChat" type="button" class="tool-button primary" title="Ouvrir un nouveau chat dans cet environnement" ${hasAccounts ? "" : "disabled"}>
+            <i data-lucide="plus"></i><span>Ouvrir un chat</span>
           </button>
         </div>
       </header>
-      <div class="expert-chat-wall" style="--expert-chat-columns: ${EXPERT_CHAT_COLUMN_COUNT}; --expert-chat-rows: ${rows}" aria-label="Chats ${firstVisible} a ${lastVisible}">
-        ${pagePanes.map(renderExpertChatPane).join("")}
+      <div class="expert-chat-wall" style="--expert-chat-columns: ${columns}; --expert-chat-rows: ${rows}" aria-label="Chats ${firstVisible} a ${lastVisible}">
+        ${pagePanes.map(renderExpertChatPane).join("") || `<div class="expert-chat-environment-empty"><i data-lucide="bot"></i><strong>Aucun chat ouvert</strong><small>Choisissez un agent puis ouvrez un chat.</small></div>`}
       </div>
     </section>`;
 };
 
 const renderChatFirstShell = () => {
-  const account = chatSelectedAccount();
   const isChat = activeView === "chat";
+  const environmentChatCount = expertChatPanesForCurrentEnvironment().length;
   const visibleSidebarWidth = displayedChatSidebarWidth();
   const sidebarMaxWidth = chatSidebarMaxWidth(window.innerWidth);
   const activeWorkspacePath = currentWorkspace();
   const newChatTitle = activeWorkspacePath
     ? `Nouvelle conversation dans ${workspaceBaseName(activeWorkspacePath)}`
-    : "Nouvelle conversation dans le dossier par defaut";
-  if (interfaceMode === "expert") captureAllExpertChatScroll();
-  else captureChatFeedScroll();
+    : "Nouvelle conversation dans un environnement a choisir";
+  captureAllExpertChatScroll();
   document.querySelector(".m-chrome")?.remove();
   document.body.classList.remove("m-drawer-open", "m-sheet-open", "chat-sidebar-resizing");
 
   app.innerHTML = `
-    <div class="layout chat-app-layout ${isChat ? "is-chat" : "is-admin"} ${interfaceMode === "expert" ? "is-expert" : "is-simple"} ${visibleSidebarWidth === 0 ? "is-sidebar-collapsed" : ""}" style="--chat-sidebar-width: ${visibleSidebarWidth}px">
+    <div class="layout chat-app-layout ${isChat ? "is-chat" : "is-admin"} ${visibleSidebarWidth === 0 ? "is-sidebar-collapsed" : ""}" style="--chat-sidebar-width: ${visibleSidebarWidth}px">
       <aside class="sidebar chat-app-sidebar" id="chatAppSidebar">
         <header class="chat-side-brand">
           <button type="button" id="chatHome" class="chat-brand-button" title="Accueil des conversations">
             <span class="chat-brand-mark"><i data-lucide="sparkles"></i></span>
-            <span><strong>Switch</strong><small>Agent workspace</small></span>
+            <span><strong>Switch</strong><small>Agent d'environnement</small></span>
           </button>
           <button type="button" id="chatSidebarClose" class="icon-button chat-sidebar-close" aria-label="Fermer le menu"><i data-lucide="x"></i></button>
         </header>
@@ -6244,23 +7151,21 @@ const renderChatFirstShell = () => {
         ${renderWorkspaceSwitcher()}
 
         <button type="button" id="newChatSide" class="chat-side-new" title="${escapeAttr(newChatTitle)}">
-          <i data-lucide="plus"></i><span>${interfaceMode === "expert" ? "Ajouter un chat" : "Nouvelle conversation"}</span><kbd>${interfaceMode === "expert" ? expertChatPanes.length : "Ctrl N"}</kbd>
+          <i data-lucide="plus"></i><span>Nouveau chat</span><kbd>${environmentChatCount}</kbd>
         </button>
         <label class="chat-side-search">
           <i data-lucide="search"></i>
-          <input id="chatSidebarSearch" type="search" value="${escapeAttr(chatSidebarSearch)}" placeholder="Rechercher partout" aria-label="Rechercher dans tous les workspaces" />
+          <input id="chatSidebarSearch" type="search" value="${escapeAttr(chatSidebarSearch)}" placeholder="Rechercher dans cet environnement" aria-label="Rechercher dans l'environnement actif" />
         </label>
-        <nav class="chat-side-conversations" id="chatSideConversations" aria-label="Workspaces et conversations">${renderChatSidebarConversations()}</nav>
+        <nav class="chat-side-conversations" id="chatSideConversations" aria-label="Chats de l'environnement actif">${renderChatSidebarConversations()}</nav>
 
         <nav class="chat-side-tools" aria-label="Outils">
           <button id="sideDiscussions" class="${activeView === "discussions" ? "active" : ""}" title="Discussions — reprendre une conversation dans un autre compte"><i data-lucide="messages-square"></i><span>Discussions</span></button>
           <button id="dashboardToggle" class="${activeView === "dashboard" ? "active" : ""}" title="Statistiques"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
           <button id="limitsToggle" class="${activeView === "limits" ? "active" : ""}" title="Limites"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
-          <button id="roomToggle" class="${activeView === "room" ? "active" : ""}" title="Salon d'agents"><i data-lucide="users"></i><span>Salon</span></button>
+          <button id="roomToggle" class="${activeView === "room" ? "active" : ""}" title="Collaboration de l'environnement"><i data-lucide="users"></i><span>Collab</span></button>
           <button id="skillsToggle" class="${activeView === "skills" ? "active" : ""}" title="Skills"><i data-lucide="library"></i><span>Skills</span></button>
         </nav>
-
-        ${renderInterfaceModeSwitch("chat-mode-switch")}
 
         <footer class="chat-side-footer">
           <button id="settingsToggle" class="icon-button ${activeView === "settings" ? "active" : ""}" title="Paramètres (comptes, pool)"><i data-lucide="settings"></i></button>
@@ -6285,14 +7190,12 @@ const renderChatFirstShell = () => {
 
       <main class="workspace chat-main-workspace" id="chatMainWorkspace">
         ${isChat
-          ? interfaceMode === "expert"
-            ? renderExpertChatGrid()
-            : renderActiveAppPanel()
+          ? renderExpertChatGrid()
           : `<header class="chat-admin-head">
               <button type="button" id="adminBackChat" class="icon-button"><i data-lucide="arrow-left"></i></button>
               <div><strong>${escapeHtml(appViewTitle(activeView))}</strong><span>${escapeHtml(statusText)}</span></div>
               <div class="chat-admin-actions">
-                ${activeView !== "discussions" ? `<button id="discussionsToggle" class="tool-button"><i data-lucide="messages-square"></i><span>Conversations</span></button>` : ""}
+                ${activeView !== "discussions" ? `<button id="discussionsToggle" type="button" data-open-discussions class="tool-button" title="Choisir une discussion a reprendre"><i data-lucide="messages-square"></i><span>Reprendre une discussion</span></button>` : ""}
                 <button id="kombaiToggle" class="icon-button" title="Kombai"><i data-lucide="bot"></i></button>
                 <button id="historyToggle" class="icon-button" title="Historique"><i data-lucide="history"></i></button>
                 <button id="auditToggle" class="icon-button" title="Audit"><i data-lucide="scan-eye"></i></button>
@@ -6302,23 +7205,18 @@ const renderChatFirstShell = () => {
         <div class="chat-status-toast" aria-live="polite">${escapeHtml(statusText)}</div>
       </main>
     </div>
+    ${renderNewChatModal()}
     ${renderNewTerminalModal()}
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
+    ${renderTerminalEnvironmentMenu()}
+    ${renderWorkspaceLiveGraphModal()}
     ${renderCodexModelSuggestions()}
   `;
 
   createIcons({ icons: lucideIcons });
   bindUi();
-  if (interfaceMode === "expert") {
-    bindExpertChatGridUi();
-  } else {
-    const chatFeed = document.querySelector<HTMLDivElement>("#chatFeed");
-    if (chatFeed) {
-      bindChatFeedScroll(chatFeed);
-      restoreChatFeedScroll(chatFeed);
-    }
-  }
+  bindExpertChatGridUi();
   if (activeView === "terminal") mountExpertTerminals();
 };
 
@@ -6340,14 +7238,11 @@ const render = () => {
     element?.parentElement?.removeChild(element);
   });
 
-  document.body.classList.toggle("interface-simple", interfaceMode === "simple");
-  document.body.classList.toggle("interface-expert", interfaceMode === "expert");
-
   renderChatFirstShell();
 };
 
 // Ancienne coque plein ecran des terminaux, conservee pour les outils PTY
-// historiques. Le selecteur Simple/Expert n'utilise plus cette coque.
+// historiques. L'interface principale n'utilise plus cette coque.
 const renderLegacyTerminalShell = () => {
   if (!settings || !app) return;
 
@@ -6368,17 +7263,18 @@ const renderLegacyTerminalShell = () => {
     ? (activeSession?.proxySummary ?? (proxy ? maskProxy(proxy.proxyUrl) : "sans proxy"))
     : "proxy off";
   const contextProject = displayProjectDir(
-    activeSession?.workspacePath ?? activeSession?.projectDir ?? account?.projectDir,
+    activeSession?.workspacePath ?? activeSession?.folderPath ?? activeSession?.projectDir ?? account?.projectDir,
   );
   const workspacePath = currentWorkspace();
-  const workspaceChipLabel = workspacePath ? workspaceBaseName(workspacePath) : "Workspace";
+  const workspaceChipLabel = workspacePath ? workspaceBaseName(workspacePath) : "Environnement";
   const workspaceTitle = workspacePath
-    ? `Workspace actif et des prochains terminaux: ${workspacePath}`
-    : "Aucun workspace actif: les nouveaux terminaux utilisent le dossier par defaut";
+    ? `Environnement actif et des prochains terminaux: ${workspacePath}`
+    : "Aucun environnement actif: une selection est obligatoire";
   const terminalCountLabel =
     terminalSessions.length === 1 ? "1 terminal" : `${terminalSessions.length} terminaux`;
   const workspaceSideItems = terminalWorkspaceGroups()
     .map((group) => {
+      const groupClosed = !!group.path && workspaceIsClosed(group.path);
       const groupActive = group.sessions.some((session) => session.key === activeTerminalKey) ||
         (!activeSession && group.path && workspacePath &&
           normalizeWorkspacePath(group.path) === normalizeWorkspacePath(workspacePath));
@@ -6403,19 +7299,24 @@ const renderLegacyTerminalShell = () => {
         })
         .join("");
       return `
-        <section class="workspace-side-group ${groupActive ? "active" : ""}">
+        <section class="workspace-side-group ${groupActive ? "active" : ""} ${groupClosed ? "closed" : ""}">
           <div class="workspace-side-head">
-            <button class="workspace-side-select" data-workspace-key="${escapeAttr(group.key)}" title="${escapeAttr(group.detail)}">
-              <i data-lucide="folder-open"></i>
+            <button class="workspace-side-select" data-workspace-key="${escapeAttr(group.key)}" title="${escapeAttr(groupClosed ? `${group.detail} · environnement ferme (cliquer pour rouvrir)` : group.detail)}">
+              <i data-lucide="${groupClosed ? "folder-x" : "folder-open"}"></i>
               <span class="workspace-side-copy">
                 <strong>${escapeHtml(group.label)}</strong>
-                <small>${escapeHtml(group.detail)}</small>
+                <small>${escapeHtml(groupClosed ? `${group.detail} · ferme` : group.detail)}</small>
               </span>
               <span class="workspace-terminal-count">${group.sessions.length}</span>
             </button>
             ${group.selectable
               ? `<button class="workspace-side-new" data-new-terminal-workspace="${escapeAttr(group.key)}" title="${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "Limite de 16 terminaux atteinte" : `Nouveau terminal dans ${escapeAttr(group.label)}`}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
                 <i data-lucide="plus"></i>
+              </button>`
+              : ""}
+            ${group.path && !groupClosed
+              ? `<button class="workspace-side-close" data-close-workspace="${escapeAttr(workspaceIdForPath(group.path))}" title="Fermer l'environnement ${escapeAttr(group.label)}" aria-label="Fermer l'environnement ${escapeAttr(group.label)}">
+                <i data-lucide="x"></i>
               </button>`
               : ""}
           </div>
@@ -6436,17 +7337,16 @@ const renderLegacyTerminalShell = () => {
               <small>${escapeHtml(terminalCountLabel)} · 16 maximum</small>
             </span>
           </div>
-          ${renderInterfaceModeSwitch("expert-mode-switch")}
         </header>
 
         <section class="side-section">
           <div class="section-row">
-            <span>Workspaces</span>
+            <span>Environnements</span>
             <span class="section-actions">
-              <button class="icon-button" id="workspaceAddSide" title="Choisir ou ajouter un workspace">
+              <button class="icon-button" id="workspaceAddSide" title="Choisir ou ajouter un environnement">
                 <i data-lucide="folder-open"></i>
               </button>
-              <button class="icon-button" id="newTerminalSide" title="${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "Limite de 16 terminaux atteinte" : "Nouveau terminal dans le workspace actif"}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
+              <button class="icon-button" id="newTerminalSide" title="${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "Limite de 16 terminaux atteinte" : "Nouveau terminal dans l'environnement actif"}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
                 <i data-lucide="plus"></i>
               </button>
             </span>
@@ -6482,11 +7382,16 @@ const renderLegacyTerminalShell = () => {
                 <span>${escapeHtml(workspaceChipLabel)}</span>
               </button>
               ${workspacePath
-                ? `<button id="workspaceClear" class="icon-button" title="Retirer le workspace">
+                ? `<button id="workspaceClear" class="icon-button" title="Fermer l'environnement actif" aria-label="Fermer l'environnement actif">
                 <i data-lucide="x"></i>
               </button>`
                 : ""}
             </div>
+            ${workspacePath
+              ? `<button id="workspaceLiveGraph" class="tool-button workspace-live-button" title="Activité temps réel de l'environnement">
+                <i data-lucide="activity"></i><span>Activité live</span>
+              </button>`
+              : ""}
             <button id="fullscreenToggle" class="icon-button wide ${isFullscreen ? "active" : ""}" title="${isFullscreen ? "Quitter plein ecran (F11)" : "Plein ecran (F11)"}" aria-label="${isFullscreen ? "Quitter plein ecran" : "Plein ecran"}" aria-pressed="${isFullscreen}">
               <i data-lucide="${isFullscreen ? "minimize-2" : "maximize-2"}"></i>
             </button>
@@ -6506,17 +7411,17 @@ const renderLegacyTerminalShell = () => {
               <i data-lucide="bot"></i>
               <span>Kombai</span>
             </button>
-            <button id="discussionsToggle" class="tool-button ${activeView === "discussions" ? "primary" : ""}" title="Historique des discussions">
+            <button id="discussionsToggle" data-open-discussions class="tool-button ${activeView === "discussions" ? "primary" : ""}" title="Choisir une discussion a reprendre">
               <i data-lucide="messages-square"></i>
-              <span>Discussions</span>
+              <span>Reprendre une discussion</span>
             </button>
             <button id="historyToggle" class="tool-button ${activeView === "history" ? "primary" : ""}" title="Historique des demandes (recherche)">
               <i data-lucide="history"></i>
               <span>Historique</span>
             </button>
-            <button id="roomToggle" class="tool-button ${activeView === "room" ? "primary" : ""}" title="Salon d'agents (communication inter-agents)">
+            <button id="roomToggle" class="tool-button ${activeView === "room" ? "primary" : ""}" title="Collaboration native de l'environnement">
               <i data-lucide="users"></i>
-              <span>Salon</span>
+              <span>Collab</span>
             </button>
             <button id="auditToggle" class="tool-button ${activeView === "audit" ? "primary" : ""}" title="Audit design de la vue affichée (détecteur Impeccable)">
               <i data-lucide="scan-eye"></i>
@@ -6589,9 +7494,12 @@ const renderLegacyTerminalShell = () => {
         </footer>
       </main>
     </div>
+    ${renderNewChatModal()}
     ${renderNewTerminalModal()}
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
+    ${renderTerminalEnvironmentMenu()}
+    ${renderWorkspaceLiveGraphModal()}
     ${renderCodexModelSuggestions()}
   `;
 
@@ -6658,9 +7566,14 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
         <section class="account-editor">
           <div class="section-row">
             <span>Compte selectionne</span>
-            <button id="removeAccount" class="icon-button wide danger" title="Supprimer le compte" ${account ? "" : "disabled"}>
-              <i data-lucide="trash-2"></i>
-            </button>
+            <div class="account-editor-actions">
+              <button id="loginAccount" class="tool-button" title="Ouvrir une fenetre de connexion (login) pour ce compte" ${account ? "" : "disabled"}>
+                <i data-lucide="log-in"></i><span>Se connecter</span>
+              </button>
+              <button id="removeAccount" class="icon-button wide danger" title="Supprimer le compte" ${account ? "" : "disabled"}>
+                <i data-lucide="trash-2"></i>
+              </button>
+            </div>
           </div>
           <div class="account-form-grid">
             <label>
@@ -6675,7 +7588,7 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
               <span>${projectFieldLabel()}</span>
               <div class="field-row">
                 <input id="projectDir" value="${escapeAttr(account?.projectDir ?? "")}" placeholder="${escapeAttr(projectFieldPlaceholder())}" ${account ? "" : "disabled"} />
-                <button id="pickProjectDir" type="button" class="icon-button" title="Choisir dossier projet" ${account && !isRemoteMode() ? "" : "disabled"}>
+                <button id="pickProjectDir" type="button" class="icon-button" title="Choisir l'environnement projet" ${account && !isRemoteMode() ? "" : "disabled"}>
                   <i data-lucide="folder-open"></i>
                 </button>
               </div>
@@ -6743,6 +7656,106 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
   `;
 };
 
+// Vue « Comptes & pool » : l'editeur complet des comptes (ajout / edition /
+// suppression via renderAccountsPanel) en tete, suivi du pool de service. Le
+// panneau editeur exige la liste d'options du proxy du compte selectionne, qui
+// n'etait construite nulle part depuis que la vue etait cablee sur le seul pool.
+const renderAccountsAndPool = (): string => {
+  if (!settings) return renderPoolPanel();
+  const proxiesEnabled = proxyControlsEnabled();
+  const account = selectedAccount();
+  const proxyOptions = [
+    `<option value="">Aucun proxy</option>`,
+    ...settings.proxies.map(
+      (item) =>
+        `<option value="${escapeAttr(item.id)}" ${item.id === account?.proxyId ? "selected" : ""}>${escapeHtml(item.label)}</option>`,
+    ),
+  ].join("");
+  return `${renderAccountsPanel(proxyOptions, proxiesEnabled)}${renderPoolPanel()}`;
+};
+
+const renderNewChatModal = () => {
+  if (!settings || !newChatModalOpen) return "";
+
+  const accounts = settings.accounts;
+  const account = accountById(newChatAccountId) ?? accounts[0] ?? null;
+  const provider = accountProvider(account);
+  const environmentPath = userEnvironmentPath(newChatPendingWorkspace ?? currentWorkspace());
+  const environmentLabel = environmentPath
+    ? knownWorkspaces().find((workspace) => workspace.id === workspaceIdForPath(environmentPath))?.label
+      ?? workspaceBaseName(environmentPath)
+    : null;
+  const modelValue = newChatModel || accountModel(account);
+
+  const accountOptions = accounts
+    .map((item) => {
+      const selected = item.id === account?.id;
+      return `<button
+        type="button"
+        class="new-chat-account-option ${selected ? "selected" : ""}"
+        data-new-chat-account="${escapeAttr(item.id)}"
+        role="radio"
+        aria-checked="${selected}"
+        title="${escapeAttr(item.label)}"
+      >
+        <span class="new-chat-account-dot" aria-hidden="true"></span>
+        <span class="new-chat-account-copy">
+          <strong>${escapeHtml(item.label)}</strong>
+          <small>${escapeHtml(providerLabel(accountProvider(item)))} · ${escapeHtml(accountModel(item))}</small>
+        </span>
+        <i data-lucide="${accountProvider(item) === "claude" ? "sparkles" : "cpu"}"></i>
+      </button>`;
+    })
+    .join("");
+
+  return `
+    <div class="modal-backdrop" id="newChatBackdrop">
+      <section class="modal new-chat-modal" role="dialog" aria-modal="true" aria-labelledby="newChatModalTitle">
+        <header class="modal-head">
+          <div>
+            <h2 id="newChatModalTitle">Nouveau chat</h2>
+            <p>${environmentLabel
+              ? `Compte, modele et mode pour ce chat dans <strong>${escapeHtml(environmentLabel)}</strong>.`
+              : "Choisis le compte, le modele et le mode de ce chat."}</p>
+          </div>
+          <button class="icon-button" id="closeNewChatModal" title="Fermer" aria-label="Fermer">
+            <i data-lucide="x"></i>
+          </button>
+        </header>
+
+        <div class="modal-body">
+          <section class="modal-section">
+            <span class="new-chat-field-title">Compte / agent</span>
+            ${accounts.length
+              ? `<div class="new-chat-account-options" role="radiogroup" aria-label="Compte du nouveau chat">${accountOptions}</div>`
+              : `<div class="empty">Aucun compte agent : ajoutez-en un dans les parametres.</div>`}
+            <label>
+              <span>Modele</span>
+              <input id="newChatModel" list="codexModelSuggestions" value="${escapeAttr(modelValue)}" placeholder="${escapeAttr(providerDefaultModel(provider))}" autocomplete="off" spellcheck="false" maxlength="160" ${account ? "" : "disabled"} />
+            </label>
+            <label>
+              <span>Mode</span>
+              <select id="newChatMode" ${account ? "" : "disabled"}>
+                <option value="build" ${newChatMode === "build" ? "selected" : ""}>Construire</option>
+                <option value="plan" ${newChatMode === "plan" ? "selected" : ""}>Planifier</option>
+                <option value="ask" ${newChatMode === "ask" ? "selected" : ""}>Question</option>
+              </select>
+            </label>
+          </section>
+        </div>
+
+        <footer class="modal-actions">
+          <button class="tool-button" id="cancelNewChat">Annuler</button>
+          <button class="tool-button primary" id="confirmNewChat" ${account && environmentPath ? "" : "disabled"}>
+            <i data-lucide="plus"></i>
+            <span>Ouvrir le chat</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+  `;
+};
+
 const renderNewTerminalModal = () => {
   if (!settings || !newTerminalModalOpen) return "";
 
@@ -6767,14 +7780,33 @@ const renderNewTerminalModal = () => {
         `<option value="${escapeAttr(item.id)}" ${item.id === account?.proxyId ? "selected" : ""}>${escapeHtml(item.label)}</option>`,
     ),
   ].join("");
+  const selectedEnvironment = userEnvironmentPath(newTerminalWorkspacePath);
+  const environmentOptions = terminalEnvironmentGroups()
+    .map((group) => {
+      const selected =
+        !!selectedEnvironment &&
+        workspaceIdForPath(group.path) === workspaceIdForPath(selectedEnvironment);
+      return `<button
+        type="button"
+        class="new-terminal-environment-option ${selected ? "selected" : ""}"
+        data-new-terminal-environment-path="${escapeAttr(group.path)}"
+        aria-pressed="${selected}"
+        title="${escapeAttr(group.path)}"
+      >
+        <i data-lucide="folder${selected ? "-open" : ""}"></i>
+        <span><strong>${escapeHtml(group.label)}</strong><small>${escapeHtml(group.path)}</small></span>
+        <b>${group.sessions.length}</b>
+      </button>`;
+    })
+    .join("");
 
   return `
     <div class="modal-backdrop" id="newTerminalBackdrop">
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="newTerminalTitle">
         <header class="modal-head">
           <div>
-            <h2 id="newTerminalTitle">Nouveau terminal</h2>
-            <p>Chaque terminal garde le workspace choisi pour toute sa session.</p>
+            <h2 id="newTerminalTitle">Nouvelle session terminal</h2>
+            <p>L'environnement est obligatoire et reste verrouille pendant toute la session.</p>
           </div>
           <button class="icon-button" id="closeNewTerminalModal" title="Fermer">
             <i data-lucide="x"></i>
@@ -6783,29 +7815,40 @@ const renderNewTerminalModal = () => {
 
         <div class="modal-body">
           <section class="modal-section">
+            <div class="new-terminal-environment-required ${selectedEnvironment ? "selected" : "missing"}">
+              <span class="new-terminal-environment-required-icon"><i data-lucide="shield-check"></i></span>
+              <span>
+                <strong>1. Choisir l'environnement isole</strong>
+                <small>${selectedEnvironment ? escapeHtml(selectedEnvironment) : "Aucun terminal ne peut demarrer sans environnement explicite"}</small>
+              </span>
+            </div>
+            ${environmentOptions
+              ? `<div class="new-terminal-environment-options" role="radiogroup" aria-label="Environnements recents">${environmentOptions}</div>`
+              : ""}
+            <label class="new-terminal-environment-field">
+              <span>Environnement de ce terminal / session (obligatoire)</span>
+              <div class="field-row">
+                <input id="newTerminalWorkspace" value="${escapeAttr(selectedEnvironment ?? "")}" placeholder="${escapeAttr(isRemoteMode() ? "/chemin/vers/environnement" : "C:\\chemin\\vers\\environnement")}" spellcheck="false" required aria-required="true" aria-invalid="${!selectedEnvironment}" />
+                <button id="pickNewTerminalWorkspace" type="button" class="icon-button" title="Choisir l'environnement">
+                  <i data-lucide="folder-open"></i>
+                </button>
+              </div>
+              <small class="new-terminal-environment-help">Les fichiers, le cwd, le worktree et le home de l'agent seront separes des autres onglets.</small>
+            </label>
             <label>
-              <span>Agent</span>
+              <span>2. Agent</span>
               <select id="newTerminalAgent" ${settings.agents.length > 0 ? "" : "disabled"}>
                 ${agentOptions || `<option value="">Aucun agent</option>`}
               </select>
             </label>
             <label>
-              <span>Compte</span>
+              <span>3. Compte</span>
               <select id="newTerminalAccount" ${settings.accounts.length > 0 ? "" : "disabled"}>
                 ${accountOptions || `<option value="">Aucun compte</option>`}
               </select>
             </label>
-            <label>
-              <span>Workspace de ce terminal</span>
-              <div class="field-row">
-                <input id="newTerminalWorkspace" value="${escapeAttr(newTerminalWorkspacePath ?? "")}" placeholder="${escapeAttr(isRemoteMode() ? "/chemin/du/serveur" : "C:\\chemin\\vers\\workspace")}" spellcheck="false" />
-                <button id="pickNewTerminalWorkspace" type="button" class="icon-button" title="Choisir le workspace">
-                  <i data-lucide="folder-open"></i>
-                </button>
-              </div>
-            </label>
             <div class="account-create-box">
-              <strong>Ajouter un nouvel environnement</strong>
+              <strong>Ajouter un nouveau compte agent</strong>
               <div class="account-create-grid">
                 <label>
                   <span>Nom du compte</span>
@@ -6874,12 +7917,12 @@ const renderNewTerminalModal = () => {
         <footer class="modal-actions">
           <button class="tool-button" id="cancelNewTerminal">Annuler</button>
           ${selectedAgent?.loginCommand
-            ? `<button class="tool-button" id="loginNewTerminal" ${account ? "" : "disabled"}>
+            ? `<button class="tool-button" id="loginNewTerminal" ${account && selectedEnvironment ? "" : "disabled"}>
             <i data-lucide="badge-check"></i>
             <span>Login ${escapeHtml(selectedAgent.label)}</span>
           </button>`
             : ""}
-          <button class="tool-button primary" id="confirmNewTerminal" ${account ? "" : "disabled"}>
+          <button class="tool-button primary" id="confirmNewTerminal" ${account && selectedEnvironment ? "" : "disabled"}>
             <i data-lucide="square-terminal"></i>
             <span>Creer le terminal</span>
           </button>
@@ -6955,7 +7998,7 @@ const renderAgentsModal = () => {
             <i data-lucide="plus"></i>
             <span>Ajouter un agent</span>
           </button>
-          <p class="agent-hint">Kombai est une extension d'IDE : un agent <strong>IDE</strong> ouvre l'editeur choisi (code, cursor, windsurf, trae, antigravity, kiro) sur le dossier projet, ou tu utilises le panneau Kombai.</p>
+          <p class="agent-hint">Kombai est une extension d'IDE : un agent <strong>IDE</strong> ouvre l'editeur choisi (code, cursor, windsurf, trae, antigravity, kiro) sur l'environnement projet, ou tu utilises le panneau Kombai.</p>
         </div>
 
         <footer class="modal-actions">
@@ -6974,13 +8017,39 @@ const renderWorkspaceModal = () => {
   if (!workspaceModalOpen) return "";
 
   const data = workspaceBrowse;
-  const entries = data?.entries ?? [];
+  const entries = (data?.entries ?? []).filter(
+    (entry) => !isEphemeralChatWorkspacePath(entry.path),
+  );
+  const selectableBrowsePath = userEnvironmentPath(data?.path);
+  const breadcrumbs = workspacePathBreadcrumbs(data?.root, data?.path);
+  const breadcrumbTrail = breadcrumbs
+    .map(
+      (breadcrumb, index) => `
+        <span class="ws-breadcrumb-part">
+          ${index ? `<i data-lucide="chevron-right"></i>` : ""}
+          <button type="button" data-ws-dir="${escapeAttr(breadcrumb.path)}" ${index === breadcrumbs.length - 1 ? 'aria-current="location"' : ""} title="${escapeAttr(breadcrumb.path)}">${escapeHtml(breadcrumb.label)}</button>
+        </span>`,
+    )
+    .join("");
+  const browseId = data?.path ? workspaceIdForPath(data.path) : null;
+  const quickAccess = knownWorkspaces()
+    .filter((workspace) => workspace.id !== browseId)
+    .slice(0, 8)
+    .map(
+      (workspace) => `
+        <button type="button" class="ws-quick-entry" data-ws-dir="${escapeAttr(workspace.path)}" title="${escapeAttr(workspace.path)}">
+          <i data-lucide="folder"></i>
+          <span><strong>${escapeHtml(workspace.label)}</strong><small>${escapeHtml(workspace.path)}</small></span>
+        </button>`,
+    )
+    .join("");
   const list = entries
     .map(
       (entry) => `
-        <button class="ws-entry" data-ws-dir="${escapeAttr(entry.path)}" title="${escapeAttr(entry.path)}">
+        <button type="button" class="ws-entry ws-folder-entry" data-ws-dir="${escapeAttr(entry.path)}" data-ws-name="${escapeAttr(entry.name.toLocaleLowerCase())}" title="Ouvrir ${escapeAttr(entry.path)}">
           <i data-lucide="folder-open"></i>
-          <span>${escapeHtml(entry.name)}</span>
+          <span class="ws-entry-copy"><strong>${escapeHtml(entry.name)}</strong><small>${escapeHtml(entry.path)}</small></span>
+          <i data-lucide="chevron-right"></i>
         </button>`,
     )
     .join("");
@@ -6989,41 +8058,49 @@ const renderWorkspaceModal = () => {
 
   return `
     <div class="modal-backdrop" id="workspaceBackdrop">
-      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="workspaceModalTitle">
+      <section class="modal workspace-browser-modal" role="dialog" aria-modal="true" aria-labelledby="workspaceModalTitle">
         <header class="modal-head">
           <div>
-            <h2 id="workspaceModalTitle">${pickingForTerminal ? "Workspace du nouveau terminal" : "Choisir le workspace actif"}</h2>
-            <p>${pickingForTerminal ? "Ce dossier sera fixe pour cette session." : "Les prochains terminaux seront crees dans ce dossier."}</p>
+            <h2 id="workspaceModalTitle">${pickingForTerminal ? "Environnement du nouveau terminal" : "Choisir l'environnement actif"}</h2>
+            <p>${pickingForTerminal ? "Naviguez puis choisissez le dossier fixe de cette session." : "Parcourez les dossiers puis choisissez celui qui regroupera les chats et les agents."}</p>
           </div>
           <button class="icon-button" id="closeWorkspaceModal" title="Fermer">
             <i data-lucide="x"></i>
           </button>
         </header>
 
-        <div class="modal-body">
+        <div class="modal-body workspace-browser-body">
+          ${breadcrumbTrail ? `<nav class="ws-breadcrumb" aria-label="Chemin du dossier">${breadcrumbTrail}</nav>` : ""}
           <div class="ws-path-row">
-            <input id="workspacePathInput" value="${escapeAttr(data?.path ?? "")}" placeholder="/chemin/vers/dossier" spellcheck="false" />
+            <input id="workspacePathInput" value="${escapeAttr(data?.path ?? "")}" placeholder="Chemin du dossier" spellcheck="false" aria-label="Chemin du dossier" />
             <button class="tool-button" id="workspaceGo" title="Aller a ce chemin">
               <i data-lucide="search"></i>
               <span>Aller</span>
             </button>
           </div>
-          ${selected ? `<div class="ws-current">Selection : <strong>${escapeHtml(selected)}</strong></div>` : ""}
+          ${selected ? `<div class="ws-current">Environnement actif : <strong>${escapeHtml(selected)}</strong></div>` : ""}
+          ${quickAccess ? `<section class="ws-quick-access"><header><span>Acces rapides</span><small>Environnements connus</small></header><div>${quickAccess}</div></section>` : ""}
+          <div class="ws-folder-toolbar">
+            <label for="workspaceFolderSearch"><i data-lucide="search"></i><input id="workspaceFolderSearch" type="search" placeholder="Filtrer les sous-dossiers..." autocomplete="off" /></label>
+            <span id="workspaceVisibleFolderCount">${entries.length} dossier${entries.length > 1 ? "s" : ""}</span>
+          </div>
           ${data?.parent
             ? `<button class="ws-entry ws-parent" data-ws-dir="${escapeAttr(data.parent)}" title="${escapeAttr(data.parent)}">
-                 <i data-lucide="folder-open"></i>
-                 <span>.. (dossier parent)</span>
+                 <i data-lucide="arrow-left"></i>
+                 <span class="ws-entry-copy"><strong>Dossier parent</strong><small>${escapeHtml(data.parent)}</small></span>
                </button>`
             : ""}
           ${workspaceBrowseLoading ? `<div class="ws-hint">Chargement...</div>` : ""}
           ${workspaceBrowseError ? `<div class="ws-error">${escapeHtml(workspaceBrowseError)}</div>` : ""}
+          ${data?.path && !selectableBrowsePath ? `<div class="ws-error">Ce dossier appartient au runtime temporaire des agents. Il ne peut pas devenir un environnement.</div>` : ""}
           <div class="ws-list">${list || (workspaceBrowseLoading ? "" : `<div class="empty">Aucun sous-dossier</div>`)}</div>
+          <div class="empty ws-search-empty" id="workspaceSearchEmpty" hidden>Aucun dossier ne correspond a la recherche.</div>
         </div>
 
         <footer class="modal-actions">
           <button class="tool-button" id="cancelWorkspaceModal">Annuler</button>
-          <button class="tool-button" id="clearWorkspaceModal">Dossier par defaut</button>
-          <button class="tool-button primary" id="confirmWorkspaceModal" ${data?.path ? "" : "disabled"}>
+          ${pickingForTerminal ? "" : `<button class="tool-button" id="clearWorkspaceModal">Fermer l'environnement</button>`}
+          <button class="tool-button primary" id="confirmWorkspaceModal" ${selectableBrowsePath ? "" : "disabled"}>
             <i data-lucide="badge-check"></i>
             <span>Choisir ce dossier</span>
           </button>
@@ -7053,7 +8130,7 @@ const renderKombaiPanel = () => {
           <div class="kombai-bar-info">
             <span class="live-dot on"></span>
             <strong>Kombai</strong>
-            <span>${escapeHtml(`${status.url} | ${projectDir ?? "aucun dossier"}`)}</span>
+            <span>${escapeHtml(`${status.url} | ${projectDir ?? "aucun environnement"}`)}</span>
           </div>
           <div class="kombai-bar-actions">
             <button id="kombaiReload" class="tool-button" title="Recharger l'onglet Kombai">
@@ -7092,7 +8169,7 @@ const renderKombaiPanel = () => {
         <div><span>Commande</span><strong>${escapeHtml(command)}</strong></div>
         <div><span>Port</span><strong>${port}</strong></div>
         <div><span>Extension</span><strong>${escapeHtml(extensionId)}</strong></div>
-        <div><span>Dossier projet</span><strong>${escapeHtml(projectDir ?? "aucun (compte sans projet)")}</strong></div>
+        <div><span>Environnement projet</span><strong>${escapeHtml(projectDir ?? "aucun (compte sans projet)")}</strong></div>
       </div>
 
       <div class="kombai-actions">
@@ -7183,14 +8260,16 @@ const renderLimitsPanel = () => {
   const connected = limitStatus.filter((account) => account.hasTokens).length;
   const nextSession = nextLimitTimestamp("sessionResetAt");
   const nextWeekly = nextLimitTimestamp("weeklyResetAt");
-  const serverCount = limitStatus.filter((account) => account.source === "server").length;
+  const availableCount = limitStatus.filter(
+    (account) => account.source === "server" || account.source === "session",
+  ).length;
 
   return `
     <section class="limits-panel">
       <div class="limits-head">
         <div>
           <strong>Limites comptes</strong>
-          <span>${connected}/${settings?.accounts.length ?? 0} comptes connectes · ${serverCount} lus serveur</span>
+          <span>${connected}/${settings?.accounts.length ?? 0} comptes connectes · ${availableCount} limites disponibles</span>
         </div>
         <div class="limit-summary">
           <div>
@@ -7249,6 +8328,9 @@ const renderLimitRow = (account: AccountLimitView) => `
     <td>
       <span class="limit-badge ${limitBadgeClass(account)}">${escapeHtml(limitSourceLabel(account))}</span>
       ${account.error ? `<small class="limit-error">${escapeHtml(account.error)}</small>` : ""}
+      <button type="button" class="tool-button limit-relogin${limitNeedsRelogin(account) ? " primary" : ""}" data-relogin-account="${escapeAttr(account.id)}" title="Ouvrir un terminal de connexion (codex login) pour ce compte">
+        <i data-lucide="log-in"></i><span>${escapeHtml(limitReloginLabel(account))}</span>
+      </button>
     </td>
     <td>
       <strong>${formatTimestamp(account.sessionResetAt)}</strong>
@@ -7267,7 +8349,7 @@ const renderLimitRow = (account: AccountLimitView) => `
 
 const limitBadgeClass = (account: AccountLimitView) => {
   if (!account.hasTokens) return "missing";
-  if (account.source === "server") return "connected";
+  if (account.source === "server" || account.source === "session") return "connected";
   if (account.source === "server-empty") return "empty";
   return "error";
 };
@@ -7275,9 +8357,28 @@ const limitBadgeClass = (account: AccountLimitView) => {
 const limitSourceLabel = (account: AccountLimitView) => {
   if (!account.hasTokens) return "non connecte";
   if (account.source === "server") return "serveur";
+  if (account.source === "session") return "session Codex";
   if (account.source === "server-empty") return "vide";
   return "erreur";
 };
+
+// Un token revoque/invalide (`token_invalidated`, `refresh_token_invalidated`,
+// 401...) laisse un compte « connecte » cote fichier mais illisible cote serveur.
+const AUTH_LIMIT_ERROR =
+  /token[_ ]?invalidat|refresh[_ ]?token|revoked|revoqu|\b401\b|unauthor|authentication|session (?:has )?ended|sign(?:ing)? ?in again|log ?in again|not logged in|connexion requise|authentication required/i;
+
+// Vrai quand le compte doit etre (re)connecte pour que ses quotas redeviennent
+// lisibles : jamais connecte, ou lecture serveur echouee sur une erreur d'auth.
+const limitNeedsRelogin = (account: AccountLimitView): boolean => {
+  if (!account.hasTokens || account.source === "none") return true;
+  if (account.source === "unavailable") {
+    return !account.error || AUTH_LIMIT_ERROR.test(account.error);
+  }
+  return false;
+};
+
+const limitReloginLabel = (account: AccountLimitView): string =>
+  account.hasTokens && account.source !== "none" ? "Reconnecter" : "Connecter";
 
 const formatLimitDetail = (seconds?: number | null, usedPercent?: number | null) => {
   const parts = [];
@@ -7815,7 +8916,67 @@ const addPoolAccount = async () => {
   }
 };
 
-const openNewTerminalModal = (workspacePath: string | null | undefined = undefined) => {
+const openNewChatModal = (options: { workspacePath?: string | null } = {}) => {
+  if (!settings) return;
+  const environmentPath = userEnvironmentPath(options.workspacePath ?? currentWorkspace());
+  if (!environmentPath) {
+    // Pas d'environnement isole : on conserve le garde-fou existant.
+    openTerminalEnvironmentMenu();
+    return;
+  }
+  newChatPendingWorkspace = environmentPath;
+  newChatAccountId =
+    selectedAccountId ?? settings.defaultAccountId ?? settings.accounts[0]?.id ?? null;
+  newChatModel = accountModel(accountById(newChatAccountId));
+  newChatMode = "build";
+  newChatModalOpen = true;
+  statusText = "Choisis le compte, le modele et le mode de ce chat";
+  render();
+  window.setTimeout(() => {
+    document.querySelector<HTMLInputElement>("#newChatModel")?.focus();
+  }, 0);
+};
+
+const closeNewChatModal = () => {
+  if (!newChatModalOpen) return;
+  newChatModalOpen = false;
+  render();
+};
+
+const confirmNewChatModal = () => {
+  if (!settings) return;
+  const account = accountById(newChatAccountId) ?? settings.accounts[0] ?? null;
+  if (!account) {
+    statusText = "Ajoute d'abord un compte agent";
+    render();
+    return;
+  }
+  const modelInput = document.querySelector<HTMLInputElement>("#newChatModel");
+  const modeSelect = document.querySelector<HTMLSelectElement>("#newChatMode");
+  const requestedModel = (modelInput?.value ?? newChatModel).trim();
+  if (requestedModel.length > 160 || /\s/.test(requestedModel)) {
+    modelInput?.setCustomValidity(
+      "Le nom du modele doit faire 160 caracteres maximum et ne contenir aucun espace",
+    );
+    modelInput?.reportValidity();
+    statusText = "Nom de modele invalide";
+    return;
+  }
+  const mode = (modeSelect?.value as ChatMode) || newChatMode;
+  const previousModel = accountModel(account);
+  const nextModel = requestedModel || previousModel;
+  if (nextModel !== previousModel) {
+    account.model = nextModel;
+    persistChatPreferences(account.id);
+  }
+  selectedAccountId = account.id;
+  const pendingWorkspace = newChatPendingWorkspace;
+  newChatModalOpen = false;
+  addExpertChatPane(account.id, { mode, pendingWorkspace });
+  void loadChatModelCatalog(account.id);
+};
+
+const openNewTerminalModal = (folderPath: string | null | undefined = undefined) => {
   if (!settings) return;
   if (terminalSessions.length >= EXPERT_MAX_TERMINALS) {
     statusText = `Limite atteinte: ${EXPERT_MAX_TERMINALS} terminaux maximum dans une fenetre`;
@@ -7825,13 +8986,13 @@ const openNewTerminalModal = (workspacePath: string | null | undefined = undefin
   newTerminalAccountId = selectedAccountId || settings.defaultAccountId || settings.accounts[0]?.id || null;
   newTerminalAgentId = settings.activeAgentId || settings.agents[0]?.id || null;
   newTerminalWorkspacePath =
-    workspacePath === undefined ? currentWorkspace() : workspacePath?.trim() || null;
+    folderPath === undefined ? null : userEnvironmentPath(folderPath);
   newTerminalAccountLabel = "";
   newTerminalAccountBypass = settings.codexBypass ?? true;
   newTerminalAccountModel = DEFAULT_CODEX_MODEL;
   newTerminalAccountReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
   newTerminalModalOpen = true;
-  statusText = "Choisis le workspace, l'agent et le compte du nouveau terminal";
+  statusText = "Choisis obligatoirement l'environnement, puis l'agent et le compte";
   render();
 };
 
@@ -7997,15 +9158,106 @@ const addAccountFromModal = () => {
   render();
 };
 
+// « + Compte » depuis l'editeur : cree un compte (CODEX_HOME unique), le
+// persiste tout de suite pour qu'il soit reellement supprimable, puis ouvre une
+// fenetre de connexion interactive (codex login / claude) afin de s'authentifier
+// sans etape supplementaire. On capture d'abord les modifs en cours de l'ancien
+// compte selectionne pour ne pas les perdre.
+const addAccountAndLogin = async () => {
+  if (!settings) return;
+  readSettingsForm();
+  const label = "Nouveau compte";
+  const account = newAccountProfile(label, uniqueCodexHomeForLabel(label));
+  settings.accounts.push(account);
+  selectedAccountId = account.id;
+  settings.defaultAccountId = account.id;
+  try {
+    settings = await invoke<AppSettings>("save_settings", { settings });
+  } catch (error) {
+    statusText = String(error);
+    render();
+    return;
+  }
+  render();
+  // Ouvre le terminal de login. Necessite un environnement : sans lui,
+  // reloginAccount affiche le message d'aide adequat (le compte reste cree).
+  await reloginAccount(account.id);
+};
+
+// Suppression depuis l'editeur : suppression backend d'abord (compte persiste),
+// avec repli en memoire + save_settings pour un compte tout juste cree que le
+// backend ne connait pas encore (« Compte introuvable »). deleteFiles reste
+// false : on retire l'entree sans toucher au CODEX_HOME (non destructif).
+const deleteSelectedAccount = async () => {
+  if (!settings || !selectedAccountId) return;
+  const id = selectedAccountId;
+  const label = settings.accounts.find((account) => account.id === id)?.label ?? "";
+  try {
+    settings = await invoke<AppSettings>("remove_account", { accountId: id, deleteFiles: false });
+    statusText = `Compte « ${label} » supprime`;
+  } catch {
+    settings.accounts = settings.accounts.filter((account) => account.id !== id);
+    if (settings.defaultAccountId === id) {
+      settings.defaultAccountId = settings.accounts[0]?.id ?? null;
+    }
+    try {
+      settings = await invoke<AppSettings>("save_settings", { settings });
+      statusText = `Compte « ${label} » retire`;
+    } catch (error) {
+      statusText = String(error);
+      render();
+      return;
+    }
+  }
+  selectedAccountId = settings.defaultAccountId ?? settings.accounts[0]?.id ?? null;
+  render();
+};
+
 const bindUi = () => {
   bindChatSidebarResizer();
 
-  document.querySelectorAll<HTMLButtonElement>("[data-interface-mode]").forEach((button) => {
+  document
+    .querySelectorAll<HTMLButtonElement>("#chooseTerminalEnvironment, #chooseEnvironmentFromChat")
+    .forEach((button) => {
+      button.addEventListener("click", openTerminalEnvironmentMenu);
+    });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-environment-menu-id]").forEach((button) => {
     button.addEventListener("click", () => {
-      const mode = button.dataset.interfaceMode === "expert" ? "expert" : "simple";
-      void setInterfaceMode(mode);
+      const id = button.dataset.environmentMenuId;
+      const group = terminalEnvironmentGroups().find(
+        (candidate) => id && workspaceIdForPath(candidate.path) === id,
+      );
+      if (!group) return;
+      void selectEnvironment(group.path);
     });
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-delete-environment-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.deleteEnvironmentId;
+      const workspace = knownWorkspaces().find((candidate) => candidate.id === id);
+      if (!workspace) return;
+      const confirmed = window.confirm(
+        `Supprimer l'environnement « ${workspace.label} » de Switch ?\n\nLe repertoire et ses fichiers resteront sur le disque.`,
+      );
+      if (confirmed) void closeWorkspace(workspace, true);
+    });
+  });
+  document
+    .querySelector<HTMLButtonElement>("#closeTerminalEnvironmentMenu")
+    ?.addEventListener("click", closeTerminalEnvironmentMenu);
+  document
+    .querySelector<HTMLButtonElement>("#createEnvironmentFromMenu")
+    ?.addEventListener("click", () => {
+      terminalEnvironmentMenuOpen = false;
+      render();
+      void openWorkspacePicker("active");
+    });
+  document
+    .querySelector<HTMLDivElement>("#terminalEnvironmentMenuBackdrop")
+    ?.addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) closeTerminalEnvironmentMenu();
+    });
 
   document.querySelector<HTMLSelectElement>("#expertGridLayout")?.addEventListener("change", (event) => {
     const value = (event.currentTarget as HTMLSelectElement).value;
@@ -8034,12 +9286,26 @@ const bindUi = () => {
     setExpertChatPage(expertChatPage + 1);
   });
 
-  document.querySelector<HTMLButtonElement>("#addExpertChat")?.addEventListener("click", addExpertChatPane);
-
-  document.querySelectorAll<HTMLButtonElement>("[data-add-expert-terminal]").forEach((button) => {
-    button.addEventListener("click", () => openNewTerminalModal());
+  document.querySelector<HTMLButtonElement>("#addExpertChat")?.addEventListener("click", () => {
+    openNewChatModal();
+  });
+  document.querySelector<HTMLButtonElement>("#openEnvironmentCollaboration")?.addEventListener("click", () => {
+    setActiveView("room");
   });
 
+  document.querySelectorAll<HTMLButtonElement>("[data-add-expert-terminal]").forEach((button) => {
+    button.addEventListener("click", () => openNewTerminalModal(terminalFolderFilter ?? undefined));
+  });
+  document.querySelector<HTMLButtonElement>("#folderNewTerminal")?.addEventListener("click", () => {
+    openNewTerminalModal(terminalFolderFilter ?? undefined);
+  });
+  document.querySelector<HTMLButtonElement>("#folderNewChat")?.addEventListener("click", () => {
+    if (terminalFolderFilter) {
+      setCurrentWorkspace(terminalFolderFilter);
+      setChatWorkspaceFilter(workspaceIdForPath(terminalFolderFilter));
+    }
+    openNewChat();
+  });
   const focusExpertSession = (session: TerminalSession, focus = false) => {
     activateTerminalSession(session);
     statusText = `Terminal actif: ${terminalTitle(session)}`;
@@ -8054,7 +9320,7 @@ const bindUi = () => {
     const meta = document.querySelector<HTMLElement>("#expertActiveMeta");
     if (title) title.textContent = terminalTitle(session);
     if (meta) {
-      meta.textContent = `${session.proxySummary} | ${displayProjectDir(session.workspacePath ?? session.projectDir)}`;
+      meta.textContent = `${session.proxySummary} | ${displayProjectDir(session.workspacePath ?? session.folderPath ?? session.projectDir)}`;
     }
     persistTerminalSessions();
     if (focus) session.terminal.focus();
@@ -8069,11 +9335,21 @@ const bindUi = () => {
 
   document.querySelectorAll<HTMLElement>("[data-expert-terminal-pane]").forEach((pane) => {
     pane.addEventListener("pointerdown", (event) => {
-      if ((event.target as HTMLElement).closest("[data-close-terminal]")) return;
+      if ((event.target as HTMLElement).closest("[data-close-terminal],[data-toggle-chat-sidebar],[data-toggle-terminal-fullscreen]")) return;
       const session = terminalSessions.find(
         (candidate) => candidate.key === pane.dataset.expertTerminalPane,
       );
       if (session && session.key !== activeTerminalKey) focusExpertSession(session);
+    });
+
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-toggle-terminal-fullscreen]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const session = terminalSessions.find(
+        (candidate) => candidate.key === button.dataset.toggleTerminalFullscreen,
+      );
+      if (session) toggleExpertTerminalFullscreen(session);
     });
   });
 
@@ -8118,8 +9394,10 @@ const bindUi = () => {
         activateTerminalSession(session);
       } else {
         activeTerminalKey = null;
-        setCurrentWorkspace(group.path);
       }
+      setCurrentWorkspace(group.path);
+      terminalFolderFilter = group.path;
+      if (group.path) void upsertWorkspaceRegistry(group.path);
       activeView = "terminal";
       stopLimitPoll();
       stopUsagePoll();
@@ -8127,7 +9405,7 @@ const bindUi = () => {
       stopDiscussionsPoll();
       stopRoomPoll();
       stopChatSync();
-      statusText = `Workspace actif: ${group.label}`;
+      statusText = `Environnement actif: ${group.label}`;
       render();
       persistTerminalSessions();
     });
@@ -8142,6 +9420,8 @@ const bindUi = () => {
         );
         if (!group) return;
         setCurrentWorkspace(group.path);
+        terminalFolderFilter = group.path;
+        if (group.path) void upsertWorkspaceRegistry(group.path);
         openNewTerminalModal(group.path);
       });
     });
@@ -8153,16 +9433,27 @@ const bindUi = () => {
     });
   });
 
+  document.querySelectorAll<HTMLButtonElement>("[data-toggle-chat-sidebar]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (displayedChatSidebarWidth() === 0) {
+        setChatSidebarWidth(defaultChatSidebarWidth(window.innerWidth));
+      } else {
+        setChatSidebarWidth(0);
+      }
+      fitAndResizeVisibleTerminals();
+    });
+  });
+
   document.querySelector<HTMLButtonElement>("#addAccount")?.addEventListener("click", () => {
-    if (!settings) return;
-    const account = newAccountProfile(
-      "Nouveau compte",
-      isRemoteMode() ? `${userHomeHint()}/new` : `${userHomeHint()}\\.codex-new`,
-    );
-    settings.accounts.push(account);
-    selectedAccountId = account.id;
-    statusText = "Choisis le bypass, le modele et l'intensite, puis clique sur Save";
-    render();
+    void addAccountAndLogin();
+  });
+
+  document.querySelector<HTMLButtonElement>("#loginAccount")?.addEventListener("click", () => {
+    if (!selectedAccountId) return;
+    // Capture les modifs en cours (CODEX_HOME, label…) avant d'ouvrir le login,
+    // sinon la connexion utiliserait l'ancien home du compte.
+    readSettingsForm();
+    void reloginAccount(selectedAccountId);
   });
 
   document.querySelector<HTMLButtonElement>("#addProxy")?.addEventListener("click", () => {
@@ -8199,7 +9490,11 @@ const bindUi = () => {
   bindWorkspaceSwitcherUi();
 
   document.querySelector<HTMLButtonElement>("#workspaceClear")?.addEventListener("click", () => {
-    chooseWorkspace(null, "active");
+    const path = currentWorkspace();
+    const workspace = path
+      ? knownWorkspaces().find((candidate) => candidate.id === workspaceIdForPath(path))
+      : null;
+    if (workspace) void closeWorkspace(workspace);
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-ws-dir]").forEach((button) => {
@@ -8220,6 +9515,20 @@ const bindUi = () => {
       const value = (event.currentTarget as HTMLInputElement).value.trim();
       void loadWorkspaceDir(value || null);
     }
+  });
+
+  document.querySelector<HTMLInputElement>("#workspaceFolderSearch")?.addEventListener("input", (event) => {
+    const query = (event.currentTarget as HTMLInputElement).value.trim().toLocaleLowerCase();
+    let visible = 0;
+    document.querySelectorAll<HTMLButtonElement>(".ws-folder-entry").forEach((entry) => {
+      const matches = !query || (entry.dataset.wsName ?? "").includes(query);
+      entry.hidden = !matches;
+      if (matches) visible += 1;
+    });
+    const count = document.querySelector<HTMLElement>("#workspaceVisibleFolderCount");
+    if (count) count.textContent = `${visible} dossier${visible > 1 ? "s" : ""}`;
+    const empty = document.querySelector<HTMLElement>("#workspaceSearchEmpty");
+    if (empty) empty.hidden = !query || visible > 0;
   });
 
   document.querySelector<HTMLButtonElement>("#confirmWorkspaceModal")?.addEventListener("click", () => {
@@ -8263,6 +9572,73 @@ const bindUi = () => {
     void openWorkspacePicker("new-terminal");
   });
 
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-new-terminal-environment-path]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        readNewTerminalAccountDraft();
+        readNewTerminalModalForm();
+        newTerminalWorkspacePath = userEnvironmentPath(
+          button.dataset.newTerminalEnvironmentPath,
+        );
+        if (newTerminalWorkspacePath) rememberWorkspace(newTerminalWorkspacePath);
+        statusText = `Environnement selectionne: ${newTerminalWorkspacePath}`;
+        render();
+      });
+    });
+
+  document.querySelector<HTMLInputElement>("#newTerminalWorkspace")?.addEventListener("input", (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    newTerminalWorkspacePath = userEnvironmentPath(input.value);
+    const hasEnvironment = !!newTerminalWorkspacePath;
+    input.setAttribute("aria-invalid", String(!hasEnvironment));
+    document
+      .querySelector<HTMLElement>(".new-terminal-environment-required")
+      ?.classList.toggle("missing", !hasEnvironment);
+    document
+      .querySelector<HTMLElement>(".new-terminal-environment-required")
+      ?.classList.toggle("selected", hasEnvironment);
+    const accountAvailable = !!newTerminalAccount();
+    const confirm = document.querySelector<HTMLButtonElement>("#confirmNewTerminal");
+    const login = document.querySelector<HTMLButtonElement>("#loginNewTerminal");
+    if (confirm) confirm.disabled = !accountAvailable || !hasEnvironment;
+    if (login) login.disabled = !accountAvailable || !hasEnvironment;
+  });
+
+  document.querySelector<HTMLButtonElement>("#closeNewChatModal")?.addEventListener("click", () => {
+    closeNewChatModal();
+  });
+  document.querySelector<HTMLButtonElement>("#cancelNewChat")?.addEventListener("click", () => {
+    closeNewChatModal();
+  });
+  document.querySelector<HTMLDivElement>("#newChatBackdrop")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeNewChatModal();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-new-chat-account]").forEach((button) => {
+    button.addEventListener("click", () => {
+      // Conserve le mode saisi puis reinitialise le modele au defaut du compte choisi.
+      const modeSelect = document.querySelector<HTMLSelectElement>("#newChatMode");
+      if (modeSelect) newChatMode = (modeSelect.value as ChatMode) || newChatMode;
+      newChatAccountId = button.dataset.newChatAccount || null;
+      newChatModel = accountModel(accountById(newChatAccountId));
+      render();
+      window.setTimeout(() => {
+        document.querySelector<HTMLInputElement>("#newChatModel")?.focus();
+      }, 0);
+    });
+  });
+  const newChatModelInput = document.querySelector<HTMLInputElement>("#newChatModel");
+  newChatModelInput?.addEventListener("input", () => {
+    newChatModelInput.setCustomValidity("");
+    newChatModel = newChatModelInput.value;
+  });
+  document.querySelector<HTMLSelectElement>("#newChatMode")?.addEventListener("change", (event) => {
+    newChatMode = (event.currentTarget as HTMLSelectElement).value as ChatMode;
+  });
+  document.querySelector<HTMLButtonElement>("#confirmNewChat")?.addEventListener("click", () => {
+    confirmNewChatModal();
+  });
+
   document.querySelector<HTMLButtonElement>("#closeNewTerminalModal")?.addEventListener("click", () => {
     closeNewTerminalModal();
   });
@@ -8304,6 +9680,16 @@ const bindUi = () => {
       render();
       return;
     }
+    const environmentPath = userEnvironmentPath(newTerminalWorkspacePath);
+    if (!environmentPath) {
+      statusText = "Choisis un environnement avant de creer le terminal";
+      render();
+      return;
+    }
+    newTerminalWorkspacePath = environmentPath;
+    setCurrentWorkspace(environmentPath);
+    terminalFolderFilter = environmentPath;
+    void upsertWorkspaceRegistry(environmentPath);
     newTerminalModalOpen = false;
     void createNewTerminal(
       account.id,
@@ -8322,6 +9708,16 @@ const bindUi = () => {
       render();
       return;
     }
+    const environmentPath = userEnvironmentPath(newTerminalWorkspacePath);
+    if (!environmentPath) {
+      statusText = "Choisis un environnement avant d'ouvrir le terminal de connexion";
+      render();
+      return;
+    }
+    newTerminalWorkspacePath = environmentPath;
+    setCurrentWorkspace(environmentPath);
+    terminalFolderFilter = environmentPath;
+    void upsertWorkspaceRegistry(environmentPath);
     const agent = newTerminalAgent();
     if (!agent?.loginCommand) {
       statusText = "Cet agent n'a pas de commande de login";
@@ -8375,6 +9771,13 @@ const bindUi = () => {
     void refreshLimitStatus();
   });
 
+  document.querySelectorAll<HTMLButtonElement>("[data-relogin-account]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const accountId = button.dataset.reloginAccount;
+      if (accountId) void reloginAccount(accountId);
+    });
+  });
+
   document.querySelector<HTMLButtonElement>("#dashboardToggle")?.addEventListener("click", () => {
     setActiveView("dashboard");
   });
@@ -8391,7 +9794,8 @@ const bindUi = () => {
   });
 
   document.querySelector<HTMLButtonElement>("#roomToggle")?.addEventListener("click", () => {
-    setActiveView("room");
+    if (userEnvironmentPath(currentWorkspace())) setActiveView("room");
+    else openTerminalEnvironmentMenu();
   });
 
   document.querySelector<HTMLButtonElement>("#auditToggle")?.addEventListener("click", () => {
@@ -8430,14 +9834,6 @@ const bindUi = () => {
     void refreshRoom();
   });
 
-  document.querySelector<HTMLButtonElement>("#roomToggleEnabled")?.addEventListener("click", () => {
-    if (settings?.agentRoom?.enabled) {
-      void disableRoom();
-    } else {
-      void enableRoom();
-    }
-  });
-
   document.querySelector<HTMLSelectElement>("#roomTarget")?.addEventListener("change", (event) => {
     roomComposeTarget = (event.target as HTMLSelectElement).value;
   });
@@ -8467,17 +9863,14 @@ const bindUi = () => {
     reloadKombaiFrame();
   });
 
-  document.querySelector<HTMLButtonElement>("#discussionsToggle")?.addEventListener("click", () => {
-    setActiveView("discussions");
+  document.querySelectorAll<HTMLButtonElement>("[data-open-discussions]").forEach((button) => {
+    button.addEventListener("click", () => setActiveView("discussions"));
   });
 
   const returnToChat = () => {
     activeView = "chat";
-    statusText = interfaceMode === "expert"
-      ? expertChatStatusText()
-      : chatDiscussion ? "Conversation" : "Nouveau chat";
-    if (interfaceMode === "expert") startAllExpertChatWork();
-    else if (chatDiscussion) startChatSync();
+    statusText = expertChatStatusText();
+    startAllExpertChatWork();
     render();
   };
   document.querySelector<HTMLButtonElement>("#chatHome")?.addEventListener("click", returnToChat);
@@ -8548,6 +9941,21 @@ const bindUi = () => {
     void stopCurrentChatTurn();
   });
 
+  document.querySelector<HTMLButtonElement>("#closeWorkspaceLiveGraph")?.addEventListener("click", () => {
+    closeWorkspaceLiveGraph();
+  });
+  document.querySelector<HTMLDivElement>("#workspaceLiveGraphBackdrop")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeWorkspaceLiveGraph();
+  });
+  document
+    .querySelector<HTMLButtonElement>("#chatPanel [data-chat-action='quota-switch'][data-quota-account]")
+    ?.addEventListener("click", (event) => {
+      const targetAccountId = (event.currentTarget as HTMLButtonElement).dataset.quotaAccount;
+      if (chatDiscussion && targetAccountId) {
+        void continueDiscussionWith(chatDiscussion, targetAccountId);
+      }
+    });
+
   const chatPrompt = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
   const resizeChatPrompt = () => {
     if (!chatPrompt) return;
@@ -8568,12 +9976,6 @@ const bindUi = () => {
   document.querySelector<HTMLFormElement>("#chatComposer")?.addEventListener("submit", (event) => {
     event.preventDefault();
     void sendChatMessage();
-  });
-  document.querySelector<HTMLSelectElement>("#chatAccount")?.addEventListener("change", (event) => {
-    chatAccountId = (event.currentTarget as HTMLSelectElement).value;
-    selectedAccountId = chatAccountId;
-    render();
-    void loadChatModelCatalog(chatAccountId);
   });
   document.querySelector<HTMLSelectElement>("#chatMode")?.addEventListener("change", (event) => {
     chatMode = (event.currentTarget as HTMLSelectElement).value as ChatMode;
@@ -8706,7 +10108,7 @@ const bindUi = () => {
       const acc = poolStatus?.accounts?.find((item) => item.id === id);
       const home = acc?.codexHome ?? "";
       const confirmed = window.confirm(
-        `Supprimer définitivement le compte « ${acc?.label ?? id ?? ""} » ET son dossier sur le disque ?\n\n${home}\n\nCette action est irréversible : auth.json, sessions, config… seront effacés.`,
+        `Supprimer définitivement le compte « ${acc?.label ?? id ?? ""} » ET son environnement sur le disque ?\n\n${home}\n\nCette action est irréversible : auth.json, sessions, config… seront effacés.`,
       );
       if (confirmed) {
         void removeAccount(id, true);
@@ -8798,11 +10200,7 @@ const bindUi = () => {
   });
 
   document.querySelector<HTMLButtonElement>("#removeAccount")?.addEventListener("click", () => {
-    if (!settings || !selectedAccountId) return;
-    settings.accounts = settings.accounts.filter((account) => account.id !== selectedAccountId);
-    selectedAccountId = settings.accounts[0]?.id ?? null;
-    statusText = "Compte retire";
-    render();
+    void deleteSelectedAccount();
   });
 
   document.querySelector<HTMLInputElement>("#autoRun")?.addEventListener("change", (event) => {
@@ -8907,8 +10305,12 @@ const createTerminalSession = (
   account: AccountProfile,
   proxy: ProxyProfile | null,
   agentId: string,
-  workspacePath: string | null | undefined = undefined,
+  folderPath: string,
 ): TerminalSession => {
+  const capturedEnvironment = userEnvironmentPath(folderPath);
+  if (!capturedEnvironment) {
+    throw new Error("Environnement terminal obligatoire");
+  }
   const terminal = new Terminal({
     cursorBlink: true,
     cursorStyle: "bar",
@@ -8944,21 +10346,15 @@ const createTerminalSession = (
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
 
-  const requestedWorkspace =
-    workspacePath === undefined ? currentWorkspace() : workspacePath?.trim() || null;
-  // Sur desktop, le dossier projet du compte est deja le cwd historique : on
-  // le materialise comme workspace pour classer correctement la session. En
-  // web, projectDir est une URL Git et reste donc separee.
-  const capturedWorkspace =
-    requestedWorkspace ?? (!isRemoteMode() ? account.projectDir?.trim() || null : null);
-
   const session: TerminalSession = {
     key: uid("terminal"),
     ptyId: null,
     accountId: account.id,
     agentId,
     title: account.label,
-    workspacePath: capturedWorkspace,
+    folderPath: capturedEnvironment,
+    workspaceId: null,
+    workspacePath: null,
     projectDir: account.projectDir?.trim() || null,
     proxySummary: proxy ? maskProxy(proxy.proxyUrl) : "sans proxy",
     status: "Pret",
@@ -8988,7 +10384,7 @@ const mountExpertTerminals = () => {
   document.querySelectorAll<HTMLDivElement>("[data-terminal-host]").forEach((host) => {
     const session = sessionByKey.get(host.dataset.terminalHost ?? "");
     if (!session) return;
-    session.terminal.options.fontSize = fontSize;
+    session.terminal.options.fontSize = session.key === expertTerminalFullscreenKey ? 13 : fontSize;
     if (session.terminal.element) {
       host.appendChild(session.terminal.element);
     } else {
@@ -8996,7 +10392,11 @@ const mountExpertTerminals = () => {
     }
   });
 
-  const modalOpen = newTerminalModalOpen || agentsModalOpen || workspaceModalOpen;
+  const modalOpen =
+    newTerminalModalOpen ||
+    agentsModalOpen ||
+    workspaceModalOpen ||
+    terminalEnvironmentMenuOpen;
   const focusKey = requestTerminalFocusKey ?? focusedTerminalKeyBeforeRender;
   if (!modalOpen && focusKey) sessionByKey.get(focusKey)?.terminal.focus();
   requestTerminalFocusKey = null;
@@ -9009,9 +10409,15 @@ const createNewTerminal = async (
   commandOverride: string | null = null,
   agentId: string | null = null,
   resumeSessionId: string | null = null,
-  workspacePath: string | null | undefined = undefined,
+  folderPath: string | null | undefined = undefined,
 ) => {
   if (!settings) return null;
+  const environmentPath = userEnvironmentPath(folderPath);
+  if (!environmentPath) {
+    statusText = "Creation bloquee: choisis d'abord un environnement";
+    render();
+    return null;
+  }
 
   activeView = "terminal";
   await ensureTerminalsRestored();
@@ -9077,7 +10483,7 @@ const createNewTerminal = async (
     savedAccount,
     proxyForAccount(savedAccount),
     chosenAgentId,
-    workspacePath,
+    environmentPath,
   );
   session.resumeSessionId = resumeSessionId;
   if (resumeSessionId) {
@@ -9105,6 +10511,14 @@ const createNewTerminal = async (
 
 const startTerminalSession = async (session: TerminalSession, commandOverride: string | null = null) => {
   if (!settings) return;
+  const folder = userEnvironmentPath(session.folderPath);
+  if (!folder) {
+    session.running = false;
+    session.status = "Bloque";
+    statusText = "Demarrage refuse: aucun environnement selectionne";
+    render();
+    return;
+  }
 
   await waitForFrame();
   fitAndResizeTerminal(session);
@@ -9130,27 +10544,29 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
     //  - web  : envoye au serveur comme `workspacePath` (cwd = ce dossier ; le
     //           serveur ignore alors `repoUrl`) ;
     //  - desktop : envoye comme `projectDir` (override du dossier du compte).
-    const workspace = session.workspacePath;
-    const ptyId = await invoke<number>("start_terminal", {
+    const started = await invoke<number | TerminalStartResponse>("start_terminal", {
       id: requestedId,
       accountId: session.accountId,
       repoUrl: isRemoteMode() ? session.projectDir ?? "" : undefined,
-      workspacePath: isRemoteMode() ? workspace ?? undefined : undefined,
-      projectDir: !isRemoteMode() ? workspace ?? undefined : undefined,
+      workspacePath: isRemoteMode() ? folder ?? undefined : undefined,
+      projectDir: !isRemoteMode() ? folder ?? undefined : undefined,
       branch: null,
       cols: session.terminal.cols,
       rows: session.terminal.rows,
       command: commandOverride ?? autoRunCommand,
       agentId: session.agentId,
     });
+    const ptyId = typeof started === "number" ? started : started.id;
     session.ptyId = ptyId;
+    session.workspaceId = typeof started === "number" ? null : started.workspaceId;
+    session.workspacePath = typeof started === "number" ? null : started.workspacePath;
     session.running = true;
     session.status = "Actif";
     statusText = "Terminal actif";
     if (settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
       // Utilise le workspace capture par cette session, meme si l'utilisateur
       // en a selectionne un autre pendant le demarrage du PTY.
-      void launchIde(sessionAgent, session.workspacePath ?? session.projectDir);
+      void launchIde(sessionAgent, session.workspacePath ?? session.folderPath ?? session.projectDir);
     }
     persistTerminalSessions();
     const startedAccount = settings.accounts.find((candidate) => candidate.id === session.accountId) ?? null;
@@ -9174,6 +10590,7 @@ const closeTerminalSession = async (key: string) => {
   if (index === -1) return;
 
   const [session] = terminalSessions.splice(index, 1);
+  if (expertTerminalFullscreenKey === key) expertTerminalFullscreenKey = null;
   const closedWorkspaceKey = terminalWorkspaceDescriptor(session).key;
   const ptyId = session.ptyId;
   session.ptyId = null;
@@ -9199,6 +10616,7 @@ const closeTerminalSession = async (key: string) => {
   if (ptyId !== null) {
     await invoke("stop_terminal", { id: ptyId }).catch(() => undefined);
   }
+  await persistTerminalDiscussionFolder(session).catch(() => undefined);
 };
 
 const sendLine = async (line: string) => {
@@ -9226,10 +10644,105 @@ const escapeAttr = escapeHtml;
 
 const userHomeHint = () => (isRemoteMode() ? "%CST_DATA_DIR%\\codex-homes" : "%USERPROFILE%");
 
+const expertChatKeyFromElement = (element: Element | null): string | null => {
+  return element?.closest<HTMLElement>("[data-chat-panel]")?.dataset.chatPanel || null;
+};
+
+const expertChatKeyAtPointer = (): string | null => {
+  const pointedElement = lastPointerClientX !== null && lastPointerClientY !== null
+    ? document.elementFromPoint(lastPointerClientX, lastPointerClientY)
+    : null;
+  const pointedKey = expertChatKeyFromElement(pointedElement);
+  if (pointedKey) return pointedKey;
+
+  return document.querySelector<HTMLElement>("[data-chat-panel]:hover")?.dataset.chatPanel || null;
+};
+
+const closeHoveredExpertChat = (action: ChatHoverShortcutAction): boolean => {
+  if (activeView !== "chat") return false;
+  if (document.querySelector(".modal-backdrop")) return false;
+
+  const key = expertChatKeyAtPointer();
+  const pane = expertChatPanes.find((candidate) => candidate.key === key);
+  if (!pane) return false;
+
+  if (action === "close-chat-and-discussion") {
+    void closeExpertChatAndDiscussion(pane);
+  } else {
+    closeExpertChatPane(pane);
+  }
+  return true;
+};
+
+const toggleHoveredExpertFullscreen = (): boolean => {
+  if (activeView === "terminal") {
+    const hoveredPane = document.querySelector<HTMLElement>("[data-expert-terminal-pane]:hover");
+    const key = expertTerminalFullscreenKey ?? hoveredPane?.dataset.expertTerminalPane;
+    const session = terminalSessions.find((candidate) => candidate.key === key);
+    if (!session) return false;
+    toggleExpertTerminalFullscreen(session);
+    return true;
+  }
+
+  if (activeView === "chat") {
+    const hoveredPane = document.querySelector<HTMLElement>("[data-chat-panel]:hover");
+    const key = expertChatFullscreenKey ?? hoveredPane?.dataset.chatPanel;
+    const pane = expertChatPanes.find((candidate) => candidate.key === key);
+    if (!pane) return false;
+    toggleExpertChatFullscreen(pane);
+    return true;
+  }
+
+  return false;
+};
+
+const handleHoveredExpertTerminalArrows = (event: KeyboardEvent): boolean => {
+  if (activeView !== "terminal") return false;
+  const hoveredPane = document.querySelector<HTMLElement>("[data-expert-terminal-pane]:hover");
+  const key = hoveredPane?.dataset.expertTerminalPane ?? expertTerminalFullscreenKey;
+  if (!key) return false;
+  const session = terminalSessions.find((candidate) => candidate.key === key);
+  if (!session) return false;
+
+  if (event.key === "ArrowRight") {
+    void closeTerminalSession(session.key);
+    return true;
+  }
+  if (event.key === "ArrowUp") {
+    if (expertTerminalFullscreenKey !== session.key) {
+      toggleExpertTerminalFullscreen(session);
+    }
+    return true;
+  }
+  if (event.key === "ArrowDown") {
+    if (expertTerminalFullscreenKey === session.key) {
+      toggleExpertTerminalFullscreen(session);
+    }
+    return true;
+  }
+  return false;
+};
+
 const setupEvents = async () => {
   document.addEventListener("fullscreenchange", scheduleFullscreenSync);
   document.addEventListener("webkitfullscreenchange", scheduleFullscreenSync);
   window.addEventListener("resize", scheduleFullscreenSync);
+  window.addEventListener("pointermove", (event) => {
+    lastPointerClientX = event.clientX;
+    lastPointerClientY = event.clientY;
+  }, true);
+  window.addEventListener("pointerdown", (event) => {
+    lastPointerClientX = event.clientX;
+    lastPointerClientY = event.clientY;
+  }, true);
+  document.addEventListener("pointerleave", () => {
+    lastPointerClientX = null;
+    lastPointerClientY = null;
+  });
+  window.addEventListener("blur", () => {
+    lastPointerClientX = null;
+    lastPointerClientY = null;
+  });
 
   unlistenData = await listen<PtyDataEvent>("pty-data", (event) => {
     const session = terminalSessions.find((candidate) => candidate.ptyId === event.payload.id);
@@ -9256,12 +10769,69 @@ const setupEvents = async () => {
       render();
     }
     persistTerminalSessions();
+    void persistTerminalDiscussionFolder(session).catch(() => undefined);
   });
 
   window.addEventListener("resize", () => {
     syncChatSidebarWidthDom();
     fitAndResizeVisibleTerminals();
   });
+
+  window.addEventListener("keydown", (event) => {
+    const isAzertyBacktick =
+      event.key === "Dead" &&
+      event.code === "Digit7" &&
+      (event.altKey || event.getModifierState("AltGraph"));
+    const isEnvironmentShortcut =
+      event.key === "`" || event.code === "Backquote" || isAzertyBacktick;
+    if (!isEnvironmentShortcut || event.repeat || !settings) return;
+    if (
+      !terminalEnvironmentMenuOpen &&
+      (newTerminalModalOpen || agentsModalOpen || workspaceModalOpen || workspaceLiveGraphOpen)
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    toggleTerminalEnvironmentMenu();
+  }, true);
+
+  window.addEventListener("keydown", (event) => {
+    const action = chatHoverShortcutAction(event);
+    if (!action || !closeHoveredExpertChat(action)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+
+  window.addEventListener("keydown", (event) => {
+    const isSpaceBar = event.code === "Space" || event.key === " ";
+    if (!isSpaceBar || event.repeat || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+    const target = event.target as HTMLElement | null;
+    const tag = target?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable === true) return;
+    if (document.querySelector(".modal-backdrop")) return;
+    if (!toggleHoveredExpertFullscreen()) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+
+  window.addEventListener("keydown", (event) => {
+    if (
+      event.key !== "ArrowUp" &&
+      event.key !== "ArrowDown" &&
+      event.key !== "ArrowRight"
+    ) {
+      return;
+    }
+    if (event.repeat || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+    const target = event.target as HTMLElement | null;
+    const tag = target?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable === true) return;
+    if (document.querySelector(".modal-backdrop")) return;
+    if (!handleHoveredExpertTerminalArrows(event)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
 
   window.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
@@ -9280,6 +10850,12 @@ const setupEvents = async () => {
       return;
     }
 
+    if (event.key === "Escape" && terminalEnvironmentMenuOpen) {
+      event.preventDefault();
+      closeTerminalEnvironmentMenu();
+      return;
+    }
+
     if (event.key === "Escape" && document.body.classList.contains("chat-sidebar-open")) {
       document.body.classList.remove("chat-sidebar-open");
       return;
@@ -9291,9 +10867,21 @@ const setupEvents = async () => {
       return;
     }
 
+    if (event.key === "Escape" && newChatModalOpen) {
+      event.preventDefault();
+      closeNewChatModal();
+      return;
+    }
+
     if (event.key === "Escape" && newTerminalModalOpen) {
       event.preventDefault();
       closeNewTerminalModal();
+      return;
+    }
+
+    if (event.key === "Escape" && workspaceLiveGraphOpen) {
+      event.preventDefault();
+      closeWorkspaceLiveGraph();
       return;
     }
 
@@ -9375,27 +10963,18 @@ const boot = async () => {
   // Migre le registre de workspaces (localStorage -> settings) et fixe le
   // filtre par defaut, avant le premier rendu de la barre laterale.
   await syncWorkspaceRegistry();
-  interfaceMode = loadInterfaceMode();
   expertGridLayout = loadExpertGridLayout();
   expertChatsPerPage = loadExpertChatsPerPage();
   chatSidebarWidth = loadChatSidebarWidth();
   isFullscreen = await appWindow.isFullscreen().catch(() => false);
   await setupEvents();
-  if (interfaceMode === "expert") {
-    activeView = "chat";
-    await refreshDiscussions();
-    restoreExpertChats();
-    render();
-    startDiscussionsPoll();
-    startAllExpertChatWork();
-    expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
-  } else {
-    activeView = "chat";
-    await refreshDiscussions();
-    render();
-    void loadChatModelCatalog(chatAccountId);
-    startDiscussionsPoll();
-  }
+  activeView = "chat";
+  await refreshDiscussions();
+  restoreExpertChats();
+  render();
+  startDiscussionsPoll();
+  startAllExpertChatWork();
+  expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
 };
 
 window.addEventListener("beforeunload", () => {
@@ -9419,6 +10998,8 @@ window.addEventListener("beforeunload", () => {
     }
   });
 });
+
+initPwaSupport();
 
 void boot().catch((error) => {
   app.innerHTML = `<main class="boot error">${escapeHtml(String(error))}</main>`;
