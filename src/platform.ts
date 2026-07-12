@@ -4,6 +4,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export type UnlistenFn = () => void;
 
+export type RealtimeConnectionState = "connecting" | "live" | "reconnecting" | "closed" | "unsupported";
+
+export type DiscussionStreamMessage =
+  | { type: "dashboard"; dashboard: unknown }
+  | { type: "transcript"; accountId: string; sessionId: string; transcript: unknown }
+  | { type: "error"; message: string }
+  | { type: "pong" };
+
 type Listener<T> = (event: { payload: T }) => void;
 
 type RemoteStartResponse = {
@@ -179,10 +187,57 @@ export const clearRemoteConfig = () => {
 
 const tauriWindow = isTauriRuntime() ? getCurrentWindow() : null;
 
+type BrowserFullscreenDocument = Document & {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+};
+
+type BrowserFullscreenElement = HTMLElement & {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+};
+
+const browserFullscreenElement = () => {
+  if (typeof document === "undefined") return null;
+  const fullscreenDocument = document as BrowserFullscreenDocument;
+  return document.fullscreenElement ?? fullscreenDocument.webkitFullscreenElement ?? null;
+};
+
+const setBrowserFullscreen = async (fullscreen: boolean) => {
+  if (typeof document === "undefined") {
+    throw new Error("Le plein ecran n'est pas disponible dans cet environnement.");
+  }
+
+  const fullscreenDocument = document as BrowserFullscreenDocument;
+  if (fullscreen) {
+    if (browserFullscreenElement()) return;
+    const root = document.documentElement as BrowserFullscreenElement;
+    const requestFullscreen = root.requestFullscreen?.bind(root) ??
+      root.webkitRequestFullscreen?.bind(root);
+    if (!requestFullscreen) {
+      throw new Error("Ce navigateur ne prend pas en charge le mode plein ecran.");
+    }
+    await requestFullscreen();
+    return;
+  }
+
+  if (!browserFullscreenElement()) return;
+  const exitFullscreen = document.exitFullscreen?.bind(document) ??
+    fullscreenDocument.webkitExitFullscreen?.bind(fullscreenDocument);
+  if (!exitFullscreen) {
+    throw new Error("Impossible de quitter le mode plein ecran dans ce navigateur.");
+  }
+  await exitFullscreen();
+};
+
 export const appWindow = {
-  isFullscreen: async () => (tauriWindow ? tauriWindow.isFullscreen() : false),
+  isFullscreen: async () =>
+    tauriWindow ? tauriWindow.isFullscreen() : browserFullscreenElement() !== null,
   setFullscreen: async (fullscreen: boolean) => {
-    if (tauriWindow) await tauriWindow.setFullscreen(fullscreen);
+    if (tauriWindow) {
+      await tauriWindow.setFullscreen(fullscreen);
+      return;
+    }
+    await setBrowserFullscreen(fullscreen);
   },
 };
 
@@ -196,6 +251,128 @@ export async function listen<T>(event: string, handler: Listener<T>): Promise<Un
   listeners.set(event, set);
   return () => {
     set.delete(handler);
+  };
+}
+
+/**
+ * Souscrit au flux partage des discussions du serveur. Sans options, le flux
+ * suit l'index ; avec accountId/sessionId il suit le transcript correspondant.
+ * La reconnexion est automatique (reseau mobile, sortie de veille, WebView mise
+ * en arriere-plan). Le runtime Tauri local utilise le repli par polling de
+ * main.ts, car il n'a pas de serveur HTTP a joindre.
+ */
+export function subscribeDiscussionUpdates(
+  options: { accountId?: string; sessionId?: string },
+  onMessage: (message: DiscussionStreamMessage) => void,
+  onState?: (state: RealtimeConnectionState) => void,
+): UnlistenFn {
+  if (!isRemoteMode()) {
+    onState?.("unsupported");
+    return () => undefined;
+  }
+
+  let stopped = false;
+  let socket: WebSocket | null = null;
+  let retryTimer: number | null = null;
+  let heartbeatTimer: number | null = null;
+  let retryCount = 0;
+  let lastMessageAt = 0;
+
+  const clearRetry = () => {
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  };
+
+  const clearHeartbeat = () => {
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
+
+  const startHeartbeat = (target: WebSocket) => {
+    clearHeartbeat();
+    heartbeatTimer = window.setInterval(() => {
+      if (socket !== target || target.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastMessageAt > 45_000) {
+        target.close();
+        return;
+      }
+      target.send(JSON.stringify({ type: "ping" }));
+    }, 15_000);
+  };
+
+  const connect = () => {
+    if (stopped || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+    clearRetry();
+    onState?.(retryCount > 0 ? "reconnecting" : "connecting");
+
+    const route = defaultRemoteRoute();
+    const wsBase = route.baseUrl.startsWith("https://")
+      ? route.baseUrl.replace(/^https:\/\//, "wss://")
+      : route.baseUrl.replace(/^http:\/\//, "ws://");
+    const query = new URLSearchParams({ token: route.token });
+    if (options.accountId && options.sessionId) {
+      query.set("accountId", options.accountId);
+      query.set("sessionId", options.sessionId);
+    }
+
+    const next = new WebSocket(`${wsBase}/ws/discussions?${query.toString()}`);
+    socket = next;
+    next.addEventListener("open", () => {
+      if (socket !== next || stopped) return;
+      retryCount = 0;
+      lastMessageAt = Date.now();
+      startHeartbeat(next);
+      onState?.("live");
+    });
+    next.addEventListener("message", (event) => {
+      if (socket !== next || stopped) return;
+      lastMessageAt = Date.now();
+      try {
+        onMessage(JSON.parse(String(event.data)) as DiscussionStreamMessage);
+      } catch {
+        // Ignore un paquet incomplet/inconnu ; le prochain snapshot est complet.
+      }
+    });
+    next.addEventListener("close", () => {
+      if (socket === next) socket = null;
+      clearHeartbeat();
+      if (stopped) return;
+      retryCount += 1;
+      onState?.("reconnecting");
+      const delay = Math.min(10_000, 500 * 2 ** Math.min(retryCount - 1, 5));
+      retryTimer = window.setTimeout(connect, delay);
+    });
+    next.addEventListener("error", () => {
+      // `close` planifie la reconnexion et centralise les changements d'etat.
+      next.close();
+    });
+  };
+
+  const onVisibilityChange = () => {
+    if (document.visibilityState !== "visible") return;
+    if (!socket) {
+      connect();
+    } else if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "ping" }));
+    }
+  };
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  connect();
+
+  return () => {
+    stopped = true;
+    clearRetry();
+    clearHeartbeat();
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    socket?.close();
+    socket = null;
+    onState?.("closed");
   };
 }
 
@@ -216,9 +393,15 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
     case "ensure_account_home":
       return api<T>("POST", "/api/accounts/home", {
         codexHome: args.codexHome,
+        provider: args.provider ?? null,
         bypass: args.bypass ?? true,
         model: args.model ?? null,
         reasoningEffort: args.reasoningEffort ?? null,
+      });
+    case "export_discussion_transcript":
+      return api<T>("POST", "/api/discussions/export", {
+        accountId: args.accountId,
+        sessionId: args.sessionId,
       });
     case "import_account_json":
       return api<T>("POST", "/api/accounts/import", { content: args.content });
@@ -275,6 +458,30 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       throw new Error("Le lancement d'IDE local n'est pas disponible en mode SaaS.");
     case "list_discussions":
       return api<T>("GET", "/api/discussions");
+    case "get_discussion_transcript":
+      return api<T>(
+        "GET",
+        `/api/discussions/transcript?accountId=${encodeURIComponent(String(args.accountId))}&sessionId=${encodeURIComponent(String(args.sessionId))}`,
+      );
+    case "account_model_catalog":
+      return api<T>(
+        "GET",
+        `/api/chat/models?accountId=${encodeURIComponent(String(args.accountId))}`,
+      );
+    case "start_chat_turn":
+      return api<T>("POST", "/api/chat/turns", {
+        accountId: args.accountId,
+        sessionId: args.sessionId ?? null,
+        prompt: args.prompt,
+        projectDir: args.projectDir ?? null,
+        mode: args.mode ?? "build",
+        model: args.model ?? null,
+        reasoningEffort: args.reasoningEffort ?? null,
+      });
+    case "chat_turn_status":
+      return api<T>("GET", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
+    case "stop_chat_turn":
+      return api<T>("DELETE", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
     case "list_prompt_history":
       return {
         generatedAt: Math.floor(Date.now() / 1000),
@@ -295,6 +502,12 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         sessionId: args.sessionId,
         sourceAccountId: args.sourceAccountId,
         targetAccountId: args.targetAccountId,
+      });
+    case "move_discussion":
+      return api<T>("POST", "/api/discussions/move", {
+        accountId: args.accountId,
+        sessionId: args.sessionId,
+        workspacePath: args.workspacePath,
       });
     case "delete_discussion":
       return api<T>("POST", "/api/discussions/delete", {

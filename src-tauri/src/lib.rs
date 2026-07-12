@@ -1,16 +1,20 @@
 mod account_usage;
 pub mod agent_room;
+mod chat;
 mod client_startup;
 pub mod devices;
 mod discussions;
+mod fs_util;
 mod kombai;
 mod metrics;
+mod merge_queue;
 mod pool;
 mod provider;
 mod security;
 pub mod server;
 mod settings;
 mod terminal;
+mod worktree;
 
 // `Provider` fait partie de l'API publique (champ de `agent_room::AgentMeta`,
 // DTOs serveur) : on le re-exporte pour qu'il soit nommable hors du crate.
@@ -84,10 +88,16 @@ async fn serve_room(
 }
 
 pub fn run() {
+    let worktrees = settings::runtime_data_dir()
+        .and_then(|root| worktree::WorktreeManager::from_env(root.join("agents")))
+        .expect("initialisation du gestionnaire de worktrees impossible");
+    let _ = worktrees.sweep_stale(7 * 24 * 60 * 60);
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(terminal::TerminalManager::default())
+        .manage(chat::ChatTurnManager::default())
+        .manage(worktrees)
         .manage(PoolState::default())
         .manage(build_room_state())
         .manage(RoomServer::default())
@@ -124,6 +134,7 @@ pub fn run() {
             settings::import_account_json,
             settings::remove_account,
             settings::account_limit_status,
+            settings::account_model_catalog,
             settings::pick_project_dir,
             metrics::usage_dashboard,
             account_usage::account_token_usage,
@@ -131,9 +142,13 @@ pub fn run() {
             discussions::list_prompt_history,
             discussions::claim_session_for_terminal,
             discussions::copy_discussion_to_account,
+            discussions::move_discussion,
             discussions::export_discussion_transcript,
             discussions::get_discussion_transcript,
             discussions::delete_discussion,
+            chat::start_chat_turn,
+            chat::chat_turn_status,
+            chat::stop_chat_turn,
             terminal::start_terminal,
             terminal::write_terminal,
             terminal::resize_terminal,

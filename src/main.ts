@@ -8,17 +8,61 @@ import {
   remoteBaseUrl,
   remoteNodesText,
   saveRemoteConfig,
+  subscribeDiscussionUpdates,
+  type DiscussionStreamMessage,
+  type RealtimeConnectionState,
   type UnlistenFn,
 } from "./platform";
 import { initDesktopUpdater } from "./updater";
+import {
+  chatSyncLabel,
+  renderChatFeedInner,
+  renderChatPanel,
+  type ChatActivity,
+  type ChatMode,
+  type ChatMessage,
+  type ChatPanelModel,
+  type ChatSyncState,
+  type ChatTurnStatus,
+} from "./chat/view";
+import {
+  CHAT_SIDEBAR_DEFAULT_WIDTH,
+  CHAT_SIDEBAR_MAX_WIDTH,
+  CHAT_SIDEBAR_MIN_WIDTH,
+  chatSidebarMaxWidth,
+  clampChatSidebarWidth,
+  defaultChatSidebarWidth,
+} from "./chat/sidebar";
+import {
+  DEFAULT_EXPERT_CHAT_PAGE_SIZE,
+  EXPERT_CHAT_COLUMN_COUNT,
+  clampExpertChatPage,
+  expertChatPageCount,
+  expertChatPageForIndex,
+  expertChatRowCount,
+  expertChatsOnPage,
+  normalizeExpertChatPageSize,
+  type ExpertChatPageSize,
+  type ExpertGridLayout,
+} from "./chat/expert";
+import {
+  mergeWorkspaceProfiles,
+  normalizeWorkspacePath,
+  workspaceBaseName,
+  workspaceIdForPath,
+  type WorkspaceProfile,
+} from "./workspace";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import {
   AppWindow,
+  ArrowLeft,
   BadgeCheck,
   BarChart3,
   Bot,
   CalendarClock,
+  ChevronLeft,
+  ChevronRight,
   CircleDollarSign,
   Clock3,
   FlaskConical,
@@ -41,6 +85,8 @@ import {
   Users,
   X,
   Copy,
+  Cpu,
+  Gauge,
   MessagesSquare,
   Search,
   Send,
@@ -49,12 +95,19 @@ import {
   ScanEye,
   FolderX,
   Library,
+  ListChecks,
+  Square,
+  Wrench,
+  Settings,
+  Folder,
+  FolderPlus,
+  ChevronsUpDown,
   createIcons,
 } from "lucide";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 
-type CodexReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
+type CodexReasoningEffort = string;
 
 // Fournisseur CLI d'un compte / agent. Absent des configs anterieures => Codex.
 type Provider = "codex" | "claude";
@@ -103,7 +156,21 @@ const CODEX_REASONING_EFFORTS: Array<{ value: CodexReasoningEffort; label: strin
   { value: "medium", label: "Moyenne" },
   { value: "high", label: "Elevee" },
   { value: "xhigh", label: "Tres elevee" },
+  { value: "max", label: "Max" },
+  { value: "ultra", label: "Ultra" },
 ];
+
+type ModelReasoningEffortView = {
+  reasoningEffort: string;
+  description?: string | null;
+};
+
+type AccountModelView = {
+  id: string;
+  displayName: string;
+  defaultReasoningEffort?: string | null;
+  supportedReasoningEfforts: ModelReasoningEffortView[];
+};
 
 type AccountLimitTracking = {
   connectedAt?: number | null;
@@ -186,6 +253,11 @@ type AppSettings = {
   agentRoom: AgentRoomConfig;
   codexBypass: boolean;
   autoDiscoverAccounts: boolean;
+  // Registre synchronise des workspaces (dossiers projets ouverts). Optionnel
+  // pour la retro-compat : un settings.json anterieur ne le porte pas encore.
+  // Le workspace ACTIF reste local a l'appareil (WORKSPACE_STORAGE_KEY) : seule
+  // la LISTE se synchronise entre appareils.
+  workspaces?: WorkspaceProfile[];
 };
 
 type RoomAgent = {
@@ -194,9 +266,25 @@ type RoomAgent = {
   accountId: string;
   label: string;
   cwd?: string | null;
+  workspaceId?: string | null;
   present: boolean;
   joinedAt: number;
   lastSeen: number;
+};
+
+type RoomMerge = {
+  id: number;
+  status: "queued" | "running" | "landed" | "conflict" | "verifyFailed" | "failed";
+  agentIdent: string;
+  targetRef: string;
+  landedSha?: string | null;
+};
+
+type RoomTask = {
+  id: string;
+  description: string;
+  status: "claimed" | "completed";
+  claimedBy: string;
 };
 
 type RoomMessage = {
@@ -218,6 +306,16 @@ type RoomStatus = {
     present: number;
     totalMessages: number;
     cursor: number;
+    oldestCursor: number;
+    coordination: {
+      queued: number;
+      running: number;
+      landed: number;
+      attention: number;
+      recentLanded: RoomMerge[];
+      tasks: RoomTask[];
+    };
+    storeOwner: boolean;
   };
 };
 
@@ -376,6 +474,10 @@ type TerminalSession = {
   accountId: string;
   agentId: string;
   title: string;
+  // Workspace immuable de cette session. Il est capture a la creation afin
+  // qu'un changement de workspace global ne deplace pas le prochain PTY en
+  // cours de demarrage.
+  workspacePath: string | null;
   projectDir: string | null;
   proxySummary: string;
   status: string;
@@ -393,11 +495,12 @@ type PersistedTerminalRecord = {
   accountId: string;
   agentId: string;
   codexSessionId?: string | null;
+  workspacePath?: string | null;
   projectDir?: string | null;
 };
 
 type PersistedTerminalState = {
-  v: 2;
+  v: 3;
   activeKey: string | null;
   terminals: PersistedTerminalRecord[];
 };
@@ -412,7 +515,11 @@ type AppView =
   | "history"
   | "room"
   | "audit"
-  | "skills";
+  | "skills"
+  | "settings"
+  | "chat";
+
+type InterfaceMode = "simple" | "expert";
 
 type DiscussionSummary = {
   // Identite LOGIQUE de la conversation (stable a travers les reprises/forks).
@@ -456,6 +563,62 @@ type DiscussionsView = {
   accounts: DiscussionAccountGroup[];
 };
 
+// Transcript structure d'une discussion pour la vue conversation (bulles).
+type DiscussionTranscriptView = {
+  sessionId: string;
+  messages: ChatMessage[];
+  truncated: boolean;
+};
+
+type ChatTurnSnapshot = {
+  id: number;
+  accountId: string;
+  sessionId?: string | null;
+  status: Exclude<ChatTurnStatus, "idle">;
+  startedAt: number;
+  finishedAt?: number | null;
+  error?: string | null;
+  activities: ChatActivity[];
+};
+
+type ExpertChatPane = {
+  key: string;
+  discussion: DiscussionSummary | null;
+  messages: ChatMessage[];
+  loading: boolean;
+  error: string | null;
+  truncated: boolean;
+  syncState: ChatSyncState;
+  liveUnlisten: UnlistenFn | null;
+  fallbackPoll: number | null;
+  loadInFlight: boolean;
+  turn: ChatTurnSnapshot | null;
+  turnPoll: number | null;
+  turnPollInFlight: boolean;
+  draft: string;
+  mode: ChatMode;
+  accountId: string | null;
+  historyOpen: boolean;
+  pendingWorkspace: string | null;
+  followLatest: boolean;
+  scrollTop: number;
+};
+
+type PersistedExpertChatPane = {
+  key: string;
+  sessionId: string | null;
+  accountId: string | null;
+  draft: string;
+  mode: ChatMode;
+  pendingWorkspace: string | null;
+};
+
+type PersistedExpertChats = {
+  v: 1;
+  activeKey: string | null;
+  panes: PersistedExpertChatPane[];
+};
+
 type PromptEntry = {
   sessionId: string;
   accountId: string;
@@ -473,6 +636,18 @@ type PromptHistoryView = {
   totalPrompts: number;
   returned: number;
   truncated: boolean;
+  prompts: PromptEntry[];
+};
+
+type PromptSessionHistory = {
+  key: string;
+  sessionId: string;
+  accountId: string;
+  accountLabel: string;
+  cwd: string | null;
+  sessionTitle: string | null;
+  firstTimestamp: number;
+  lastTimestamp: number;
   prompts: PromptEntry[];
 };
 
@@ -505,9 +680,29 @@ let activeTerminalKey: string | null = null;
 let statusText = "Pret";
 let ptyIdSeed = Date.now();
 let terminalSessions: TerminalSession[] = [];
+// Creations de terminaux en vol (pas encore poussees dans terminalSessions) :
+// permet de faire respecter la limite EXPERT_MAX_TERMINALS malgre les await
+// (deux creations concurrentes ne peuvent plus reserver le meme dernier slot).
+let pendingTerminalCreations = 0;
+// Terminal qui detenait le focus juste avant le dernier render() (capture avant
+// la destruction du DOM) : restaure de facon synchrone au remontage pour ne pas
+// perdre les frappes lors d'un re-render incident (ex: sortie d'un PTY voisin).
+let focusedTerminalKeyBeforeRender: string | null = null;
+// Terminal a focaliser volontairement au prochain montage (nouveau terminal,
+// selection dans la liste, entree en mode expert).
+let requestTerminalFocusKey: string | null = null;
+let globalMobileListenersBound = false;
+let mobileRefitTimer = 0;
 let unlistenData: UnlistenFn | null = null;
 let unlistenExit: UnlistenFn | null = null;
-let activeView: AppView = "terminal";
+let activeView: AppView = "chat";
+let interfaceMode: InterfaceMode = "simple";
+let expertGridLayout: ExpertGridLayout = "auto";
+let expertChatsPerPage: ExpertChatPageSize = DEFAULT_EXPERT_CHAT_PAGE_SIZE;
+let expertChatPage = 0;
+let interfaceModeRequestId = 0;
+let terminalRestoreAttempted = false;
+let terminalRestorePromise: Promise<void> | null = null;
 let poolStatus: PoolStatus | null = null;
 let poolPoll: number | null = null;
 let poolImportPaths = "";
@@ -533,7 +728,9 @@ let isFullscreen = false;
 let newTerminalModalOpen = false;
 let newTerminalAccountId: string | null = null;
 let newTerminalAgentId: string | null = null;
+let newTerminalWorkspacePath: string | null = null;
 let newTerminalAccountLabel = "";
+let newTerminalAccountProvider: Provider = "codex";
 let newTerminalAccountBypass = true;
 let newTerminalAccountModel = DEFAULT_CODEX_MODEL;
 let newTerminalAccountReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
@@ -541,12 +738,48 @@ let agentsModalOpen = false;
 let discussions: DiscussionsView | null = null;
 let discussionsLoaded = false;
 let discussionsPoll: number | null = null;
+let discussionsLiveUnlisten: UnlistenFn | null = null;
+let discussionsSyncState: RealtimeConnectionState = "closed";
 let discussionSearch = "";
+let chatSidebarSearch = "";
+let chatSidebarWidth = CHAT_SIDEBAR_DEFAULT_WIDTH;
 // Compte cible choisi par discussion (sessionId -> accountId). Defaut : le
 // compte d'origine. Persiste entre les re-rendus (poll 60s) pour ne pas perdre
 // le choix en cours.
 const discussionTargetSel = new Map<string, string>();
 let discussionBusyId: string | null = null;
+const CHAT_DRAG_MIME = "application/x-cst-chat";
+let draggedChatSessionId: string | null = null;
+// Vue conversation : discussion ouverte en bulles + son transcript charge.
+let chatDiscussion: DiscussionSummary | null = null;
+let chatMessages: ChatMessage[] = [];
+let chatLoading = false;
+let chatError: string | null = null;
+let chatTruncated = false;
+let chatSyncState: ChatSyncState = "closed";
+let chatLiveUnlisten: UnlistenFn | null = null;
+let chatFallbackPoll: number | null = null;
+let chatLoadInFlight = false;
+let chatTurn: ChatTurnSnapshot | null = null;
+let chatTurnPoll: number | null = null;
+let chatTurnPollInFlight = false;
+let chatDraft = "";
+let chatMode: ChatMode = "build";
+let chatAccountId: string | null = null;
+let chatHistoryOpen = false;
+// Le fil est mis a jour plusieurs fois par seconde pendant une reponse. Garder
+// l'intention de suivi en memoire evite de ramener de force au bas un utilisateur
+// qui vient juste de commencer a remonter avec la molette ou au tactile.
+const CHAT_SCROLL_BOTTOM_EPSILON = 12;
+let chatFollowLatest = true;
+let chatScrollTop = 0;
+let skipNextChatScrollCapture = false;
+let chatPreferencesSave: Promise<void> = Promise.resolve();
+const chatModelCatalogs = new Map<string, AccountModelView[]>();
+const chatModelCatalogLoads = new Set<string>();
+let expertChatPanes: ExpertChatPane[] = [];
+let activeExpertChatKey: string | null = null;
+let expertChatsRestored = false;
 let promptHistory: PromptHistoryView | null = null;
 let promptHistoryLoaded = false;
 let promptSearch = "";
@@ -557,7 +790,9 @@ let roomPoll: number | null = null;
 // agent (DM). Conserve entre les rendus complets.
 let roomComposeTarget = "";
 // Selecteur de workspace (mode web) : modale de navigation de dossiers serveur.
+type WorkspacePickerTarget = "active" | "new-terminal";
 let workspaceModalOpen = false;
+let workspacePickerTarget: WorkspacePickerTarget = "active";
 let workspaceBrowse: FsListResponse | null = null;
 let workspaceBrowseLoading = false;
 let workspaceBrowseError = "";
@@ -598,10 +833,13 @@ let skillsError: string | null = null;
 
 const lucideIcons = {
   AppWindow,
+  ArrowLeft,
   BadgeCheck,
   BarChart3,
   Bot,
   CalendarClock,
+  ChevronLeft,
+  ChevronRight,
   CircleDollarSign,
   Clock3,
   FlaskConical,
@@ -624,6 +862,8 @@ const lucideIcons = {
   Users,
   X,
   Copy,
+  Cpu,
+  Gauge,
   MessagesSquare,
   Search,
   Send,
@@ -632,14 +872,160 @@ const lucideIcons = {
   ScanEye,
   FolderX,
   Library,
+  ListChecks,
+  Square,
+  Wrench,
+  Settings,
+  Folder,
+  FolderPlus,
+  ChevronsUpDown,
 };
 
-const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v2";
+const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v3";
+const LEGACY_OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v2";
+const INTERFACE_MODE_STORAGE_KEY = "codex-switch-terminal.interface-mode.v1";
+const EXPERT_GRID_LAYOUT_STORAGE_KEY = "codex-switch-terminal.expert-grid-layout.v1";
+const EXPERT_CHATS_PER_PAGE_STORAGE_KEY = "codex-switch-terminal.expert-chats-per-page.v1";
+const EXPERT_MAX_TERMINALS = 16;
+const EXPERT_OPEN_CHATS_STORAGE_KEY = "codex-switch-terminal.expert-open-chats.v1";
+const CHAT_SIDEBAR_WIDTH_STORAGE_KEY = "codex-switch-terminal.chat-sidebar-width.v1";
+const CHAT_SIDEBAR_SNAP_CLOSED_WIDTH = 48;
 
-// Workspace courant = dossier de travail (cwd) applique aux PROCHAINS agents.
-// Memorise par appareil (localStorage) : chaque navigateur/PC garde son propre
-// choix. En web c'est un dossier du serveur ; en desktop un dossier local.
+const loadInterfaceMode = (): InterfaceMode =>
+  localStorage.getItem(INTERFACE_MODE_STORAGE_KEY) === "expert" ? "expert" : "simple";
+
+const loadExpertGridLayout = (): ExpertGridLayout => {
+  const value = localStorage.getItem(EXPERT_GRID_LAYOUT_STORAGE_KEY);
+  return value === "2" || value === "3" || value === "4" ? value : "auto";
+};
+
+const loadExpertChatsPerPage = (): ExpertChatPageSize =>
+  normalizeExpertChatPageSize(localStorage.getItem(EXPERT_CHATS_PER_PAGE_STORAGE_KEY));
+
+const loadChatSidebarWidth = (): number => {
+  const stored = localStorage.getItem(CHAT_SIDEBAR_WIDTH_STORAGE_KEY);
+  if (stored === null) return defaultChatSidebarWidth(window.innerWidth);
+  const parsed = Number(stored);
+  if (!Number.isFinite(parsed)) return defaultChatSidebarWidth(window.innerWidth);
+  return Math.max(
+    CHAT_SIDEBAR_MIN_WIDTH,
+    Math.min(CHAT_SIDEBAR_MAX_WIDTH, Math.round(parsed)),
+  );
+};
+
+const displayedChatSidebarWidth = (): number =>
+  clampChatSidebarWidth(chatSidebarWidth, window.innerWidth);
+
+const syncChatSidebarWidthDom = () => {
+  const layout = document.querySelector<HTMLElement>(".chat-app-layout");
+  const resizer = document.querySelector<HTMLElement>("#chatSidebarResizer");
+  if (!layout || !resizer) return;
+  const width = displayedChatSidebarWidth();
+  layout.style.setProperty("--chat-sidebar-width", `${width}px`);
+  layout.classList.toggle("is-sidebar-collapsed", width === 0);
+  resizer.setAttribute("aria-valuenow", String(width));
+  resizer.setAttribute("aria-valuemax", String(chatSidebarMaxWidth(window.innerWidth)));
+  resizer.setAttribute("aria-valuetext", width === 0 ? "Colonne masquée" : `${width} pixels`);
+};
+
+const setChatSidebarWidth = (width: number, persist = true) => {
+  chatSidebarWidth = clampChatSidebarWidth(width, window.innerWidth);
+  syncChatSidebarWidthDom();
+  if (persist) {
+    localStorage.setItem(CHAT_SIDEBAR_WIDTH_STORAGE_KEY, String(chatSidebarWidth));
+  }
+};
+
+const bindChatSidebarResizer = () => {
+  const resizer = document.querySelector<HTMLElement>("#chatSidebarResizer");
+  if (!resizer) return;
+
+  let pointerId: number | null = null;
+  let pointerStartX = 0;
+  let widthAtPointerStart = 0;
+
+  const finishResize = (event: PointerEvent) => {
+    if (pointerId !== event.pointerId) return;
+    const capturedPointerId = pointerId;
+    pointerId = null;
+    document.body.classList.remove("chat-sidebar-resizing");
+    if (displayedChatSidebarWidth() <= CHAT_SIDEBAR_SNAP_CLOSED_WIDTH) {
+      setChatSidebarWidth(0);
+    } else {
+      localStorage.setItem(CHAT_SIDEBAR_WIDTH_STORAGE_KEY, String(chatSidebarWidth));
+    }
+    if (resizer.hasPointerCapture(capturedPointerId)) {
+      resizer.releasePointerCapture(capturedPointerId);
+    }
+    fitAndResizeVisibleTerminals();
+  };
+
+  resizer.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    event.preventDefault();
+    pointerId = event.pointerId;
+    pointerStartX = event.clientX;
+    widthAtPointerStart = displayedChatSidebarWidth();
+    resizer.setPointerCapture(event.pointerId);
+    document.body.classList.add("chat-sidebar-resizing");
+  });
+  resizer.addEventListener("pointermove", (event) => {
+    if (pointerId !== event.pointerId) return;
+    setChatSidebarWidth(widthAtPointerStart + event.clientX - pointerStartX, false);
+  });
+  resizer.addEventListener("pointerup", finishResize);
+  resizer.addEventListener("pointercancel", finishResize);
+  resizer.addEventListener("lostpointercapture", finishResize);
+  resizer.addEventListener("dblclick", () => {
+    setChatSidebarWidth(defaultChatSidebarWidth(window.innerWidth));
+    fitAndResizeVisibleTerminals();
+  });
+  resizer.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 32 : 16;
+    let nextWidth: number | null = null;
+    if (event.key === "ArrowLeft") nextWidth = displayedChatSidebarWidth() - step;
+    if (event.key === "ArrowRight") nextWidth = displayedChatSidebarWidth() + step;
+    if (event.key === "Home") nextWidth = CHAT_SIDEBAR_MIN_WIDTH;
+    if (event.key === "End") nextWidth = chatSidebarMaxWidth(window.innerWidth);
+    if (nextWidth === null) return;
+    event.preventDefault();
+    setChatSidebarWidth(nextWidth);
+    fitAndResizeVisibleTerminals();
+  });
+};
+
+// Workspace actif = valeur proposee aux PROCHAINS terminaux. Chaque session en
+// capture ensuite une copie immuable. Memorise par appareil (localStorage) : en
+// web c'est un dossier du serveur ; en desktop un dossier local.
 const WORKSPACE_STORAGE_KEY = "codex-switch-terminal.workspace.path";
+const WORKSPACES_STORAGE_KEY = "codex-switch-terminal.workspaces.v1";
+
+const loadWorkspacePaths = (): string[] => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(WORKSPACES_STORAGE_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<string>();
+    return parsed
+      .filter((path): path is string => typeof path === "string" && path.trim().length > 0)
+      .map((path) => path.trim())
+      .filter((path) => {
+        const key = normalizeWorkspacePath(path);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  } catch {
+    return [];
+  }
+};
+
+const rememberWorkspace = (path: string) => {
+  const trimmed = path.trim();
+  if (!trimmed) return;
+  const key = normalizeWorkspacePath(trimmed);
+  const paths = loadWorkspacePaths().filter((item) => normalizeWorkspacePath(item) !== key);
+  localStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify([trimmed, ...paths].slice(0, 12)));
+};
 
 const currentWorkspace = (): string | null =>
   localStorage.getItem(WORKSPACE_STORAGE_KEY)?.trim() || null;
@@ -647,24 +1033,144 @@ const currentWorkspace = (): string | null =>
 const setCurrentWorkspace = (path: string | null) => {
   const trimmed = path?.trim();
   if (trimmed) {
+    rememberWorkspace(trimmed);
     localStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
   } else {
     localStorage.removeItem(WORKSPACE_STORAGE_KEY);
   }
 };
 
-// Dernier segment d'un chemin (nom du dossier) pour un affichage compact.
-const workspaceBaseName = (path: string): string =>
-  path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
+// --- Workspaces (dossiers projets, contexte des chats) ---------------------
+// Un workspace regroupe les chats faits dans un meme dossier. L'appartenance
+// d'un chat est DERIVEE du cwd de sa discussion (aucune reference stockee). Le
+// registre synchronise vit dans settings.workspaces (backend) ; la selection
+// locale indique le workspace cible sans masquer les autres groupes.
+const WORKSPACE_ALL = "__all__";
+const WORKSPACE_UNKNOWN = "__unknown__";
+const CHAT_WS_FILTER_KEY = "codex-switch-terminal.chat-workspace-filter";
+
+const chatWorkspaceFilterRaw = (): string | null =>
+  localStorage.getItem(CHAT_WS_FILTER_KEY);
+const activeChatWorkspaceFilter = (): string =>
+  chatWorkspaceFilterRaw() || WORKSPACE_ALL;
+const setChatWorkspaceFilter = (value: string) => {
+  localStorage.setItem(CHAT_WS_FILTER_KEY, value);
+};
+
+// Workspace lie a un NOUVEAU chat (capture-a-la-creation) : garantit que le
+// dossier d'un chat cree dans le workspace X reste X meme si l'utilisateur
+// change de workspace avant d'envoyer le premier message.
+let pendingChatWorkspace: string | null = null;
+
+// Enumeration des workspaces connus : union du registre synchronise, du MRU
+// local, du workspace actif, et des cwd distincts des discussions. Trie : actif
+// d'abord, puis par activite la plus recente, puis alphabetique.
+const knownWorkspaces = (): WorkspaceProfile[] => {
+  const byId = new Map<string, WorkspaceProfile>();
+  const add = (rawPath: string | null | undefined) => {
+    const path = rawPath?.trim();
+    if (!path) return;
+    const id = workspaceIdForPath(path);
+    if (!byId.has(id)) byId.set(id, { id, label: workspaceBaseName(path), path });
+  };
+
+  mergeWorkspaceProfiles(settings?.workspaces ?? []).workspaces.forEach((ws) => {
+    if (!byId.has(ws.id)) byId.set(ws.id, ws);
+  });
+  add(currentWorkspace());
+  loadWorkspacePaths().forEach(add);
+  allDiscussions().forEach((discussion) => add(discussion.cwd));
+
+  const lastActivity = new Map<string, number>();
+  allDiscussions().forEach((discussion) => {
+    if (!discussion.cwd?.trim()) return;
+    const id = workspaceIdForPath(discussion.cwd);
+    lastActivity.set(id, Math.max(lastActivity.get(id) ?? 0, discussion.lastActivity));
+  });
+
+  const active = currentWorkspace();
+  const activeId = active ? workspaceIdForPath(active) : null;
+  return [...byId.values()].sort((left, right) => {
+    if (left.id === activeId) return -1;
+    if (right.id === activeId) return 1;
+    const delta = (lastActivity.get(right.id) ?? 0) - (lastActivity.get(left.id) ?? 0);
+    if (delta !== 0) return delta;
+    return left.label.localeCompare(right.label);
+  });
+};
+
+// Ajoute un dossier au registre synchronise s'il en est absent, puis persiste.
+const upsertWorkspaceRegistry = async (path: string): Promise<void> => {
+  if (!settings) return;
+  const trimmed = path.trim();
+  if (!trimmed) return;
+  const id = workspaceIdForPath(trimmed);
+  const list = (settings.workspaces ??= []);
+  const merged = mergeWorkspaceProfiles(list);
+  if (merged.workspaces.some((ws) => ws.id === id) && !merged.changed) return;
+  settings.workspaces = merged.workspaces;
+  if (!settings.workspaces.some((ws) => ws.id === id)) {
+    settings.workspaces.push({ id, label: workspaceBaseName(trimmed), path: trimmed });
+  }
+  try {
+    settings = await invoke<AppSettings>("save_settings", { settings });
+  } catch (error) {
+    statusText = String(error);
+  }
+};
+
+// Migration au demarrage : peuple le registre synchronise depuis le MRU + le
+// workspace actif locaux (utilisateurs existants), miroir le registre dans le
+// MRU local (nouvel appareil), puis fixe un filtre par defaut pour cet appareil.
+const syncWorkspaceRegistry = async (): Promise<void> => {
+  if (!settings) return;
+  const merged = mergeWorkspaceProfiles(settings.workspaces ?? []);
+  const byId = new Map<string, WorkspaceProfile>(
+    merged.workspaces.map((ws) => [ws.id, ws]),
+  );
+  let changed = merged.changed;
+
+  const seed = (rawPath: string | null | undefined) => {
+    const path = rawPath?.trim();
+    if (!path) return;
+    const id = workspaceIdForPath(path);
+    if (!byId.has(id)) {
+      byId.set(id, { id, label: workspaceBaseName(path), path });
+      changed = true;
+    }
+  };
+  seed(currentWorkspace());
+  loadWorkspacePaths().forEach(seed);
+
+  // Miroir inverse : rend les workspaces synchronises visibles sur cet appareil.
+  byId.forEach((ws) => rememberWorkspace(ws.path));
+
+  if (changed) {
+    settings.workspaces = [...byId.values()];
+    try {
+      settings = await invoke<AppSettings>("save_settings", { settings });
+    } catch {
+      // best-effort : la migration retentera au prochain demarrage.
+    }
+  }
+
+  // Valeur de compatibilite pour les utilisateurs existants. La barre laterale
+  // affiche desormais tous les groupes, quelle que soit cette selection.
+  if (chatWorkspaceFilterRaw() === null) {
+    setChatWorkspaceFilter(WORKSPACE_ALL);
+  }
+};
 
 const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 
-const EMPTY_TERMINAL_STATE: PersistedTerminalState = { v: 2, activeKey: null, terminals: [] };
+const EMPTY_TERMINAL_STATE: PersistedTerminalState = { v: 3, activeKey: null, terminals: [] };
 
 const loadOpenTerminalRecords = (): PersistedTerminalState => {
   try {
-    const raw = localStorage.getItem(OPEN_TERMINALS_STORAGE_KEY);
+    const raw =
+      localStorage.getItem(OPEN_TERMINALS_STORAGE_KEY) ??
+      localStorage.getItem(LEGACY_OPEN_TERMINALS_STORAGE_KEY);
     if (!raw) return { ...EMPTY_TERMINAL_STATE };
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.terminals)) return { ...EMPTY_TERMINAL_STATE };
@@ -679,13 +1185,14 @@ const loadOpenTerminalRecords = (): PersistedTerminalState => {
           accountId: item.accountId,
           agentId: typeof item.agentId === "string" ? item.agentId : "codex",
           codexSessionId: typeof item.codexSessionId === "string" ? item.codexSessionId : null,
+          workspacePath: typeof item.workspacePath === "string" ? item.workspacePath : null,
           projectDir: typeof item.projectDir === "string" ? item.projectDir : null,
         };
       })
       .filter((item: PersistedTerminalRecord | null): item is PersistedTerminalRecord => item !== null);
 
     return {
-      v: 2,
+      v: 3,
       activeKey: typeof parsed.activeKey === "string" ? parsed.activeKey : null,
       terminals,
     };
@@ -696,11 +1203,15 @@ const loadOpenTerminalRecords = (): PersistedTerminalState => {
 
 const saveOpenTerminalRecords = (state: PersistedTerminalState) => {
   localStorage.setItem(OPEN_TERMINALS_STORAGE_KEY, JSON.stringify(state));
+  localStorage.removeItem(LEGACY_OPEN_TERMINALS_STORAGE_KEY);
 };
 
 const persistTerminalSessions = () => {
+  // En mode simple les PTY sont charges paresseusement. Ne jamais ecraser leur
+  // etat persiste par une liste vide tant que le mode expert n'a pas ete ouvert.
+  if (!terminalRestoreAttempted && terminalSessions.length === 0) return;
   saveOpenTerminalRecords({
-    v: 2,
+    v: 3,
     activeKey: activeTerminalKey,
     terminals: terminalSessions
       .filter((session) => session.status !== "Ferme")
@@ -709,6 +1220,7 @@ const persistTerminalSessions = () => {
         accountId: session.accountId,
         agentId: session.agentId,
         codexSessionId: session.codexSessionId,
+        workspacePath: session.workspacePath,
         projectDir: session.projectDir,
       })),
   });
@@ -869,7 +1381,7 @@ const accountBypassEnabled = (account: AccountProfile | null | undefined) =>
   account?.bypass ?? settings?.codexBypass ?? true;
 
 const isCodexReasoningEffort = (value: string | null | undefined): value is CodexReasoningEffort =>
-  CODEX_REASONING_EFFORTS.some((item) => item.value === value);
+  typeof value === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(value);
 
 const normalizeCodexReasoningEffort = (
   value: string | null | undefined,
@@ -885,6 +1397,85 @@ const accountModel = (account: AccountProfile | null | undefined) =>
 const accountReasoningEffort = (account: AccountProfile | null | undefined) =>
   normalizeCodexReasoningEffort(account?.reasoningEffort);
 
+const reasoningEffortLabel = (effort: CodexReasoningEffort) =>
+  CODEX_REASONING_EFFORTS.find((item) => item.value === effort)?.label ?? effort;
+
+const chatCatalogModel = (
+  account: AccountProfile | null | undefined,
+  model: string,
+): AccountModelView | null =>
+  (account ? chatModelCatalogs.get(account.id) : undefined)?.find(
+    (candidate) => candidate.id.toLocaleLowerCase() === model.toLocaleLowerCase(),
+  ) ?? null;
+
+const fallbackReasoningEffortsForModel = (model: string): CodexReasoningEffort[] => {
+  const normalized = model.toLocaleLowerCase();
+  if (normalized === "gpt-5.6-sol" || normalized === "gpt-5.6-terra") {
+    return ["low", "medium", "high", "xhigh", "max", "ultra"];
+  }
+  if (normalized === "gpt-5.6-luna") {
+    return ["low", "medium", "high", "xhigh", "max"];
+  }
+  return ["low", "medium", "high", "xhigh"];
+};
+
+const reasoningEffortsForChatModel = (
+  account: AccountProfile | null | undefined,
+  model: string,
+): CodexReasoningEffort[] => {
+  const advertised =
+    chatCatalogModel(account, model)?.supportedReasoningEfforts
+      .map((item) => item.reasoningEffort)
+      .filter(isCodexReasoningEffort) ?? [];
+  return advertised.length ? advertised : fallbackReasoningEffortsForModel(model);
+};
+
+const reasoningEffortForChatModel = (
+  account: AccountProfile | null | undefined,
+  model: string,
+  requested: string | null | undefined,
+): CodexReasoningEffort => {
+  const supported = reasoningEffortsForChatModel(account, model);
+  if (isCodexReasoningEffort(requested) && supported.includes(requested)) return requested;
+  const advertisedDefault = chatCatalogModel(account, model)?.defaultReasoningEffort;
+  if (isCodexReasoningEffort(advertisedDefault) && supported.includes(advertisedDefault)) {
+    return advertisedDefault;
+  }
+  if (supported.includes(DEFAULT_CODEX_REASONING_EFFORT)) {
+    return DEFAULT_CODEX_REASONING_EFFORT;
+  }
+  return supported[0] ?? DEFAULT_CODEX_REASONING_EFFORT;
+};
+
+const chatReasoningEffortOptions = (
+  account: AccountProfile | null | undefined,
+  model: string,
+) =>
+  reasoningEffortsForChatModel(account, model).map((value) => ({
+    value,
+    label: reasoningEffortLabel(value),
+  }));
+
+const loadChatModelCatalog = async (accountId: string | null | undefined) => {
+  if (!accountId || chatModelCatalogs.has(accountId) || chatModelCatalogLoads.has(accountId)) return;
+  const account = accountById(accountId);
+  if (!account || accountProvider(account) !== "codex") return;
+  chatModelCatalogLoads.add(accountId);
+  try {
+    const catalog = await invoke<AccountModelView[]>("account_model_catalog", { accountId });
+    if (catalog.length) chatModelCatalogs.set(accountId, catalog);
+  } catch {
+    // Les valeurs de secours restent utilisables avec un ancien backend/CLI.
+  } finally {
+    chatModelCatalogLoads.delete(accountId);
+    const accountIsVisible =
+      interfaceMode === "expert"
+        ? expertChatPanes.some((pane) => expertChatSelectedAccount(pane)?.id === accountId)
+        : chatSelectedAccount()?.id === accountId;
+    if (activeView === "chat" && accountIsVisible) render();
+  }
+};
+
 const reasoningEffortOptions = (selected: string | null | undefined) => {
   const normalized = normalizeCodexReasoningEffort(selected);
   return CODEX_REASONING_EFFORTS.map(
@@ -895,7 +1486,9 @@ const reasoningEffortOptions = (selected: string | null | undefined) => {
 
 const renderCodexModelSuggestions = () => `
   <datalist id="codexModelSuggestions">
-    ${CODEX_MODEL_SUGGESTIONS.map((model) => `<option value="${escapeAttr(model)}"></option>`).join("")}
+    ${[...CODEX_MODEL_SUGGESTIONS, ...CLAUDE_MODEL_SUGGESTIONS]
+      .map((model) => `<option value="${escapeAttr(model)}"></option>`)
+      .join("")}
   </datalist>
 `;
 
@@ -925,11 +1518,14 @@ const agentRunCommand = (
 
 const agentIsIde = (agent: AgentProfile | null | undefined) => agent?.kind === "ide";
 
-// Dossier projet a ouvrir pour un agent IDE / Kombai : le workspace choisi est
-// prioritaire (choix explicite global), sinon le dossier du terminal actif,
-// sinon celui du compte selectionne.
+// Dossier projet a ouvrir pour un agent IDE / Kombai. Pour une action liee au
+// terminal actif, son workspace gagne toujours sur le selecteur global.
 const currentProjectDir = () =>
-  currentWorkspace() ?? activeTerminal()?.projectDir ?? selectedAccount()?.projectDir?.trim() ?? null;
+  activeTerminal()?.workspacePath ??
+  currentWorkspace() ??
+  activeTerminal()?.projectDir ??
+  selectedAccount()?.projectDir?.trim() ??
+  null;
 
 const launchIde = async (agent: AgentProfile, projectDir: string | null = currentProjectDir()) => {
   try {
@@ -969,11 +1565,136 @@ const selectedProxy = () => proxyForAccount(selectedAccount());
 const activeTerminal = () =>
   terminalSessions.find((session) => session.key === activeTerminalKey) ?? null;
 
-const fitAndResizeActiveTerminal = () => {
-  const session = activeTerminal();
-  if (!session) return;
+const expertTerminalSessions = () => terminalSessions.slice(0, EXPERT_MAX_TERMINALS);
 
-  session.fitAddon.fit();
+const expertGridSlotCount = () => Math.max(2, expertTerminalSessions().length);
+
+const expertGridColumnCount = (slotCount = expertGridSlotCount()) => {
+  if (expertGridLayout !== "auto") {
+    return Math.min(Number(expertGridLayout), slotCount);
+  }
+  if (slotCount <= 2) return 2;
+  if (slotCount <= 4) return 2;
+  if (slotCount <= 9) return 3;
+  return 4;
+};
+
+type TerminalWorkspaceGroup = {
+  key: string;
+  path: string | null;
+  label: string;
+  detail: string;
+  selectable: boolean;
+  sessions: TerminalSession[];
+};
+
+const DEFAULT_WORKSPACE_KEY = "workspace:default";
+
+const workspaceKeyForPath = (path: string) => `workspace:${normalizeWorkspacePath(path)}`;
+
+const terminalWorkspaceDescriptor = (
+  session: TerminalSession,
+): Omit<TerminalWorkspaceGroup, "sessions"> => {
+  const workspacePath = session.workspacePath?.trim();
+  if (workspacePath) {
+    return {
+      key: workspaceKeyForPath(workspacePath),
+      path: workspacePath,
+      label: workspaceBaseName(workspacePath),
+      detail: workspacePath,
+      selectable: true,
+    };
+  }
+
+  // En mode web, projectDir est une URL Git et non un chemin navigable du
+  // serveur. On regroupe quand meme les terminaux du meme depot, sans proposer
+  // cette URL comme workspace existant.
+  const repository = isRemoteMode() ? session.projectDir?.trim() : null;
+  if (repository) {
+    return {
+      key: `repository:${repository.toLocaleLowerCase()}`,
+      path: null,
+      label: workspaceBaseName(repository),
+      detail: repository,
+      selectable: false,
+    };
+  }
+
+  return {
+    key: DEFAULT_WORKSPACE_KEY,
+    path: null,
+    label: "Sans workspace",
+    detail: isRemoteMode() ? "Workspace genere par le serveur" : "Dossier par defaut",
+    selectable: true,
+  };
+};
+
+const terminalWorkspaceGroups = (): TerminalWorkspaceGroup[] => {
+  const groups = new Map<string, TerminalWorkspaceGroup>();
+  const addPath = (path: string, label = workspaceBaseName(path)) => {
+    const trimmed = path.trim();
+    if (!trimmed) return;
+    const key = workspaceKeyForPath(trimmed);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        path: trimmed,
+        label,
+        detail: trimmed,
+        selectable: true,
+        sessions: [],
+      });
+    }
+  };
+
+  // La liste canonique contient le registre synchronise, le MRU local, le
+  // workspace actif et ceux derives des discussions. Un meme chemin ne cree
+  // donc qu'un groupe, auquel toutes ses sessions sont ajoutees ci-dessous.
+  knownWorkspaces().forEach((workspace) => addPath(workspace.path, workspace.label));
+
+  terminalSessions.forEach((session) => {
+    const descriptor = terminalWorkspaceDescriptor(session);
+    let group = groups.get(descriptor.key);
+    if (!group) {
+      group = { ...descriptor, sessions: [] };
+      groups.set(descriptor.key, group);
+    }
+    group.sessions.push(session);
+  });
+
+  if (groups.size === 0) {
+    groups.set(DEFAULT_WORKSPACE_KEY, {
+      key: DEFAULT_WORKSPACE_KEY,
+      path: null,
+      label: "Sans workspace",
+      detail: isRemoteMode() ? "Workspace genere par le serveur" : "Dossier par defaut",
+      selectable: true,
+      sessions: [],
+    });
+  }
+
+  return Array.from(groups.values());
+};
+
+const activateTerminalSession = (session: TerminalSession) => {
+  activeTerminalKey = session.key;
+  selectedAccountId = session.accountId;
+  setCurrentWorkspace(session.workspacePath);
+  if (settings && session.agentId && settings.agents.some((agent) => agent.id === session.agentId)) {
+    settings.activeAgentId = session.agentId;
+  }
+};
+
+const fitAndResizeTerminal = (session: TerminalSession) => {
+  const element = session.terminal.element;
+  const host = element?.parentElement;
+  if (!host || host.clientWidth < 2 || host.clientHeight < 2) return;
+
+  try {
+    session.fitAddon.fit();
+  } catch {
+    return;
+  }
 
   if (session.ptyId !== null) {
     void invoke("resize_terminal", {
@@ -981,6 +1702,23 @@ const fitAndResizeActiveTerminal = () => {
       cols: session.terminal.cols,
       rows: session.terminal.rows,
     }).catch(() => undefined);
+  }
+};
+
+const fitAndResizeActiveTerminal = () => {
+  const session = activeTerminal();
+  if (session) fitAndResizeTerminal(session);
+};
+
+const fitAndResizeExpertTerminals = () => {
+  expertTerminalSessions().forEach(fitAndResizeTerminal);
+};
+
+const fitAndResizeVisibleTerminals = () => {
+  if (activeView === "terminal") {
+    fitAndResizeExpertTerminals();
+  } else {
+    fitAndResizeActiveTerminal();
   }
 };
 
@@ -993,18 +1731,49 @@ const displayProjectDir = (projectDir?: string | null) =>
 const maskProxy = (value: string) =>
   value.replace(/:\/\/([^:@/]+):([^@/]+)@/, "://$1:***@");
 
+let fullscreenToggleInFlight = false;
+let fullscreenSyncQueued = false;
+let fullscreenSyncFrame: number | null = null;
+
+const scheduleFullscreenSync = () => {
+  if (fullscreenToggleInFlight) {
+    fullscreenSyncQueued = true;
+    return;
+  }
+  if (fullscreenSyncFrame !== null) return;
+
+  fullscreenSyncFrame = window.requestAnimationFrame(() => {
+    fullscreenSyncFrame = null;
+    void appWindow.isFullscreen().then(async (fullscreen) => {
+      if (fullscreen === isFullscreen) return;
+      isFullscreen = fullscreen;
+      statusText = fullscreen ? "Mode plein ecran" : "Mode fenetre";
+      render();
+      await waitForFrame();
+      fitAndResizeVisibleTerminals();
+    }).catch(() => undefined);
+  });
+};
+
 const toggleFullscreen = async () => {
+  fullscreenToggleInFlight = true;
   try {
     const nextFullscreen = !(await appWindow.isFullscreen());
     await appWindow.setFullscreen(nextFullscreen);
-    isFullscreen = nextFullscreen;
-    statusText = nextFullscreen ? "Mode plein ecran" : "Mode fenetre";
+    isFullscreen = await appWindow.isFullscreen();
+    statusText = isFullscreen ? "Mode plein ecran" : "Mode fenetre";
     render();
     await waitForFrame();
-    fitAndResizeActiveTerminal();
+    fitAndResizeVisibleTerminals();
   } catch (error) {
     statusText = String(error);
     render();
+  } finally {
+    fullscreenToggleInFlight = false;
+    if (fullscreenSyncQueued) {
+      fullscreenSyncQueued = false;
+      scheduleFullscreenSync();
+    }
   }
 };
 
@@ -1139,6 +1908,48 @@ const renderRoomFeedInner = (): string => {
     .join("");
 };
 
+const renderRoomCoordinationInner = (): string => {
+  const coordination = roomStatus?.snapshot.coordination;
+  if (!coordination) return "";
+  const tasks = coordination.tasks.slice(0, 6);
+  const landed = coordination.recentLanded.slice(0, 6);
+  return `
+    <div class="room-coordination-summary">
+      <span><strong>${coordination.queued}</strong> en attente</span>
+      <span><strong>${coordination.running}</strong> en intégration</span>
+      <span class="ok"><strong>${coordination.landed}</strong> landed</span>
+      <span class="${coordination.attention ? "warn" : ""}"><strong>${coordination.attention}</strong> à reprendre</span>
+    </div>
+    <div class="room-coordination-lists">
+      <div>
+        <small>Task board</small>
+        ${
+          tasks.length
+            ? tasks
+                .map(
+                  (task) =>
+                    `<span class="room-coordination-item ${task.status}"><b>${escapeHtml(task.id)}</b> · ${escapeHtml(task.claimedBy)}</span>`,
+                )
+                .join("")
+            : `<span class="room-coordination-empty">Aucune tâche claimée</span>`
+        }
+      </div>
+      <div>
+        <small>Derniers landed</small>
+        ${
+          landed.length
+            ? landed
+                .map(
+                  (merge) =>
+                    `<span class="room-coordination-item landed"><b>#${merge.id}</b> · ${escapeHtml((merge.landedSha ?? "").slice(0, 10))}</span>`,
+                )
+                .join("")
+            : `<span class="room-coordination-empty">Aucun merge atterri</span>`
+        }
+      </div>
+    </div>`;
+};
+
 const roomTargetOptions = (): string =>
   roomPresentAgents()
     .map(
@@ -1185,6 +1996,10 @@ const auditViewLabelFor = (view: AppView): string => {
       return "vue Historique";
     case "room":
       return "vue Salon";
+    case "settings":
+      return "vue Paramètres";
+    case "chat":
+      return "vue Conversation";
     default:
       return "vue Terminal";
   }
@@ -1455,11 +2270,43 @@ const pasteToActiveSession = async (text: string): Promise<boolean> => {
 const applySkill = async (id: string): Promise<void> => {
   const skill = (skillsList ?? []).find((entry) => entry.id === id);
   if (!skill) return;
-  const injected = await pasteToActiveSession(skill.content);
-  statusText = injected
-    ? `Skill « ${skill.name} » collé dans Codex — relis puis appuie sur Entrée`
-    : "Aucune session Codex active pour injecter ce skill";
-  render();
+  const content = skill.content.trim();
+  if (!content) {
+    statusText = `Le contenu du skill « ${skill.name} » est indisponible`;
+    render();
+    return;
+  }
+
+  // Les deux modes de l'interface utilisent le composer du chat. En expert,
+  // l'injection cible le panneau actif.
+  // composer du chat. On le place avant le brouillon existant afin que les
+  // instructions du skill encadrent bien la demande déjà saisie.
+  if (interfaceMode === "expert") {
+    const pane = activeExpertChatPane();
+    if (!pane) return;
+    const existingDraft = pane.draft.trim();
+    pane.draft = existingDraft ? `${content}\n\n${existingDraft}` : content;
+    setActiveView("chat");
+    statusText = `Skill « ${skill.name} » ajouté au chat`;
+    window.setTimeout(() => {
+      const input = expertChatPaneRoot(pane)?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }, 0);
+    return;
+  }
+
+  const existingDraft = chatDraft.trim();
+  chatDraft = existingDraft ? `${content}\n\n${existingDraft}` : content;
+  setActiveView("chat");
+  statusText = `Skill « ${skill.name} » ajouté au chat`;
+  window.setTimeout(() => {
+    const input = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+    if (!input) return;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }, 0);
 };
 
 const copySkill = async (id: string): Promise<void> => {
@@ -1474,11 +2321,26 @@ const copySkill = async (id: string): Promise<void> => {
   render();
 };
 
-const renderSkillCard = (skill: SkillEntry, hasActiveSession: boolean): string => {
+const renderSkillCard = (
+  skill: SkillEntry,
+  applyTarget: "chat" | "terminal",
+  hasActiveSession: boolean,
+): string => {
   const tags = skill.tags
     .slice(0, 6)
     .map((tag) => `<span class="skill-tag">${escapeHtml(tag)}</span>`)
     .join("");
+  const applyToChat = applyTarget === "chat";
+  const hasContent = skill.content.trim().length > 0;
+  const canApply = hasContent && (applyToChat || hasActiveSession);
+  const applyLabel = applyToChat ? "Ajouter au chat" : "Injecter dans Codex";
+  const applyTitle = !hasContent
+    ? "Contenu du skill indisponible"
+    : applyToChat
+      ? "Ajouter le skill au brouillon du chat"
+      : hasActiveSession
+        ? "Coller le skill dans la session Codex active (relis puis Entrée)"
+        : "Aucune session Codex active";
   return `
     <div class="skill-card">
       <div class="skill-card-head">
@@ -1487,8 +2349,8 @@ const renderSkillCard = (skill: SkillEntry, hasActiveSession: boolean): string =
       ${skill.description ? `<p class="skill-desc">${escapeHtml(skill.description)}</p>` : ""}
       ${tags ? `<div class="skill-tags">${tags}</div>` : ""}
       <div class="skill-actions">
-        <button class="tool-button primary" data-skill-apply="${escapeAttr(skill.id)}" ${hasActiveSession ? "" : "disabled"} title="${hasActiveSession ? "Coller le skill dans la session Codex active (relis puis Entrée)" : "Aucune session Codex active"}">
-          <i data-lucide="send"></i><span>Injecter dans Codex</span>
+        <button class="tool-button primary" data-skill-apply="${escapeAttr(skill.id)}" ${canApply ? "" : "disabled"} title="${escapeAttr(applyTitle)}">
+          <i data-lucide="send"></i><span>${applyLabel}</span>
         </button>
         <button class="tool-button" data-skill-copy="${escapeAttr(skill.id)}" title="Copier le contenu du skill dans le presse-papiers">
           <i data-lucide="copy"></i><span>Copier</span>
@@ -1503,10 +2365,13 @@ const renderSkillCard = (skill: SkillEntry, hasActiveSession: boolean): string =
 
 const renderSkillsPanel = (): string => {
   const skills = skillsList ?? [];
+  const applyTarget = "chat" as const;
   const hasActiveSession = activeTerminal()?.running ?? false;
   const sub = !skillsLoaded
     ? "Chargement…"
-    : `${skills.length} skill(s) disponible(s)${hasActiveSession ? "" : " · démarre un terminal Codex pour pouvoir les injecter"}`;
+    : applyTarget === "chat"
+      ? `${skills.length} skill(s) disponible(s) · ajoute-les au brouillon de ton chat`
+      : `${skills.length} skill(s) disponible(s)${hasActiveSession ? "" : " · démarre un terminal Codex pour pouvoir les injecter"}`;
 
   const body = skillsError
     ? `<div class="empty audit-error">${escapeHtml(skillsError)}</div>`
@@ -1514,7 +2379,7 @@ const renderSkillsPanel = (): string => {
       ? `<div class="empty">Chargement des skills…</div>`
       : skills.length === 0
         ? `<div class="empty">Aucun skill trouvé (<code>public/skills/index.json</code>).</div>`
-        : `<div id="skillsList" class="skills-list">${skills.map((skill) => renderSkillCard(skill, hasActiveSession)).join("")}</div>`;
+        : `<div id="skillsList" class="skills-list">${skills.map((skill) => renderSkillCard(skill, applyTarget, hasActiveSession)).join("")}</div>`;
 
   return `
     <div class="panel audit-panel skills-panel">
@@ -1536,7 +2401,7 @@ const renderRoomPanel = (): string => {
   const running = roomStatus?.running ?? false;
   const present = roomStatus?.snapshot.present ?? 0;
   const sub = enabled
-    ? `${running ? `Actif · ${escapeHtml(roomStatus?.url ?? "")}` : "Serveur arrêté"} · ${present} agent(s) présent(s)`
+    ? `${running ? `Actif · ${escapeHtml(roomStatus?.url ?? "")}` : "Serveur arrêté"} · ${present} agent(s) présent(s)${roomStatus?.snapshot.storeOwner === false ? " · store passif" : ""}`
     : "Désactivé";
   return `
     <div class="panel room-panel">
@@ -1555,8 +2420,9 @@ const renderRoomPanel = (): string => {
       ${
         enabled
           ? ""
-          : `<div class="room-hint">Active le salon pour que les agents Codex se voient et se parlent (outils MCP <code>list_agents</code>, <code>send_message</code>, <code>read_messages</code>). L'app ajoute une entrée <code>agent_room</code> dans le <code>config.toml</code> de chaque compte au lancement d'un terminal — réversible à la désactivation.</div>`
+          : `<div class="room-hint">Active le salon pour que les agents se parlent et coordonnent leurs tâches/merges (outils MCP <code>list_agents</code>, <code>claim_task</code>, <code>submit_for_merge</code>). L'app ajoute une entrée <code>agent_room</code> dans le home isolé de chaque agent.</div>`
       }
+      <section id="roomCoordination" class="room-coordination">${renderRoomCoordinationInner()}</section>
       <div class="room-grid">
         <aside class="room-agents">
           <div class="section-row"><span>Présents</span></div>
@@ -1605,10 +2471,12 @@ const refreshRoom = async () => {
   if (activeView !== "room") return;
   const agentsEl = document.querySelector<HTMLDivElement>("#roomAgents");
   const feedEl = document.querySelector<HTMLDivElement>("#roomFeed");
+  const coordinationEl = document.querySelector<HTMLElement>("#roomCoordination");
   if (agentsEl && feedEl) {
     const atBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 40;
     agentsEl.innerHTML = renderRoomAgentsInner();
     feedEl.innerHTML = renderRoomFeedInner();
+    if (coordinationEl) coordinationEl.innerHTML = renderRoomCoordinationInner();
     syncRoomTargetOptions();
     createIcons({ icons: lucideIcons });
     if (atBottom) feedEl.scrollTop = feedEl.scrollHeight;
@@ -1696,8 +2564,68 @@ const removeAccount = async (id: string | null, deleteFiles = false) => {
   render();
 };
 
+const ensureTerminalsRestored = async () => {
+  if (terminalRestoreAttempted) {
+    await terminalRestorePromise;
+    return;
+  }
+
+  terminalRestoreAttempted = true;
+  terminalRestorePromise = restoreTerminals();
+  try {
+    await terminalRestorePromise;
+  } finally {
+    terminalRestorePromise = null;
+  }
+};
+
+const setInterfaceMode = async (mode: InterfaceMode) => {
+  const previousMode = interfaceMode;
+  ++interfaceModeRequestId;
+  if (previousMode === "simple" && mode === "expert") {
+    captureChatFeedScroll();
+    stopChatSync();
+    stopChatTurnPoll();
+    mergeSimpleChatIntoExpert();
+  } else if (previousMode === "expert" && mode === "simple") {
+    captureAllExpertChatScroll();
+    stopAllExpertChatWork();
+    copyExpertChatIntoSimple();
+  }
+  interfaceMode = mode;
+  localStorage.setItem(INTERFACE_MODE_STORAGE_KEY, mode);
+  closeMobileOverlays();
+  document.body.classList.remove("chat-sidebar-open");
+
+  stopLimitPoll();
+  stopUsagePoll();
+  stopKombaiPoll();
+  stopRoomPoll();
+
+  if (mode === "simple") {
+    activeView = "chat";
+    statusText = "Mode simple";
+    startDiscussionsPoll();
+    startChatSync();
+    if (chatTurn?.status === "running" && chatTurn.id !== 0) startChatTurnPoll();
+    render();
+    void loadChatModelCatalog(chatAccountId);
+    if (!discussionsLoaded) void refreshDiscussions();
+    return;
+  }
+
+  activeView = "chat";
+  restoreExpertChats();
+  startDiscussionsPoll();
+  statusText = expertChatStatusText();
+  render();
+  startAllExpertChatWork();
+  expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
+  if (!discussionsLoaded) void refreshDiscussions();
+};
+
 const setActiveView = (view: AppView) => {
-  activeView = activeView === view ? "terminal" : view;
+  activeView = view;
   statusText =
     activeView === "pool"
       ? "Vue pool"
@@ -1717,7 +2645,11 @@ const setActiveView = (view: AppView) => {
                     ? "Audit design"
                     : activeView === "skills"
                       ? "Skills"
-                      : "Vue terminal";
+                      : activeView === "settings"
+                        ? "Paramètres"
+                        : activeView === "chat"
+                          ? "Vue conversation"
+                          : "Mur de terminaux";
 
   if (activeView === "limits") {
     startLimitPoll();
@@ -1743,10 +2675,17 @@ const setActiveView = (view: AppView) => {
     stopKombaiPoll();
   }
 
-  if (activeView === "discussions") {
+  if (activeView === "discussions" || activeView === "chat") {
     startDiscussionsPoll();
   } else {
     stopDiscussionsPoll();
+  }
+
+  if (activeView === "chat") {
+    if (interfaceMode === "expert") startAllExpertChatWork();
+    else startChatSync();
+  } else if (interfaceMode === "simple") {
+    stopChatSync();
   }
 
   render();
@@ -1878,15 +2817,17 @@ const stopKombaiPoll = () => {
   }
 };
 
-const refreshDiscussions = async () => {
-  try {
-    discussions = await invoke<DiscussionsView>("list_discussions");
-    discussionsLoaded = true;
-  } catch (error) {
-    statusText = String(error);
-    discussionsLoaded = true;
-  }
-
+const applyDiscussionsSnapshot = (snapshot: DiscussionsView) => {
+  discussions = snapshot;
+  discussionsLoaded = true;
+  const latestBySession = new Map(
+    snapshot.accounts.flatMap((group) => group.discussions).map((discussion) => [discussion.sessionId, discussion]),
+  );
+  expertChatPanes.forEach((pane) => {
+    if (!pane.discussion) return;
+    const latest = latestBySession.get(pane.discussion.sessionId);
+    if (latest) Object.assign(pane.discussion, latest);
+  });
   if (activeView === "discussions") {
     const host = document.querySelector<HTMLDivElement>("#discussionGroups");
     if (host) {
@@ -1894,17 +2835,62 @@ const refreshDiscussions = async () => {
     } else {
       render();
     }
+  } else if (activeView === "chat") {
+    const host = document.querySelector<HTMLElement>("#chatSideConversations");
+    // Ne remplace jamais le DOM sous le pointeur pendant un drag natif : sinon
+    // le navigateur annule le geste avant que le drop atteigne son workspace.
+    if (host && !draggedChatSessionId) {
+      host.innerHTML = renderChatSidebarConversations();
+      createIcons({ icons: lucideIcons });
+      bindDiscussionRowUi();
+      bindWorkspaceSwitcherUi(host);
+    }
+    // Garde le compteur global des workspaces et conversations a jour.
+    refreshWorkspaceSwitcher();
+  }
+};
+
+const refreshDiscussions = async () => {
+  try {
+    applyDiscussionsSnapshot(await invoke<DiscussionsView>("list_discussions"));
+  } catch (error) {
+    statusText = String(error);
+    discussionsLoaded = true;
   }
 };
 
 const startDiscussionsPoll = () => {
   stopDiscussionsPoll();
-  // Scan disque couteux : rafraichissement lent ; l'essentiel se fait a
-  // l'ouverture de la vue et apres chaque action (reprise / archivage).
-  discussionsPoll = window.setInterval(() => void refreshDiscussions(), 60000);
+  if (isRemoteMode()) {
+    discussionsSyncState = "connecting";
+    discussionsLiveUnlisten = subscribeDiscussionUpdates(
+      {},
+      (message: DiscussionStreamMessage) => {
+        if (message.type === "dashboard") {
+          applyDiscussionsSnapshot(message.dashboard as DiscussionsView);
+        } else if (message.type === "error") {
+          statusText = `Synchronisation des discussions : ${message.message}`;
+        }
+      },
+      (state) => {
+        discussionsSyncState = state;
+      },
+    );
+    // Filet de securite si un proxy intermediaire coupe durablement les WS.
+    discussionsPoll = window.setInterval(() => {
+      if (discussionsSyncState !== "live") void refreshDiscussions();
+    }, 2000);
+  } else {
+    // Le bureau local n'a pas de serveur WebSocket : le scan ne tourne que tant
+    // que la vue est ouverte, avec une cadence assez courte pour suivre un chat.
+    discussionsPoll = window.setInterval(() => void refreshDiscussions(), 2000);
+  }
 };
 
 const stopDiscussionsPoll = () => {
+  discussionsLiveUnlisten?.();
+  discussionsLiveUnlisten = null;
+  discussionsSyncState = "closed";
   if (discussionsPoll !== null) {
     clearInterval(discussionsPoll);
     discussionsPoll = null;
@@ -1940,6 +2926,7 @@ const resumeSessionInTerminal = async (accountId: string, sessionId: string) => 
   stopUsagePoll();
   stopKombaiPoll();
   stopDiscussionsPoll();
+  stopChatSync();
   await createNewTerminal(
     accountId,
     true,
@@ -1954,42 +2941,203 @@ const resumeSessionInTerminal = async (accountId: string, sessionId: string) => 
 const resumeDiscussion = (discussion: DiscussionSummary) =>
   resumeSessionInTerminal(discussion.accountId, discussion.rolloutId || discussion.sessionId);
 
-// Reprise dans un AUTRE compte : on copie le rollout HEAD vers le compte cible
-// (nouvel uuid) puis on le reprend la-bas. La source reste intacte.
+// Delai (ms) avant d'injecter le transcript dans une session inter-provider
+// fraichement lancee, le temps que le CLI cible ait affiche son invite.
+const SEED_PASTE_DELAY_MS = 3500;
+
+// Archive la version source APRES que la continuation cible est prete. Elle
+// disparait ainsi de l'onglet Discussions, tout en restant recuperable dans le
+// dossier d'archive si un retour arriere est necessaire.
+const archiveTransferredDiscussion = async (discussion: DiscussionSummary): Promise<number> => {
+  const result = await invoke<{ count?: number }>("delete_discussion", {
+    accountId: discussion.accountId,
+    // sessionId (identite logique) archive aussi tous les anciens forks Codex.
+    sessionId: discussion.sessionId,
+    archive: true,
+  });
+  discussionTargetSel.delete(discussion.sessionId);
+  return result?.count ?? 1;
+};
+
+const transferredTerminal = (
+  session: TerminalSession | null | undefined,
+  targetAccountId: string,
+) => {
+  return session?.accountId === targetAccountId && session.running && session.ptyId !== null
+    ? session
+    : null;
+};
+
+const transferredDiscussionStatus = (
+  target: AccountProfile,
+  archivedCount: number,
+  transcriptNeedsSubmit = false,
+) => {
+  const forkNote = archivedCount > 1 ? ` (${archivedCount} anciennes reprises archivees)` : "";
+  const submitNote = transcriptNeedsSubmit ? " — relis le transcript puis appuie sur Entree" : "";
+  return `Discussion deplacee vers « ${target.label} »${forkNote}${submitNote}`;
+};
+
+// Reprise dans un AUTRE compte = deplacement, pas duplication. Deux cas :
+//  - MEME provider Codex : copie FIDELE du rollout HEAD vers le compte cible,
+//    reprise native, puis archivage de la chaine source.
+//  - INTER-provider (ou impliquant Claude) : export du transcript, injection
+//    dans une session NEUVE du provider cible, puis archivage de la source.
+//
+// Dans les deux cas, la source n'est archivee qu'une fois le terminal cible
+// demarre (et, pour un transcript, l'injection reussie). Un echec conserve donc
+// l'ancienne discussion dans la liste.
 const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccountId: string) => {
   if (!settings || !targetAccountId || targetAccountId === discussion.accountId) return;
-  if (!settings.accounts.some((account) => account.id === targetAccountId)) return;
+  const target = accountById(targetAccountId);
+  if (!target) return;
+  const sourceProvider = discussion.provider ?? accountProvider(accountById(discussion.accountId));
+  const targetProvider = accountProvider(target);
   discussionBusyId = discussion.sessionId;
   render();
   try {
-    const copied = await invoke<DiscussionSummary>("copy_discussion_to_account", {
-      sessionId: discussion.rolloutId || discussion.sessionId,
-      sourceAccountId: discussion.accountId,
-      targetAccountId,
-    });
-    discussionBusyId = null;
-    const resumeId = copied.rolloutId || copied.sessionId;
-    if (!isPlausibleSessionId(resumeId)) {
-      statusText = "Copie effectuee mais identifiant invalide";
+    if (sourceProvider === "codex" && targetProvider === "codex") {
+      const copied = await invoke<DiscussionSummary>("copy_discussion_to_account", {
+        sessionId: discussion.rolloutId || discussion.sessionId,
+        sourceAccountId: discussion.accountId,
+        targetAccountId,
+      });
+      const resumeId = copied.rolloutId || copied.sessionId;
+      if (!isPlausibleSessionId(resumeId)) {
+        discussionBusyId = null;
+        statusText = "Copie effectuee mais identifiant invalide";
+        await refreshDiscussions();
+        return;
+      }
+      const resumed = await createNewTerminal(
+        targetAccountId,
+        true,
+        buildResumeCommand(resumeId, target),
+        providerAgentId("codex"),
+        resumeId,
+      );
+      if (!transferredTerminal(resumed, targetAccountId)) {
+        discussionBusyId = null;
+        statusText = `La nouvelle discussion est disponible dans « ${target.label} », mais le terminal n'a pas demarre. L'ancienne a ete conservee.`;
+        render();
+        await refreshDiscussions();
+        return;
+      }
+      const archivedCount = await archiveTransferredDiscussion(discussion);
+      discussionBusyId = null;
+      statusText = transferredDiscussionStatus(target, archivedCount);
+      render();
       await refreshDiscussions();
       return;
     }
-    activeView = "terminal";
-    stopLimitPoll();
-    stopUsagePoll();
-    stopKombaiPoll();
-    stopDiscussionsPoll();
-    await createNewTerminal(
+
+    // Inter-provider : export du transcript puis amorce dans une session neuve.
+    const transcript = await invoke<string>("export_discussion_transcript", {
+      accountId: discussion.accountId,
+      sessionId: discussion.rolloutId || discussion.sessionId,
+    });
+    // On lance explicitement le CLI cible (independamment de autoRunCodex) afin
+    // de pouvoir injecter le transcript juste apres.
+    const started = await createNewTerminal(
       targetAccountId,
       true,
-      buildResumeCommand(resumeId, accountById(targetAccountId)),
-      codexAgentId(),
-      resumeId,
+      agentRunCommand(agentById(providerAgentId(targetProvider)), target),
+      providerAgentId(targetProvider),
+      null,
     );
-    void refreshDiscussions();
+    const seeded = transferredTerminal(started, targetAccountId);
+    if (!seeded) {
+      discussionBusyId = null;
+      statusText = "Le terminal cible n'a pas demarre. L'ancienne discussion a ete conservee.";
+      render();
+      return;
+    }
+    await seedSessionWithTranscript(seeded, transcript);
+    const archivedCount = await archiveTransferredDiscussion(discussion);
+    discussionBusyId = null;
+    statusText = transferredDiscussionStatus(target, archivedCount, true);
+    render();
+    await refreshDiscussions();
   } catch (error) {
     discussionBusyId = null;
-    statusText = String(error);
+    statusText = `Deplacement incomplet : ${String(error)}. L'ancienne discussion a ete conservee si son archivage n'avait pas commence.`;
+    render();
+  }
+};
+
+// Injecte le transcript exporte dans une session fraichement lancee, apres un
+// court delai (boot du CLI). Collage entre crochets NON soumis : l'utilisateur
+// relit puis appuie sur Entree — meme mecanique que l'injection de skills.
+const seedSessionWithTranscript = async (
+  session: (typeof terminalSessions)[number] | null,
+  transcript: string,
+) => {
+  if (!session) throw new Error("Terminal cible introuvable");
+  await sleep(SEED_PASTE_DELAY_MS);
+  if (session.ptyId === null || !session.running) {
+    throw new Error("Le terminal cible s'est ferme avant l'injection du transcript");
+  }
+  await invoke("write_terminal", {
+    id: session.ptyId,
+    data: `\x1b[200~${transcript}\x1b[201~`,
+  });
+};
+
+const discussionHasRunningTurn = (discussion: DiscussionSummary): boolean =>
+  (chatDiscussion?.sessionId === discussion.sessionId && chatTurn?.status === "running") ||
+  expertChatPanes.some(
+    (pane) =>
+      pane.discussion?.sessionId === discussion.sessionId && pane.turn?.status === "running",
+  );
+
+// Deplacement persistant utilise par le drag-and-drop de la barre laterale.
+// Le backend reecrit le cwd (et relocalise la session Claude si necessaire),
+// puis renvoie le resume a jour pour les chats deja ouverts.
+const moveDiscussionToWorkspace = async (
+  discussion: DiscussionSummary,
+  workspace: WorkspaceProfile,
+) => {
+  if (discussionBusyId) return;
+  if (discussionHasRunningTurn(discussion)) {
+    statusText = "Arretez la reponse en cours avant de deplacer cette conversation";
+    render();
+    return;
+  }
+  if (
+    discussion.cwd?.trim() &&
+    normalizeWorkspacePath(discussion.cwd) === normalizeWorkspacePath(workspace.path)
+  ) {
+    statusText = `La conversation est deja dans ${workspace.label}`;
+    return;
+  }
+
+  discussionBusyId = discussion.sessionId;
+  statusText = `Deplacement vers ${workspace.label}…`;
+  render();
+
+  try {
+    const moved = await invoke<DiscussionSummary>("move_discussion", {
+      accountId: discussion.accountId,
+      sessionId: discussion.sessionId,
+      workspacePath: workspace.path,
+    });
+    Object.assign(discussion, moved);
+    if (chatDiscussion?.sessionId === moved.sessionId) {
+      Object.assign(chatDiscussion, moved);
+    }
+    expertChatPanes.forEach((pane) => {
+      if (pane.discussion?.sessionId === moved.sessionId) {
+        Object.assign(pane.discussion, moved);
+        pane.pendingWorkspace = moved.cwd;
+      }
+    });
+    discussionBusyId = null;
+    statusText = `Conversation deplacee vers ${workspace.label}`;
+    await refreshDiscussions();
+    render();
+  } catch (error) {
+    discussionBusyId = null;
+    statusText = `Deplacement impossible : ${String(error)}`;
     render();
   }
 };
@@ -2012,6 +3160,30 @@ const deleteDiscussion = async (discussion: DiscussionSummary) => {
       archive: true,
     });
     discussionTargetSel.delete(discussion.sessionId);
+    const closedExpertPanes = expertChatPanes.filter(
+      (pane) => pane.discussion?.sessionId === discussion.sessionId,
+    );
+    closedExpertPanes.forEach((pane) => {
+      stopExpertChatSync(pane);
+      stopExpertChatTurnPoll(pane);
+    });
+    expertChatPanes = expertChatPanes.filter(
+      (pane) => pane.discussion?.sessionId !== discussion.sessionId,
+    );
+    if (expertChatsRestored && !expertChatPanes.length) expertChatPanes.push(createExpertChatPane());
+    if (closedExpertPanes.some((pane) => pane.key === activeExpertChatKey)) {
+      activeExpertChatKey = expertChatPanes[0]?.key ?? null;
+    }
+    reconcileExpertChatPage();
+    if (closedExpertPanes.length) persistExpertChats();
+    if (chatDiscussion?.sessionId === discussion.sessionId) {
+      chatDiscussion = null;
+      chatMessages = [];
+      chatTurn = null;
+      chatError = null;
+      chatLoading = false;
+      chatTruncated = false;
+    }
     const count = result?.count ?? 1;
     statusText = count > 1 ? `Discussion archivee (${count} fichiers)` : "Discussion archivee";
   } catch (error) {
@@ -2043,14 +3215,1497 @@ const discussionSubtitle = (discussion: DiscussionSummary): string => {
     .trim();
 };
 
+// --- Vue conversation interactive -------------------------------------------
+// Le provider tourne en arriere-plan, sans TUI visible. Son JSONL reste la
+// source de verite : desktop, web et Android voient donc le meme fil.
+
+const chatSelectedAccount = (): AccountProfile | null => {
+  const preferred = chatDiscussion?.accountId ?? chatAccountId ?? settings?.defaultAccountId;
+  return accountById(preferred) ?? settings?.accounts[0] ?? null;
+};
+
+const readChatPreferences = (account: AccountProfile, root: ParentNode = document) => {
+  const provider = accountProvider(account);
+  const previousModel = accountModel(account);
+  const previousReasoningEffort = accountReasoningEffort(account);
+  const model =
+    root.querySelector<HTMLInputElement>("[data-chat-control='model'], #chatModel")?.value.trim() || previousModel;
+  const reasoningEffort =
+    provider === "codex"
+      ? reasoningEffortForChatModel(
+          account,
+          model,
+          root.querySelector<HTMLSelectElement>("[data-chat-control='reasoning-effort'], #chatReasoningEffort")?.value ??
+            previousReasoningEffort,
+        )
+      : null;
+
+  if (model.length > 160 || /\s/.test(model)) {
+    return {
+      model,
+      reasoningEffort,
+      changed: false,
+      error: "Le nom du modele doit faire 160 caracteres maximum et ne contenir aucun espace",
+    };
+  }
+
+  account.model = model;
+  if (reasoningEffort) account.reasoningEffort = reasoningEffort;
+
+  return {
+    model,
+    reasoningEffort,
+    changed:
+      model !== previousModel ||
+      (provider === "codex" && reasoningEffort !== previousReasoningEffort),
+    error: null,
+  };
+};
+
+// Les controles du mode simple deviennent aussi les valeurs par defaut du
+// compte. Les sauvegardes sont serialisees pour qu'un changement rapide de
+// modele puis d'intensite ne puisse pas s'ecraser dans settings.json.
+const persistChatPreferences = (accountId: string) => {
+  chatPreferencesSave = chatPreferencesSave
+    .catch(() => undefined)
+    .then(async () => {
+      if (!settings) return;
+      await invoke<AppSettings>("save_settings", { settings });
+      const account = accountById(accountId);
+      if (account) await provisionAccountHome(account);
+    })
+    .catch((error) => {
+      statusText = `Preferences du chat non enregistrees : ${String(error)}`;
+    });
+};
+
+const chatPanelModel = (): ChatPanelModel => {
+  const discussion = chatDiscussion;
+  const account = chatSelectedAccount();
+  const provider = accountProvider(account);
+  const selectedModel = accountModel(account);
+  const catalog = account ? chatModelCatalogs.get(account.id) : undefined;
+  const workspace =
+    discussion?.cwd ?? pendingChatWorkspace ?? currentWorkspace() ?? account?.projectDir ?? null;
+  const metaParts = discussion
+    ? [
+        discussion.accountLabel,
+        discussion.cwd ? displayProjectDir(discussion.cwd) : "",
+        `${chatMessages.length || discussion.messageCount} message(s)`,
+      ].filter(Boolean)
+    : [account?.label ?? "Choisissez un compte", workspace ? displayProjectDir(workspace) : "Workspace a choisir"];
+  return {
+    title: discussion?.title?.trim() || "Nouvelle conversation",
+    subtitle: metaParts.join(" \u00b7 "),
+    providerLabel: providerLabel(accountProvider(account)),
+    loading: chatLoading,
+    error: chatError,
+    truncated: chatTruncated,
+    syncState: discussion ? chatSyncState : "closed",
+    messages: chatMessages,
+    activities: chatTurn?.activities ?? [],
+    turnStatus: chatTurn?.status ?? "idle",
+    turnError: chatTurn?.status === "failed" ? (chatTurn.error ?? "La reponse a echoue") : null,
+    accounts: (settings?.accounts ?? []).map((candidate) => ({
+      id: candidate.id,
+      label: candidate.label,
+      providerLabel: providerLabel(accountProvider(candidate)),
+      model: accountModel(candidate),
+    })),
+    selectedAccountId: account?.id ?? "",
+    selectedModel,
+    modelSuggestions:
+      provider === "claude"
+        ? CLAUDE_MODEL_SUGGESTIONS
+        : catalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS,
+    selectedReasoningEffort: reasoningEffortForChatModel(
+      account,
+      selectedModel,
+      accountReasoningEffort(account),
+    ),
+    reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
+    supportsReasoningEffort: provider === "codex",
+    mode: chatMode,
+    draft: chatDraft,
+    newConversation: !discussion,
+    workspaceLabel: workspace ? displayProjectDir(workspace) : "Workspace",
+    historyOpen: chatHistoryOpen,
+  };
+};
+
+const refreshChatSyncIndicator = () => {
+  const indicator = document.querySelector<HTMLSpanElement>("#chatSync");
+  if (!indicator) return;
+  indicator.className = `chat-sync chat-sync--${chatSyncState}`;
+  const label = indicator.querySelector<HTMLElement>("[data-chat-sync-label]");
+  if (label) label.textContent = chatSyncLabel(chatSyncState);
+};
+
+const chatFeedMaxScrollTop = (feed: HTMLElement) =>
+  Math.max(0, feed.scrollHeight - feed.clientHeight);
+
+const chatFeedIsAtBottom = (feed: HTMLElement) =>
+  chatFeedMaxScrollTop(feed) - feed.scrollTop <= CHAT_SCROLL_BOTTOM_EPSILON;
+
+const rememberChatFeedScroll = (feed: HTMLElement) => {
+  chatScrollTop = feed.scrollTop;
+  chatFollowLatest = chatFeedIsAtBottom(feed);
+};
+
+const captureChatFeedScroll = () => {
+  if (skipNextChatScrollCapture) {
+    skipNextChatScrollCapture = false;
+    return;
+  }
+  const feed = document.querySelector<HTMLDivElement>("#chatFeed");
+  if (feed) rememberChatFeedScroll(feed);
+};
+
+const restoreChatFeedScroll = (feed: HTMLElement | null) => {
+  if (!feed) return;
+  const maxScrollTop = chatFeedMaxScrollTop(feed);
+  const target = chatFollowLatest
+    ? maxScrollTop
+    : Math.min(Math.max(0, chatScrollTop), maxScrollTop);
+  feed.scrollTop = target;
+  chatScrollTop = target;
+  if (maxScrollTop <= CHAT_SCROLL_BOTTOM_EPSILON) chatFollowLatest = true;
+};
+
+const resetChatFeedScroll = () => {
+  chatFollowLatest = true;
+  chatScrollTop = 0;
+  // Le DOM contient encore l'ancien chat jusqu'au prochain render : ne pas
+  // capturer sa position apres avoir demande la remise a zero.
+  skipNextChatScrollCapture = true;
+};
+
+const bindChatFeedScroll = (feed: HTMLDivElement) => {
+  feed.addEventListener("scroll", () => rememberChatFeedScroll(feed), { passive: true });
+
+  // Le listener scroll arrive apres le geste. On desactive donc le suivi des le
+  // debut d'une remontee afin qu'un tick de streaming concurrent ne l'annule pas.
+  feed.addEventListener(
+    "wheel",
+    (event) => {
+      if (event.deltaY < 0 && feed.scrollTop > 0) {
+        chatFollowLatest = false;
+        chatScrollTop = feed.scrollTop;
+      }
+    },
+    { passive: true },
+  );
+
+  let lastTouchY: number | null = null;
+  feed.addEventListener(
+    "touchstart",
+    (event) => {
+      lastTouchY = event.touches[0]?.clientY ?? null;
+    },
+    { passive: true },
+  );
+  feed.addEventListener(
+    "touchmove",
+    (event) => {
+      const touchY = event.touches[0]?.clientY ?? null;
+      if (touchY !== null && lastTouchY !== null && touchY > lastTouchY && feed.scrollTop > 0) {
+        chatFollowLatest = false;
+        chatScrollTop = feed.scrollTop;
+      }
+      lastTouchY = touchY;
+    },
+    { passive: true },
+  );
+  feed.addEventListener("touchend", () => {
+    lastTouchY = null;
+  }, { passive: true });
+  feed.addEventListener("touchcancel", () => {
+    lastTouchY = null;
+  }, { passive: true });
+};
+
+// Patch CIBLE du fil (pattern #roomFeed) : pas de re-render global. Le suivi
+// reste actif jusqu'a une remontee explicite, puis reprend quand le bas est
+// atteint. La position absolue est conservee pendant le remplacement du HTML.
+const refreshChatFeed = () => {
+  const feed = document.querySelector<HTMLDivElement>("#chatFeed");
+  if (!feed) {
+    render();
+    return;
+  }
+  chatScrollTop = feed.scrollTop;
+  feed.innerHTML = renderChatFeedInner(chatPanelModel());
+  const subtitle = document.querySelector<HTMLSpanElement>("#chatSubtitle");
+  if (subtitle) subtitle.textContent = chatPanelModel().subtitle;
+  const historyCount = document.querySelector<HTMLElement>("#chatHistoryToggle small");
+  if (historyCount) {
+    historyCount.textContent = String(chatMessages.filter((message) => message.role === "user").length);
+  }
+  refreshChatSyncIndicator();
+  createIcons({ icons: lucideIcons });
+  restoreChatFeedScroll(feed);
+};
+
+const stopChatTurnPoll = () => {
+  if (chatTurnPoll !== null) {
+    clearInterval(chatTurnPoll);
+    chatTurnPoll = null;
+  }
+  chatTurnPollInFlight = false;
+};
+
+const findDiscussionByRollout = (sessionId: string) =>
+  allDiscussions().find(
+    (discussion) => discussion.sessionId === sessionId || discussion.rolloutId === sessionId,
+  ) ?? null;
+
+const attachCreatedChat = async (sessionId: string): Promise<boolean> => {
+  if (chatDiscussion) return true;
+  let discussion = findDiscussionByRollout(sessionId);
+  if (!discussion) {
+    await refreshDiscussions();
+    discussion = findDiscussionByRollout(sessionId);
+  }
+  if (!discussion) return false;
+
+  chatDiscussion = discussion;
+  chatAccountId = discussion.accountId;
+  void loadChatModelCatalog(chatAccountId);
+  chatLoading = false;
+  chatError = null;
+  startChatSync();
+  void loadChatTranscript();
+  return true;
+};
+
+const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
+  if (interfaceMode === "expert") {
+    const pane = expertChatPanes.find(
+      (candidate) =>
+        candidate.turn?.status === "running" &&
+        (candidate.turn.id === 0 || candidate.turn.id === snapshot.id) &&
+        candidate.turn.accountId === snapshot.accountId,
+    ) ?? activeExpertChatPane();
+    if (pane?.turn?.status === "running") {
+      await applyExpertChatTurnSnapshot(pane, snapshot);
+      return;
+    }
+  }
+  if (chatTurn && chatTurn.id !== 0 && snapshot.id !== chatTurn.id) return;
+  const previousStatus = chatTurn?.status;
+  chatTurn = snapshot;
+  const attached = snapshot.sessionId ? await attachCreatedChat(snapshot.sessionId) : !!chatDiscussion;
+
+  if (snapshot.status === "completed") {
+    statusText = "Reponse terminee";
+    if (attached) {
+      await loadChatTranscript();
+      stopChatTurnPoll();
+    }
+  } else if (snapshot.status === "failed") {
+    statusText = snapshot.error || "La reponse a echoue";
+    stopChatTurnPoll();
+  } else if (snapshot.status === "cancelled") {
+    statusText = "Reponse arretee";
+    stopChatTurnPoll();
+  } else {
+    statusText = `${chatPanelModel().providerLabel} travaille…`;
+  }
+
+  if (activeView === "chat") {
+    if (previousStatus !== snapshot.status) render();
+    else refreshChatFeed();
+  }
+};
+
+const pollChatTurn = async () => {
+  if (!chatTurn || chatTurn.id === 0 || chatTurnPollInFlight) return;
+  chatTurnPollInFlight = true;
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("chat_turn_status", { id: chatTurn.id });
+    await applyChatTurnSnapshot(snapshot);
+  } catch (error) {
+    statusText = `Suivi de la reponse : ${String(error)}`;
+  } finally {
+    chatTurnPollInFlight = false;
+  }
+};
+
+const startChatTurnPoll = () => {
+  stopChatTurnPoll();
+  chatTurnPoll = window.setInterval(() => void pollChatTurn(), 550);
+};
+
+const sendChatMessage = async () => {
+  if (chatTurn?.status === "running") return;
+  const input = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+  const prompt = (input?.value ?? chatDraft).trim();
+  const account = chatSelectedAccount();
+  if (!prompt || !account) {
+    statusText = account ? "Ecrivez un message" : "Ajoutez d'abord un compte agent";
+    return;
+  }
+  const preferences = readChatPreferences(account);
+  if (preferences.error) {
+    const modelInput = document.querySelector<HTMLInputElement>("#chatModel");
+    modelInput?.setCustomValidity(preferences.error);
+    modelInput?.reportValidity();
+    statusText = preferences.error;
+    return;
+  }
+  if (preferences.changed) persistChatPreferences(account.id);
+
+  chatDraft = "";
+  chatError = null;
+  chatMessages = [
+    ...chatMessages,
+    { role: "user", text: prompt, timestamp: Math.floor(Date.now() / 1000) },
+  ];
+  chatTurn = {
+    id: 0,
+    accountId: account.id,
+    sessionId: chatDiscussion?.rolloutId ?? chatDiscussion?.sessionId ?? null,
+    status: "running",
+    startedAt: Math.floor(Date.now() / 1000),
+    finishedAt: null,
+    error: null,
+    activities: [
+      {
+        id: "preparing",
+        kind: "think",
+        label: `${providerLabel(accountProvider(account))} prepare la reponse`,
+        detail: null,
+        status: "running",
+      },
+    ],
+  };
+  statusText = `${providerLabel(accountProvider(account))} travaille…`;
+  resetChatFeedScroll();
+  render();
+
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("start_chat_turn", {
+      accountId: account.id,
+      sessionId: chatDiscussion?.rolloutId ?? chatDiscussion?.sessionId ?? null,
+      prompt,
+      projectDir:
+        chatDiscussion?.cwd ?? pendingChatWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
+      mode: chatMode,
+      model: preferences.model,
+      reasoningEffort: preferences.reasoningEffort,
+    });
+    if (interfaceMode === "expert") {
+      const pane = expertChatPanes.find(
+        (candidate) =>
+          candidate.turn?.status === "running" &&
+          candidate.turn.id === 0 &&
+          candidate.turn.accountId === snapshot.accountId,
+      );
+      if (pane) {
+        pane.turn = snapshot;
+        startExpertChatTurnPoll(pane);
+        await applyExpertChatTurnSnapshot(pane, snapshot);
+        return;
+      }
+    }
+    chatTurn = snapshot;
+    startChatTurnPoll();
+    await applyChatTurnSnapshot(snapshot);
+  } catch (error) {
+    if (interfaceMode === "expert") {
+      const pane = expertChatPanes.find(
+        (candidate) =>
+          candidate.turn?.status === "running" &&
+          candidate.turn.id === 0 &&
+          candidate.turn.accountId === account.id,
+      );
+      if (pane) {
+        pane.turn = {
+          ...pane.turn!,
+          status: "failed",
+          finishedAt: Math.floor(Date.now() / 1000),
+          error: String(error),
+        };
+        statusText = String(error);
+        refreshExpertChatPane(pane);
+        return;
+      }
+    }
+    chatTurn = {
+      ...chatTurn,
+      id: 0,
+      status: "failed",
+      finishedAt: Math.floor(Date.now() / 1000),
+      error: String(error),
+    } as ChatTurnSnapshot;
+    statusText = String(error);
+    render();
+  }
+};
+
+const stopCurrentChatTurn = async () => {
+  if (!chatTurn || chatTurn.status !== "running") return;
+  if (chatTurn.id === 0) {
+    chatTurn = { ...chatTurn, status: "cancelled" };
+    stopChatTurnPoll();
+    render();
+    return;
+  }
+  try {
+    await applyChatTurnSnapshot(
+      await invoke<ChatTurnSnapshot>("stop_chat_turn", { id: chatTurn.id }),
+    );
+  } catch (error) {
+    statusText = String(error);
+  }
+};
+
+const openNewChat = () => {
+  if (interfaceMode === "expert") {
+    addExpertChatPane();
+    return;
+  }
+  if (chatTurn?.status === "running") {
+    statusText = "Arretez la reponse en cours avant d'ouvrir un nouveau chat";
+    return;
+  }
+  stopChatSync();
+  stopChatTurnPoll();
+  chatDiscussion = null;
+  chatMessages = [];
+  chatLoading = false;
+  chatError = null;
+  chatTruncated = false;
+  chatTurn = null;
+  chatDraft = "";
+  chatHistoryOpen = false;
+  // Fixe le dossier du nouveau chat au workspace actif de l'appareil : le
+  // premier message sera cree dans ce dossier (cf. sendChatMessage).
+  pendingChatWorkspace = currentWorkspace();
+  chatAccountId = selectedAccountId ?? settings?.defaultAccountId ?? settings?.accounts[0]?.id ?? null;
+  void loadChatModelCatalog(chatAccountId);
+  // Aligne le filtre de la barre laterale pour que le futur chat y soit visible
+  // apres son premier message. Le dossier resolu doit correspondre a celui
+  // envoye a start_chat_turn (pendingChatWorkspace ?? account.projectDir).
+  const newChatPath =
+    pendingChatWorkspace ?? accountById(chatAccountId)?.projectDir?.trim() ?? null;
+  const newChatFilter = newChatPath ? workspaceIdForPath(newChatPath) : WORKSPACE_UNKNOWN;
+  const currentFilter = activeChatWorkspaceFilter();
+  if (currentFilter !== WORKSPACE_ALL && currentFilter !== newChatFilter) {
+    setChatWorkspaceFilter(newChatFilter);
+  }
+  activeView = "chat";
+  document.body.classList.remove("chat-sidebar-open");
+  statusText = "Nouveau chat";
+  resetChatFeedScroll();
+  render();
+  window.setTimeout(() => document.querySelector<HTMLTextAreaElement>("#chatPrompt")?.focus(), 0);
+};
+
+const sameChatMessages = (left: ChatMessage[], right: ChatMessage[]) =>
+  left.length === right.length &&
+  left.every(
+    (message, index) =>
+      message.role === right[index]?.role &&
+      message.timestamp === right[index]?.timestamp &&
+      message.text === right[index]?.text,
+  );
+
+const applyChatTranscript = (
+  discussion: DiscussionSummary,
+  transcript: DiscussionTranscriptView,
+) => {
+  if (chatDiscussion !== discussion) return;
+  const wasLoading = chatLoading;
+  const changed = !sameChatMessages(chatMessages, transcript.messages);
+  const truncationChanged = chatTruncated !== transcript.truncated;
+  chatMessages = transcript.messages;
+  chatTruncated = transcript.truncated;
+  chatLoading = false;
+  chatError = null;
+  if (activeView === "chat" && (changed || truncationChanged || wasLoading)) {
+    if (chatHistoryOpen && changed) render();
+    else refreshChatFeed();
+  } else if (activeView === "chat") {
+    refreshChatSyncIndicator();
+  }
+};
+
+const loadChatTranscript = async () => {
+  const discussion = chatDiscussion;
+  if (!discussion || chatLoadInFlight) return;
+  chatLoadInFlight = true;
+  if (chatMessages.length === 0) {
+    chatLoading = true;
+    chatError = null;
+  }
+  try {
+    const transcript = await invoke<DiscussionTranscriptView>("get_discussion_transcript", {
+      accountId: discussion.accountId,
+      // rolloutId = fichier HEAD : l'historique le plus complet a travers les
+      // reprises (cf. collapse_forks cote backend).
+      sessionId: discussion.rolloutId || discussion.sessionId,
+    });
+    applyChatTranscript(discussion, transcript);
+  } catch (error) {
+    if (chatDiscussion !== discussion) return;
+    chatLoading = false;
+    const empty = chatMessages.length === 0;
+    if (empty) chatError = String(error);
+    statusText = `Conversation : ${String(error)}`;
+    if (activeView === "chat") {
+      if (empty) refreshChatFeed();
+      else refreshChatSyncIndicator();
+    }
+  } finally {
+    chatLoadInFlight = false;
+  }
+};
+
+const stopChatSync = () => {
+  chatLiveUnlisten?.();
+  chatLiveUnlisten = null;
+  if (chatFallbackPoll !== null) {
+    clearInterval(chatFallbackPoll);
+    chatFallbackPoll = null;
+  }
+  chatSyncState = "closed";
+};
+
+const startChatSync = () => {
+  stopChatSync();
+  const discussion = chatDiscussion;
+  if (!discussion) return;
+
+  if (!isRemoteMode()) {
+    chatSyncState = "polling";
+    chatFallbackPoll = window.setInterval(() => void loadChatTranscript(), 1000);
+    return;
+  }
+
+  chatSyncState = "connecting";
+  const watchedSessionId = discussion.rolloutId || discussion.sessionId;
+  chatLiveUnlisten = subscribeDiscussionUpdates(
+    { accountId: discussion.accountId, sessionId: watchedSessionId },
+    (message: DiscussionStreamMessage) => {
+      if (chatDiscussion !== discussion) return;
+      if (
+        message.type === "transcript" &&
+        message.accountId === discussion.accountId &&
+        message.sessionId === watchedSessionId
+      ) {
+        applyChatTranscript(discussion, message.transcript as DiscussionTranscriptView);
+      } else if (message.type === "error") {
+        chatLoading = false;
+        const empty = chatMessages.length === 0;
+        if (empty) chatError = message.message;
+        statusText = `Conversation : ${message.message}`;
+        if (activeView === "chat") {
+          if (empty) refreshChatFeed();
+          else refreshChatSyncIndicator();
+        }
+      }
+    },
+    (state: RealtimeConnectionState) => {
+      if (chatDiscussion !== discussion) return;
+      chatSyncState = state;
+      if (activeView === "chat") refreshChatSyncIndicator();
+    },
+  );
+  // Si un reverse-proxy refuse les WebSockets, le REST garde la conversation
+  // vivante pendant les tentatives de reconnexion.
+  chatFallbackPoll = window.setInterval(() => {
+    if (chatSyncState !== "live") void loadChatTranscript();
+  }, 2000);
+};
+
+const openDiscussionChat = (discussion: DiscussionSummary) => {
+  if (interfaceMode === "expert") {
+    openDiscussionInExpert(discussion);
+    return;
+  }
+  if (chatTurn?.status === "running") {
+    statusText = "Arretez la reponse en cours avant de changer de conversation";
+    return;
+  }
+  stopChatTurnPoll();
+  resetChatFeedScroll();
+  chatDiscussion = discussion;
+  chatAccountId = discussion.accountId;
+  void loadChatModelCatalog(chatAccountId);
+  chatMessages = [];
+  chatError = null;
+  chatTruncated = false;
+  chatLoading = true;
+  chatTurn = null;
+  chatDraft = "";
+  chatHistoryOpen = false;
+  document.body.classList.remove("chat-sidebar-open");
+  if (activeView !== "chat") {
+    setActiveView("chat"); // rend la coquille avec l'etat \u00ab chargement \u00bb
+  } else {
+    startChatSync();
+    render();
+  }
+  void loadChatTranscript();
+};
+
+// --- Mode expert : le meme chat que le mode simple, en plusieurs panneaux ---
+
+const createExpertChatPane = (
+  discussion: DiscussionSummary | null = null,
+  persisted: Partial<PersistedExpertChatPane> = {},
+): ExpertChatPane => ({
+  key: persisted.key || uid("chat-pane"),
+  discussion,
+  messages: [],
+  loading: !!discussion,
+  error: null,
+  truncated: false,
+  syncState: "closed",
+  liveUnlisten: null,
+  fallbackPoll: null,
+  loadInFlight: false,
+  turn: null,
+  turnPoll: null,
+  turnPollInFlight: false,
+  draft: persisted.draft ?? "",
+  mode:
+    persisted.mode === "plan" || persisted.mode === "ask" ? persisted.mode : "build",
+  accountId:
+    discussion?.accountId ??
+    persisted.accountId ??
+    selectedAccountId ??
+    settings?.defaultAccountId ??
+    settings?.accounts[0]?.id ??
+    null,
+  historyOpen: false,
+  pendingWorkspace:
+    discussion?.cwd ??
+    persisted.pendingWorkspace ??
+    currentWorkspace(),
+  followLatest: true,
+  scrollTop: 0,
+});
+
+const activeExpertChatPane = (): ExpertChatPane | null =>
+  expertChatPanes.find((pane) => pane.key === activeExpertChatKey) ?? expertChatPanes[0] ?? null;
+
+const expertChatPageTotal = (): number =>
+  expertChatPageCount(expertChatPanes.length, expertChatsPerPage);
+
+const visibleExpertChatPanes = (): ExpertChatPane[] =>
+  expertChatsOnPage(expertChatPanes, expertChatPage, expertChatsPerPage);
+
+const expertChatStatusText = (): string => {
+  const count = expertChatPanes.length;
+  const totalPages = expertChatPageTotal();
+  return `${count} chat${count > 1 ? "s" : ""} ouvert${count > 1 ? "s" : ""} · page ${expertChatPage + 1}/${totalPages}`;
+};
+
+const moveExpertChatPageToPane = (pane: ExpertChatPane | null) => {
+  const index = pane ? expertChatPanes.indexOf(pane) : -1;
+  expertChatPage = index >= 0
+    ? expertChatPageForIndex(index, expertChatsPerPage)
+    : clampExpertChatPage(expertChatPage, expertChatPanes.length, expertChatsPerPage);
+};
+
+const reconcileExpertChatPage = () => {
+  const active = activeExpertChatPane();
+  if (active) {
+    activeExpertChatKey = active.key;
+    moveExpertChatPageToPane(active);
+    return;
+  }
+  expertChatPage = clampExpertChatPage(
+    expertChatPage,
+    expertChatPanes.length,
+    expertChatsPerPage,
+  );
+};
+
+const expertChatPaneRoot = (pane: ExpertChatPane): HTMLElement | null =>
+  document.getElementById(`chatPanel-${pane.key.replace(/[^a-zA-Z0-9_-]/g, "-")}`);
+
+const expertChatSelectedAccount = (pane: ExpertChatPane): AccountProfile | null => {
+  const preferred = pane.discussion?.accountId ?? pane.accountId ?? settings?.defaultAccountId;
+  return accountById(preferred) ?? settings?.accounts[0] ?? null;
+};
+
+const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
+  const discussion = pane.discussion;
+  const account = expertChatSelectedAccount(pane);
+  const provider = accountProvider(account);
+  const selectedModel = accountModel(account);
+  const catalog = account ? chatModelCatalogs.get(account.id) : undefined;
+  const workspace =
+    discussion?.cwd ?? pane.pendingWorkspace ?? currentWorkspace() ?? account?.projectDir ?? null;
+  const metaParts = discussion
+    ? [
+        discussion.accountLabel,
+        discussion.cwd ? displayProjectDir(discussion.cwd) : "",
+        `${pane.messages.length || discussion.messageCount} message(s)`,
+      ].filter(Boolean)
+    : [account?.label ?? "Choisissez un compte", workspace ? displayProjectDir(workspace) : "Workspace a choisir"];
+  return {
+    title: discussion?.title?.trim() || "Nouvelle conversation",
+    subtitle: metaParts.join(" \u00b7 "),
+    providerLabel: providerLabel(provider),
+    loading: pane.loading,
+    error: pane.error,
+    truncated: pane.truncated,
+    syncState: discussion ? pane.syncState : "closed",
+    messages: pane.messages,
+    activities: pane.turn?.activities ?? [],
+    turnStatus: pane.turn?.status ?? "idle",
+    turnError: pane.turn?.status === "failed" ? (pane.turn.error ?? "La reponse a echoue") : null,
+    accounts: (settings?.accounts ?? []).map((candidate) => ({
+      id: candidate.id,
+      label: candidate.label,
+      providerLabel: providerLabel(accountProvider(candidate)),
+      model: accountModel(candidate),
+    })),
+    selectedAccountId: account?.id ?? "",
+    selectedModel,
+    modelSuggestions:
+      provider === "claude"
+        ? CLAUDE_MODEL_SUGGESTIONS
+        : catalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS,
+    selectedReasoningEffort: reasoningEffortForChatModel(
+      account,
+      selectedModel,
+      accountReasoningEffort(account),
+    ),
+    reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
+    supportsReasoningEffort: provider === "codex",
+    mode: pane.mode,
+    draft: pane.draft,
+    newConversation: !discussion,
+    workspaceLabel: workspace ? displayProjectDir(workspace) : "Workspace",
+    historyOpen: pane.historyOpen,
+  };
+};
+
+const persistExpertChats = () => {
+  // Le mode simple charge les panneaux Expert paresseusement. Ne pas ecraser
+  // leur etat local par une liste vide tant qu'ils n'ont pas ete restaures.
+  if (!expertChatsRestored && expertChatPanes.length === 0) return;
+  const state: PersistedExpertChats = {
+    v: 1,
+    activeKey: activeExpertChatKey,
+    panes: expertChatPanes.map((pane) => ({
+      key: pane.key,
+      sessionId: pane.discussion?.sessionId ?? null,
+      accountId: pane.accountId,
+      draft: pane.draft,
+      mode: pane.mode,
+      pendingWorkspace: pane.pendingWorkspace,
+    })),
+  };
+  localStorage.setItem(EXPERT_OPEN_CHATS_STORAGE_KEY, JSON.stringify(state));
+};
+
+const restoreExpertChats = () => {
+  if (expertChatsRestored) return;
+  expertChatsRestored = true;
+  let persisted: PersistedExpertChats | null = null;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(EXPERT_OPEN_CHATS_STORAGE_KEY) ?? "null") as Partial<PersistedExpertChats> | null;
+    if (parsed?.v === 1 && Array.isArray(parsed.panes)) {
+      persisted = parsed as PersistedExpertChats;
+    }
+  } catch {
+    localStorage.removeItem(EXPERT_OPEN_CHATS_STORAGE_KEY);
+  }
+
+  expertChatPanes = (persisted?.panes ?? [])
+    .flatMap((record) => {
+      if (!record || typeof record.key !== "string") return [];
+      const discussion = record.sessionId ? findDiscussion(record.sessionId) : null;
+      if (record.sessionId && !discussion) return [];
+      return [createExpertChatPane(discussion, record)];
+    });
+  if (!expertChatPanes.length) expertChatPanes = [createExpertChatPane()];
+  activeExpertChatKey =
+    (persisted?.activeKey && expertChatPanes.some((pane) => pane.key === persisted.activeKey)
+      ? persisted.activeKey
+      : expertChatPanes[0]?.key) ?? null;
+  reconcileExpertChatPage();
+  persistExpertChats();
+};
+
+const captureExpertChatScroll = (pane: ExpertChatPane, root = expertChatPaneRoot(pane)) => {
+  const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
+  if (!feed) return;
+  pane.scrollTop = feed.scrollTop;
+  pane.followLatest = chatFeedIsAtBottom(feed);
+};
+
+const restoreExpertChatScroll = (pane: ExpertChatPane, root = expertChatPaneRoot(pane)) => {
+  const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
+  if (!feed) return;
+  const maxScrollTop = chatFeedMaxScrollTop(feed);
+  const target = pane.followLatest
+    ? maxScrollTop
+    : Math.min(Math.max(0, pane.scrollTop), maxScrollTop);
+  feed.scrollTop = target;
+  pane.scrollTop = target;
+  if (maxScrollTop <= CHAT_SCROLL_BOTTOM_EPSILON) pane.followLatest = true;
+};
+
+const captureAllExpertChatScroll = () => expertChatPanes.forEach((pane) => captureExpertChatScroll(pane));
+
+const renderExpertChatPane = (pane: ExpertChatPane): string =>
+  renderChatPanel(expertChatPanelModel(pane), {
+    instanceId: pane.key,
+    paneIndex: expertChatPanes.indexOf(pane) + 1,
+    closeable: true,
+    active: pane.key === activeExpertChatKey,
+  });
+
+const refreshExpertChatSyncIndicator = (pane: ExpertChatPane) => {
+  const indicator = expertChatPaneRoot(pane)?.querySelector<HTMLElement>("[data-chat-control='sync']");
+  if (!indicator) return;
+  indicator.className = `chat-sync chat-sync--${pane.syncState}`;
+  const label = indicator.querySelector<HTMLElement>("[data-chat-sync-label]");
+  if (label) label.textContent = chatSyncLabel(pane.syncState);
+};
+
+const refreshExpertChatFeed = (pane: ExpertChatPane) => {
+  const root = expertChatPaneRoot(pane);
+  const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
+  if (!root || !feed) return;
+  pane.scrollTop = feed.scrollTop;
+  const model = expertChatPanelModel(pane);
+  feed.innerHTML = renderChatFeedInner(model, pane.key);
+  const subtitle = root.querySelector<HTMLElement>("[data-chat-control='subtitle']");
+  if (subtitle) subtitle.textContent = model.subtitle;
+  const historyCount = root.querySelector<HTMLElement>("[data-chat-action='history-toggle'] small");
+  if (historyCount) {
+    historyCount.textContent = String(pane.messages.filter((message) => message.role === "user").length);
+  }
+  refreshExpertChatSyncIndicator(pane);
+  createIcons({ icons: lucideIcons });
+  restoreExpertChatScroll(pane, root);
+};
+
+const refreshExpertChatPane = (pane: ExpertChatPane) => {
+  const root = expertChatPaneRoot(pane);
+  if (!root) return;
+  captureExpertChatScroll(pane, root);
+  root.outerHTML = renderExpertChatPane(pane);
+  createIcons({ icons: lucideIcons });
+  const nextRoot = expertChatPaneRoot(pane);
+  if (nextRoot) bindExpertChatPaneUi(pane, nextRoot);
+  restoreExpertChatScroll(pane, nextRoot);
+};
+
+const stopExpertChatTurnPoll = (pane: ExpertChatPane) => {
+  if (pane.turnPoll !== null) {
+    clearInterval(pane.turnPoll);
+    pane.turnPoll = null;
+  }
+  pane.turnPollInFlight = false;
+};
+
+const stopExpertChatSync = (pane: ExpertChatPane) => {
+  pane.liveUnlisten?.();
+  pane.liveUnlisten = null;
+  if (pane.fallbackPoll !== null) {
+    clearInterval(pane.fallbackPoll);
+    pane.fallbackPoll = null;
+  }
+  pane.syncState = "closed";
+};
+
+const stopAllExpertChatWork = () => {
+  expertChatPanes.forEach((pane) => {
+    stopExpertChatSync(pane);
+    stopExpertChatTurnPoll(pane);
+  });
+};
+
+const applyExpertChatTranscript = (
+  pane: ExpertChatPane,
+  discussion: DiscussionSummary,
+  transcript: DiscussionTranscriptView,
+) => {
+  if (!expertChatPanes.includes(pane) || pane.discussion !== discussion) return;
+  const wasLoading = pane.loading;
+  const changed = !sameChatMessages(pane.messages, transcript.messages);
+  const truncationChanged = pane.truncated !== transcript.truncated;
+  pane.messages = transcript.messages;
+  pane.truncated = transcript.truncated;
+  pane.loading = false;
+  pane.error = null;
+  if (interfaceMode === "expert" && activeView === "chat" && (changed || truncationChanged || wasLoading)) {
+    if (pane.historyOpen && changed) refreshExpertChatPane(pane);
+    else refreshExpertChatFeed(pane);
+  } else if (interfaceMode === "expert" && activeView === "chat") {
+    refreshExpertChatSyncIndicator(pane);
+  }
+};
+
+const loadExpertChatTranscript = async (pane: ExpertChatPane) => {
+  const discussion = pane.discussion;
+  if (!discussion || pane.loadInFlight || !expertChatPanes.includes(pane)) return;
+  pane.loadInFlight = true;
+  if (pane.messages.length === 0) {
+    pane.loading = true;
+    pane.error = null;
+  }
+  try {
+    const transcript = await invoke<DiscussionTranscriptView>("get_discussion_transcript", {
+      accountId: discussion.accountId,
+      sessionId: discussion.rolloutId || discussion.sessionId,
+    });
+    applyExpertChatTranscript(pane, discussion, transcript);
+  } catch (error) {
+    if (!expertChatPanes.includes(pane) || pane.discussion !== discussion) return;
+    pane.loading = false;
+    if (pane.messages.length === 0) pane.error = String(error);
+    statusText = `Conversation : ${String(error)}`;
+    if (interfaceMode === "expert" && activeView === "chat") refreshExpertChatPane(pane);
+  } finally {
+    pane.loadInFlight = false;
+  }
+};
+
+const startExpertChatSync = (pane: ExpertChatPane) => {
+  stopExpertChatSync(pane);
+  const discussion = pane.discussion;
+  if (!discussion || interfaceMode !== "expert") return;
+
+  if (!isRemoteMode()) {
+    pane.syncState = "polling";
+    pane.fallbackPoll = window.setInterval(() => void loadExpertChatTranscript(pane), 1000);
+    return;
+  }
+
+  pane.syncState = "connecting";
+  const watchedSessionId = discussion.rolloutId || discussion.sessionId;
+  pane.liveUnlisten = subscribeDiscussionUpdates(
+    { accountId: discussion.accountId, sessionId: watchedSessionId },
+    (message: DiscussionStreamMessage) => {
+      if (!expertChatPanes.includes(pane) || pane.discussion !== discussion) return;
+      if (
+        message.type === "transcript" &&
+        message.accountId === discussion.accountId &&
+        message.sessionId === watchedSessionId
+      ) {
+        applyExpertChatTranscript(pane, discussion, message.transcript as DiscussionTranscriptView);
+      } else if (message.type === "error") {
+        pane.loading = false;
+        if (pane.messages.length === 0) pane.error = message.message;
+        statusText = `Conversation : ${message.message}`;
+        if (interfaceMode === "expert" && activeView === "chat") refreshExpertChatPane(pane);
+      }
+    },
+    (state: RealtimeConnectionState) => {
+      if (!expertChatPanes.includes(pane) || pane.discussion !== discussion) return;
+      pane.syncState = state;
+      if (interfaceMode === "expert" && activeView === "chat") refreshExpertChatSyncIndicator(pane);
+    },
+  );
+  pane.fallbackPoll = window.setInterval(() => {
+    if (pane.syncState !== "live") void loadExpertChatTranscript(pane);
+  }, 2000);
+};
+
+const attachCreatedExpertChat = async (
+  pane: ExpertChatPane,
+  sessionId: string,
+): Promise<boolean> => {
+  if (pane.discussion) return true;
+  let discussion = findDiscussionByRollout(sessionId);
+  if (!discussion) {
+    await refreshDiscussions();
+    discussion = findDiscussionByRollout(sessionId);
+  }
+  if (!discussion || !expertChatPanes.includes(pane)) return false;
+  pane.discussion = discussion;
+  pane.accountId = discussion.accountId;
+  pane.loading = false;
+  pane.error = null;
+  void loadChatModelCatalog(pane.accountId);
+  startExpertChatSync(pane);
+  persistExpertChats();
+  void loadExpertChatTranscript(pane);
+  return true;
+};
+
+const applyExpertChatTurnSnapshot = async (
+  pane: ExpertChatPane,
+  snapshot: ChatTurnSnapshot,
+) => {
+  if (!expertChatPanes.includes(pane)) return;
+  if (pane.turn && pane.turn.id !== 0 && snapshot.id !== pane.turn.id) return;
+  const previousStatus = pane.turn?.status;
+  pane.turn = snapshot;
+  const attached = snapshot.sessionId
+    ? await attachCreatedExpertChat(pane, snapshot.sessionId)
+    : !!pane.discussion;
+
+  if (snapshot.status === "completed") {
+    statusText = "Reponse terminee";
+    if (attached) await loadExpertChatTranscript(pane);
+    stopExpertChatTurnPoll(pane);
+  } else if (snapshot.status === "failed") {
+    statusText = snapshot.error || "La reponse a echoue";
+    stopExpertChatTurnPoll(pane);
+  } else if (snapshot.status === "cancelled") {
+    statusText = "Reponse arretee";
+    stopExpertChatTurnPoll(pane);
+  } else {
+    statusText = `${expertChatPanelModel(pane).providerLabel} travaille…`;
+  }
+
+  if (interfaceMode === "expert" && activeView === "chat") {
+    if (previousStatus !== snapshot.status) refreshExpertChatPane(pane);
+    else refreshExpertChatFeed(pane);
+  }
+};
+
+const pollExpertChatTurn = async (pane: ExpertChatPane) => {
+  if (!pane.turn || pane.turn.id === 0 || pane.turnPollInFlight || !expertChatPanes.includes(pane)) return;
+  pane.turnPollInFlight = true;
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("chat_turn_status", { id: pane.turn.id });
+    await applyExpertChatTurnSnapshot(pane, snapshot);
+  } catch (error) {
+    statusText = `Suivi de la reponse : ${String(error)}`;
+  } finally {
+    pane.turnPollInFlight = false;
+  }
+};
+
+const startExpertChatTurnPoll = (pane: ExpertChatPane) => {
+  stopExpertChatTurnPoll(pane);
+  pane.turnPoll = window.setInterval(() => void pollExpertChatTurn(pane), 550);
+};
+
+const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) => {
+  if (pane.turn?.status === "running") return;
+  const input = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
+  const prompt = (input?.value ?? pane.draft).trim();
+  const account = expertChatSelectedAccount(pane);
+  if (!prompt || !account) {
+    statusText = account ? "Ecrivez un message" : "Ajoutez d'abord un compte agent";
+    return;
+  }
+  const preferences = readChatPreferences(account, root);
+  if (preferences.error) {
+    const modelInput = root.querySelector<HTMLInputElement>("[data-chat-control='model']");
+    modelInput?.setCustomValidity(preferences.error);
+    modelInput?.reportValidity();
+    statusText = preferences.error;
+    return;
+  }
+  if (preferences.changed) persistChatPreferences(account.id);
+
+  pane.draft = "";
+  pane.error = null;
+  pane.messages = [
+    ...pane.messages,
+    { role: "user", text: prompt, timestamp: Math.floor(Date.now() / 1000) },
+  ];
+  pane.turn = {
+    id: 0,
+    accountId: account.id,
+    sessionId: pane.discussion?.rolloutId ?? pane.discussion?.sessionId ?? null,
+    status: "running",
+    startedAt: Math.floor(Date.now() / 1000),
+    finishedAt: null,
+    error: null,
+    activities: [
+      {
+        id: "preparing",
+        kind: "think",
+        label: `${providerLabel(accountProvider(account))} prepare la reponse`,
+        detail: null,
+        status: "running",
+      },
+    ],
+  };
+  pane.followLatest = true;
+  pane.scrollTop = 0;
+  statusText = `${providerLabel(accountProvider(account))} travaille…`;
+  persistExpertChats();
+  refreshExpertChatPane(pane);
+
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("start_chat_turn", {
+      accountId: account.id,
+      sessionId: pane.discussion?.rolloutId ?? pane.discussion?.sessionId ?? null,
+      prompt,
+      projectDir:
+        pane.discussion?.cwd ?? pane.pendingWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
+      mode: pane.mode,
+      model: preferences.model,
+      reasoningEffort: preferences.reasoningEffort,
+    });
+    if (!expertChatPanes.includes(pane)) return;
+    pane.turn = snapshot;
+    if (interfaceMode === "simple" && pane.key === activeExpertChatKey && chatTurn?.status === "running") {
+      chatTurn = snapshot;
+      startChatTurnPoll();
+      await applyChatTurnSnapshot(snapshot);
+      return;
+    }
+    if (interfaceMode !== "expert") return;
+    startExpertChatTurnPoll(pane);
+    await applyExpertChatTurnSnapshot(pane, snapshot);
+  } catch (error) {
+    if (!expertChatPanes.includes(pane)) return;
+    pane.turn = {
+      ...pane.turn,
+      id: 0,
+      status: "failed",
+      finishedAt: Math.floor(Date.now() / 1000),
+      error: String(error),
+    } as ChatTurnSnapshot;
+    statusText = String(error);
+    if (interfaceMode === "simple" && pane.key === activeExpertChatKey) {
+      chatTurn = pane.turn;
+      render();
+      return;
+    }
+    refreshExpertChatPane(pane);
+  }
+};
+
+const stopExpertChatTurn = async (pane: ExpertChatPane) => {
+  if (!pane.turn || pane.turn.status !== "running") return;
+  if (pane.turn.id === 0) {
+    pane.turn = { ...pane.turn, status: "cancelled" };
+    stopExpertChatTurnPoll(pane);
+    refreshExpertChatPane(pane);
+    return;
+  }
+  try {
+    await applyExpertChatTurnSnapshot(
+      pane,
+      await invoke<ChatTurnSnapshot>("stop_chat_turn", { id: pane.turn.id }),
+    );
+  } catch (error) {
+    statusText = String(error);
+  }
+};
+
+const startAllExpertChatWork = () => {
+  expertChatPanes.forEach((pane) => {
+    if (pane.discussion) {
+      startExpertChatSync(pane);
+      void loadExpertChatTranscript(pane);
+    }
+    if (pane.turn?.status === "running" && pane.turn.id !== 0) startExpertChatTurnPoll(pane);
+  });
+};
+
+const activateExpertChatPane = (pane: ExpertChatPane, focusPrompt = false) => {
+  if (!expertChatPanes.includes(pane)) return;
+  activeExpertChatKey = pane.key;
+  moveExpertChatPageToPane(pane);
+  document.querySelectorAll<HTMLElement>("[data-chat-panel]").forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.chatPanel === pane.key);
+  });
+  persistExpertChats();
+  if (focusPrompt) {
+    expertChatPaneRoot(pane)
+      ?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']")
+      ?.focus();
+  }
+};
+
+const setExpertChatPage = (requestedPage: number) => {
+  captureAllExpertChatScroll();
+  expertChatPage = clampExpertChatPage(
+    requestedPage,
+    expertChatPanes.length,
+    expertChatsPerPage,
+  );
+  const panes = visibleExpertChatPanes();
+  if (!panes.some((pane) => pane.key === activeExpertChatKey)) {
+    activeExpertChatKey = panes[0]?.key ?? null;
+  }
+  statusText = expertChatStatusText();
+  persistExpertChats();
+  render();
+};
+
+const addExpertChatPane = () => {
+  const pane = createExpertChatPane();
+  expertChatPanes.push(pane);
+  activeExpertChatKey = pane.key;
+  moveExpertChatPageToPane(pane);
+  activeView = "chat";
+  statusText = expertChatStatusText();
+  persistExpertChats();
+  render();
+  window.setTimeout(() => activateExpertChatPane(pane, true), 0);
+  return pane;
+};
+
+const openDiscussionInExpert = (discussion: DiscussionSummary) => {
+  const existing = expertChatPanes.find(
+    (pane) => pane.discussion?.sessionId === discussion.sessionId,
+  );
+  if (existing) {
+    activeView = "chat";
+    activateExpertChatPane(existing);
+    statusText = expertChatStatusText();
+    render();
+    return;
+  }
+  const pane = createExpertChatPane(discussion);
+  expertChatPanes.push(pane);
+  activeExpertChatKey = pane.key;
+  moveExpertChatPageToPane(pane);
+  activeView = "chat";
+  statusText = expertChatStatusText();
+  void loadChatModelCatalog(pane.accountId);
+  persistExpertChats();
+  render();
+  startExpertChatSync(pane);
+  void loadExpertChatTranscript(pane);
+};
+
+const closeExpertChatPane = (pane: ExpertChatPane) => {
+  if (pane.turn?.status === "running") {
+    statusText = "Arretez la reponse avant de fermer ce chat";
+    return;
+  }
+  const index = expertChatPanes.indexOf(pane);
+  if (index < 0) return;
+  stopExpertChatSync(pane);
+  stopExpertChatTurnPoll(pane);
+  expertChatPanes.splice(index, 1);
+  if (!expertChatPanes.length) expertChatPanes.push(createExpertChatPane());
+  if (activeExpertChatKey === pane.key) {
+    activeExpertChatKey = expertChatPanes[Math.min(index, expertChatPanes.length - 1)]?.key ?? null;
+  }
+  reconcileExpertChatPage();
+  statusText = expertChatStatusText();
+  persistExpertChats();
+  render();
+};
+
+const copySimpleChatIntoExpertPane = (pane: ExpertChatPane) => {
+  stopExpertChatSync(pane);
+  stopExpertChatTurnPoll(pane);
+  pane.discussion = chatDiscussion;
+  pane.messages = [...chatMessages];
+  pane.loading = chatLoading;
+  pane.error = chatError;
+  pane.truncated = chatTruncated;
+  pane.syncState = "closed";
+  pane.loadInFlight = false;
+  pane.turn = chatTurn ? { ...chatTurn, activities: [...chatTurn.activities] } : null;
+  pane.draft = chatDraft;
+  pane.mode = chatMode;
+  pane.accountId = chatAccountId;
+  pane.historyOpen = chatHistoryOpen;
+  pane.pendingWorkspace = pendingChatWorkspace;
+  pane.followLatest = chatFollowLatest;
+  pane.scrollTop = chatScrollTop;
+};
+
+const mergeSimpleChatIntoExpert = () => {
+  restoreExpertChats();
+  const pane = chatDiscussion
+    ? expertChatPanes.find((candidate) => candidate.discussion?.sessionId === chatDiscussion?.sessionId)
+    : expertChatPanes.find((candidate) => !candidate.discussion && candidate.messages.length === 0);
+  let target = pane ?? null;
+  if (!target) {
+    target = createExpertChatPane();
+    expertChatPanes.push(target);
+  }
+  if (!expertChatPanes.includes(target)) expertChatPanes.push(target);
+  copySimpleChatIntoExpertPane(target);
+  activeExpertChatKey = target.key;
+  moveExpertChatPageToPane(target);
+  persistExpertChats();
+};
+
+const copyExpertChatIntoSimple = () => {
+  const pane = activeExpertChatPane();
+  if (!pane) return;
+  chatDiscussion = pane.discussion;
+  chatMessages = [...pane.messages];
+  chatLoading = pane.loading;
+  chatError = pane.error;
+  chatTruncated = pane.truncated;
+  chatSyncState = "closed";
+  chatLoadInFlight = false;
+  chatTurn = pane.turn ? { ...pane.turn, activities: [...pane.turn.activities] } : null;
+  chatDraft = pane.draft;
+  chatMode = pane.mode;
+  chatAccountId = pane.accountId;
+  chatHistoryOpen = pane.historyOpen;
+  pendingChatWorkspace = pane.pendingWorkspace;
+  chatFollowLatest = pane.followLatest;
+  chatScrollTop = pane.scrollTop;
+};
+
+const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
+  root.addEventListener("pointerdown", () => {
+    if (pane.key !== activeExpertChatKey) activateExpertChatPane(pane);
+  });
+
+  root.querySelector<HTMLButtonElement>("[data-chat-action='back']")?.addEventListener("click", () => {
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      document.body.classList.add("chat-sidebar-open");
+    } else {
+      setActiveView("discussions");
+    }
+  });
+  root.querySelector<HTMLButtonElement>("[data-chat-action='new']")?.addEventListener("click", addExpertChatPane);
+  root.querySelector<HTMLButtonElement>("[data-chat-action='close']")?.addEventListener("click", () => closeExpertChatPane(pane));
+  root.querySelector<HTMLButtonElement>("[data-chat-action='refresh']")?.addEventListener("click", () => {
+    if (pane.discussion) void loadExpertChatTranscript(pane);
+    else void refreshDiscussions();
+  });
+  root.querySelector<HTMLButtonElement>("[data-chat-action='history-toggle']")?.addEventListener("click", () => {
+    pane.historyOpen = !pane.historyOpen;
+    refreshExpertChatPane(pane);
+  });
+  root.querySelector<HTMLButtonElement>("[data-chat-action='history-close']")?.addEventListener("click", () => {
+    pane.historyOpen = false;
+    refreshExpertChatPane(pane);
+  });
+  root.querySelectorAll<HTMLButtonElement>("[data-chat-history-message]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.chatHistoryMessage);
+      if (!Number.isInteger(index)) return;
+      const reveal = () => {
+        const message = root.querySelector<HTMLElement>(`[data-chat-message-index='${index}']`);
+        message?.scrollIntoView({ behavior: "smooth", block: "center" });
+        message?.classList.add("chat-msg--located");
+        window.setTimeout(() => message?.classList.remove("chat-msg--located"), 1400);
+      };
+      if (window.matchMedia("(max-width: 760px)").matches) {
+        pane.historyOpen = false;
+        refreshExpertChatPane(pane);
+        window.requestAnimationFrame(() => {
+          const nextRoot = expertChatPaneRoot(pane);
+          const message = nextRoot?.querySelector<HTMLElement>(`[data-chat-message-index='${index}']`);
+          message?.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
+      } else {
+        reveal();
+      }
+    });
+  });
+  root.querySelector<HTMLButtonElement>("[data-chat-action='stop']")?.addEventListener("click", () => {
+    void stopExpertChatTurn(pane);
+  });
+
+  const prompt = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
+  const resizePrompt = () => {
+    if (!prompt) return;
+    prompt.style.height = "0px";
+    prompt.style.height = `${Math.min(prompt.scrollHeight, 190)}px`;
+  };
+  prompt?.addEventListener("input", () => {
+    pane.draft = prompt.value;
+    resizePrompt();
+  });
+  prompt?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      void sendExpertChatMessage(pane, root);
+    }
+  });
+  resizePrompt();
+  root.querySelector<HTMLFormElement>("[data-chat-control='composer']")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendExpertChatMessage(pane, root);
+  });
+  root.querySelector<HTMLSelectElement>("[data-chat-control='account']")?.addEventListener("change", (event) => {
+    pane.accountId = (event.currentTarget as HTMLSelectElement).value;
+    selectedAccountId = pane.accountId;
+    persistExpertChats();
+    refreshExpertChatPane(pane);
+    void loadChatModelCatalog(pane.accountId);
+  });
+  root.querySelector<HTMLSelectElement>("[data-chat-control='mode']")?.addEventListener("change", (event) => {
+    pane.mode = (event.currentTarget as HTMLSelectElement).value as ChatMode;
+    persistExpertChats();
+  });
+
+  const modelInput = root.querySelector<HTMLInputElement>("[data-chat-control='model']");
+  const commitPreferences = () => {
+    const account = expertChatSelectedAccount(pane);
+    if (!account) return false;
+    const preferences = readChatPreferences(account, root);
+    modelInput?.setCustomValidity(preferences.error ?? "");
+    if (preferences.error) {
+      modelInput?.reportValidity();
+      statusText = preferences.error;
+      return false;
+    }
+    if (preferences.changed) persistChatPreferences(account.id);
+    return true;
+  };
+  modelInput?.addEventListener("input", () => modelInput.setCustomValidity(""));
+  modelInput?.addEventListener("change", () => {
+    if (commitPreferences()) refreshExpertChatPane(pane);
+  });
+  modelInput?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    modelInput.blur();
+  });
+  root.querySelector<HTMLSelectElement>("[data-chat-control='reasoning-effort']")?.addEventListener("change", commitPreferences);
+  root.querySelectorAll<HTMLButtonElement>("[data-chat-starter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      pane.draft = button.dataset.chatStarter ?? "";
+      if (prompt) {
+        prompt.value = pane.draft;
+        prompt.dispatchEvent(new Event("input"));
+        prompt.focus();
+        prompt.setSelectionRange(prompt.value.length, prompt.value.length);
+      }
+    });
+  });
+
+  const feed = root.querySelector<HTMLDivElement>("[data-chat-control='feed']");
+  feed?.addEventListener("scroll", () => captureExpertChatScroll(pane, root), { passive: true });
+  feed?.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0 && feed.scrollTop > 0) {
+      pane.followLatest = false;
+      pane.scrollTop = feed.scrollTop;
+    }
+  }, { passive: true });
+  feed?.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>(".chat-code-copy");
+    if (!button) return;
+    const code = button.closest(".chat-code")?.querySelector("code")?.textContent ?? "";
+    if (!code) return;
+    void navigator.clipboard.writeText(code).then(() => {
+      button.classList.add("copied");
+      window.setTimeout(() => button.classList.remove("copied"), 1200);
+    });
+  });
+};
+
+const bindExpertChatGridUi = () => {
+  expertChatPanes.forEach((pane) => {
+    const root = expertChatPaneRoot(pane);
+    if (root) {
+      bindExpertChatPaneUi(pane, root);
+      restoreExpertChatScroll(pane, root);
+    }
+  });
+};
+
 const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string) => {
   const busy = discussionBusyId === discussion.sessionId;
-  const accounts = settings?.accounts ?? [];
-  const target = discussionTargetFor(discussion);
-  const willCopy = target !== discussion.accountId;
   const title = discussion.title?.trim() || "(sans titre)";
   const subtitle = discussionSubtitle(discussion);
+  const provider = discussion.provider ?? "codex";
   const meta = [
+    `<span class="discussion-badge prov-${provider}" title="Fournisseur d'origine"><i data-lucide="cpu"></i>${escapeHtml(providerLabel(provider))}</span>`,
     discussion.cwd
       ? `<span title="${escapeAttr(discussion.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(discussion.cwd))}</span>`
       : "",
@@ -2066,16 +4721,20 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
     .filter(Boolean)
     .join("");
 
-  // Le compte d'origine est propose EN PREMIER (marque), puis les autres. On
-  // choisit le compte dans lequel reprendre directement ; s'il differe du
-  // compte d'origine la reprise copie d'abord la discussion (non destructif).
-  const options = accounts
-    .map((account) => {
-      const selected = account.id === target ? " selected" : "";
-      const suffix = account.id === discussion.accountId ? " (origine)" : "";
-      return `<option value="${escapeAttr(account.id)}"${selected}>${escapeHtml(account.label)}${suffix}</option>`;
-    })
-    .join("") ||
+  // Compte cible : origine EN PREMIER (marquee), puis les autres. Choisir un
+  // autre compte transforme la reprise en deplacement (copie fidele puis
+  // archivage de la source) — logique portee par continueDiscussionWith.
+  const accounts = settings?.accounts ?? [];
+  const target = discussionTargetFor(discussion);
+  const willCopy = target !== discussion.accountId;
+  const options =
+    accounts
+      .map((account) => {
+        const selected = account.id === target ? " selected" : "";
+        const suffix = account.id === discussion.accountId ? " (origine)" : "";
+        return `<option value="${escapeAttr(account.id)}"${selected}>${escapeHtml(account.label)}${suffix}</option>`;
+      })
+      .join("") ||
     `<option value="${escapeAttr(discussion.accountId)}" selected>${escapeHtml(accountLabel)}</option>`;
 
   return `
@@ -2092,8 +4751,11 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
             ${options}
           </select>
         </label>
-        <button class="tool-button primary" data-resume-session="${escapeAttr(discussion.sessionId)}" title="${willCopy ? "Copier la discussion dans le compte choisi puis la reprendre" : "Reprendre dans un terminal"}">
+        <button class="tool-button" data-resume-session="${escapeAttr(discussion.sessionId)}" title="${willCopy ? "Copier la discussion dans le compte choisi puis la reprendre" : "Reprendre dans un terminal"}">
           <i data-lucide="${willCopy ? "copy" : "play"}"></i><span data-resume-label>${willCopy ? "Copier + reprendre" : "Reprendre"}</span>
+        </button>
+        <button class="tool-button primary" data-open-chat="${escapeAttr(discussion.sessionId)}" title="Ouvrir cette conversation dans le chat">
+          <i data-lucide="messages-square"></i><span>Ouvrir le chat</span>
         </button>
         <button class="icon-button wide danger" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Retirer de l'historique (archive toutes les reprises)">
           <i data-lucide="trash-2"></i>
@@ -2170,7 +4832,135 @@ const refreshDiscussionList = () => {
   bindDiscussionRowUi();
 };
 
+const clearChatDragUi = () => {
+  draggedChatSessionId = null;
+  document
+    .querySelectorAll<HTMLElement>(".chat-side-item.dragging, .chat-workspace-group.drag-over")
+    .forEach((element) => element.classList.remove("dragging", "drag-over"));
+  document.body.classList.remove("chat-dragging");
+};
+
+// Attache les gestionnaires de la liste de workspaces. Le root optionnel permet
+// de rebinder seulement les groupes remplaces par un rafraichissement cible.
+const bindWorkspaceSwitcherUi = (root: ParentNode = document) => {
+  root.querySelectorAll<HTMLButtonElement>("[data-ws-select]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const value = button.dataset.wsSelect;
+      if (value) selectWorkspaceFilter(value);
+    });
+  });
+  root.querySelectorAll<HTMLButtonElement>("[data-new-chat-workspace]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const workspace = knownWorkspaces().find(
+        (candidate) => candidate.id === button.dataset.newChatWorkspace,
+      );
+      if (!workspace) return;
+      setCurrentWorkspace(workspace.path);
+      setChatWorkspaceFilter(workspace.id);
+      pendingChatWorkspace = workspace.path;
+      void upsertWorkspaceRegistry(workspace.path);
+      openNewChat();
+    });
+  });
+  root.querySelector<HTMLButtonElement>("#wsOpenFolder")?.addEventListener("click", () => {
+    void openWorkspacePicker("active");
+  });
+
+  root
+    .querySelectorAll<HTMLElement>("[data-drag-chat][draggable=\"true\"]")
+    .forEach((row) => {
+      row.addEventListener("dragstart", (event) => {
+        const dragEvent = event as DragEvent;
+        const sessionId = row.dataset.dragChat;
+        const discussion = findDiscussion(sessionId);
+        if (!sessionId || !discussion || discussionBusyId || discussionHasRunningTurn(discussion)) {
+          dragEvent.preventDefault();
+          return;
+        }
+        draggedChatSessionId = sessionId;
+        dragEvent.dataTransfer?.setData(CHAT_DRAG_MIME, sessionId);
+        dragEvent.dataTransfer?.setData("text/plain", sessionId);
+        if (dragEvent.dataTransfer) dragEvent.dataTransfer.effectAllowed = "move";
+        document.body.classList.add("chat-dragging");
+        window.requestAnimationFrame(() => row.classList.add("dragging"));
+      });
+      row.addEventListener("dragend", clearChatDragUi);
+    });
+
+  root.querySelectorAll<HTMLElement>("[data-chat-drop-workspace]").forEach((target) => {
+    const dropContext = (event: DragEvent) => {
+      const sessionId =
+        draggedChatSessionId || event.dataTransfer?.getData(CHAT_DRAG_MIME) || null;
+      const discussion = findDiscussion(sessionId);
+      const workspace = knownWorkspaces().find(
+        (candidate) => candidate.id === target.dataset.chatDropWorkspace,
+      );
+      if (!discussion || !workspace || discussionBusyId || discussionHasRunningTurn(discussion)) {
+        return null;
+      }
+      if (
+        discussion.cwd?.trim() &&
+        normalizeWorkspacePath(discussion.cwd) === normalizeWorkspacePath(workspace.path)
+      ) {
+        return null;
+      }
+      return { discussion, workspace };
+    };
+
+    target.addEventListener("dragover", (event) => {
+      const dragEvent = event as DragEvent;
+      if (!dropContext(dragEvent)) return;
+      dragEvent.preventDefault();
+      if (dragEvent.dataTransfer) dragEvent.dataTransfer.dropEffect = "move";
+      document
+        .querySelectorAll<HTMLElement>(".chat-workspace-group.drag-over")
+        .forEach((group) => group.classList.toggle("drag-over", group === target));
+    });
+    target.addEventListener("dragleave", (event) => {
+      const related = (event as DragEvent).relatedTarget;
+      if (related instanceof Node && target.contains(related)) return;
+      target.classList.remove("drag-over");
+    });
+    target.addEventListener("drop", (event) => {
+      const dragEvent = event as DragEvent;
+      const context = dropContext(dragEvent);
+      if (!context) return;
+      dragEvent.preventDefault();
+      clearChatDragUi();
+      void moveDiscussionToWorkspace(context.discussion, context.workspace);
+    });
+  });
+};
+
+// Rafraichit uniquement l'en-tete des workspaces sans re-render global.
+const refreshWorkspaceSwitcher = () => {
+  const current = document.querySelector<HTMLElement>("#chatWsSwitcher");
+  if (!current) return;
+  // Rien n'a change depuis le dernier rendu : on ne touche pas au DOM (evite
+  // repaint/perte de focus inutiles a chaque poll).
+  if (current.dataset.wsSig === workspaceSwitcherSignature()) return;
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = renderWorkspaceSwitcher();
+  const next = wrapper.firstElementChild;
+  if (!next) return;
+  current.replaceWith(next);
+  createIcons({ icons: lucideIcons });
+  bindWorkspaceSwitcherUi(next);
+};
+
 const bindDiscussionRowUi = () => {
+  document.querySelectorAll<HTMLButtonElement>("[data-delete-session]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const discussion = findDiscussion(button.dataset.deleteSession);
+      if (discussion) void deleteDiscussion(discussion);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-open-chat]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const discussion = findDiscussion(button.dataset.openChat);
+      if (discussion) openDiscussionChat(discussion);
+    });
+  });
   // Changement de compte cible : on memorise le choix et on met a jour, sans
   // re-render complet, le libelle/icone du bouton (Reprendre <-> Copier +
   // reprendre) pour ne pas voler le focus du select.
@@ -2184,9 +4974,6 @@ const bindDiscussionRowUi = () => {
       const row = select.closest(".discussion-row");
       const button = row?.querySelector<HTMLButtonElement>("[data-resume-session]");
       const label = button?.querySelector<HTMLElement>("[data-resume-label]");
-      // On met a jour le libelle/title en place (l'icone se resynchronise au
-      // prochain rendu complet). Pas de createIcons ici : lucide a deja remplace
-      // le <i data-lucide> par un <svg> au premier rendu.
       if (label) label.textContent = willCopy ? "Copier + reprendre" : "Reprendre";
       if (button) {
         button.title = willCopy
@@ -2207,19 +4994,12 @@ const bindDiscussionRowUi = () => {
       }
     });
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-delete-session]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const discussion = findDiscussion(button.dataset.deleteSession);
-      if (discussion) void deleteDiscussion(discussion);
-    });
-  });
 };
 
-// --- Historique des demandes (recherche globale) -------------------------
-// Index recherchable de TOUTES les demandes (messages utilisateur) envoyees a
-// Codex, tous comptes et toutes sessions confondus. Le backend
-// (`list_prompt_history`) scanne les rollouts ; le filtrage/recherche se fait
-// cote client, comme pour la liste des discussions.
+// --- Historique des demandes, regroupe par chat / terminal ----------------
+// Le backend renvoie les messages utilisateur individuellement. La vue les
+// regroupe par session ET par compte afin qu'une carte resume exclusivement les
+// messages envoyes dans le chat ou le terminal correspondant.
 const PROMPT_RENDER_LIMIT = 400;
 
 const refreshPromptHistory = async () => {
@@ -2238,12 +5018,52 @@ const refreshPromptHistory = async () => {
 
 const allPrompts = (): PromptEntry[] => promptHistory?.prompts ?? [];
 
-const promptMatches = (entry: PromptEntry) => {
+const promptSessions = (): PromptSessionHistory[] => {
+  const groups = new Map<string, PromptSessionHistory>();
+  for (const entry of allPrompts()) {
+    const key = `${entry.accountId}\u0000${entry.sessionId}`;
+    const existing = groups.get(key);
+    if (existing) {
+      const duplicate = existing.prompts.some(
+        (candidate) => candidate.timestamp === entry.timestamp && candidate.text === entry.text,
+      );
+      if (!duplicate) existing.prompts.push(entry);
+      existing.firstTimestamp = Math.min(existing.firstTimestamp, entry.timestamp);
+      existing.lastTimestamp = Math.max(existing.lastTimestamp, entry.timestamp);
+      existing.cwd ||= entry.cwd;
+      existing.sessionTitle ||= entry.sessionTitle;
+      continue;
+    }
+    groups.set(key, {
+      key,
+      sessionId: entry.sessionId,
+      accountId: entry.accountId,
+      accountLabel: entry.accountLabel,
+      cwd: entry.cwd,
+      sessionTitle: entry.sessionTitle,
+      firstTimestamp: entry.timestamp,
+      lastTimestamp: entry.timestamp,
+      prompts: [entry],
+    });
+  }
+  return [...groups.values()]
+    .map((session) => ({
+      ...session,
+      prompts: session.prompts.sort((left, right) => left.timestamp - right.timestamp),
+    }))
+    .sort((left, right) => right.lastTimestamp - left.lastTimestamp);
+};
+
+const promptSessionMatches = (session: PromptSessionHistory) => {
   const query = promptSearch.trim().toLowerCase();
   if (!query) return true;
-  return [entry.text, entry.cwd ?? "", entry.accountLabel, entry.sessionTitle ?? "", entry.sessionId].some(
-    (field) => field.toLowerCase().includes(query),
-  );
+  return [
+    ...session.prompts.map((entry) => entry.text),
+    session.cwd ?? "",
+    session.accountLabel,
+    session.sessionTitle ?? "",
+    session.sessionId,
+  ].some((field) => field.toLowerCase().includes(query));
 };
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -2269,29 +5089,38 @@ const highlightMatch = (text: string, query: string) => {
   return result;
 };
 
-const renderPromptRow = (entry: PromptEntry) => {
+const renderPromptSession = (session: PromptSessionHistory) => {
   const meta = [
-    `<span><i data-lucide="clock-3"></i>${escapeHtml(formatTimestamp(entry.timestamp))}</span>`,
-    `<span><i data-lucide="users"></i>${escapeHtml(entry.accountLabel)}</span>`,
-    entry.cwd
-      ? `<span title="${escapeAttr(entry.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(entry.cwd))}</span>`
+    `<span><i data-lucide="clock-3"></i>${escapeHtml(formatTimestamp(session.lastTimestamp))}</span>`,
+    `<span><i data-lucide="users"></i>${escapeHtml(session.accountLabel)}</span>`,
+    session.cwd
+      ? `<span title="${escapeAttr(session.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(session.cwd))}</span>`
       : "",
+    `<span><i data-lucide="message-square-text"></i>${session.prompts.length} message(s) envoye(s)</span>`,
   ]
     .filter(Boolean)
     .join("");
-  const canResume = isPlausibleSessionId(entry.sessionId);
+  const title = session.sessionTitle?.trim() || session.prompts[0]?.text.trim() || "Session sans titre";
+  const messages = session.prompts
+    .map(
+      (entry, index) => `
+        <li>
+          <span class="prompt-message-index">${index + 1}</span>
+          <span>${highlightMatch(entry.text, promptSearch)}</span>
+          <time>${escapeHtml(formatTimestamp(entry.timestamp))}</time>
+        </li>`,
+    )
+    .join("");
   return `
-    <div class="prompt-row">
+    <div class="prompt-row prompt-session-row">
       <div class="prompt-main">
-        <span class="prompt-text">${highlightMatch(entry.text, promptSearch)}</span>
+        <strong class="prompt-session-title">${highlightMatch(title, promptSearch)}</strong>
         <span class="prompt-meta">${meta}</span>
+        <ol class="prompt-session-messages">${messages}</ol>
       </div>
       <div class="prompt-actions">
-        <button class="tool-button" data-prompt-resume="${escapeAttr(entry.sessionId)}" data-prompt-account="${escapeAttr(entry.accountId)}" title="Reprendre cette session dans un terminal" ${canResume ? "" : "disabled"}>
-          <i data-lucide="play"></i><span>Reprendre</span>
-        </button>
-        <button class="icon-button wide" data-prompt-discussion="${escapeAttr(entry.sessionId)}" title="Voir dans les discussions">
-          <i data-lucide="messages-square"></i>
+        <button class="tool-button" data-prompt-discussion="${escapeAttr(session.sessionId)}" data-prompt-account="${escapeAttr(session.accountId)}" title="Voir la conversation">
+          <i data-lucide="messages-square"></i><span>Conversation</span>
         </button>
       </div>
     </div>
@@ -2302,11 +5131,11 @@ const renderPromptRows = () => {
   if (!promptHistoryLoaded) {
     return `<div class="pool-empty">Lecture des demandes Codex…</div>`;
   }
-  const all = allPrompts();
+  const all = promptSessions();
   if (all.length === 0) {
     return `<div class="pool-empty">Aucune demande trouvee</div>`;
   }
-  const matches = all.filter(promptMatches);
+  const matches = all.filter(promptSessionMatches);
   if (matches.length === 0) {
     return `<div class="pool-empty">Aucune demande ne correspond a « ${escapeHtml(promptSearch)} »</div>`;
   }
@@ -2315,25 +5144,29 @@ const renderPromptRows = () => {
     matches.length > shown.length
       ? `<div class="prompt-more">Affichage limite a ${PROMPT_RENDER_LIMIT} sur ${matches.length} resultats — affine la recherche.</div>`
       : "";
-  return `${shown.map(renderPromptRow).join("")}${capped}`;
+  return `${shown.map(renderPromptSession).join("")}${capped}`;
 };
 
 const renderPromptHistoryPanel = () => {
-  const total = promptHistory?.totalPrompts ?? 0;
   const returned = promptHistory?.returned ?? 0;
   const truncatedNote = promptHistory?.truncated ? ` · ${returned} plus recentes indexees` : "";
-  const countLabel = promptHistoryLoaded ? `${total} demande(s)${truncatedNote}` : "Lecture…";
+  const sessions = promptSessions();
+  const sessionCount = sessions.length;
+  const messageCount = sessions.reduce((sum, session) => sum + session.prompts.length, 0);
+  const countLabel = promptHistoryLoaded
+    ? `${sessionCount} chat(s) / terminal(aux) · ${messageCount} message(s)${truncatedNote}`
+    : "Lecture…";
   return `
     <section class="discussions-panel">
       <div class="discussions-head">
         <div>
-          <strong>Historique des demandes</strong>
+          <strong>Historique par chat ou terminal</strong>
           <span>${escapeHtml(countLabel)}</span>
         </div>
         <div class="discussions-tools">
           <label class="discussion-search">
             <i data-lucide="search"></i>
-            <input id="promptSearch" type="search" placeholder="Rechercher dans vos demandes (texte, dossier, compte)" value="${escapeAttr(promptSearch)}" />
+            <input id="promptSearch" type="search" placeholder="Rechercher dans les chats, terminaux et messages" value="${escapeAttr(promptSearch)}" />
           </label>
           <button id="refreshPromptHistory" class="tool-button" title="Actualiser">
             <i data-lucide="refresh-ccw"></i><span>Actualiser</span>
@@ -2356,7 +5189,14 @@ const refreshPromptList = () => {
   bindPromptRowUi();
 };
 
-const openDiscussionForSession = (sessionId: string) => {
+const openDiscussionForSession = (accountId: string, sessionId: string) => {
+  const discussion = allDiscussions().find(
+    (candidate) => candidate.accountId === accountId && candidate.sessionId === sessionId,
+  );
+  if (discussion) {
+    openDiscussionChat(discussion);
+    return;
+  }
   discussionSearch = sessionId;
   if (activeView === "discussions") {
     refreshDiscussionList();
@@ -2366,17 +5206,11 @@ const openDiscussionForSession = (sessionId: string) => {
 };
 
 const bindPromptRowUi = () => {
-  document.querySelectorAll<HTMLButtonElement>("[data-prompt-resume]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const sessionId = button.dataset.promptResume;
-      const accountId = button.dataset.promptAccount;
-      if (sessionId && accountId) void resumeSessionInTerminal(accountId, sessionId);
-    });
-  });
   document.querySelectorAll<HTMLButtonElement>("[data-prompt-discussion]").forEach((button) => {
     button.addEventListener("click", () => {
       const sessionId = button.dataset.promptDiscussion;
-      if (sessionId) openDiscussionForSession(sessionId);
+      const accountId = button.dataset.promptAccount;
+      if (accountId && sessionId) openDiscussionForSession(accountId, sessionId);
     });
   });
 };
@@ -2384,9 +5218,10 @@ const bindPromptRowUi = () => {
 const restoreTerminals = async () => {
   if (!settings) return;
   const state = loadOpenTerminalRecords();
-  const records = state.terminals.filter((record) =>
+  const eligibleRecords = state.terminals.filter((record) =>
     settings!.accounts.some((account) => account.id === record.accountId),
   );
+  const records = eligibleRecords.slice(0, EXPERT_MAX_TERMINALS);
   if (records.length === 0) return;
 
   const restored: TerminalSession[] = [];
@@ -2397,10 +5232,18 @@ const restoreTerminals = async () => {
       record.agentId && settings.agents.some((agent) => agent.id === record.agentId)
         ? record.agentId
         : codexAgentId();
-    const session = createTerminalSession(account, proxyForAccount(account), agentId);
+    const restoredWorkspace =
+      record.workspacePath ?? (!isRemoteMode() ? record.projectDir?.trim() || null : null);
+    const session = createTerminalSession(
+      account,
+      proxyForAccount(account),
+      agentId,
+      restoredWorkspace,
+    );
     session.key = record.key;
     session.codexSessionId = record.codexSessionId ?? null;
     session.resumeSessionId = record.codexSessionId ?? null;
+    session.projectDir = record.projectDir?.trim() || account.projectDir?.trim() || null;
     if (session.codexSessionId) claimedSessionIds.add(session.codexSessionId);
     terminalSessions.push(session);
     restored.push(session);
@@ -2411,8 +5254,9 @@ const restoreTerminals = async () => {
   activeTerminalKey =
     (state.activeKey && restored.some((session) => session.key === state.activeKey) && state.activeKey) ||
     restored[0].key;
-  activeView = "terminal";
-  render();
+  const restoredActive = activeTerminal();
+  if (restoredActive && activeView === "terminal") activateTerminalSession(restoredActive);
+  if (activeView === "terminal") render();
 
   for (const session of restored) {
     const command = isPlausibleSessionId(session.codexSessionId)
@@ -2421,6 +5265,9 @@ const restoreTerminals = async () => {
     await startTerminalSession(session, command);
   }
 
+  if (eligibleRecords.length > EXPERT_MAX_TERMINALS) {
+    statusText = `${EXPERT_MAX_TERMINALS} terminaux restaures; la limite de la fenetre est atteinte`;
+  }
   persistTerminalSessions();
 };
 
@@ -2612,25 +5459,80 @@ const pickProjectDir = async () => {
 };
 
 // --- Selecteur de workspace ----------------------------------------------
-// Ouvre le choix du dossier de travail global. Desktop : dialogue natif.
-// Web : modale de navigation des dossiers du serveur (borne a la racine).
-const openWorkspacePicker = async () => {
+// Ouvre le choix du dossier de travail actif ou celui du terminal en cours de
+// creation. Desktop : dialogue natif. Web : navigateur de dossiers du serveur.
+const workspacePickerPath = () =>
+  workspacePickerTarget === "new-terminal" ? newTerminalWorkspacePath : currentWorkspace();
+
+const chooseWorkspace = (
+  path: string | null,
+  target: WorkspacePickerTarget = workspacePickerTarget,
+) => {
+  const trimmed = path?.trim() || null;
+  if (target === "new-terminal") {
+    newTerminalWorkspacePath = trimmed;
+    if (trimmed) rememberWorkspace(trimmed);
+    statusText = trimmed
+      ? `Workspace du nouveau terminal: ${trimmed}`
+      : "Le nouveau terminal utilisera le dossier par defaut";
+  } else {
+    setCurrentWorkspace(trimmed);
+    setChatWorkspaceFilter(trimmed ? workspaceIdForPath(trimmed) : WORKSPACE_ALL);
+    pendingChatWorkspace = null;
+    if (trimmed) void upsertWorkspaceRegistry(trimmed);
+    activeView = "chat";
+    stopLimitPoll();
+    stopUsagePoll();
+    stopKombaiPoll();
+    stopRoomPoll();
+    startDiscussionsPoll();
+    statusText = trimmed ? `Workspace actif: ${trimmed}` : "Workspace actif retire";
+  }
+  workspaceModalOpen = false;
+  render();
+};
+
+// Selectionne le workspace cible depuis son groupe lateral. Tous les groupes
+// restent affiches ; un workspace reel devient le cwd des prochains chats.
+const selectWorkspaceFilter = (value: string) => {
+  setChatWorkspaceFilter(value);
+  pendingChatWorkspace = null;
+  if (value !== WORKSPACE_ALL && value !== WORKSPACE_UNKNOWN) {
+    const workspace = knownWorkspaces().find((ws) => ws.id === value);
+    if (workspace) {
+      setCurrentWorkspace(workspace.path);
+      void upsertWorkspaceRegistry(workspace.path);
+      statusText = `Workspace actif: ${workspace.label}`;
+    }
+  } else {
+    statusText =
+      value === WORKSPACE_UNKNOWN ? "Chats sans dossier" : "Toutes les conversations";
+  }
+  if (activeView !== "chat") {
+    setActiveView("chat");
+  } else {
+    render();
+  }
+};
+
+const openWorkspacePicker = async (target: WorkspacePickerTarget = "active") => {
+  workspacePickerTarget = target;
   if (isRemoteMode()) {
     workspaceModalOpen = true;
     workspaceBrowse = null;
     workspaceBrowseError = "";
     render();
-    await loadWorkspaceDir(currentWorkspace());
+    await loadWorkspaceDir(workspacePickerPath());
     return;
   }
 
   try {
     const picked = await invoke<string | null>("pick_project_dir", {
-      currentDir: currentWorkspace() ?? "",
+      currentDir: workspacePickerPath() ?? "",
     });
     if (picked) {
-      setCurrentWorkspace(picked);
-      statusText = `Workspace: ${picked}`;
+      chooseWorkspace(picked, target);
+      return;
     } else {
       statusText = "Selection annulee";
     }
@@ -2661,14 +5563,13 @@ const closeWorkspaceModal = () => {
   render();
 };
 
-const chooseWorkspace = (path: string | null) => {
-  setCurrentWorkspace(path);
-  workspaceModalOpen = false;
-  statusText = path ? `Workspace: ${path}` : "Workspace retire";
-  render();
-};
-
 const createPoolTerminal = async () => {
+  await ensureTerminalsRestored();
+  if (terminalSessions.length >= EXPERT_MAX_TERMINALS) {
+    statusText = `Limite atteinte: ${EXPERT_MAX_TERMINALS} terminaux maximum dans une fenetre`;
+    render();
+    return;
+  }
   try {
     const picked = await invoke<AccountProfile>("pool_pick_terminal_account");
     settings = await invoke<AppSettings>("load_settings");
@@ -2676,6 +5577,7 @@ const createPoolTerminal = async () => {
     activeView = "terminal";
     stopLimitPoll();
     stopUsagePoll();
+    stopChatSync();
     statusText = `Pool -> ${picked.label}`;
     render();
     await createNewTerminal(undefined, false, null, codexAgentId());
@@ -2732,7 +5634,8 @@ const syncSessionsForAccount = (account: AccountProfile) => {
   terminalSessions.forEach((session) => {
     if (session.accountId === account.id) {
       session.title = account.label;
-      session.projectDir = account.projectDir?.trim() || null;
+      // Le dossier/repo est un instantane du lancement. Modifier le compte ne
+      // doit pas reclasser un terminal deja ouvert dans un autre workspace.
       session.proxySummary = proxySummary;
     }
   });
@@ -2758,6 +5661,8 @@ function mobileViewLabel(view: AppView): string {
       return "Kombai";
     case "discussions":
       return "Discussions";
+    case "chat":
+      return "Conversation";
     case "history":
       return "Historique";
     case "room":
@@ -2776,7 +5681,12 @@ function syncMobileChrome(): void {
   if (!chrome) return;
   chrome.querySelectorAll<HTMLElement>(".m-tab[data-view]").forEach((tab) => {
     const view = tab.getAttribute("data-view");
-    const active = view === "terminal" ? activeView === "terminal" : activeView === view;
+    const active =
+      view === "discussions"
+        ? activeView === "discussions" || activeView === "chat"
+        : view === "terminal"
+          ? activeView === "terminal"
+          : activeView === view;
     tab.classList.toggle("active", active);
   });
   const title = document.getElementById("mTitle");
@@ -2790,6 +5700,28 @@ function syncMobileChrome(): void {
           : "Codex Terminal";
   }
 }
+
+const bindGlobalMobileListeners = () => {
+  if (globalMobileListenersBound) return;
+  globalMobileListenersBound = true;
+  document.addEventListener("click", (event) => {
+    if (
+      (event.target as HTMLElement).closest(
+        "[data-terminal-key],[data-close-terminal],[data-workspace-key],[data-new-terminal-workspace],#newTerminalSide,#workspaceAddSide",
+      )
+    ) {
+      document.body.classList.remove("m-drawer-open");
+    }
+  });
+  const refit = () => {
+    window.clearTimeout(mobileRefitTimer);
+    mobileRefitTimer = window.setTimeout(() => fitAndResizeVisibleTerminals(), 120);
+  };
+  window.visualViewport?.addEventListener("resize", refit);
+  window.addEventListener("orientationchange", () =>
+    window.setTimeout(() => fitAndResizeVisibleTerminals(), 280),
+  );
+};
 
 function ensureMobileChrome(): void {
   if (typeof document === "undefined" || !document.body) return;
@@ -2839,7 +5771,7 @@ function ensureMobileChrome(): void {
 
   const gotoView = (view: AppView) => {
     if (view === "terminal") {
-      if (activeView !== "terminal") setActiveView(activeView);
+      if (activeView !== "terminal") setActiveView("terminal");
     } else if (activeView !== view) {
       setActiveView(view);
     }
@@ -2887,48 +5819,544 @@ function ensureMobileChrome(): void {
     }
   });
 
-  // Choisir ou fermer un terminal dans la liste referme le tiroir.
-  document.addEventListener("click", (event) => {
-    if (
-      (event.target as HTMLElement).closest(
-        "[data-terminal-key],[data-close-terminal],#newTerminalSide",
-      )
-    ) {
-      document.body.classList.remove("m-drawer-open");
-    }
-  });
-
-  // Reajuste le terminal a l'ouverture/fermeture du clavier ou a la rotation.
-  let refitTimer = 0;
-  const refit = () => {
-    window.clearTimeout(refitTimer);
-    refitTimer = window.setTimeout(() => fitAndResizeActiveTerminal(), 120);
-  };
-  window.visualViewport?.addEventListener("resize", refit);
-  window.addEventListener("orientationchange", () =>
-    window.setTimeout(() => fitAndResizeActiveTerminal(), 280),
-  );
+  bindGlobalMobileListeners();
 
   createIcons({ icons: lucideIcons });
   syncMobileChrome();
 }
 
+type ChatWorkspaceSidebarGroup = {
+  id: string;
+  label: string;
+  path: string | null;
+  discussions: DiscussionSummary[];
+};
+
+// Les deux modes partagent la meme lecture des workspaces : tous les dossiers
+// restent visibles et leurs conversations sont rangees juste dessous.
+const chatWorkspaceSidebarGroups = (): ChatWorkspaceSidebarGroup[] => {
+  const groups = new Map<string, ChatWorkspaceSidebarGroup>();
+  knownWorkspaces().forEach((workspace) => {
+    groups.set(workspace.id, {
+      id: workspace.id,
+      label: workspace.label,
+      path: workspace.path,
+      discussions: [],
+    });
+  });
+
+  let unknown: ChatWorkspaceSidebarGroup | null = null;
+  allDiscussions().forEach((discussion) => {
+    const path = discussion.cwd?.trim();
+    if (!path) {
+      unknown ??= {
+        id: WORKSPACE_UNKNOWN,
+        label: "Sans workspace",
+        path: null,
+        discussions: [],
+      };
+      unknown.discussions.push(discussion);
+      return;
+    }
+
+    const id = workspaceIdForPath(path);
+    let group = groups.get(id);
+    if (!group) {
+      group = {
+        id,
+        label: workspaceBaseName(path),
+        path,
+        discussions: [],
+      };
+      groups.set(id, group);
+    }
+    group.discussions.push(discussion);
+  });
+
+  const result = [...groups.values()];
+  if (unknown) result.push(unknown);
+  return result;
+};
+
+const renderChatSidebarConversations = (): string => {
+  const query = chatSidebarSearch.trim().toLocaleLowerCase();
+  const activeWorkspacePath = currentWorkspace();
+  const activeWorkspaceId = activeWorkspacePath
+    ? workspaceIdForPath(activeWorkspacePath)
+    : null;
+  const sidebarDiscussion = interfaceMode === "expert"
+    ? activeExpertChatPane()?.discussion ?? null
+    : chatDiscussion;
+  const activeDiscussionWorkspaceId = sidebarDiscussion?.cwd?.trim()
+    ? workspaceIdForPath(sidebarDiscussion.cwd)
+    : sidebarDiscussion
+      ? WORKSPACE_UNKNOWN
+      : null;
+
+  if (!discussionsLoaded) {
+    return `<div class="chat-side-empty"><span class="chat-loader"></span>Chargement…</div>`;
+  }
+
+  const renderedGroups = chatWorkspaceSidebarGroups()
+    .map((group) => {
+      const groupMatches = query
+        ? [group.label, group.path ?? ""].some((value) =>
+            value.toLocaleLowerCase().includes(query),
+          )
+        : false;
+      const discussions = group.discussions
+        .filter((discussion) => {
+          if (!query || groupMatches) return true;
+          return [
+            discussion.title ?? "",
+            discussion.preview ?? "",
+            discussion.cwd ?? "",
+            discussion.accountLabel,
+            providerLabel(discussion.provider ?? "codex"),
+          ].some((value) => value.toLocaleLowerCase().includes(query));
+        })
+        .sort((left, right) => right.lastActivity - left.lastActivity);
+
+      if (query && !groupMatches && !discussions.length) return "";
+
+      const isWorkspaceActive = group.id === activeWorkspaceId;
+      const containsActiveDiscussion = group.id === activeDiscussionWorkspaceId;
+      const detail = group.path ?? "Conversations sans dossier";
+      const workspaceHead = group.path
+        ? `<button type="button" class="chat-workspace-select" data-ws-select="${escapeAttr(group.id)}" title="Activer ${escapeAttr(detail)}">
+            <span class="chat-workspace-mark"><i data-lucide="folder-open"></i></span>
+            <span class="chat-workspace-copy"><strong>${escapeHtml(group.label)}</strong><small>${escapeHtml(detail)}</small></span>
+            <span class="chat-workspace-count">${group.discussions.length}</span>
+          </button>
+          <button type="button" class="chat-workspace-new" data-new-chat-workspace="${escapeAttr(group.id)}" title="Nouvelle conversation dans ${escapeAttr(group.label)}" aria-label="Nouvelle conversation dans ${escapeAttr(group.label)}">
+            <i data-lucide="plus"></i>
+          </button>`
+        : `<div class="chat-workspace-select chat-workspace-select-static" title="${escapeAttr(detail)}">
+            <span class="chat-workspace-mark"><i data-lucide="folder-x"></i></span>
+            <span class="chat-workspace-copy"><strong>${escapeHtml(group.label)}</strong><small>${escapeHtml(detail)}</small></span>
+            <span class="chat-workspace-count">${group.discussions.length}</span>
+          </div>`;
+
+      const terminals = discussions.length
+        ? discussions
+            .map((discussion) => {
+            const openedPane =
+              interfaceMode === "expert"
+                ? expertChatPanes.find((pane) => pane.discussion?.sessionId === discussion.sessionId)
+                : null;
+            const active = interfaceMode === "expert"
+              ? !!openedPane
+              : chatDiscussion?.sessionId === discussion.sessionId;
+            const current = interfaceMode === "expert"
+              ? openedPane?.key === activeExpertChatKey
+              : active;
+            const title = discussion.title?.trim() || "Conversation sans titre";
+            const busy = discussionBusyId === discussion.sessionId;
+            const draggable = !busy && !discussionHasRunningTurn(discussion);
+            return `
+              <div class="chat-side-item ${active ? "active" : ""} ${current ? "current" : ""} ${busy ? "moving" : ""}" draggable="${draggable}" data-drag-chat="${escapeAttr(discussion.sessionId)}" aria-busy="${busy}">
+                  <span class="chat-side-drag-handle" title="Glisser vers un autre workspace" aria-hidden="true"><i data-lucide="grip-vertical"></i></span>
+                  <button type="button" class="chat-side-open" data-open-chat="${escapeAttr(discussion.sessionId)}" title="${escapeAttr(title)}">
+                    <span class="chat-side-active"></span>
+                    <i class="chat-side-terminal-icon" data-lucide="message-square"></i>
+                    <span class="chat-side-copy">
+                      <strong>${escapeHtml(title)}</strong>
+                      <small>${escapeHtml(discussion.accountLabel)} · ${escapeHtml(providerLabel(discussion.provider ?? "codex"))}</small>
+                    </span>
+                  </button>
+                  <button type="button" class="chat-side-delete" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Supprimer la conversation" aria-label="Supprimer ${escapeAttr(title)}">
+                    <i data-lucide="trash-2"></i>
+                  </button>
+                </div>`;
+            })
+            .join("")
+        : `<div class="chat-workspace-empty">Aucune conversation</div>`;
+
+      return `
+        <section class="chat-workspace-group ${isWorkspaceActive ? "active" : ""} ${containsActiveDiscussion ? "contains-active" : ""}" ${group.path ? `data-chat-drop-workspace="${escapeAttr(group.id)}"` : ""}>
+          <div class="chat-workspace-head">${workspaceHead}</div>
+          <div class="chat-workspace-terminals">${terminals}</div>
+        </section>`;
+    })
+    .join("");
+
+  if (renderedGroups) return renderedGroups;
+  return `<div class="chat-side-empty">${query ? "Aucun resultat" : "Aucun workspace — ouvrez un dossier pour commencer"}</div>`;
+};
+
+// Signature legere de l'en-tete : evite tout churn DOM au poll quand les
+// workspaces et le nombre total de conversations n'ont pas change.
+const workspaceSwitcherSignature = (): string => {
+  const all = allDiscussions();
+  const counts = new Map<string, number>();
+  all.forEach((discussion) => {
+    if (discussion.cwd?.trim()) {
+      const id = workspaceIdForPath(discussion.cwd);
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+  });
+  const ws = knownWorkspaces()
+    .map((workspace) => `${workspace.id}:${counts.get(workspace.id) ?? 0}`)
+    .join(",");
+  return `${all.length}|${ws}`;
+};
+
+// En-tete compact de la liste. Les workspaces eux-memes ne sont plus caches
+// dans un menu : ils sont tous affiches dans renderChatSidebarConversations().
+const renderWorkspaceSwitcher = (): string => {
+  const workspaces = knownWorkspaces();
+  const all = allDiscussions();
+  const workspaceLabel = workspaces.length === 1 ? "1 workspace" : `${workspaces.length} workspaces`;
+  const conversationLabel = all.length === 1 ? "1 conversation" : `${all.length} conversations`;
+
+  return `
+    <section class="chat-workspace-overview" id="chatWsSwitcher" data-ws-sig="${escapeAttr(workspaceSwitcherSignature())}">
+      <span class="chat-workspace-overview-mark"><i data-lucide="folders"></i></span>
+      <span class="chat-workspace-overview-copy">
+        <strong>Workspaces</strong>
+        <small>${escapeHtml(`${workspaceLabel} · ${conversationLabel}`)}</small>
+      </span>
+      <button type="button" id="wsOpenFolder" class="chat-workspace-add" title="Choisir ou ajouter un workspace" aria-label="Choisir ou ajouter un workspace">
+        <i data-lucide="folder-plus"></i>
+      </button>
+    </section>`;
+};
+
+const appViewTitle = (view: AppView): string => {
+  switch (view) {
+    case "pool":
+      return "Comptes et pool";
+    case "limits":
+      return "Limites";
+    case "dashboard":
+      return "Statistiques";
+    case "kombai":
+      return "Kombai";
+    case "discussions":
+      return "Toutes les conversations";
+    case "history":
+      return "Historique";
+    case "room":
+      return "Salon d'agents";
+    case "audit":
+      return "Audit de l'interface";
+    case "skills":
+      return "Bibliotheque de skills";
+    case "settings":
+      return "Paramètres";
+    default:
+      return "Conversation";
+  }
+};
+
+// Page « Paramètres » : regroupe la configuration de l'app. Le compte/pool
+// (anciennement dans la barre latérale) vit désormais ici ; l'entrée latérale
+// affiche à la place « Discussions » (reprise d'une conversation dans un autre
+// compte). Chaque carte ouvre la vue/modale dédiée existante.
+const renderSettingsPanel = (): string => {
+  const accountCount = settings?.accounts.length ?? 0;
+  const poolRunning = poolStatus?.running ?? false;
+  return `
+    <div class="panel settings-panel">
+      <div class="panel-head">
+        <div>
+          <h2>Paramètres</h2>
+          <p class="panel-sub">Comptes, pool et configuration de l'application</p>
+        </div>
+      </div>
+      <div class="settings-cards">
+        <button type="button" id="settingsAccounts" class="settings-card">
+          <span class="settings-card-icon"><i data-lucide="server"></i></span>
+          <span class="settings-card-copy">
+            <strong>Comptes &amp; pool</strong>
+            <small>${accountCount} compte(s) · pool ${poolRunning ? "actif" : "arrêté"}</small>
+          </span>
+        </button>
+        <button type="button" id="settingsAgents" class="settings-card">
+          <span class="settings-card-icon"><i data-lucide="bot"></i></span>
+          <span class="settings-card-copy">
+            <strong>Réglages des agents</strong>
+            <small>Fournisseurs, modèles et commandes de lancement</small>
+          </span>
+        </button>
+      </div>
+    </div>`;
+};
+
+const renderActiveAppPanel = (): string => {
+  switch (activeView) {
+    case "terminal":
+      return renderExpertTerminalGrid();
+    case "pool":
+      return renderPoolPanel();
+    case "limits":
+      return renderLimitsPanel();
+    case "dashboard":
+      return renderDashboardPanel();
+    case "kombai":
+      return renderKombaiPanel();
+    case "discussions":
+      return renderDiscussionsPanel();
+    case "history":
+      return renderPromptHistoryPanel();
+    case "room":
+      return renderRoomPanel();
+    case "audit":
+      return renderAuditPanel();
+    case "skills":
+      return renderSkillsPanel();
+    case "settings":
+      return renderSettingsPanel();
+    default:
+      return renderChatPanel(chatPanelModel());
+  }
+};
+
+const renderInterfaceModeSwitch = (extraClass = "") => `
+  <div class="interface-mode-switch ${extraClass}" role="group" aria-label="Mode d'interface">
+    <button type="button" data-interface-mode="simple" class="${interfaceMode === "simple" ? "active" : ""}" aria-pressed="${interfaceMode === "simple"}">
+      <i data-lucide="app-window"></i><span>Simple</span>
+    </button>
+    <button type="button" data-interface-mode="expert" class="${interfaceMode === "expert" ? "active" : ""}" aria-pressed="${interfaceMode === "expert"}">
+      <i data-lucide="messages-square"></i><span>Expert</span><small>16</small>
+    </button>
+  </div>
+`;
+
+const renderExpertTerminalGrid = () => {
+  const sessions = expertTerminalSessions();
+  const slotCount = Math.max(2, sessions.length);
+  const columns = expertGridColumnCount(slotCount);
+  const rows = Math.ceil(slotCount / columns);
+  const panes = sessions
+    .map((session, index) => {
+      const sessionAgentLabel = agentById(session.agentId)?.label ?? session.agentId;
+      const workspaceLabel = session.workspacePath
+        ? workspaceBaseName(session.workspacePath)
+        : session.projectDir
+          ? workspaceBaseName(session.projectDir)
+          : "Dossier par defaut";
+      return `
+        <article class="expert-terminal-pane ${session.key === activeTerminalKey ? "active" : ""} ${session.running ? "running" : ""}" data-expert-terminal-pane="${escapeAttr(session.key)}">
+          <header class="expert-terminal-pane-head">
+            <button type="button" class="expert-pane-identity" data-focus-terminal="${escapeAttr(session.key)}" title="Activer ${escapeAttr(terminalTitle(session))}">
+              <span class="expert-pane-index">${index + 1}</span>
+              <span class="live-dot ${session.running ? "on" : ""}"></span>
+              <span class="expert-pane-copy">
+                <strong>${escapeHtml(terminalTitle(session))}</strong>
+                <small>${escapeHtml(`${workspaceLabel} · ${sessionAgentLabel}`)}</small>
+              </span>
+            </button>
+            <span class="expert-pane-status">${escapeHtml(session.ptyId ? `PTY ${session.ptyId}` : session.status)}</span>
+            <button type="button" class="expert-pane-close" data-close-terminal="${escapeAttr(session.key)}" title="Fermer ce terminal" aria-label="Fermer ${escapeAttr(terminalTitle(session))}">
+              <i data-lucide="x"></i>
+            </button>
+          </header>
+          <div class="expert-terminal-host" data-terminal-host="${escapeAttr(session.key)}"></div>
+        </article>
+      `;
+    })
+    .join("");
+  const emptySlots = Array.from({ length: Math.max(0, columns * rows - sessions.length) }, (_, index) => `
+    <button type="button" class="expert-terminal-empty" data-add-expert-terminal ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
+      <span class="expert-empty-icon"><i data-lucide="plus"></i></span>
+      <strong>${sessions.length === 0 && index === 0 ? "Ouvrir le premier terminal" : "Ajouter un terminal"}</strong>
+      <small>Compte, agent et workspace au choix</small>
+    </button>
+  `).join("");
+
+  return `
+    <div class="expert-terminal-wall" style="--expert-columns: ${columns}; --expert-rows: ${rows}" aria-label="Mur de ${sessions.length} terminaux">
+      ${panes}${emptySlots}
+    </div>
+  `;
+};
+
+const renderExpertChatGrid = () => {
+  const count = expertChatPanes.length;
+  expertChatPage = clampExpertChatPage(expertChatPage, count, expertChatsPerPage);
+  const totalPages = expertChatPageTotal();
+  const pagePanes = visibleExpertChatPanes();
+  const rows = expertChatRowCount(expertChatsPerPage);
+  const firstVisible = count ? expertChatPage * expertChatsPerPage + 1 : 0;
+  const lastVisible = expertChatPage * expertChatsPerPage + pagePanes.length;
+  return `
+    <section class="expert-chat-workspace" aria-label="${count} chats ouverts, page ${expertChatPage + 1} sur ${totalPages}">
+      <header class="expert-chat-toolbar">
+        <div>
+          <span class="expert-chat-toolbar-mark"><i data-lucide="messages-square"></i></span>
+          <span><strong>Chats ouverts</strong><small>Cliquez sur un chat pour afficher sa zone de saisie</small></span>
+        </div>
+        <div class="expert-chat-toolbar-actions">
+          <span class="expert-chat-count" title="Aucun plafond logiciel"><strong>${count}</strong> chat${count > 1 ? "s" : ""}</span>
+          <label class="expert-grid-control expert-page-size-control" title="Nombre de chats affiches sur chaque page">
+            <span><i data-lucide="app-window"></i><small>Par page</small></span>
+            <select id="expertChatPageSize" aria-label="Nombre de chats par page">
+              <option value="6" ${expertChatsPerPage === 6 ? "selected" : ""}>6 chats</option>
+              <option value="9" ${expertChatsPerPage === 9 ? "selected" : ""}>9 chats</option>
+            </select>
+          </label>
+          <nav class="expert-chat-pagination" aria-label="Pages de chats">
+            <button id="expertChatPrevPage" type="button" ${expertChatPage === 0 ? "disabled" : ""} title="Page precedente" aria-label="Page precedente">
+              <i data-lucide="chevron-left"></i>
+            </button>
+            <span aria-live="polite" title="Chats ${firstVisible} a ${lastVisible} sur ${count}"><strong>${expertChatPage + 1}</strong><small>/ ${totalPages}</small></span>
+            <button id="expertChatNextPage" type="button" ${expertChatPage + 1 >= totalPages ? "disabled" : ""} title="Page suivante" aria-label="Page suivante">
+              <i data-lucide="chevron-right"></i>
+            </button>
+          </nav>
+          <button id="addExpertChat" type="button" class="tool-button primary" title="Ajouter un chat a la fin">
+            <i data-lucide="plus"></i><span>Nouveau chat</span>
+          </button>
+        </div>
+      </header>
+      <div class="expert-chat-wall" style="--expert-chat-columns: ${EXPERT_CHAT_COLUMN_COUNT}; --expert-chat-rows: ${rows}" aria-label="Chats ${firstVisible} a ${lastVisible}">
+        ${pagePanes.map(renderExpertChatPane).join("")}
+      </div>
+    </section>`;
+};
+
+const renderChatFirstShell = () => {
+  const account = chatSelectedAccount();
+  const isChat = activeView === "chat";
+  const visibleSidebarWidth = displayedChatSidebarWidth();
+  const sidebarMaxWidth = chatSidebarMaxWidth(window.innerWidth);
+  const activeWorkspacePath = currentWorkspace();
+  const newChatTitle = activeWorkspacePath
+    ? `Nouvelle conversation dans ${workspaceBaseName(activeWorkspacePath)}`
+    : "Nouvelle conversation dans le dossier par defaut";
+  if (interfaceMode === "expert") captureAllExpertChatScroll();
+  else captureChatFeedScroll();
+  document.querySelector(".m-chrome")?.remove();
+  document.body.classList.remove("m-drawer-open", "m-sheet-open", "chat-sidebar-resizing");
+
+  app.innerHTML = `
+    <div class="layout chat-app-layout ${isChat ? "is-chat" : "is-admin"} ${interfaceMode === "expert" ? "is-expert" : "is-simple"} ${visibleSidebarWidth === 0 ? "is-sidebar-collapsed" : ""}" style="--chat-sidebar-width: ${visibleSidebarWidth}px">
+      <aside class="sidebar chat-app-sidebar" id="chatAppSidebar">
+        <header class="chat-side-brand">
+          <button type="button" id="chatHome" class="chat-brand-button" title="Accueil des conversations">
+            <span class="chat-brand-mark"><i data-lucide="sparkles"></i></span>
+            <span><strong>Switch</strong><small>Agent workspace</small></span>
+          </button>
+          <button type="button" id="chatSidebarClose" class="icon-button chat-sidebar-close" aria-label="Fermer le menu"><i data-lucide="x"></i></button>
+        </header>
+
+        ${renderWorkspaceSwitcher()}
+
+        <button type="button" id="newChatSide" class="chat-side-new" title="${escapeAttr(newChatTitle)}">
+          <i data-lucide="plus"></i><span>${interfaceMode === "expert" ? "Ajouter un chat" : "Nouvelle conversation"}</span><kbd>${interfaceMode === "expert" ? expertChatPanes.length : "Ctrl N"}</kbd>
+        </button>
+        <label class="chat-side-search">
+          <i data-lucide="search"></i>
+          <input id="chatSidebarSearch" type="search" value="${escapeAttr(chatSidebarSearch)}" placeholder="Rechercher partout" aria-label="Rechercher dans tous les workspaces" />
+        </label>
+        <nav class="chat-side-conversations" id="chatSideConversations" aria-label="Workspaces et conversations">${renderChatSidebarConversations()}</nav>
+
+        <nav class="chat-side-tools" aria-label="Outils">
+          <button id="sideDiscussions" class="${activeView === "discussions" ? "active" : ""}" title="Discussions — reprendre une conversation dans un autre compte"><i data-lucide="messages-square"></i><span>Discussions</span></button>
+          <button id="dashboardToggle" class="${activeView === "dashboard" ? "active" : ""}" title="Statistiques"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
+          <button id="limitsToggle" class="${activeView === "limits" ? "active" : ""}" title="Limites"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
+          <button id="roomToggle" class="${activeView === "room" ? "active" : ""}" title="Salon d'agents"><i data-lucide="users"></i><span>Salon</span></button>
+          <button id="skillsToggle" class="${activeView === "skills" ? "active" : ""}" title="Skills"><i data-lucide="library"></i><span>Skills</span></button>
+        </nav>
+
+        ${renderInterfaceModeSwitch("chat-mode-switch")}
+
+        <footer class="chat-side-footer">
+          <button id="settingsToggle" class="icon-button ${activeView === "settings" ? "active" : ""}" title="Paramètres (comptes, pool)"><i data-lucide="settings"></i></button>
+          <button id="manageAgents" class="icon-button" title="Reglages des agents"><i data-lucide="bot"></i></button>
+        </footer>
+      </aside>
+      <div
+        id="chatSidebarResizer"
+        class="chat-sidebar-resizer"
+        role="separator"
+        tabindex="0"
+        aria-label="Redimensionner la colonne des conversations"
+        aria-orientation="vertical"
+        aria-controls="chatAppSidebar chatMainWorkspace"
+        aria-valuemin="${CHAT_SIDEBAR_MIN_WIDTH}"
+        aria-valuemax="${sidebarMaxWidth}"
+        aria-valuenow="${visibleSidebarWidth}"
+        aria-valuetext="${visibleSidebarWidth === 0 ? "Colonne masquée" : `${visibleSidebarWidth} pixels`}"
+        title="Faire glisser pour redimensionner · Double-cliquer pour réinitialiser"
+      ></div>
+      <button type="button" id="chatSidebarScrim" class="chat-sidebar-scrim" aria-label="Fermer le menu"></button>
+
+      <main class="workspace chat-main-workspace" id="chatMainWorkspace">
+        ${isChat
+          ? interfaceMode === "expert"
+            ? renderExpertChatGrid()
+            : renderActiveAppPanel()
+          : `<header class="chat-admin-head">
+              <button type="button" id="adminBackChat" class="icon-button"><i data-lucide="arrow-left"></i></button>
+              <div><strong>${escapeHtml(appViewTitle(activeView))}</strong><span>${escapeHtml(statusText)}</span></div>
+              <div class="chat-admin-actions">
+                ${activeView !== "discussions" ? `<button id="discussionsToggle" class="tool-button"><i data-lucide="messages-square"></i><span>Conversations</span></button>` : ""}
+                <button id="kombaiToggle" class="icon-button" title="Kombai"><i data-lucide="bot"></i></button>
+                <button id="historyToggle" class="icon-button" title="Historique"><i data-lucide="history"></i></button>
+                <button id="auditToggle" class="icon-button" title="Audit"><i data-lucide="scan-eye"></i></button>
+              </div>
+            </header>
+            <section class="terminal-shell chat-admin-panel">${renderActiveAppPanel()}</section>`}
+        <div class="chat-status-toast" aria-live="polite">${escapeHtml(statusText)}</div>
+      </main>
+    </div>
+    ${renderNewTerminalModal()}
+    ${renderAgentsModal()}
+    ${renderWorkspaceModal()}
+    ${renderCodexModelSuggestions()}
+  `;
+
+  createIcons({ icons: lucideIcons });
+  bindUi();
+  if (interfaceMode === "expert") {
+    bindExpertChatGridUi();
+  } else {
+    const chatFeed = document.querySelector<HTMLDivElement>("#chatFeed");
+    if (chatFeed) {
+      bindChatFeedScroll(chatFeed);
+      restoreChatFeedScroll(chatFeed);
+    }
+  }
+  if (activeView === "terminal") mountExpertTerminals();
+};
+
 const render = () => {
+  if (draggedChatSessionId) clearChatDragUi();
   if (!settings) {
     app.innerHTML = `<main class="boot">Chargement</main>`;
     return;
   }
+
+  const activeEl = document.activeElement;
+  focusedTerminalKeyBeforeRender =
+    (activeEl &&
+      terminalSessions.find((session) => session.terminal.element?.contains(activeEl))?.key) ||
+    null;
 
   terminalSessions.forEach((session) => {
     const element = session.terminal.element;
     element?.parentElement?.removeChild(element);
   });
 
+  document.body.classList.toggle("interface-simple", interfaceMode === "simple");
+  document.body.classList.toggle("interface-expert", interfaceMode === "expert");
+
+  renderChatFirstShell();
+};
+
+// Ancienne coque plein ecran des terminaux, conservee pour les outils PTY
+// historiques. Le selecteur Simple/Expert n'utilise plus cette coque.
+const renderLegacyTerminalShell = () => {
+  if (!settings || !app) return;
+
   const account = selectedAccount();
   const proxiesEnabled = proxyControlsEnabled();
   const proxy = selectedProxy();
   const activeSession = activeTerminal();
   const activeRunning = activeSession?.running ?? false;
+  const terminalActionReturnsToGrid = activeView !== "terminal";
   const agent = activeAgent();
   const agentOptions = settings.agents
     .map(
@@ -2939,23 +6367,31 @@ const render = () => {
   const contextProxy = proxiesEnabled
     ? (activeSession?.proxySummary ?? (proxy ? maskProxy(proxy.proxyUrl) : "sans proxy"))
     : "proxy off";
-  const contextProject = displayProjectDir(activeSession?.projectDir ?? account?.projectDir);
+  const contextProject = displayProjectDir(
+    activeSession?.workspacePath ?? activeSession?.projectDir ?? account?.projectDir,
+  );
   const workspacePath = currentWorkspace();
   const workspaceChipLabel = workspacePath ? workspaceBaseName(workspacePath) : "Workspace";
   const workspaceTitle = workspacePath
-    ? `Workspace des nouveaux agents: ${workspacePath}`
-    : "Aucun workspace: les nouveaux agents demarrent dans le dossier par defaut";
+    ? `Workspace actif et des prochains terminaux: ${workspacePath}`
+    : "Aucun workspace actif: les nouveaux terminaux utilisent le dossier par defaut";
   const terminalCountLabel =
     terminalSessions.length === 1 ? "1 terminal" : `${terminalSessions.length} terminaux`;
-  const terminalSideItems = terminalSessions
-    .map(
-      (session) => `
+  const workspaceSideItems = terminalWorkspaceGroups()
+    .map((group) => {
+      const groupActive = group.sessions.some((session) => session.key === activeTerminalKey) ||
+        (!activeSession && group.path && workspacePath &&
+          normalizeWorkspacePath(group.path) === normalizeWorkspacePath(workspacePath));
+      const terminals = group.sessions
+        .map((session) => {
+          const sessionAgentLabel = agentById(session.agentId)?.label ?? session.agentId;
+          return `
         <div class="terminal-side-item ${session.key === activeTerminalKey ? "active" : ""}">
           <button class="terminal-side-button" data-terminal-key="${escapeAttr(session.key)}" title="${escapeAttr(terminalTitle(session))}">
             <i data-lucide="square-terminal"></i>
             <span class="terminal-side-main">
               <span class="terminal-side-title">${escapeHtml(terminalTitle(session))}</span>
-              <span class="terminal-side-meta">${escapeHtml(`${session.ptyId ? `#${session.ptyId}` : session.status} | ${displayProjectDir(session.projectDir)}`)}</span>
+              <span class="terminal-side-meta">${escapeHtml(`${session.ptyId ? `#${session.ptyId}` : session.status} · ${sessionAgentLabel}`)}</span>
             </span>
             <span class="live-dot ${session.running ? "on" : ""}"></span>
           </button>
@@ -2963,45 +6399,59 @@ const render = () => {
             <i data-lucide="x"></i>
           </button>
         </div>
-      `,
-    )
-    .join("");
-  const sessionTabs = terminalSessions
-    .map(
-      (session) => `
-        <div class="terminal-tab-item ${session.key === activeTerminalKey ? "active" : ""}">
-          <button class="terminal-tab" data-terminal-key="${escapeAttr(session.key)}" title="${escapeAttr(terminalTitle(session))}">
-            <i data-lucide="square-terminal"></i>
-            <span>${escapeHtml(terminalTitle(session))}</span>
-            <small>${session.ptyId ? `#${session.ptyId}` : escapeHtml(session.status)}</small>
-          </button>
-          <button class="tab-close" data-close-terminal="${escapeAttr(session.key)}" title="Fermer terminal">
-            <i data-lucide="x"></i>
-          </button>
-        </div>
-      `,
-    )
+      `;
+        })
+        .join("");
+      return `
+        <section class="workspace-side-group ${groupActive ? "active" : ""}">
+          <div class="workspace-side-head">
+            <button class="workspace-side-select" data-workspace-key="${escapeAttr(group.key)}" title="${escapeAttr(group.detail)}">
+              <i data-lucide="folder-open"></i>
+              <span class="workspace-side-copy">
+                <strong>${escapeHtml(group.label)}</strong>
+                <small>${escapeHtml(group.detail)}</small>
+              </span>
+              <span class="workspace-terminal-count">${group.sessions.length}</span>
+            </button>
+            ${group.selectable
+              ? `<button class="workspace-side-new" data-new-terminal-workspace="${escapeAttr(group.key)}" title="${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "Limite de 16 terminaux atteinte" : `Nouveau terminal dans ${escapeAttr(group.label)}`}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
+                <i data-lucide="plus"></i>
+              </button>`
+              : ""}
+          </div>
+          <div class="terminal-side-list">${terminals || `<div class="workspace-empty">Aucun terminal</div>`}</div>
+        </section>
+      `;
+    })
     .join("");
 
   app.innerHTML = `
     <div class="layout">
       <aside class="sidebar">
-        <header class="brand">
-          <i data-lucide="square-terminal"></i>
-          <div>
-            <strong>Codex Terminal</strong>
-            <span>${escapeHtml(terminalCountLabel)}</span>
+        <header class="brand expert-brand">
+          <div class="expert-brand-copy">
+            <i data-lucide="square-terminal"></i>
+            <span>
+              <strong>Switch Terminals</strong>
+              <small>${escapeHtml(terminalCountLabel)} · 16 maximum</small>
+            </span>
           </div>
+          ${renderInterfaceModeSwitch("expert-mode-switch")}
         </header>
 
         <section class="side-section">
           <div class="section-row">
-            <span>Terminaux</span>
-            <button class="icon-button" id="newTerminalSide" title="Nouveau terminal">
-              <i data-lucide="plus"></i>
-            </button>
+            <span>Workspaces</span>
+            <span class="section-actions">
+              <button class="icon-button" id="workspaceAddSide" title="Choisir ou ajouter un workspace">
+                <i data-lucide="folder-open"></i>
+              </button>
+              <button class="icon-button" id="newTerminalSide" title="${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "Limite de 16 terminaux atteinte" : "Nouveau terminal dans le workspace actif"}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
+                <i data-lucide="plus"></i>
+              </button>
+            </span>
           </div>
-          <div class="terminal-side-list">${terminalSideItems || `<div class="empty">Aucun terminal ouvert</div>`}</div>
+          <div class="workspace-side-list">${workspaceSideItems}</div>
         </section>
       </aside>
 
@@ -3010,11 +6460,22 @@ const render = () => {
           <div class="session-title">
             <span class="live-dot ${activeRunning ? "on" : ""}"></span>
             <div>
-              <strong>${escapeHtml(activeSession ? terminalTitle(activeSession) : (account?.label ?? "Aucun terminal"))}</strong>
-              <span>${escapeHtml(`${contextProxy} | ${contextProject}`)}</span>
+              <strong id="expertActiveTitle">${escapeHtml(activeSession ? terminalTitle(activeSession) : (account?.label ?? "Aucun terminal"))}</strong>
+              <span id="expertActiveMeta">${escapeHtml(`${contextProxy} | ${contextProject}`)}</span>
             </div>
           </div>
           <div class="actions">
+            ${activeView === "terminal"
+              ? `<label class="expert-grid-control" title="Disposition du mur de terminaux">
+                  <span><i data-lucide="square-terminal"></i><strong>${terminalSessions.length}</strong><small>/ ${EXPERT_MAX_TERMINALS}</small></span>
+                  <select id="expertGridLayout" aria-label="Nombre de colonnes">
+                    <option value="auto" ${expertGridLayout === "auto" ? "selected" : ""}>Auto</option>
+                    <option value="2" ${expertGridLayout === "2" ? "selected" : ""}>2 col.</option>
+                    <option value="3" ${expertGridLayout === "3" ? "selected" : ""}>3 col.</option>
+                    <option value="4" ${expertGridLayout === "4" ? "selected" : ""}>4 col.</option>
+                  </select>
+                </label>`
+              : ""}
             <div class="workspace-control" title="${escapeAttr(workspaceTitle)}">
               <button id="workspacePick" class="tool-button ${workspacePath ? "primary" : ""}" title="${escapeAttr(workspaceTitle)}">
                 <i data-lucide="folder-open"></i>
@@ -3065,9 +6526,9 @@ const render = () => {
               <i data-lucide="library"></i>
               <span>Skills</span>
             </button>
-            <button id="newTerminal" class="tool-button primary" title="Nouveau terminal">
-              <i data-lucide="plus"></i>
-              <span>Terminal</span>
+            <button id="expertTerminalAction" class="tool-button primary" title="${terminalActionReturnsToGrid ? "Revenir au mur de terminaux" : terminalSessions.length >= EXPERT_MAX_TERMINALS ? "Limite de 16 terminaux atteinte" : "Nouveau terminal"}" ${!terminalActionReturnsToGrid && terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
+              <i data-lucide="${terminalActionReturnsToGrid ? "square-terminal" : "plus"}"></i>
+              <span>${terminalActionReturnsToGrid ? "Terminaux" : "Nouveau"}</span>
             </button>
             <button id="poolTerminal" class="tool-button" title="Terminal depuis le pool">
               <i data-lucide="shuffle"></i>
@@ -3098,26 +6559,28 @@ const render = () => {
           </div>
         </header>
 
-        <section class="terminal-shell">
-          ${activeView === "pool"
-            ? renderPoolPanel()
-            : activeView === "limits"
-              ? renderLimitsPanel()
-              : activeView === "dashboard"
-                ? renderDashboardPanel()
-                : activeView === "kombai"
-                  ? renderKombaiPanel()
-                  : activeView === "discussions"
-                    ? renderDiscussionsPanel()
-                    : activeView === "history"
-                      ? renderPromptHistoryPanel()
-                      : activeView === "room"
-                        ? renderRoomPanel()
-                        : activeView === "audit"
-                          ? renderAuditPanel()
-                          : activeView === "skills"
-                            ? renderSkillsPanel()
-                            : `<div id="terminal"></div>`}
+        <section class="terminal-shell ${activeView === "terminal" ? "expert-terminal-shell" : ""}">
+          ${activeView === "terminal"
+            ? renderExpertTerminalGrid()
+            : activeView === "pool"
+              ? renderPoolPanel()
+              : activeView === "limits"
+                ? renderLimitsPanel()
+                : activeView === "dashboard"
+                  ? renderDashboardPanel()
+                  : activeView === "kombai"
+                    ? renderKombaiPanel()
+                    : activeView === "discussions"
+                      ? renderDiscussionsPanel()
+                      : activeView === "history"
+                        ? renderPromptHistoryPanel()
+                        : activeView === "room"
+                          ? renderRoomPanel()
+                          : activeView === "audit"
+                            ? renderAuditPanel()
+                            : activeView === "skills"
+                              ? renderSkillsPanel()
+                              : renderChatPanel(chatPanelModel())}
         </section>
 
         <footer class="statusbar">
@@ -3134,7 +6597,7 @@ const render = () => {
 
   createIcons({ icons: lucideIcons });
   bindUi();
-  mountActiveTerminal();
+  if (activeView === "terminal") mountExpertTerminals();
   ensureMobileChrome();
 };
 
@@ -3311,7 +6774,7 @@ const renderNewTerminalModal = () => {
         <header class="modal-head">
           <div>
             <h2 id="newTerminalTitle">Nouveau terminal</h2>
-            <p>Choisis l'agent et le compte a utiliser pour cette session.</p>
+            <p>Chaque terminal garde le workspace choisi pour toute sa session.</p>
           </div>
           <button class="icon-button" id="closeNewTerminalModal" title="Fermer">
             <i data-lucide="x"></i>
@@ -3332,6 +6795,15 @@ const renderNewTerminalModal = () => {
                 ${accountOptions || `<option value="">Aucun compte</option>`}
               </select>
             </label>
+            <label>
+              <span>Workspace de ce terminal</span>
+              <div class="field-row">
+                <input id="newTerminalWorkspace" value="${escapeAttr(newTerminalWorkspacePath ?? "")}" placeholder="${escapeAttr(isRemoteMode() ? "/chemin/du/serveur" : "C:\\chemin\\vers\\workspace")}" spellcheck="false" />
+                <button id="pickNewTerminalWorkspace" type="button" class="icon-button" title="Choisir le workspace">
+                  <i data-lucide="folder-open"></i>
+                </button>
+              </div>
+            </label>
             <div class="account-create-box">
               <strong>Ajouter un nouvel environnement</strong>
               <div class="account-create-grid">
@@ -3340,14 +6812,21 @@ const renderNewTerminalModal = () => {
                   <input id="newTerminalAccountLabel" value="${escapeAttr(newTerminalAccountLabel)}" placeholder="perso, pro, client" />
                 </label>
                 <label>
-                  <span>Modele par defaut</span>
-                  <input id="newAccountModel" list="codexModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${DEFAULT_CODEX_MODEL}" />
+                  <span>Fournisseur</span>
+                  <select id="newAccountProvider">
+                    <option value="codex" ${newTerminalAccountProvider === "codex" ? "selected" : ""}>Codex (ChatGPT)</option>
+                    <option value="claude" ${newTerminalAccountProvider === "claude" ? "selected" : ""}>Claude Code</option>
+                  </select>
                 </label>
                 <label>
-                  <span>Intensite par defaut</span>
+                  <span>Modele par defaut</span>
+                  <input id="newAccountModel" list="codexModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${DEFAULT_CODEX_MODEL} / sonnet" />
+                </label>
+                <label title="Intensite de raisonnement : Codex uniquement (ignoree pour Claude)">
+                  <span>Intensite (Codex)</span>
                   <select id="newAccountReasoningEffort">${reasoningEffortOptions(newTerminalAccountReasoningEffort)}</select>
                 </label>
-                <label class="modal-check" title="Sans approbations et sans sandbox Codex">
+                <label class="modal-check" title="Sans approbations / sans sandbox (Codex : bypass ; Claude : skip permissions)">
                   <input id="newAccountBypass" type="checkbox" ${newTerminalAccountBypass ? "checked" : ""} />
                   <span>Mode bypass</span>
                 </label>
@@ -3505,15 +6984,16 @@ const renderWorkspaceModal = () => {
         </button>`,
     )
     .join("");
-  const selected = currentWorkspace();
+  const selected = workspacePickerPath();
+  const pickingForTerminal = workspacePickerTarget === "new-terminal";
 
   return `
     <div class="modal-backdrop" id="workspaceBackdrop">
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="workspaceModalTitle">
         <header class="modal-head">
           <div>
-            <h2 id="workspaceModalTitle">Choisir un workspace</h2>
-            <p>Dossier du serveur ou demarreront les prochains agents (cwd).</p>
+            <h2 id="workspaceModalTitle">${pickingForTerminal ? "Workspace du nouveau terminal" : "Choisir le workspace actif"}</h2>
+            <p>${pickingForTerminal ? "Ce dossier sera fixe pour cette session." : "Les prochains terminaux seront crees dans ce dossier."}</p>
           </div>
           <button class="icon-button" id="closeWorkspaceModal" title="Fermer">
             <i data-lucide="x"></i>
@@ -3528,7 +7008,7 @@ const renderWorkspaceModal = () => {
               <span>Aller</span>
             </button>
           </div>
-          ${selected ? `<div class="ws-current">Workspace actuel : <strong>${escapeHtml(selected)}</strong></div>` : ""}
+          ${selected ? `<div class="ws-current">Selection : <strong>${escapeHtml(selected)}</strong></div>` : ""}
           ${data?.parent
             ? `<button class="ws-entry ws-parent" data-ws-dir="${escapeAttr(data.parent)}" title="${escapeAttr(data.parent)}">
                  <i data-lucide="folder-open"></i>
@@ -3542,7 +7022,7 @@ const renderWorkspaceModal = () => {
 
         <footer class="modal-actions">
           <button class="tool-button" id="cancelWorkspaceModal">Annuler</button>
-          <button class="tool-button" id="clearWorkspaceModal">Aucun workspace</button>
+          <button class="tool-button" id="clearWorkspaceModal">Dossier par defaut</button>
           <button class="tool-button primary" id="confirmWorkspaceModal" ${data?.path ? "" : "disabled"}>
             <i data-lucide="badge-check"></i>
             <span>Choisir ce dossier</span>
@@ -4205,33 +7685,39 @@ const formatMonthLabel = (date: string) => {
   }).format(parsed);
 };
 
-const defaultCodexHomeForLabel = (label: string) => {
-  const slug = label
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
-  return isRemoteMode()
-    ? `${userHomeHint()}/${slug || "account"}`
-    : `${userHomeHint()}\\.codex-${slug || "account"}`;
+const defaultCodexHomeForLabel = (label: string, provider: Provider = "codex") => {
+  const slug =
+    label
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "") || "account";
+  if (isRemoteMode()) {
+    return `${userHomeHint()}/${provider === "claude" ? "claude-" : ""}${slug}`;
+  }
+  // Home isole par compte : `.codex-<slug>` (CODEX_HOME) ou `.claude-<slug>`
+  // (CLAUDE_CONFIG_DIR).
+  const prefix = provider === "claude" ? ".claude-" : ".codex-";
+  return `${userHomeHint()}\\${prefix}${slug}`;
 };
 
 const normalizeCodexHome = (value: string) => value.trim().replaceAll("/", "\\").toLowerCase();
 
-const uniqueCodexHomeForLabel = (label: string) => {
+const uniqueCodexHomeForLabel = (label: string, provider: Provider = "codex") => {
   const used = new Set((settings?.accounts ?? []).map((account) => normalizeCodexHome(account.codexHome)));
-  let candidate = defaultCodexHomeForLabel(label);
+  let candidate = defaultCodexHomeForLabel(label, provider);
   if (!used.has(normalizeCodexHome(candidate))) return candidate;
 
   for (let index = 2; index < 1000; index += 1) {
-    candidate = defaultCodexHomeForLabel(`${label}-${index}`);
+    candidate = defaultCodexHomeForLabel(`${label}-${index}`, provider);
     if (!used.has(normalizeCodexHome(candidate))) return candidate;
   }
 
-  return defaultCodexHomeForLabel(`${label}-${Date.now().toString(36)}`);
+  return defaultCodexHomeForLabel(`${label}-${Date.now().toString(36)}`, provider);
 };
 
 type NewAccountPreferences = {
+  provider?: Provider;
   bypass?: boolean;
   model?: string | null;
   reasoningEffort?: string | null;
@@ -4239,21 +7725,27 @@ type NewAccountPreferences = {
 
 const newAccountProfile = (
   label: string,
-  codexHome = defaultCodexHomeForLabel(label),
+  codexHome: string | undefined = undefined,
   projectDir: string | null = null,
   proxyId: string | null = null,
   preferences: NewAccountPreferences = {},
-): AccountProfile => ({
-  id: uid("account"),
-  label,
-  codexHome,
-  projectDir,
-  proxyId,
-  startupCommand: null,
-  bypass: preferences.bypass ?? settings?.codexBypass ?? true,
-  model: preferences.model?.trim() || DEFAULT_CODEX_MODEL,
-  reasoningEffort: normalizeCodexReasoningEffort(preferences.reasoningEffort),
-});
+): AccountProfile => {
+  const provider = preferences.provider ?? "codex";
+  return {
+    id: uid("account"),
+    label,
+    provider,
+    codexHome: codexHome ?? defaultCodexHomeForLabel(label, provider),
+    projectDir,
+    proxyId,
+    startupCommand: null,
+    bypass: preferences.bypass ?? settings?.codexBypass ?? true,
+    model: preferences.model?.trim() || providerDefaultModel(provider),
+    // L'intensite de raisonnement ne concerne que Codex ; on la laisse par
+    // defaut pour Claude (le backend l'ignore).
+    reasoningEffort: normalizeCodexReasoningEffort(preferences.reasoningEffort),
+  };
+};
 
 const refreshPoolAfterAccountChange = async (message: string) => {
   if (poolStatus?.running) {
@@ -4323,16 +7815,23 @@ const addPoolAccount = async () => {
   }
 };
 
-const openNewTerminalModal = () => {
+const openNewTerminalModal = (workspacePath: string | null | undefined = undefined) => {
   if (!settings) return;
+  if (terminalSessions.length >= EXPERT_MAX_TERMINALS) {
+    statusText = `Limite atteinte: ${EXPERT_MAX_TERMINALS} terminaux maximum dans une fenetre`;
+    render();
+    return;
+  }
   newTerminalAccountId = selectedAccountId || settings.defaultAccountId || settings.accounts[0]?.id || null;
   newTerminalAgentId = settings.activeAgentId || settings.agents[0]?.id || null;
+  newTerminalWorkspacePath =
+    workspacePath === undefined ? currentWorkspace() : workspacePath?.trim() || null;
   newTerminalAccountLabel = "";
   newTerminalAccountBypass = settings.codexBypass ?? true;
   newTerminalAccountModel = DEFAULT_CODEX_MODEL;
   newTerminalAccountReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
   newTerminalModalOpen = true;
-  statusText = "Choisis l'agent et le compte du nouveau terminal";
+  statusText = "Choisis le workspace, l'agent et le compte du nouveau terminal";
   render();
 };
 
@@ -4417,6 +7916,9 @@ const readNewTerminalModalForm = () => {
   const account = settings.accounts.find((candidate) => candidate.id === newTerminalAccountId);
   if (!account) return null;
 
+  newTerminalWorkspacePath =
+    document.querySelector<HTMLInputElement>("#newTerminalWorkspace")?.value.trim() || null;
+
   account.codexHome =
     document.querySelector<HTMLInputElement>("#newTerminalCodexHome")?.value.trim() ||
     account.codexHome ||
@@ -4446,6 +7948,8 @@ const readNewTerminalAccountDraft = () => {
   newTerminalAccountLabel =
     document.querySelector<HTMLInputElement>("#newTerminalAccountLabel")?.value.trim() ??
     newTerminalAccountLabel;
+  const providerValue = document.querySelector<HTMLSelectElement>("#newAccountProvider")?.value;
+  newTerminalAccountProvider = providerValue === "claude" ? "claude" : "codex";
   newTerminalAccountBypass =
     document.querySelector<HTMLInputElement>("#newAccountBypass")?.checked ??
     newTerminalAccountBypass;
@@ -4469,20 +7973,110 @@ const addAccountFromModal = () => {
     return;
   }
 
+  // Si l'utilisateur passe en Claude sans toucher au champ modele (encore sur le
+  // defaut Codex), on laisse le defaut Claude s'appliquer plutot que d'heriter
+  // d'un modele Codex incoherent.
+  const model =
+    newTerminalAccountProvider === "claude" && newTerminalAccountModel === DEFAULT_CODEX_MODEL
+      ? null
+      : newTerminalAccountModel;
   const account = newAccountProfile(label, undefined, null, null, {
+    provider: newTerminalAccountProvider,
     bypass: newTerminalAccountBypass,
-    model: newTerminalAccountModel,
+    model,
     reasoningEffort: newTerminalAccountReasoningEffort,
   });
   settings.accounts.push(account);
   selectedAccountId = account.id;
   newTerminalAccountId = account.id;
   newTerminalAccountLabel = "";
-  statusText = `Compte ajoute (${account.bypass ? "bypass" : "sandbox"}, ${account.model}, ${account.reasoningEffort})`;
+  const providerNote = providerLabel(accountProvider(account));
+  const loginHint =
+    account.provider === "claude" ? " — lance-le puis tape /login pour t'authentifier" : "";
+  statusText = `Compte ${providerNote} ajoute (${account.bypass ? "bypass" : "sandbox"}, ${account.model})${loginHint}`;
   render();
 };
 
 const bindUi = () => {
+  bindChatSidebarResizer();
+
+  document.querySelectorAll<HTMLButtonElement>("[data-interface-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const mode = button.dataset.interfaceMode === "expert" ? "expert" : "simple";
+      void setInterfaceMode(mode);
+    });
+  });
+
+  document.querySelector<HTMLSelectElement>("#expertGridLayout")?.addEventListener("change", (event) => {
+    const value = (event.currentTarget as HTMLSelectElement).value;
+    expertGridLayout = value === "2" || value === "3" || value === "4" ? value : "auto";
+    localStorage.setItem(EXPERT_GRID_LAYOUT_STORAGE_KEY, expertGridLayout);
+    statusText = expertGridLayout === "auto" ? "Disposition automatique" : `${expertGridLayout} colonnes`;
+    render();
+  });
+
+  document.querySelector<HTMLSelectElement>("#expertChatPageSize")?.addEventListener("change", (event) => {
+    captureAllExpertChatScroll();
+    expertChatsPerPage = normalizeExpertChatPageSize(
+      (event.currentTarget as HTMLSelectElement).value,
+    );
+    localStorage.setItem(EXPERT_CHATS_PER_PAGE_STORAGE_KEY, String(expertChatsPerPage));
+    reconcileExpertChatPage();
+    statusText = `${expertChatsPerPage} chats par page · ${expertChatStatusText()}`;
+    persistExpertChats();
+    render();
+  });
+
+  document.querySelector<HTMLButtonElement>("#expertChatPrevPage")?.addEventListener("click", () => {
+    setExpertChatPage(expertChatPage - 1);
+  });
+  document.querySelector<HTMLButtonElement>("#expertChatNextPage")?.addEventListener("click", () => {
+    setExpertChatPage(expertChatPage + 1);
+  });
+
+  document.querySelector<HTMLButtonElement>("#addExpertChat")?.addEventListener("click", addExpertChatPane);
+
+  document.querySelectorAll<HTMLButtonElement>("[data-add-expert-terminal]").forEach((button) => {
+    button.addEventListener("click", () => openNewTerminalModal());
+  });
+
+  const focusExpertSession = (session: TerminalSession, focus = false) => {
+    activateTerminalSession(session);
+    statusText = `Terminal actif: ${terminalTitle(session)}`;
+    document.querySelectorAll<HTMLElement>("[data-expert-terminal-pane]").forEach((pane) => {
+      pane.classList.toggle("active", pane.dataset.expertTerminalPane === session.key);
+    });
+    document.querySelectorAll<HTMLElement>(".terminal-side-item").forEach((item) => {
+      const key = item.querySelector<HTMLElement>("[data-terminal-key]")?.dataset.terminalKey;
+      item.classList.toggle("active", key === session.key);
+    });
+    const title = document.querySelector<HTMLElement>("#expertActiveTitle");
+    const meta = document.querySelector<HTMLElement>("#expertActiveMeta");
+    if (title) title.textContent = terminalTitle(session);
+    if (meta) {
+      meta.textContent = `${session.proxySummary} | ${displayProjectDir(session.workspacePath ?? session.projectDir)}`;
+    }
+    persistTerminalSessions();
+    if (focus) session.terminal.focus();
+  };
+
+  document.querySelectorAll<HTMLButtonElement>("[data-focus-terminal]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const session = terminalSessions.find((candidate) => candidate.key === button.dataset.focusTerminal);
+      if (session) focusExpertSession(session, true);
+    });
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-expert-terminal-pane]").forEach((pane) => {
+    pane.addEventListener("pointerdown", (event) => {
+      if ((event.target as HTMLElement).closest("[data-close-terminal]")) return;
+      const session = terminalSessions.find(
+        (candidate) => candidate.key === pane.dataset.expertTerminalPane,
+      );
+      if (session && session.key !== activeTerminalKey) focusExpertSession(session);
+    });
+  });
+
   document.querySelectorAll<HTMLButtonElement>("[data-account]").forEach((button) => {
     button.addEventListener("click", () => {
       selectedAccountId = button.dataset.account ?? null;
@@ -4493,19 +8087,64 @@ const bindUi = () => {
 
   document.querySelectorAll<HTMLButtonElement>("[data-terminal-key]").forEach((button) => {
     button.addEventListener("click", () => {
-      activeTerminalKey = button.dataset.terminalKey ?? null;
-      const session = activeTerminal();
-      if (session) {
-        selectedAccountId = session.accountId;
-        if (settings && session.agentId && settings.agents.some((agent) => agent.id === session.agentId)) {
-          settings.activeAgentId = session.agentId;
-        }
-      }
+      const session = terminalSessions.find(
+        (candidate) => candidate.key === button.dataset.terminalKey,
+      );
+      if (!session) return;
+      activateTerminalSession(session);
+      requestTerminalFocusKey = session.key;
+      activeView = "terminal";
+      stopLimitPoll();
+      stopUsagePoll();
+      stopKombaiPoll();
+      stopDiscussionsPoll();
+      stopRoomPoll();
+      stopChatSync();
       statusText = "Terminal selectionne";
       render();
       persistTerminalSessions();
     });
   });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-workspace-key]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const group = terminalWorkspaceGroups().find(
+        (candidate) => candidate.key === button.dataset.workspaceKey,
+      );
+      if (!group) return;
+      const session =
+        group.sessions.find((candidate) => candidate.key === activeTerminalKey) ?? group.sessions[0];
+      if (session) {
+        activateTerminalSession(session);
+      } else {
+        activeTerminalKey = null;
+        setCurrentWorkspace(group.path);
+      }
+      activeView = "terminal";
+      stopLimitPoll();
+      stopUsagePoll();
+      stopKombaiPoll();
+      stopDiscussionsPoll();
+      stopRoomPoll();
+      stopChatSync();
+      statusText = `Workspace actif: ${group.label}`;
+      render();
+      persistTerminalSessions();
+    });
+  });
+
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-new-terminal-workspace]")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        const group = terminalWorkspaceGroups().find(
+          (candidate) => candidate.key === button.dataset.newTerminalWorkspace,
+        );
+        if (!group) return;
+        setCurrentWorkspace(group.path);
+        openNewTerminalModal(group.path);
+      });
+    });
 
   document.querySelectorAll<HTMLButtonElement>("[data-close-terminal]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -4548,11 +8187,19 @@ const bindUi = () => {
   });
 
   document.querySelector<HTMLButtonElement>("#workspacePick")?.addEventListener("click", () => {
-    void openWorkspacePicker();
+    void openWorkspacePicker("active");
   });
 
+  document.querySelector<HTMLButtonElement>("#workspaceAddSide")?.addEventListener("click", () => {
+    void openWorkspacePicker("active");
+  });
+
+  // Switcher de workspace (barre laterale du chat) : selection d'un dossier /
+  // filtre, ou ouverture d'un nouveau dossier.
+  bindWorkspaceSwitcherUi();
+
   document.querySelector<HTMLButtonElement>("#workspaceClear")?.addEventListener("click", () => {
-    chooseWorkspace(null);
+    chooseWorkspace(null, "active");
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-ws-dir]").forEach((button) => {
@@ -4581,7 +8228,7 @@ const bindUi = () => {
   });
 
   document.querySelector<HTMLButtonElement>("#clearWorkspaceModal")?.addEventListener("click", () => {
-    chooseWorkspace(null);
+    chooseWorkspace(null, workspacePickerTarget);
   });
 
   document.querySelector<HTMLButtonElement>("#cancelWorkspaceModal")?.addEventListener("click", () => {
@@ -4598,12 +8245,22 @@ const bindUi = () => {
     }
   });
 
-  document.querySelector<HTMLButtonElement>("#newTerminal")?.addEventListener("click", () => {
+  document.querySelector<HTMLButtonElement>("#expertTerminalAction")?.addEventListener("click", () => {
+    if (activeView !== "terminal") {
+      setActiveView("terminal");
+      return;
+    }
     openNewTerminalModal();
   });
 
   document.querySelector<HTMLButtonElement>("#newTerminalSide")?.addEventListener("click", () => {
     openNewTerminalModal();
+  });
+
+  document.querySelector<HTMLButtonElement>("#pickNewTerminalWorkspace")?.addEventListener("click", () => {
+    readNewTerminalAccountDraft();
+    readNewTerminalModalForm();
+    void openWorkspacePicker("new-terminal");
   });
 
   document.querySelector<HTMLButtonElement>("#closeNewTerminalModal")?.addEventListener("click", () => {
@@ -4648,7 +8305,14 @@ const bindUi = () => {
       return;
     }
     newTerminalModalOpen = false;
-    void createNewTerminal(account.id, true, null, newTerminalAgentId);
+    void createNewTerminal(
+      account.id,
+      true,
+      null,
+      newTerminalAgentId,
+      null,
+      newTerminalWorkspacePath,
+    );
   });
 
   document.querySelector<HTMLButtonElement>("#loginNewTerminal")?.addEventListener("click", () => {
@@ -4665,7 +8329,14 @@ const bindUi = () => {
       return;
     }
     newTerminalModalOpen = false;
-    void createNewTerminal(account.id, true, agentSubcommand(agent, agent.loginCommand), agent.id);
+    void createNewTerminal(
+      account.id,
+      true,
+      agentSubcommand(agent, agent.loginCommand),
+      agent.id,
+      null,
+      newTerminalWorkspacePath,
+    );
   });
 
   document.querySelector<HTMLButtonElement>("#poolTerminal")?.addEventListener("click", () => {
@@ -4678,6 +8349,22 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#poolToggle")?.addEventListener("click", () => {
     setActiveView("pool");
+  });
+
+  // Barre latérale : « Discussions » (à la place de l'ancien « Comptes ») ouvre
+  // la liste des conversations avec le sélecteur de compte de reprise.
+  document.querySelector<HTMLButtonElement>("#sideDiscussions")?.addEventListener("click", () => {
+    setActiveView("discussions");
+  });
+  // « Paramètres » : page dédiée qui héberge désormais l'accès Comptes & pool.
+  document.querySelector<HTMLButtonElement>("#settingsToggle")?.addEventListener("click", () => {
+    setActiveView("settings");
+  });
+  document.querySelector<HTMLButtonElement>("#settingsAccounts")?.addEventListener("click", () => {
+    setActiveView("pool");
+  });
+  document.querySelector<HTMLButtonElement>("#settingsAgents")?.addEventListener("click", () => {
+    openAgentsModal();
   });
 
   document.querySelector<HTMLButtonElement>("#limitsToggle")?.addEventListener("click", () => {
@@ -4784,8 +8471,163 @@ const bindUi = () => {
     setActiveView("discussions");
   });
 
+  const returnToChat = () => {
+    activeView = "chat";
+    statusText = interfaceMode === "expert"
+      ? expertChatStatusText()
+      : chatDiscussion ? "Conversation" : "Nouveau chat";
+    if (interfaceMode === "expert") startAllExpertChatWork();
+    else if (chatDiscussion) startChatSync();
+    render();
+  };
+  document.querySelector<HTMLButtonElement>("#chatHome")?.addEventListener("click", returnToChat);
+  document.querySelector<HTMLButtonElement>("#adminBackChat")?.addEventListener("click", returnToChat);
+  document.querySelector<HTMLButtonElement>("#newChatSide")?.addEventListener("click", openNewChat);
+  document.querySelector<HTMLButtonElement>("#chatSidebarClose")?.addEventListener("click", () => {
+    document.body.classList.remove("chat-sidebar-open");
+  });
+  document.querySelector<HTMLButtonElement>("#chatSidebarScrim")?.addEventListener("click", () => {
+    document.body.classList.remove("chat-sidebar-open");
+  });
+  document.querySelector<HTMLInputElement>("#chatSidebarSearch")?.addEventListener("input", (event) => {
+    chatSidebarSearch = (event.currentTarget as HTMLInputElement).value;
+    const host = document.querySelector<HTMLElement>("#chatSideConversations");
+    if (host) {
+      host.innerHTML = renderChatSidebarConversations();
+      createIcons({ icons: lucideIcons });
+      bindDiscussionRowUi();
+      bindWorkspaceSwitcherUi(host);
+    }
+  });
+
   document.querySelector<HTMLButtonElement>("#refreshDiscussions")?.addEventListener("click", () => {
     void refreshDiscussions();
+  });
+
+  // Vue conversation : navigation, composer, arret et copie des blocs de code.
+  document.querySelector<HTMLButtonElement>("#chatBack")?.addEventListener("click", () => {
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      document.body.classList.add("chat-sidebar-open");
+    } else {
+      setActiveView("discussions");
+    }
+  });
+  document.querySelector<HTMLButtonElement>("#chatRefresh")?.addEventListener("click", () => {
+    if (chatDiscussion) void loadChatTranscript();
+    else void refreshDiscussions();
+  });
+  document.querySelector<HTMLButtonElement>("#chatHistoryToggle")?.addEventListener("click", () => {
+    chatHistoryOpen = !chatHistoryOpen;
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#chatHistoryClose")?.addEventListener("click", () => {
+    chatHistoryOpen = false;
+    render();
+  });
+  document.querySelectorAll<HTMLButtonElement>("#chatPanel [data-chat-history-message]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.chatHistoryMessage);
+      if (!Number.isInteger(index)) return;
+      const reveal = () => {
+        const message = document.querySelector<HTMLElement>(`#chat-message-${index}`);
+        message?.scrollIntoView({ behavior: "smooth", block: "center" });
+        message?.classList.add("chat-msg--located");
+        window.setTimeout(() => message?.classList.remove("chat-msg--located"), 1400);
+      };
+      if (window.matchMedia("(max-width: 760px)").matches) {
+        chatHistoryOpen = false;
+        render();
+        window.requestAnimationFrame(reveal);
+      } else {
+        reveal();
+      }
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#chatNew")?.addEventListener("click", openNewChat);
+  document.querySelector<HTMLButtonElement>("#chatStop")?.addEventListener("click", () => {
+    void stopCurrentChatTurn();
+  });
+
+  const chatPrompt = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+  const resizeChatPrompt = () => {
+    if (!chatPrompt) return;
+    chatPrompt.style.height = "0px";
+    chatPrompt.style.height = `${Math.min(chatPrompt.scrollHeight, 190)}px`;
+  };
+  chatPrompt?.addEventListener("input", () => {
+    chatDraft = chatPrompt.value;
+    resizeChatPrompt();
+  });
+  chatPrompt?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      void sendChatMessage();
+    }
+  });
+  resizeChatPrompt();
+  document.querySelector<HTMLFormElement>("#chatComposer")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendChatMessage();
+  });
+  document.querySelector<HTMLSelectElement>("#chatAccount")?.addEventListener("change", (event) => {
+    chatAccountId = (event.currentTarget as HTMLSelectElement).value;
+    selectedAccountId = chatAccountId;
+    render();
+    void loadChatModelCatalog(chatAccountId);
+  });
+  document.querySelector<HTMLSelectElement>("#chatMode")?.addEventListener("change", (event) => {
+    chatMode = (event.currentTarget as HTMLSelectElement).value as ChatMode;
+  });
+  const chatModelInput = document.querySelector<HTMLInputElement>("#chatModel");
+  const commitChatPreferences = () => {
+    const account = chatSelectedAccount();
+    if (!account) return false;
+    const preferences = readChatPreferences(account);
+    chatModelInput?.setCustomValidity(preferences.error ?? "");
+    if (preferences.error) {
+      chatModelInput?.reportValidity();
+      statusText = preferences.error;
+      return false;
+    }
+    if (preferences.changed) persistChatPreferences(account.id);
+    return true;
+  };
+  chatModelInput?.addEventListener("input", () => chatModelInput.setCustomValidity(""));
+  chatModelInput?.addEventListener("change", () => {
+    if (commitChatPreferences()) render();
+  });
+  chatModelInput?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    chatModelInput.blur();
+  });
+  document
+    .querySelector<HTMLSelectElement>("#chatReasoningEffort")
+    ?.addEventListener("change", commitChatPreferences);
+  document.querySelectorAll<HTMLButtonElement>("#chatPanel [data-chat-starter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      chatDraft = button.dataset.chatStarter ?? "";
+      const prompt = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+      if (prompt) {
+        prompt.value = chatDraft;
+        prompt.dispatchEvent(new Event("input"));
+        prompt.focus();
+        prompt.setSelectionRange(prompt.value.length, prompt.value.length);
+      }
+    });
+  });
+  // Delegation sur le conteneur : les boutons copier sont recrees a chaque
+  // patch du fil, le listener sur #chatFeed (stable) les couvre tous.
+  document.querySelector<HTMLDivElement>("#chatFeed")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement | null;
+    const button = target?.closest<HTMLButtonElement>(".chat-code-copy");
+    if (!button) return;
+    const code = button.closest(".chat-code")?.querySelector("code")?.textContent ?? "";
+    if (!code) return;
+    void navigator.clipboard.writeText(code).then(() => {
+      button.classList.add("copied");
+      window.setTimeout(() => button.classList.remove("copied"), 1200);
+    });
   });
 
   document.querySelector<HTMLInputElement>("#discussionSearch")?.addEventListener("input", (event) => {
@@ -5065,6 +8907,7 @@ const createTerminalSession = (
   account: AccountProfile,
   proxy: ProxyProfile | null,
   agentId: string,
+  workspacePath: string | null | undefined = undefined,
 ): TerminalSession => {
   const terminal = new Terminal({
     cursorBlink: true,
@@ -5073,30 +8916,41 @@ const createTerminalSession = (
     fontSize: 13,
     lineHeight: 1.15,
     theme: {
-      background: "#151513",
-      foreground: "#e8e1d2",
-      cursor: "#ffd166",
-      selectionBackground: "#355f52",
-      black: "#151513",
+      // Noir & blanc profond : chrome du terminal en niveaux de gris (fond
+      // noir absolu, texte/curseur blancs). Les couleurs ANSI (red/green/...)
+      // restent fonctionnelles pour la lisibilite des sorties (git diff, ls...).
+      background: "#000000",
+      foreground: "#f4f4f4",
+      cursor: "#ffffff",
+      selectionBackground: "#3a3a3a",
+      black: "#1a1a1a",
       red: "#f06f6c",
       green: "#8fd694",
       yellow: "#ffd166",
       blue: "#78a6d9",
       magenta: "#d29bd9",
       cyan: "#6ec6bd",
-      white: "#e8e1d2",
-      brightBlack: "#6f6a5d",
+      white: "#f4f4f4",
+      brightBlack: "#6a6a6a",
       brightRed: "#ff8a82",
       brightGreen: "#a7e9aa",
       brightYellow: "#ffe08a",
       brightBlue: "#94c1f0",
       brightMagenta: "#e7b3ef",
       brightCyan: "#8de1d7",
-      brightWhite: "#fff8ea",
+      brightWhite: "#ffffff",
     },
   });
   const fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
+
+  const requestedWorkspace =
+    workspacePath === undefined ? currentWorkspace() : workspacePath?.trim() || null;
+  // Sur desktop, le dossier projet du compte est deja le cwd historique : on
+  // le materialise comme workspace pour classer correctement la session. En
+  // web, projectDir est une URL Git et reste donc separee.
+  const capturedWorkspace =
+    requestedWorkspace ?? (!isRemoteMode() ? account.projectDir?.trim() || null : null);
 
   const session: TerminalSession = {
     key: uid("terminal"),
@@ -5104,6 +8958,7 @@ const createTerminalSession = (
     accountId: account.id,
     agentId,
     title: account.label,
+    workspacePath: capturedWorkspace,
     projectDir: account.projectDir?.trim() || null,
     proxySummary: proxy ? maskProxy(proxy.proxyUrl) : "sans proxy",
     status: "Pret",
@@ -5125,31 +8980,27 @@ const createTerminalSession = (
   return session;
 };
 
-const mountActiveTerminal = () => {
-  const host = document.querySelector<HTMLDivElement>("#terminal");
-  if (!host) return;
+const mountExpertTerminals = () => {
+  const sessions = expertTerminalSessions();
+  const sessionByKey = new Map(sessions.map((session) => [session.key, session]));
+  const fontSize = sessions.length > 9 ? 10 : sessions.length > 4 ? 11 : 12;
 
-  const session = activeTerminal();
-  host.innerHTML = "";
-
-  if (!session) {
-    host.classList.add("empty-terminal");
-    host.innerHTML = `<div class="terminal-placeholder">Ouvre un terminal avec le bouton +</div>`;
-    return;
-  }
-
-  host.classList.remove("empty-terminal");
-
-  if (session.terminal.element) {
-    host.appendChild(session.terminal.element);
-  } else {
-    session.terminal.open(host);
-  }
-
-  queueMicrotask(() => {
-    fitAndResizeActiveTerminal();
-    session.terminal.focus();
+  document.querySelectorAll<HTMLDivElement>("[data-terminal-host]").forEach((host) => {
+    const session = sessionByKey.get(host.dataset.terminalHost ?? "");
+    if (!session) return;
+    session.terminal.options.fontSize = fontSize;
+    if (session.terminal.element) {
+      host.appendChild(session.terminal.element);
+    } else {
+      session.terminal.open(host);
+    }
   });
+
+  const modalOpen = newTerminalModalOpen || agentsModalOpen || workspaceModalOpen;
+  const focusKey = requestTerminalFocusKey ?? focusedTerminalKeyBeforeRender;
+  if (!modalOpen && focusKey) sessionByKey.get(focusKey)?.terminal.focus();
+  requestTerminalFocusKey = null;
+  requestAnimationFrame(() => fitAndResizeExpertTerminals());
 };
 
 const createNewTerminal = async (
@@ -5158,56 +9009,105 @@ const createNewTerminal = async (
   commandOverride: string | null = null,
   agentId: string | null = null,
   resumeSessionId: string | null = null,
+  workspacePath: string | null | undefined = undefined,
 ) => {
-  if (!settings) return;
+  if (!settings) return null;
+
+  activeView = "terminal";
+  await ensureTerminalsRestored();
+  if (terminalSessions.length + pendingTerminalCreations >= EXPERT_MAX_TERMINALS) {
+    statusText = `Limite atteinte: ${EXPERT_MAX_TERMINALS} terminaux maximum dans une fenetre`;
+    render();
+    return null;
+  }
+  pendingTerminalCreations += 1;
+  let terminalSlotReserved = true;
+  const releaseTerminalSlot = () => {
+    if (terminalSlotReserved) {
+      terminalSlotReserved = false;
+      pendingTerminalCreations -= 1;
+    }
+  };
 
   if (!settingsAlreadyRead) {
     readSettingsForm();
   }
   const account = settings.accounts.find((candidate) => candidate.id === accountId) ?? null;
-  if (!account) return;
+  if (!account) {
+    releaseTerminalSlot();
+    return null;
+  }
 
   const agents = settings.agents;
   const activeId = settings.activeAgentId ?? null;
-  const chosenAgentId =
+  let chosenAgentId =
     (agentId && agents.some((agent) => agent.id === agentId) && agentId) ||
     (activeId && agents.some((agent) => agent.id === activeId) && activeId) ||
     agents[0]?.id ||
     "codex";
 
+  // L'agent CLI lance doit correspondre au provider du compte : un compte Claude
+  // se lance avec l'agent Claude (CLAUDE_CONFIG_DIR + `claude`), un compte Codex
+  // avec Codex. Sinon la variable de home et la commande se contrediraient. On
+  // ne force que pour les agents CLI "premier rang" (on laisse les agents IDE /
+  // customs intacts).
+  const wantedProvider = accountProvider(account);
+  const chosenAgent = agentById(chosenAgentId);
+  if (isFirstPartyAgent(chosenAgent) && agentProvider(chosenAgent) !== wantedProvider) {
+    chosenAgentId = providerAgentId(wantedProvider);
+  }
+
   selectedAccountId = account.id;
   settings.defaultAccountId = account.id;
   settings.activeAgentId = chosenAgentId;
-  settings = await invoke<AppSettings>("save_settings", { settings });
+  try {
+    settings = await invoke<AppSettings>("save_settings", { settings });
+  } catch (error) {
+    releaseTerminalSlot();
+    throw error;
+  }
 
   const savedAccount = settings.accounts.find((candidate) => candidate.id === account.id) ?? null;
-  if (!savedAccount) return;
+  if (!savedAccount) {
+    releaseTerminalSlot();
+    return null;
+  }
 
-  const session = createTerminalSession(savedAccount, proxyForAccount(savedAccount), chosenAgentId);
+  const session = createTerminalSession(
+    savedAccount,
+    proxyForAccount(savedAccount),
+    chosenAgentId,
+    workspacePath,
+  );
   session.resumeSessionId = resumeSessionId;
   if (resumeSessionId) {
     session.codexSessionId = resumeSessionId;
     claimedSessionIds.add(resumeSessionId);
   }
   terminalSessions.push(session);
-  activeTerminalKey = session.key;
+  releaseTerminalSlot();
+  activateTerminalSession(session);
+  requestTerminalFocusKey = session.key;
   activeView = "terminal";
   stopLimitPoll();
   stopUsagePoll();
   stopDiscussionsPoll();
   stopRoomPoll();
+  stopChatSync();
+  stopChatTurnPoll();
   statusText = "Demarrage terminal";
   render();
 
   await startTerminalSession(session, commandOverride);
   persistTerminalSessions();
+  return session;
 };
 
 const startTerminalSession = async (session: TerminalSession, commandOverride: string | null = null) => {
   if (!settings) return;
 
   await waitForFrame();
-  session.fitAddon.fit();
+  fitAndResizeTerminal(session);
 
   const requestedId = reservePtyId();
   session.ptyId = requestedId;
@@ -5226,11 +9126,11 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
       : null;
 
   try {
-    // Workspace choisi (dossier de travail global) :
+    // Workspace capture dans CETTE session :
     //  - web  : envoye au serveur comme `workspacePath` (cwd = ce dossier ; le
     //           serveur ignore alors `repoUrl`) ;
     //  - desktop : envoye comme `projectDir` (override du dossier du compte).
-    const workspace = currentWorkspace();
+    const workspace = session.workspacePath;
     const ptyId = await invoke<number>("start_terminal", {
       id: requestedId,
       accountId: session.accountId,
@@ -5248,10 +9148,9 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
     session.status = "Actif";
     statusText = "Terminal actif";
     if (settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
-      // Cohérent avec le terminal (cwd = workspace choisi) et avec le lancement
-      // manuel : currentProjectDir() priorise le workspace, sinon le dossier du
-      // terminal/compte. Sans ça, l'IDE s'ouvrirait sur le dossier du compte.
-      void launchIde(sessionAgent, currentProjectDir());
+      // Utilise le workspace capture par cette session, meme si l'utilisateur
+      // en a selectionne un autre pendant le demarrage du PTY.
+      void launchIde(sessionAgent, session.workspacePath ?? session.projectDir);
     }
     persistTerminalSessions();
     const startedAccount = settings.accounts.find((candidate) => candidate.id === session.accountId) ?? null;
@@ -5275,13 +9174,22 @@ const closeTerminalSession = async (key: string) => {
   if (index === -1) return;
 
   const [session] = terminalSessions.splice(index, 1);
+  const closedWorkspaceKey = terminalWorkspaceDescriptor(session).key;
   const ptyId = session.ptyId;
   session.ptyId = null;
   session.running = false;
   session.terminal.dispose();
 
   if (activeTerminalKey === key) {
-    activeTerminalKey = terminalSessions[Math.max(0, index - 1)]?.key ?? terminalSessions[0]?.key ?? null;
+    const replacement =
+      terminalSessions.find(
+        (candidate) => terminalWorkspaceDescriptor(candidate).key === closedWorkspaceKey,
+      ) ?? terminalSessions[Math.max(0, index - 1)] ?? terminalSessions[0] ?? null;
+    if (replacement) {
+      activateTerminalSession(replacement);
+    } else {
+      activeTerminalKey = null;
+    }
   }
 
   statusText = "Terminal ferme";
@@ -5319,6 +9227,10 @@ const escapeAttr = escapeHtml;
 const userHomeHint = () => (isRemoteMode() ? "%CST_DATA_DIR%\\codex-homes" : "%USERPROFILE%");
 
 const setupEvents = async () => {
+  document.addEventListener("fullscreenchange", scheduleFullscreenSync);
+  document.addEventListener("webkitfullscreenchange", scheduleFullscreenSync);
+  window.addEventListener("resize", scheduleFullscreenSync);
+
   unlistenData = await listen<PtyDataEvent>("pty-data", (event) => {
     const session = terminalSessions.find((candidate) => candidate.ptyId === event.payload.id);
     session?.terminal.write(event.payload.data);
@@ -5347,10 +9259,32 @@ const setupEvents = async () => {
   });
 
   window.addEventListener("resize", () => {
-    fitAndResizeActiveTerminal();
+    syncChatSidebarWidthDom();
+    fitAndResizeVisibleTerminals();
   });
 
   window.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+      event.preventDefault();
+      openNewChat();
+      return;
+    }
+
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      if (!window.matchMedia("(max-width: 760px)").matches && displayedChatSidebarWidth() === 0) {
+        setChatSidebarWidth(defaultChatSidebarWidth(window.innerWidth));
+      }
+      document.body.classList.add("chat-sidebar-open");
+      document.querySelector<HTMLInputElement>("#chatSidebarSearch")?.focus();
+      return;
+    }
+
+    if (event.key === "Escape" && document.body.classList.contains("chat-sidebar-open")) {
+      document.body.classList.remove("chat-sidebar-open");
+      return;
+    }
+
     if (event.key === "Escape" && agentsModalOpen) {
       event.preventDefault();
       closeAgentsModal();
@@ -5436,15 +9370,37 @@ const boot = async () => {
     throw error;
   }
   selectedAccountId = settings.defaultAccountId || settings.accounts[0]?.id || null;
+  chatAccountId = selectedAccountId;
   poolNewAccountBypass = settings.codexBypass ?? true;
+  // Migre le registre de workspaces (localStorage -> settings) et fixe le
+  // filtre par defaut, avant le premier rendu de la barre laterale.
+  await syncWorkspaceRegistry();
+  interfaceMode = loadInterfaceMode();
+  expertGridLayout = loadExpertGridLayout();
+  expertChatsPerPage = loadExpertChatsPerPage();
+  chatSidebarWidth = loadChatSidebarWidth();
   isFullscreen = await appWindow.isFullscreen().catch(() => false);
   await setupEvents();
-  render();
-  await restoreTerminals();
+  if (interfaceMode === "expert") {
+    activeView = "chat";
+    await refreshDiscussions();
+    restoreExpertChats();
+    render();
+    startDiscussionsPoll();
+    startAllExpertChatWork();
+    expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
+  } else {
+    activeView = "chat";
+    await refreshDiscussions();
+    render();
+    void loadChatModelCatalog(chatAccountId);
+    startDiscussionsPoll();
+  }
 };
 
 window.addEventListener("beforeunload", () => {
   persistTerminalSessions();
+  persistExpertChats();
   unlistenData?.();
   unlistenExit?.();
   stopPoolPoll();
@@ -5452,6 +9408,9 @@ window.addEventListener("beforeunload", () => {
   stopUsagePoll();
   stopKombaiPoll();
   stopDiscussionsPoll();
+  stopChatSync();
+  stopChatTurnPoll();
+  stopAllExpertChatWork();
   // Best-effort : evite de laisser un code-server orphelin apres fermeture.
   void invoke("kombai_stop").catch(() => undefined);
   terminalSessions.forEach((session) => {

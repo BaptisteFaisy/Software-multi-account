@@ -112,6 +112,25 @@ pub struct AccountRateLimitBucketView {
     pub plan_type: Option<String>,
 }
 
+/// Capacites d'intensite exposees par le catalogue du CLI Codex pour un
+/// modele precis. Le frontend ne doit pas inventer une liste globale : `max`
+/// et `ultra`, par exemple, ne sont proposes que par certains modeles.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoningEffortView {
+    pub reasoning_effort: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountModelView {
+    pub id: String,
+    pub display_name: String,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<ModelReasoningEffortView>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyProfile {
@@ -152,6 +171,27 @@ pub struct AgentProfile {
     pub doctor_command: Option<String>,
 }
 
+/// Un **workspace** = un dossier projet ouvert par l'utilisateur, qui sert de
+/// contexte a un ensemble de chats (comme OpenCode / Codex / Claude Code). Le
+/// registre des workspaces est persiste dans `settings.json` afin de suivre
+/// l'utilisateur sur ses appareils (desktop/web/Android), a la difference du
+/// pointeur de workspace ACTIF qui reste local a l'appareil (localStorage).
+///
+/// L'appartenance d'un chat a un workspace n'est PAS stockee ici : elle est
+/// derivee cote client en comparant le `cwd` de la discussion au `path` du
+/// workspace. On ne conserve donc jamais de reference de chat fragile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceProfile {
+    /// Identite stable = chemin normalise (cf. `normalize_workspace_path`). Le
+    /// backend le recalcule toujours afin de fusionner les anciens doublons.
+    pub id: String,
+    /// Libelle affiche (par defaut le nom du dossier), personnalisable.
+    pub label: String,
+    /// Chemin du dossier projet (tel que saisi/choisi par l'utilisateur).
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -183,6 +223,12 @@ pub struct AppSettings {
     /// (import + suppression).
     #[serde(default)]
     pub auto_discover_accounts: bool,
+    /// Registre des workspaces (dossiers projets ouverts). `#[serde(default)]`
+    /// => les settings.json anterieurs (sans ce champ) restent lisibles et
+    /// demarrent avec une liste vide, ensuite peuplee par migration du
+    /// localStorage cote client.
+    #[serde(default)]
+    pub workspaces: Vec<WorkspaceProfile>,
 }
 
 /// Reglages du salon d'agents (« Agent Room »). Desactive par defaut : tant que
@@ -291,6 +337,7 @@ pub struct PoolConfig {
 const SESSION_LIMIT_MINS: i64 = 5 * 60;
 const WEEKLY_LIMIT_MINS: i64 = 7 * 24 * 60;
 const RATE_LIMIT_READ_TIMEOUT_SECS: u64 = 18;
+const MODEL_CATALOG_TIMEOUT_SECS: u64 = 12;
 
 impl Default for PoolConfig {
     fn default() -> Self {
@@ -360,6 +407,9 @@ pub fn load_settings() -> Result<AppSettings, String> {
     if ensure_agents(&mut settings) {
         changed = true;
     }
+    if ensure_workspaces(&mut settings) {
+        changed = true;
+    }
     if sync_account_limit_trackers(&mut settings) {
         changed = true;
     }
@@ -373,6 +423,7 @@ pub fn load_settings() -> Result<AppSettings, String> {
 pub fn save_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
     let path = settings_path()?;
     ensure_agents(&mut settings);
+    ensure_workspaces(&mut settings);
     sync_account_limit_trackers(&mut settings);
     write_settings(&path, &settings)?;
     Ok(settings)
@@ -555,6 +606,13 @@ pub async fn account_limit_status() -> Result<Vec<AccountLimitView>, String> {
     tauri::async_runtime::spawn_blocking(move || account_limit_views(&settings))
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn account_model_catalog(account_id: String) -> Result<Vec<AccountModelView>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_account_model_catalog(&account_id))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -754,11 +812,24 @@ mod tests {
     #[test]
     fn account_config_rejects_invalid_reasoning_effort() {
         let home = fresh_account_home("invalid-effort");
-        let error = ensure_codex_account_config(&home, true, None, Some("ultra"))
-            .expect_err("unsupported effort must be rejected");
+        let error = ensure_codex_account_config(&home, true, None, Some("ultra mode"))
+            .expect_err("malformed effort must be rejected");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(!home.join("config.toml").exists());
+    }
+
+    #[test]
+    fn account_config_accepts_max_and_ultra_reasoning_efforts() {
+        let home = fresh_account_home("max-ultra-effort");
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("max"))
+            .expect("max effort");
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("ultra"))
+            .expect("ultra effort");
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("model_reasoning_effort = \"ultra\""));
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -934,7 +1005,58 @@ mod tests {
             agent_room: AgentRoomConfig::default(),
             codex_bypass: true,
             auto_discover_accounts: false,
+            workspaces: Vec::new(),
         }
+    }
+
+    #[test]
+    fn workspace_base_name_is_utf8_safe_and_strips_git() {
+        // Regression: `base[len-4..]` panickait quand un caractere multi-octets
+        // chevauchait la borne len-4 (ex. « Éire », « 😀x »).
+        assert_eq!(workspace_base_name("C:\\Projects\\Éire"), "Éire");
+        assert_eq!(workspace_base_name("/home/u/😀x"), "😀x");
+        assert_eq!(workspace_base_name("/home/u/日本語"), "日本語");
+        // Strip `.git` insensible a la casse, mais pas si c'est tout le segment.
+        assert_eq!(workspace_base_name("/srv/myrepo.git"), "myrepo");
+        assert_eq!(workspace_base_name("/srv/Repo.GIT"), "Repo");
+        assert_eq!(workspace_base_name("C:/repos/.git"), ".git");
+        // Slashes finaux et backslashes mixtes.
+        assert_eq!(workspace_base_name("C:\\proj\\app\\"), "app");
+        assert_eq!(workspace_base_name("/a/b/c/"), "c");
+    }
+
+    #[test]
+    fn ensure_workspaces_dedups_and_fills_labels_without_panicking() {
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.workspaces = vec![
+            WorkspaceProfile {
+                id: "ancien-id-local".to_string(),
+                label: String::new(),
+                path: "C:\\Projects\\Éire\\".to_string(),
+            },
+            // Meme chemin avec une autre casse, d'autres separateurs et un id
+            // historique different : fusionne avec la premiere occurrence.
+            WorkspaceProfile {
+                id: "ancien-id-distant".to_string(),
+                label: "dup".to_string(),
+                path: "c:/projects/éire".to_string(),
+            },
+            // Chemin vide : retire.
+            WorkspaceProfile {
+                id: "x".to_string(),
+                label: "vide".to_string(),
+                path: "   ".to_string(),
+            },
+        ];
+
+        let changed = ensure_workspaces(&mut settings);
+
+        assert!(changed);
+        assert_eq!(settings.workspaces.len(), 1);
+        let ws = &settings.workspaces[0];
+        assert_eq!(ws.id, "c:/projects/éire");
+        // Label vide comble par le nom du dossier (UTF-8 safe).
+        assert_eq!(ws.label, "Éire");
     }
 
     #[test]
@@ -1055,6 +1177,33 @@ mod tests {
 
         assert_eq!(settings.active_agent_id.as_deref(), Some(CODEX_AGENT_ID));
     }
+
+    #[test]
+    fn model_catalog_preserves_model_specific_max_and_ultra_efforts() {
+        let models = parse_account_model_catalog(&json!({
+            "data": [{
+                "id": "gpt-5.6-sol",
+                "displayName": "GPT-5.6-Sol",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    { "reasoningEffort": "low", "description": "Fast" },
+                    { "reasoningEffort": "max", "description": "Maximum" },
+                    { "reasoningEffort": "ultra", "description": "Delegation" }
+                ]
+            }]
+        }));
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(
+            models[0]
+                .supported_reasoning_efforts
+                .iter()
+                .map(|item| item.reasoning_effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "max", "ultra"]
+        );
+    }
 }
 
 pub fn load_settings_for_terminal() -> Result<AppSettings, String> {
@@ -1062,12 +1211,8 @@ pub fn load_settings_for_terminal() -> Result<AppSettings, String> {
 }
 
 fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-
     let content = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
-    fs::write(path, content).map_err(|error| error.to_string())
+    crate::fs_util::atomic_write(path, content).map_err(|error| error.to_string())
 }
 
 fn settings_path() -> Result<PathBuf, String> {
@@ -1104,6 +1249,15 @@ pub fn agent_room_data_dir() -> Result<PathBuf, String> {
         .join("agent-room"))
 }
 
+/// Racine des donnees runtime (worktrees, homes isoles, merge queue). Elle suit
+/// exactement la meme resolution que `settings.json` et `agent-room`.
+pub fn runtime_data_dir() -> Result<PathBuf, String> {
+    settings_path()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "repertoire de donnees CST introuvable".to_string())
+}
+
 fn discover_initial_settings() -> Result<AppSettings, String> {
     let mut settings = AppSettings {
         accounts: Vec::new(),
@@ -1120,6 +1274,7 @@ fn discover_initial_settings() -> Result<AppSettings, String> {
         agent_room: AgentRoomConfig::default(),
         codex_bypass: true,
         auto_discover_accounts: false,
+        workspaces: Vec::new(),
     };
 
     if env::var_os("CST_DATA_DIR").is_none() {
@@ -1244,6 +1399,94 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
             changed = true;
         }
     }
+
+    changed
+}
+
+/// Normalise un chemin de workspace pour en faire une identite stable. Doit
+/// rester alignee sur `normalizeWorkspacePath` cote front (src/main.ts) : trim,
+/// retrait des slashes finaux, `\\` -> `/`, puis minuscule UNIQUEMENT pour les
+/// chemins Windows (`X:/...`) et UNC (`//...`), insensibles a la casse.
+fn normalize_workspace_path(path: &str) -> String {
+    let trimmed = path
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .replace('\\', "/");
+    let bytes = trimmed.as_bytes();
+    let is_windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'/';
+    if is_windows_drive || trimmed.starts_with("//") {
+        trimmed.to_lowercase()
+    } else {
+        trimmed
+    }
+}
+
+/// Dernier segment d'un chemin (nom du dossier, sans suffixe `.git`), pour un
+/// libelle par defaut. Aligne sur `workspaceBaseName` cote front.
+fn workspace_base_name(path: &str) -> String {
+    let cleaned = path.trim_end_matches(['\\', '/']);
+    let base = cleaned.rsplit(['\\', '/']).next().unwrap_or(cleaned);
+    // Retire un suffixe `.git` (insensible a la casse) SANS indexer le `str` par
+    // octet : `str::get` renvoie None si la borne n'est pas une frontiere de
+    // caractere, ce qui evite tout panic sur un nom de dossier multi-octets
+    // (ex. « Éire », « 😀x »). On ne retire pas `.git` s'il constitue tout le
+    // segment (dossier litteralement nomme `.git`).
+    let without_git = match base.len() {
+        n if n > 4 => match base.get(n - 4..) {
+            Some(tail) if tail.eq_ignore_ascii_case(".git") => &base[..n - 4],
+            _ => base,
+        },
+        _ => base,
+    };
+    if without_git.is_empty() {
+        path.trim().to_string()
+    } else {
+        without_git.to_string()
+    }
+}
+
+/// Garantit la coherence du registre de workspaces :
+/// - retire les entrees a chemin vide ;
+/// - recalcule un `id` manquant/incoherent depuis le chemin normalise ;
+/// - deduplique par `id` (premiere occurrence gardee) ;
+/// - complete un `label` vide par le nom du dossier.
+fn ensure_workspaces(settings: &mut AppSettings) -> bool {
+    let mut changed = false;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut deduped: Vec<WorkspaceProfile> = Vec::with_capacity(settings.workspaces.len());
+
+    for mut ws in std::mem::take(&mut settings.workspaces) {
+        let path = ws.path.trim().to_string();
+        if path.is_empty() {
+            changed = true;
+            continue;
+        }
+        // Le chemin est la source de verite. Un ancien id non vide mais
+        // incoherent ne doit jamais permettre a deux chemins equivalents de
+        // survivre comme deux workspaces distincts.
+        let id = normalize_workspace_path(&path);
+        if !seen.insert(id.clone()) {
+            changed = true;
+            continue;
+        }
+        let label = if ws.label.trim().is_empty() {
+            workspace_base_name(&path)
+        } else {
+            ws.label.trim().to_string()
+        };
+        if ws.id != id || ws.label != label || ws.path != path {
+            changed = true;
+        }
+        ws.id = id;
+        ws.label = label;
+        ws.path = path;
+        deduped.push(ws);
+    }
+
+    settings.workspaces = deduped;
 
     changed
 }
@@ -1534,6 +1777,240 @@ fn bucket_for_window(
         .iter()
         .filter(|bucket| bucket.window_duration_mins == window_duration_mins)
         .min_by_key(|bucket| bucket.resets_at)
+}
+
+/// Catalogue officiel du CLI pour le compte selectionne. `model/list` est la
+/// source de verite : chaque modele fournit sa propre liste d'intensites. Le
+/// cache local reste un fallback pour les anciens CLI ou une machine hors
+/// ligne, avec le meme resultat normalise cote frontend.
+pub fn load_account_model_catalog(account_id: &str) -> Result<Vec<AccountModelView>, String> {
+    let settings = load_settings_for_terminal()?;
+    let account = settings
+        .accounts
+        .iter()
+        .find(|candidate| candidate.id == account_id)
+        .cloned()
+        .ok_or_else(|| "Compte introuvable".to_string())?;
+    if account.provider != Provider::Codex {
+        return Ok(Vec::new());
+    }
+
+    let app_server_result = read_model_catalog_from_app_server(&account, &settings);
+    if let Ok(result) = app_server_result.as_ref() {
+        let models = parse_account_model_catalog(result);
+        if !models.is_empty() {
+            return Ok(models);
+        }
+    }
+
+    let home = expand_home(&account.codex_home)?;
+    let cache_path = home.join("models_cache.json");
+    if let Ok(content) = fs::read_to_string(&cache_path) {
+        if let Ok(value) = serde_json::from_str::<Value>(&content) {
+            let models = parse_account_model_catalog(&value);
+            if !models.is_empty() {
+                return Ok(models);
+            }
+        }
+    }
+
+    Err(app_server_result
+        .err()
+        .unwrap_or_else(|| "Catalogue de modeles Codex indisponible".to_string()))
+}
+
+fn read_model_catalog_from_app_server(
+    account: &AccountProfile,
+    settings: &AppSettings,
+) -> Result<Value, String> {
+    let codex_home = expand_home(&account.codex_home)?;
+    let mut command = codex_app_server_command(settings);
+    command
+        .env("CODEX_HOME", codex_home.to_string_lossy().to_string())
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    if let Some(proxy_url) = proxy_url_for_account(account, settings) {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env(key, proxy_url.clone());
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("codex app-server impossible: {error}"))?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        return Err("stdin app-server indisponible".to_string());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err("stdout app-server indisponible".to_string());
+    };
+
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let requests = [
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "codex_switch_terminal",
+                    "title": "Codex Switch Terminal",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        }),
+        json!({ "method": "initialized", "params": {} }),
+        json!({
+            "method": "model/list",
+            "id": 2,
+            "params": { "limit": 100, "includeHidden": false }
+        }),
+    ];
+    for request in requests {
+        if let Err(error) = writeln!(stdin, "{request}") {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("ecriture app-server impossible: {error}"));
+        }
+    }
+    let _ = stdin.flush();
+
+    let response = loop {
+        match rx.recv_timeout(Duration::from_secs(MODEL_CATALOG_TIMEOUT_SECS)) {
+            Ok(line) => {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if value.get("id").and_then(Value::as_i64) == Some(2) {
+                    break value;
+                }
+            }
+            Err(_) => {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("timeout lecture catalogue de modeles".to_string());
+            }
+        }
+    };
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Some(error) = response.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("erreur app-server")
+            .to_string());
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| "reponse app-server sans result".to_string())
+}
+
+fn parse_account_model_catalog(value: &Value) -> Vec<AccountModelView> {
+    let entries = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array);
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    entries
+        .iter()
+        .filter(|entry| entry.get("hidden").and_then(Value::as_bool) != Some(true))
+        .filter(|entry| {
+            entry
+                .get("visibility")
+                .and_then(Value::as_str)
+                .is_none_or(|visibility| visibility == "list")
+        })
+        .filter_map(|entry| {
+            let id = entry
+                .get("id")
+                .or_else(|| entry.get("model"))
+                .or_else(|| entry.get("slug"))
+                .and_then(Value::as_str)?
+                .trim()
+                .to_string();
+            if id.is_empty() || !seen.insert(id.clone()) {
+                return None;
+            }
+            let display_name = entry
+                .get("displayName")
+                .or_else(|| entry.get("display_name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            let default_reasoning_effort = entry
+                .get("defaultReasoningEffort")
+                .or_else(|| entry.get("default_reasoning_level"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let supported_reasoning_efforts = entry
+                .get("supportedReasoningEfforts")
+                .or_else(|| entry.get("supported_reasoning_levels"))
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .filter_map(|effort| {
+                            let reasoning_effort = effort
+                                .get("reasoningEffort")
+                                .or_else(|| effort.get("effort"))
+                                .and_then(Value::as_str)?
+                                .to_string();
+                            let description = effort
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                            Some(ModelReasoningEffortView {
+                                reasoning_effort,
+                                description,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AccountModelView {
+                id,
+                display_name,
+                default_reasoning_effort,
+                supported_reasoning_efforts,
+            })
+        })
+        .collect()
 }
 
 fn read_server_rate_limits(
@@ -2280,12 +2757,10 @@ pub fn ensure_codex_account_config(
         .filter(|value| !value.is_empty());
 
     if let Some(effort) = reasoning_effort {
-        if !matches!(effort, "minimal" | "low" | "medium" | "high" | "xhigh") {
+        if !is_valid_reasoning_effort(effort) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Intensite de raisonnement invalide: {effort} (valeurs: minimal, low, medium, high, xhigh)"
-                ),
+                format!("Intensite de raisonnement invalide: {effort}"),
             ));
         }
     }
@@ -2313,9 +2788,22 @@ pub fn ensure_codex_account_config(
         return Ok(());
     }
 
-    let tmp = home.join("config.toml.cst-tmp");
-    fs::write(&tmp, updated)?;
-    fs::rename(&tmp, &path)
+    crate::fs_util::atomic_write(&path, updated)
+}
+
+/// Le catalogue Codex est la source de verite des valeurs disponibles. Cette
+/// validation ne maintient donc pas de whitelist fonctionnelle : elle bloque
+/// uniquement les valeurs dangereuses/mal formees avant l'ecriture TOML ou le
+/// passage au CLI, ce qui rend les futurs efforts compatibles sans mise a jour.
+pub(crate) fn is_valid_reasoning_effort(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && value.chars().count() <= 32
+        && chars.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-')
+        })
 }
 
 /// Insere ou remplace une cle scalaire chaine AU NIVEAU RACINE d'un document TOML

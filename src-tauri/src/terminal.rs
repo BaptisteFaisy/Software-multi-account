@@ -2,11 +2,12 @@ use crate::{
     agent_room::{AgentMeta, RoomState},
     metrics,
     settings::{expand_home, load_settings_for_terminal, AccountProfile, AppSettings},
+    worktree::{AgentWorkspace, WorktreeManager},
 };
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -21,6 +22,7 @@ use tauri::{AppHandle, Emitter, State};
 #[derive(Default, Clone)]
 pub struct TerminalManager {
     sessions: Arc<Mutex<HashMap<u64, Arc<TerminalSession>>>>,
+    reservations: Arc<Mutex<HashSet<u64>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -32,6 +34,23 @@ struct TerminalSession {
     account_id: String,
     account_label: String,
     recorded_end: AtomicBool,
+    /// Le Drop du lease fusionne les transcripts et nettoie worktree/home.
+    _workspace: AgentWorkspace,
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        // Toujours tuer le CLI avant que `_workspace` ne libere/recycle son
+        // home et son worktree (y compris a la fermeture globale de l'app).
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
+    }
+}
+
+struct TerminalIdReservation {
+    reservations: Arc<Mutex<HashSet<u64>>>,
+    id: u64,
 }
 
 impl TerminalManager {
@@ -47,6 +66,51 @@ impl TerminalManager {
                 started_at: session.started_at,
             })
             .collect()
+    }
+
+    fn reserve_id(&self, requested: Option<u64>) -> Result<TerminalIdReservation, String> {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| "Reservations terminal verrouillees".to_string())?;
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Etat terminal verrouille".to_string())?;
+        let id = if let Some(id) = requested {
+            if reservations.contains(&id) || sessions.contains_key(&id) {
+                return Err(format!("Identifiant terminal deja vivant: {id}"));
+            }
+            id
+        } else {
+            loop {
+                let candidate = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+                if !reservations.contains(&candidate) && !sessions.contains_key(&candidate) {
+                    break candidate;
+                }
+            }
+        };
+        drop(sessions);
+        reservations.insert(id);
+        drop(reservations);
+        Ok(TerminalIdReservation {
+            reservations: self.reservations.clone(),
+            id,
+        })
+    }
+}
+
+impl TerminalIdReservation {
+    fn commit(self) {
+        // Le live-id est desormais porte par `sessions`.
+    }
+}
+
+impl Drop for TerminalIdReservation {
+    fn drop(&mut self) {
+        if let Ok(mut reservations) = self.reservations.lock() {
+            reservations.remove(&self.id);
+        }
     }
 }
 
@@ -65,6 +129,7 @@ struct PtyExitEvent {
 pub fn start_terminal(
     app: AppHandle,
     state: State<'_, TerminalManager>,
+    worktrees: State<'_, WorktreeManager>,
     room: State<'_, RoomState>,
     id: Option<u64>,
     account_id: String,
@@ -92,30 +157,15 @@ pub fn start_terminal(
         None
     };
 
-    let account_home = expand_home(&account.codex_home)?;
-    std::fs::create_dir_all(&account_home).map_err(|error| error.to_string())?;
-
-    // Synchronise a chaque demarrage les permissions/modele propres au compte,
-    // dans le format du provider (Codex config.toml / Claude settings.json). Non
-    // bloquant : une config invalide/non inscriptible ne doit pas empecher le
-    // terminal de demarrer.
-    if let Err(error) = provider.write_account_config(
-        &account_home,
-        account.bypass,
-        account.model.as_deref(),
-        account.reasoning_effort.as_deref(),
-    ) {
-        eprintln!(
-            "[config] config {} non ecrite pour {}: {error}",
-            provider.as_str(),
-            account.label
-        );
-    }
+    // Reserve avant toute operation couteuse : deux appels concurrents ne
+    // peuvent plus spawner sous le meme identifiant puis s'ecraser dans la map.
+    let id_reservation = state.reserve_id(id)?;
+    let id = id_reservation.id;
 
     // Workspace choisi dans l'UI (dossier de travail global) : prioritaire sur le
     // `project_dir` par defaut du compte. Sinon, on retombe sur le comportement
     // historique (dossier projet du compte).
-    let project_dir = match project_dir
+    let source_project_dir = match project_dir
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -129,6 +179,31 @@ pub fn start_terminal(
         }
         None => resolve_project_dir(&account)?,
     };
+
+    let canonical_home = expand_home(&account.codex_home)?;
+    std::fs::create_dir_all(&canonical_home).map_err(|error| error.to_string())?;
+    let workspace = worktrees.prepare_local(
+        &format!("desktop-terminal-{id}"),
+        &canonical_home,
+        source_project_dir.as_deref(),
+    )?;
+    let account_home = workspace.home().to_path_buf();
+    let project_dir = Some(workspace.cwd().to_path_buf());
+
+    // La configuration est ecrite dans le home ISOLE, jamais dans celui qu'un
+    // autre agent utilise simultanement.
+    if let Err(error) = provider.write_account_config(
+        &account_home,
+        account.bypass,
+        account.model.as_deref(),
+        account.reasoning_effort.as_deref(),
+    ) {
+        eprintln!(
+            "[config] config {} non ecrite pour {}: {error}",
+            provider.as_str(),
+            account.label
+        );
+    }
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -149,6 +224,12 @@ pub fn start_terminal(
     );
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
+    builder.env("CST_AGENT_ID", format!("desktop-terminal-{id}"));
+    builder.env("CST_WORKSPACE_ID", workspace.workspace_id());
+    builder.env("CST_ROOM_ID", workspace.room_id());
+    if let Some(base_sha) = workspace.base_sha() {
+        builder.env("CST_BASE_SHA", base_sha);
+    }
 
     if let Some(project_dir) = &project_dir {
         let project_dir_string = project_dir.to_string_lossy().to_string();
@@ -180,13 +261,16 @@ pub fn start_terminal(
         match room.provision_home(provider, &cli_bin, &account_home, &url) {
             Ok(()) => {
                 let token = room.register(AgentMeta {
-                    agent_id: provider.as_str().to_string(),
+                    agent_id: format!("desktop-terminal-{id}"),
                     provider,
                     account_id: account.id.clone(),
                     label: account.label.clone(),
                     cwd: project_dir
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
+                    workspace_id: Some(workspace.workspace_id().to_string()),
+                    room_id: workspace.room_id().to_string(),
+                    merge_context: workspace.merge_context(),
                 });
                 builder.env("CST_ROOM_TOKEN", token.clone());
                 room_token = Some(token);
@@ -217,7 +301,6 @@ pub fn start_terminal(
         .take_writer()
         .map_err(|error| error.to_string())?;
 
-    let id = id.unwrap_or_else(|| state.next_id.fetch_add(1, Ordering::Relaxed) + 1);
     let session = Arc::new(TerminalSession {
         writer: Mutex::new(writer),
         master: Mutex::new(pair.master),
@@ -226,13 +309,20 @@ pub fn start_terminal(
         account_id: account.id.clone(),
         account_label: account.label.clone(),
         recorded_end: AtomicBool::new(false),
+        _workspace: workspace,
     });
 
-    state
-        .sessions
-        .lock()
-        .map_err(|_| "Etat terminal verrouille".to_string())?
-        .insert(id, session.clone());
+    {
+        let mut sessions = state
+            .sessions
+            .lock()
+            .map_err(|_| "Etat terminal verrouille".to_string())?;
+        if sessions.contains_key(&id) {
+            return Err(format!("Identifiant terminal deja vivant: {id}"));
+        }
+        sessions.insert(id, session.clone());
+    }
+    id_reservation.commit();
 
     let sessions = state.sessions.clone();
     let reader_app = app.clone();
@@ -251,10 +341,12 @@ pub fn start_terminal(
             }
         }
 
-        if let Ok(mut guard) = sessions.lock() {
-            if let Some(session) = guard.remove(&id) {
-                finish_session(&session);
-            }
+        let ended = sessions
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.remove(&id));
+        if let Some(session) = ended {
+            finish_session(&session);
         }
         // Le PTY s'est ferme (fin naturelle ou kill) : on retire l'agent du salon.
         if let Some(token) = &room_token_thread {
@@ -507,5 +599,19 @@ fn quote_windows_arg(value: &str) -> String {
         format!("\"{}\"", value.replace('"', "\\\""))
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_terminal_id_is_reserved_atomically() {
+        let manager = TerminalManager::default();
+        let reservation = manager.reserve_id(Some(42)).unwrap();
+        assert!(manager.reserve_id(Some(42)).is_err());
+        drop(reservation);
+        assert!(manager.reserve_id(Some(42)).is_ok());
     }
 }

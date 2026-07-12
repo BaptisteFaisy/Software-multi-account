@@ -1,11 +1,13 @@
 use crate::{
     account_usage,
     agent_room::{self, AgentMeta, RoomState},
+    chat::{ChatTurnManager, StartChatTurnRequest},
     discussions,
     kombai::{KombaiManager, KombaiStatus},
     metrics,
     pool::{self, AccountStatus, PoolManager},
     settings::{self, AppSettings},
+    worktree::{AgentWorkspace, WorktreeManager},
 };
 use axum::{
     extract::{
@@ -22,12 +24,11 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -37,7 +38,6 @@ use std::{
 };
 use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, services::ServeDir};
-use uuid::Uuid;
 
 const WORKSPACE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 // Le receiver conserve les sorties produites entre le demarrage du PTY et
@@ -76,9 +76,11 @@ pub struct ServerConfig {
 struct ServerState {
     config: ServerConfig,
     terminals: RemoteTerminalManager,
+    chat: ChatTurnManager,
     kombai: Arc<KombaiManager>,
     /// Salon d'agents partage (serveur MCP monte a `/mcp`).
     room: RoomState,
+    worktrees: WorktreeManager,
     started_at: i64,
     /// Quand true, le noeud refuse les NOUVEAUX terminaux (503) et se signale
     /// `draining`/non `ready` ; les sessions deja ouvertes continuent. En
@@ -112,6 +114,7 @@ struct StartTerminalRequest {
 struct StartTerminalResponse {
     id: u64,
     workspace_id: String,
+    room_id: String,
     workspace_path: String,
 }
 
@@ -199,6 +202,14 @@ struct CopyDiscussionRequest {
     session_id: String,
     source_account_id: String,
     target_account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MoveDiscussionRequest {
+    account_id: String,
+    session_id: String,
+    workspace_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +310,7 @@ enum ClientWsMessage {
 #[derive(Clone, Default)]
 struct RemoteTerminalManager {
     sessions: Arc<Mutex<HashMap<u64, Arc<RemoteTerminalSession>>>>,
+    reservations: Arc<Mutex<HashSet<u64>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -314,9 +326,54 @@ struct RemoteTerminalSession {
     workspace_id: String,
     workspace_path: PathBuf,
     recorded_end: AtomicBool,
+    _workspace: AgentWorkspace,
+}
+
+impl Drop for RemoteTerminalSession {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+        }
+    }
+}
+
+struct RemoteTerminalIdReservation {
+    reservations: Arc<Mutex<HashSet<u64>>>,
+    id: u64,
 }
 
 impl RemoteTerminalManager {
+    fn reserve_id(&self, requested: Option<u64>) -> Result<RemoteTerminalIdReservation, String> {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| "Reservations terminal verrouillees".to_string())?;
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "Etat terminal verrouille".to_string())?;
+        let id = if let Some(id) = requested {
+            if reservations.contains(&id) || sessions.contains_key(&id) {
+                return Err(format!("Identifiant terminal deja vivant: {id}"));
+            }
+            id
+        } else {
+            loop {
+                let candidate = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+                if !reservations.contains(&candidate) && !sessions.contains_key(&candidate) {
+                    break candidate;
+                }
+            }
+        };
+        drop(sessions);
+        reservations.insert(id);
+        drop(reservations);
+        Ok(RemoteTerminalIdReservation {
+            reservations: self.reservations.clone(),
+            id,
+        })
+    }
+
     fn active_agent_runs(&self) -> Vec<metrics::ActiveAgentRun> {
         let Ok(guard) = self.sessions.lock() else {
             return Vec::new();
@@ -331,17 +388,11 @@ impl RemoteTerminalManager {
             .collect()
     }
 
-    fn active_count(&self) -> usize {
-        self.sessions
-            .lock()
-            .map(|guard| guard.len())
-            .unwrap_or_default()
-    }
-
     fn start(
         &self,
         config: &ServerConfig,
         room: &RoomState,
+        worktrees: &WorktreeManager,
         request: StartTerminalRequest,
     ) -> Result<StartTerminalResponse, String> {
         let settings = settings::load_settings_for_terminal()?;
@@ -363,42 +414,61 @@ impl RemoteTerminalManager {
             None
         };
 
-        let id = request
-            .id
-            .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let id_reservation = self.reserve_id(request.id)?;
+        let id = id_reservation.id;
+        let agent_id = request
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("saas-terminal-{id}"));
+        let canonical_home = settings::expand_home(&account.codex_home)?;
+        fs::create_dir_all(&canonical_home).map_err(|error| error.to_string())?;
 
-        // Deux facons de fixer le repertoire de travail :
-        //  - `workspace_path` : un DOSSIER EXISTANT du serveur (dans la racine
-        //    autorisee). Utilise tel quel comme cwd ; jamais clone ni purge.
-        //  - `repo_url` : un depot git clone dans un workspace EPHEMERE
-        //    (`data_dir/workspaces/<id>`, purge auto au bout de 7j).
+        // Un dossier serveur et un repo distant convergent tous deux vers un
+        // worktree/home uniques. Pour les repos distants, le clone couteux est
+        // remplace par un miroir bare partage + un checkout leger par agent.
         let selected_workspace = request
             .workspace_path
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        let (repo_dir, workspace_id, repo_label) = if let Some(raw) = selected_workspace {
+        let (workspace, repo_label) = if let Some(raw) = selected_workspace {
             let dir = resolve_within_root(&config.workspaces_root, raw)?;
-            let workspace_id = workspace_id_for_dir(&dir);
             let label = display_path(&dir);
-            (dir, workspace_id, label)
-        } else {
-            let workspace_id = format!("{id}-{}", Uuid::new_v4().simple());
-            let workspace_root = config.data_dir.join("workspaces").join(&workspace_id);
-            let repo_dir = workspace_root.join("repo");
-            let label = prepare_workspace(
-                request.repo_url.as_deref().unwrap_or(""),
-                request.branch.as_deref(),
-                &repo_dir,
-                &config.git_pat,
+            (
+                worktrees.prepare_local(&agent_id, &canonical_home, Some(&dir))?,
+                label,
             )
-            .map_err(|error| redact_secrets(&error, config))?;
-            (repo_dir, workspace_id, label)
+        } else {
+            let repo_url = request.repo_url.as_deref().unwrap_or("").trim();
+            if repo_url.is_empty() {
+                (
+                    worktrees.prepare_local(&agent_id, &canonical_home, None)?,
+                    "workspace vide".to_string(),
+                )
+            } else {
+                let repo_url = validate_repo_url(repo_url)?;
+                let fetch_url = authenticated_repo_url(&repo_url, &config.git_pat);
+                let workspace = worktrees
+                    .prepare_remote(
+                        &agent_id,
+                        &canonical_home,
+                        &repo_url,
+                        &fetch_url,
+                        request.branch.as_deref(),
+                    )
+                    .map_err(|error| redact_secrets(&error, config))?;
+                (workspace, repo_url)
+            }
         };
 
-        let account_home = settings::expand_home(&account.codex_home)?;
-        fs::create_dir_all(&account_home).map_err(|error| error.to_string())?;
+        let repo_dir = workspace.cwd().to_path_buf();
+        let workspace_id = workspace.workspace_id().to_string();
+        let room_id = workspace.room_id().to_string();
+        let account_home = workspace.home().to_path_buf();
 
         // Synchronise a chaque demarrage la config propre au compte, dans le
         // format du provider (Codex config.toml / Claude settings.json). Un echec
@@ -436,7 +506,11 @@ impl RemoteTerminalManager {
         builder.env("COLORTERM", "truecolor");
         builder.env("PWD", repo_dir.to_string_lossy().to_string());
         builder.env("CST_WORKSPACE_ID", workspace_id.clone());
-        builder.env("CST_AGENT_ID", request.agent_id.unwrap_or_default());
+        builder.env("CST_AGENT_ID", &agent_id);
+        builder.env("CST_ROOM_ID", &room_id);
+        if let Some(base_sha) = workspace.base_sha() {
+            builder.env("CST_BASE_SHA", base_sha);
+        }
 
         if let Some(proxy) = proxy {
             for key in [
@@ -455,7 +529,7 @@ impl RemoteTerminalManager {
         // agents server-spawned l'atteignent en loopback. On provisionne le
         // CODEX_HOME et on injecte un token unique par terminal.
         let mut room_token: Option<String> = None;
-        if settings.agent_room.enabled {
+        {
             let port = config
                 .bind
                 .parse::<SocketAddr>()
@@ -466,11 +540,14 @@ impl RemoteTerminalManager {
             match room.provision_home(provider, &cli_bin, &account_home, &url) {
                 Ok(()) => {
                     let token = room.register(AgentMeta {
-                        agent_id: provider.as_str().to_string(),
+                        agent_id: agent_id.clone(),
                         provider,
                         account_id: account.id.clone(),
                         label: account.label.clone(),
                         cwd: Some(repo_dir.to_string_lossy().to_string()),
+                        workspace_id: Some(workspace_id.clone()),
+                        room_id: room_id.clone(),
+                        merge_context: workspace.merge_context(),
                     });
                     builder.env("CST_ROOM_TOKEN", token.clone());
                     room_token = Some(token);
@@ -512,12 +589,20 @@ impl RemoteTerminalManager {
             workspace_id: workspace_id.clone(),
             workspace_path: repo_dir.clone(),
             recorded_end: AtomicBool::new(false),
+            _workspace: workspace,
         });
 
-        self.sessions
-            .lock()
-            .map_err(|_| "Etat terminal verrouille".to_string())?
-            .insert(id, session.clone());
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "Etat terminal verrouille".to_string())?;
+            if sessions.contains_key(&id) {
+                return Err(format!("Identifiant terminal deja vivant: {id}"));
+            }
+            sessions.insert(id, session.clone());
+        }
+        id_reservation.commit();
 
         let sessions = self.sessions.clone();
         let reader_events = events.clone();
@@ -542,11 +627,13 @@ impl RemoteTerminalManager {
                 }
             }
 
-            if let Ok(mut guard) = sessions.lock() {
-                if let Some(session) = guard.remove(&id) {
-                    finish_session(&session);
-                    let _ = session.events.send(ServerWsMessage::Exit { id });
-                }
+            let ended = sessions
+                .lock()
+                .ok()
+                .and_then(|mut sessions| sessions.remove(&id));
+            if let Some(session) = ended {
+                finish_session(&session);
+                let _ = session.events.send(ServerWsMessage::Exit { id });
             }
             if let Some(token) = &room_token_thread {
                 room_clone.deregister(token);
@@ -574,6 +661,7 @@ impl RemoteTerminalManager {
         Ok(StartTerminalResponse {
             id,
             workspace_id,
+            room_id,
             workspace_path: repo_dir.to_string_lossy().to_string(),
         })
     }
@@ -636,6 +724,20 @@ impl RemoteTerminalManager {
     }
 }
 
+impl RemoteTerminalIdReservation {
+    fn commit(self) {
+        // La session inseree porte desormais l'identifiant vivant.
+    }
+}
+
+impl Drop for RemoteTerminalIdReservation {
+    fn drop(&mut self) {
+        if let Ok(mut reservations) = self.reservations.lock() {
+            reservations.remove(&self.id);
+        }
+    }
+}
+
 fn finish_session(session: &Arc<RemoteTerminalSession>) {
     if session.recorded_end.swap(true, Ordering::Relaxed) {
         return;
@@ -658,16 +760,21 @@ pub async fn run_from_env() -> Result<(), String> {
     let settings = settings::load_settings_for_terminal()?;
     let pool_manager = Arc::new(PoolManager::build(&settings)?);
     let room = RoomState::with_data_dir(config.data_dir.join("agent-room"));
+    // L'admission est illimitee par defaut. `CST_NODE_CAPACITY` reste un indice
+    // de routage pour repartir la charge, pas une barriere de creation.
+    let worktrees = WorktreeManager::from_env(config.data_dir.join("agents"))?;
     let state = Arc::new(ServerState {
         config: config.clone(),
         terminals: RemoteTerminalManager::default(),
+        chat: ChatTurnManager::default(),
         kombai: Arc::new(KombaiManager::default()),
         room: room.clone(),
+        worktrees,
         started_at: metrics::now_ts(),
         draining: Arc::new(AtomicBool::new(false)),
     });
 
-    spawn_workspace_cleanup(config.data_dir.clone());
+    spawn_workspace_cleanup(config.data_dir.clone(), state.worktrees.clone());
 
     let api = Router::new()
         .route("/health", get(api_health))
@@ -683,9 +790,16 @@ pub async fn run_from_env() -> Result<(), String> {
         .route("/discussions", get(api_list_discussions))
         .route("/discussions/transcript", get(api_discussion_transcript))
         .route("/discussions/copy", post(api_copy_discussion))
+        .route("/discussions/move", post(api_move_discussion))
         .route("/discussions/claim", post(api_claim_session))
         .route("/discussions/delete", post(api_delete_discussion))
         .route("/discussions/export", post(api_export_discussion_transcript))
+        .route("/chat/models", get(api_chat_models))
+        .route("/chat/turns", post(api_start_chat_turn))
+        .route(
+            "/chat/turns/:id",
+            get(api_chat_turn_status).delete(api_stop_chat_turn),
+        )
         .route("/pool/status", get(api_pool_status))
         .route("/pool/start", post(api_pool_status))
         .route("/pool/stop", post(api_pool_stop))
@@ -710,6 +824,7 @@ pub async fn run_from_env() -> Result<(), String> {
 
     let ws = Router::new()
         .route("/terminals/:id", get(ws_terminal))
+        .route("/discussions", get(ws_discussions))
         .with_state(state.clone());
 
     // Liveness NON authentifiee, a la racine (`/healthz`) : l'auth de ce projet
@@ -948,6 +1063,7 @@ fn list_subdirs(dir: &Path) -> Result<Vec<FsEntry>, String> {
 /// Identifiant stable (sans separateur de chemin) pour un workspace pointant un
 /// dossier existant. Sert d'etiquette de routage ; n'est jamais utilise pour
 /// supprimer quoi que ce soit (la purge ne touche que `data_dir/workspaces`).
+#[cfg(test)]
 fn workspace_id_for_dir(dir: &Path) -> String {
     let mut id = String::from("dir-");
     for character in dir.to_string_lossy().chars() {
@@ -972,7 +1088,7 @@ async fn api_healthz(State(state): State<Arc<ServerState>>) -> Response {
         // vivant pour ses sessions en cours.
         ready: !draining,
         draining,
-        active_terminals: state.terminals.active_count(),
+        active_terminals: state.worktrees.active_count(),
         capacity: state.config.node_capacity,
     })
 }
@@ -989,7 +1105,7 @@ async fn api_health(State(state): State<Arc<ServerState>>, headers: HeaderMap) -
             commit: COMMIT,
             ready: !draining,
             draining,
-            active_terminals: state.terminals.active_count(),
+            active_terminals: state.worktrees.active_count(),
             capacity: state.config.node_capacity,
             started_at: state.started_at,
         }))
@@ -1005,7 +1121,7 @@ async fn api_admin_drain(
         state.draining.store(request.draining, Ordering::Relaxed);
         Ok(json_response(json!({
             "draining": request.draining,
-            "activeTerminals": state.terminals.active_count(),
+            "activeTerminals": state.worktrees.active_count(),
         })))
     })
 }
@@ -1138,6 +1254,23 @@ async fn api_copy_discussion(
     })
 }
 
+async fn api_move_discussion(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<MoveDiscussionRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        let workspace =
+            resolve_within_root(&state.config.workspaces_root, &request.workspace_path)?;
+        discussions::move_discussion_for_account(
+            request.account_id,
+            request.session_id,
+            display_path(&workspace),
+        )
+        .map(json_response)
+    })
+}
+
 async fn api_claim_session(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -1221,13 +1354,113 @@ async fn api_start_terminal(
             &state.config,
         );
     }
-    match state
-        .terminals
-        .start(&state.config, &state.room, request)
+    let start_state = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        start_state.terminals.start(
+            &start_state.config,
+            &start_state.room,
+            &start_state.worktrees,
+            request,
+        )
+    })
+    .await
     {
-        Ok(value) => json_response(value),
-        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config),
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(agent_start_status(&error), &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("spawn terminal interrompu: {error}"),
+            &state.config,
+        ),
     }
+}
+
+async fn api_start_chat_turn(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<StartChatTurnRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    if state.draining.load(Ordering::Relaxed) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "noeud en drain: nouveaux messages refusés",
+            &state.config,
+        );
+    }
+    let port = state
+        .config
+        .bind
+        .parse::<SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(8123);
+    let room_url = format!("http://127.0.0.1:{port}/mcp");
+    let start_state = state.clone();
+    match tokio::task::spawn_blocking(move || {
+        start_state.chat.start(
+            request,
+            &start_state.worktrees,
+            &start_state.room,
+            Some(&room_url),
+        )
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(agent_start_status(&error), &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("spawn chat interrompu: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatModelsQuery {
+    account_id: String,
+}
+
+async fn api_chat_models(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<ChatModelsQuery>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match tokio::task::spawn_blocking(move || {
+        settings::load_account_model_catalog(&query.account_id)
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error.to_string(),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_chat_turn_status(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    auth_or(&state, &headers, || state.chat.status(id).map(json_response))
+}
+
+async fn api_stop_chat_turn(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<u64>,
+) -> Response {
+    auth_or(&state, &headers, || state.chat.stop(id).map(json_response))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1372,7 +1605,11 @@ async fn api_delete_workspace(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     auth_or(&state, &headers, || {
-        delete_workspace(&state.config.data_dir, &id)?;
+        delete_workspace(
+            &state.config.data_dir,
+            &id,
+            &state.worktrees.active_workspace_ids(),
+        )?;
         Ok(json_response(json!({ "ok": true })))
     })
 }
@@ -1428,6 +1665,168 @@ async fn ws_terminal(
     };
 
     ws.on_upgrade(move |socket| handle_terminal_socket(socket, state, id, session))
+}
+
+/// Flux temps reel des discussions, utilise notamment par la WebView Android.
+/// Sans `accountId`/`sessionId`, il pousse l'index complet lorsqu'un fichier de
+/// session change. Avec les deux parametres, il pousse le transcript cible.
+async fn ws_discussions(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = params.get("token").map(String::as_str).unwrap_or("");
+    if !crate::security::constant_time_eq(token.as_bytes(), state.config.admin_token.as_bytes()) {
+        if let Err(response) = check_admin_header(&state, &headers) {
+            return response;
+        }
+    }
+
+    let account_id = params.get("accountId").cloned();
+    let session_id = params.get("sessionId").cloned();
+    if account_id.is_some() != session_id.is_some() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "accountId et sessionId doivent etre fournis ensemble",
+            &state.config,
+        );
+    }
+
+    ws.on_upgrade(move |socket| handle_discussions_socket(socket, account_id, session_id))
+}
+
+async fn handle_discussions_socket(
+    socket: WebSocket,
+    account_id: Option<String>,
+    session_id: Option<String>,
+) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut ticker = tokio::time::interval(Duration::from_millis(750));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_revision: Option<u64> = None;
+    let mut last_payload: Option<String> = None;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let update = discussion_ws_update(
+                    account_id.clone(),
+                    session_id.clone(),
+                    last_revision,
+                ).await;
+
+                match update {
+                    Ok(Some((revision, payload, signature))) => {
+                        // La revision source peut changer pour un evenement outil
+                        // qui n'ajoute aucun tour visible. Dans ce cas on memorise
+                        // la revision sans renvoyer inutilement le meme transcript.
+                        last_revision = Some(revision);
+                        last_error = None;
+                        if last_payload.as_deref() != Some(signature.as_str()) {
+                            if send_ws_value(&mut sender, &payload).await.is_err() {
+                                break;
+                            }
+                            last_payload = Some(signature);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if last_error.as_deref() != Some(error.as_str()) {
+                            let payload = json!({ "type": "error", "message": error });
+                            if send_ws_value(&mut sender, &payload).await.is_err() {
+                                break;
+                            }
+                            last_error = payload
+                                .get("message")
+                                .and_then(|value| value.as_str())
+                                .map(ToString::to_string);
+                        }
+                    }
+                }
+            }
+            incoming = receiver.next() => {
+                let Some(Ok(message)) = incoming else {
+                    break;
+                };
+                match message {
+                    Message::Close(_) => break,
+                    Message::Ping(data) => {
+                        if sender.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Text(text) if text.contains("\"type\":\"ping\"") => {
+                        if send_ws_value(&mut sender, &json!({ "type": "pong" })).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Renvoie un snapshot uniquement si l'empreinte disque a change depuis le
+/// dernier tick. Le scan/parsing de JSONL reste dans le pool bloquant pour ne
+/// jamais immobiliser les workers async d'Axum.
+async fn discussion_ws_update(
+    account_id: Option<String>,
+    session_id: Option<String>,
+    last_revision: Option<u64>,
+) -> Result<Option<(u64, serde_json::Value, String)>, String> {
+    if let (Some(account_id), Some(session_id)) = (account_id, session_id) {
+        let revision_account = account_id.clone();
+        let revision_session = session_id.clone();
+        let revision = tokio::task::spawn_blocking(move || {
+            discussions::transcript_revision_for_account(&revision_account, &revision_session)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        if last_revision == Some(revision) {
+            return Ok(None);
+        }
+
+        let transcript_account = account_id.clone();
+        let transcript_session = session_id.clone();
+        let transcript = tokio::task::spawn_blocking(move || {
+            discussions::transcript_for_account(transcript_account, transcript_session)
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        let payload = json!({
+            "type": "transcript",
+            "accountId": account_id,
+            "sessionId": session_id,
+            "transcript": transcript,
+        });
+        let signature = payload.to_string();
+        return Ok(Some((revision, payload, signature)));
+    }
+
+    let revision = tokio::task::spawn_blocking(discussions::discussions_revision)
+        .await
+        .map_err(|error| error.to_string())??;
+    if last_revision == Some(revision) {
+        return Ok(None);
+    }
+    let dashboard = tokio::task::spawn_blocking(discussions::list_discussions_dashboard)
+        .await
+        .map_err(|error| error.to_string())??;
+    let payload = json!({ "type": "dashboard", "dashboard": dashboard });
+    // generatedAt est volontairement exclu de la signature fonctionnelle : sa
+    // variation seule ne constitue pas une mise a jour visible.
+    let mut stable = payload.clone();
+    if let Some(dashboard) = stable
+        .get_mut("dashboard")
+        .and_then(|value| value.as_object_mut())
+    {
+        dashboard.remove("generatedAt");
+    }
+    let signature = stable.to_string();
+    Ok(Some((revision, payload, signature)))
 }
 
 async fn handle_terminal_socket(
@@ -1527,6 +1926,13 @@ async fn send_ws(
     sender.send(Message::Text(text)).await
 }
 
+async fn send_ws_value(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    event: &serde_json::Value,
+) -> Result<(), axum::Error> {
+    sender.send(Message::Text(event.to_string())).await
+}
+
 fn auth_or(
     state: &Arc<ServerState>,
     headers: &HeaderMap,
@@ -1581,6 +1987,16 @@ fn api_error(status: StatusCode, message: &str, config: &ServerConfig) -> Respon
         .into_response()
 }
 
+fn agent_start_status(error: &str) -> StatusCode {
+    if error.starts_with("capacite agents atteinte") {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if error.contains("deja vivant") || error.contains("déjà en cours") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 fn pool_status_response(
     config: &ServerConfig,
     settings: &AppSettings,
@@ -1623,61 +2039,6 @@ fn shell_command(settings: &AppSettings) -> CommandBuilder {
         builder.arg("-NoLogo");
     }
     builder
-}
-
-fn prepare_workspace(
-    repo_url: &str,
-    branch: Option<&str>,
-    target: &Path,
-    git_pat: &str,
-) -> Result<String, String> {
-    let repo_url = repo_url.trim();
-    if repo_url.is_empty() {
-        fs::create_dir_all(target).map_err(|error| error.to_string())?;
-        return Ok("workspace vide".to_string());
-    }
-
-    clone_repo(repo_url, branch, target, git_pat)?;
-    Ok(repo_url.to_string())
-}
-
-fn clone_repo(
-    repo_url: &str,
-    branch: Option<&str>,
-    target: &Path,
-    git_pat: &str,
-) -> Result<(), String> {
-    let repo_url = validate_repo_url(repo_url)?;
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-
-    let authed_url = authenticated_repo_url(&repo_url, git_pat);
-    let mut command = Command::new("git");
-    command.arg("clone");
-    if let Some(branch) = branch.map(str::trim).filter(|value| !value.is_empty()) {
-        command.arg("--branch").arg(branch);
-    }
-    command
-        .arg(&authed_url)
-        .arg(target)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let output = command
-        .output()
-        .map_err(|error| format!("git clone impossible: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(format!(
-        "git clone a echoue ({}): {}{}",
-        output.status, stdout, stderr
-    ))
 }
 
 fn validate_repo_url(repo_url: &str) -> Result<String, String> {
@@ -1728,16 +2089,19 @@ fn redact_secrets(value: &str, config: &ServerConfig) -> String {
     redacted
 }
 
-fn spawn_workspace_cleanup(data_dir: PathBuf) {
+fn spawn_workspace_cleanup(data_dir: PathBuf, worktrees: WorktreeManager) {
     tokio::spawn(async move {
         loop {
-            let _ = cleanup_old_workspaces(&data_dir);
+            // Ancien format (< worktree manager) uniquement. Les workspaces
+            // actifs courants sont balayes par `sweep_stale`, qui verifie le PID.
+            let _ = cleanup_legacy_workspaces(&data_dir);
+            let _ = worktrees.sweep_stale(WORKSPACE_RETENTION_SECS);
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
         }
     });
 }
 
-fn cleanup_old_workspaces(data_dir: &Path) -> Result<(), String> {
+fn cleanup_legacy_workspaces(data_dir: &Path) -> Result<(), String> {
     let now = SystemTime::now();
     let root = data_dir.join("workspaces");
     if !root.is_dir() {
@@ -1762,36 +2126,55 @@ fn cleanup_old_workspaces(data_dir: &Path) -> Result<(), String> {
 }
 
 fn list_workspaces(data_dir: &Path) -> Result<Vec<WorkspaceView>, String> {
-    let root = data_dir.join("workspaces");
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut views = Vec::new();
-    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let metadata = entry.metadata().map_err(|error| error.to_string())?;
-        if !metadata.is_dir() {
+    for root in [data_dir.join("agents").join("workspaces"), data_dir.join("workspaces")] {
+        if !root.is_dir() {
             continue;
         }
-        let modified_at = metadata.modified().ok().and_then(system_time_to_unix);
-        views.push(WorkspaceView {
-            id: entry.file_name().to_string_lossy().to_string(),
-            path: entry.path().to_string_lossy().to_string(),
-            modified_at,
-            retained_until: modified_at.map(|ts| ts + WORKSPACE_RETENTION_SECS as i64),
-        });
+        for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let metadata = entry.metadata().map_err(|error| error.to_string())?;
+            if !metadata.is_dir() {
+                continue;
+            }
+            let modified_at = metadata.modified().ok().and_then(system_time_to_unix);
+            views.push(WorkspaceView {
+                id: entry.file_name().to_string_lossy().to_string(),
+                path: entry.path().to_string_lossy().to_string(),
+                modified_at,
+                retained_until: modified_at.map(|ts| ts + WORKSPACE_RETENTION_SECS as i64),
+            });
+        }
     }
     views.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
     Ok(views)
 }
 
-fn delete_workspace(data_dir: &Path, id: &str) -> Result<(), String> {
+fn delete_workspace(
+    data_dir: &Path,
+    id: &str,
+    active: &HashSet<String>,
+) -> Result<(), String> {
     if id.contains(['/', '\\']) || id == "." || id == ".." {
         return Err("workspace id invalide".to_string());
     }
-    let target = data_dir.join("workspaces").join(id);
-    if target.is_dir() {
-        fs::remove_dir_all(target).map_err(|error| error.to_string())?;
+    if active.contains(id) {
+        return Err("workspace encore utilise par un agent vivant".to_string());
+    }
+    for target in [
+        data_dir.join("agents").join("workspaces").join(id),
+        data_dir.join("workspaces").join(id),
+    ] {
+        if target.is_dir() {
+            let root = target
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .ok_or_else(|| "racine workspace invalide".to_string())?;
+            let resolved = target.canonicalize().map_err(|error| error.to_string())?;
+            if resolved.starts_with(&root) && resolved != root {
+                fs::remove_dir_all(&resolved).map_err(|error| error.to_string())?;
+            }
+        }
     }
     Ok(())
 }
@@ -1806,6 +2189,15 @@ fn system_time_to_unix(value: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_live_terminal_id_is_reserved_atomically() {
+        let manager = RemoteTerminalManager::default();
+        let reservation = manager.reserve_id(Some(77)).unwrap();
+        assert!(manager.reserve_id(Some(77)).is_err());
+        drop(reservation);
+        assert!(manager.reserve_id(Some(77)).is_ok());
+    }
 
     #[test]
     fn terminal_output_emitted_before_socket_is_replayed() {

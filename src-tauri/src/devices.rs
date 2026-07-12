@@ -526,9 +526,7 @@ fn save_state(path: &Path, state: &PersistedState) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.cst-tmp");
-    fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
+    crate::fs_util::atomic_write(path, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -16,6 +16,9 @@
 //! - `copy_discussion_to_account` : duplique une discussion vers un autre
 //!   compte en reecrivant l'uuid (fichier + payload) ; la SOURCE reste
 //!   octet-pour-octet identique ;
+//! - `move_discussion` : rattache une discussion a un autre workspace en
+//!   reecrivant son cwd ; pour Claude, le fichier est aussi deplace dans le
+//!   dossier projet ou `claude --resume` saura le retrouver ;
 //! - `delete_discussion` : archive (deplacement, par defaut) ou suppression
 //!   explicite d'une discussion.
 //!
@@ -25,8 +28,9 @@
 //!   sont pas reprenables (`turn/start` rejete par l'app-server) et usurpent le
 //!   `session_id` du parent (cf. `is_subagent_rollout`). La cible de reprise est
 //!   donc toujours un thread utilisateur.
-//! - Seul `delete_discussion` retire/deplace un rollout ; aucun autre chemin ne
-//!   supprime ni ne tronque de fichier.
+//! - `move_discussion` ne touche qu'au cwd des metadonnees. Pour Claude, il
+//!   deplace la session entre dossiers projet sans en modifier l'identite.
+//! - Seul `delete_discussion` supprime/archive definitivement un rollout.
 //! - `copy_discussion_to_account` n'ouvre JAMAIS la source en ecriture : la
 //!   source reste identique, seule la destination est transformee.
 //! - La copie reecrit a la fois l'uuid du nom de fichier ET
@@ -39,8 +43,9 @@ use crate::settings::{self, expand_home, AccountProfile, AppSettings};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{hash_map::DefaultHasher, HashSet},
     fs,
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     thread,
@@ -130,6 +135,96 @@ pub async fn list_discussions() -> Result<DiscussionsDashboard, String> {
 pub fn list_discussions_dashboard() -> Result<DiscussionsDashboard, String> {
     let settings = settings::load_settings_for_terminal()?;
     Ok(build(&settings))
+}
+
+/// Empreinte legere de l'index des discussions.
+///
+/// Le flux temps reel appelle cette fonction plusieurs fois par seconde. Il ne
+/// relit donc pas les JSONL : seuls les chemins et metadonnees des fichiers de
+/// session sont haches. Une creation, suppression ou ecriture fait changer
+/// l'empreinte et declenche alors seulement un nouveau scan complet.
+pub fn discussions_revision() -> Result<u64, String> {
+    let settings = settings::load_settings_for_terminal()?;
+    let mut hasher = DefaultHasher::new();
+
+    for account in &settings.accounts {
+        account.id.hash(&mut hasher);
+        account.label.hash(&mut hasher);
+        account.provider.as_str().hash(&mut hasher);
+        account.codex_home.hash(&mut hasher);
+        settings::account_has_auth_tokens(account).hash(&mut hasher);
+
+        let home = match expand_home(&account.codex_home) {
+            Ok(home) => home,
+            Err(error) => {
+                error.hash(&mut hasher);
+                continue;
+            }
+        };
+        let mut files = discussion_files(&home, account.provider);
+        files.sort();
+        files.len().hash(&mut hasher);
+        for file in files {
+            hash_file_revision(&file, &mut hasher);
+        }
+    }
+
+    Ok(hasher.finish())
+}
+
+/// Empreinte du fichier qui porte un transcript precis. Elle permet au flux
+/// WebSocket de ne reparcourir le JSONL que lorsqu'il a reellement grandi.
+pub fn transcript_revision_for_account(account_id: &str, session_id: &str) -> Result<u64, String> {
+    let (_, file) = discussion_source_for_account(account_id, session_id)?;
+    let mut hasher = DefaultHasher::new();
+    hash_file_revision(&file, &mut hasher);
+    Ok(hasher.finish())
+}
+
+fn discussion_files(home: &Path, provider: settings::Provider) -> Vec<PathBuf> {
+    match provider {
+        settings::Provider::Codex => {
+            let mut files = Vec::new();
+            collect_rollouts(&home.join("sessions"), &mut files);
+            files
+        }
+        settings::Provider::Claude => {
+            let mut files = Vec::new();
+            let Ok(projects) = fs::read_dir(home.join("projects")) else {
+                return files;
+            };
+            for project in projects.flatten() {
+                let project_dir = project.path();
+                if !project_dir.is_dir() {
+                    continue;
+                }
+                let Ok(entries) = fs::read_dir(project_dir) else {
+                    continue;
+                };
+                files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+                    path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                }));
+            }
+            files
+        }
+    }
+}
+
+fn hash_file_revision(path: &Path, hasher: &mut DefaultHasher) {
+    path.to_string_lossy().hash(hasher);
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            true.hash(hasher);
+            metadata.len().hash(hasher);
+            metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .hash(hasher);
+        }
+        Err(_) => false.hash(hasher),
+    }
 }
 
 fn build(settings: &AppSettings) -> DiscussionsDashboard {
@@ -919,7 +1014,262 @@ fn copy_discussion(
 }
 
 // ---------------------------------------------------------------------------
-// (d) delete_discussion
+// (d) move_discussion
+// ---------------------------------------------------------------------------
+
+/// Rattache une conversation existante a un autre workspace. Le `cwd` du
+/// resume est modifie de facon persistante ; l'identite et le transcript de la
+/// discussion restent inchanges.
+#[tauri::command]
+pub async fn move_discussion(
+    account_id: String,
+    session_id: String,
+    workspace_path: String,
+) -> Result<DiscussionSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        move_discussion_for_account(account_id, session_id, workspace_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Variante synchrone reutilisable par le serveur HTTP.
+pub fn move_discussion_for_account(
+    account_id: String,
+    session_id: String,
+    workspace_path: String,
+) -> Result<DiscussionSummary, String> {
+    if !is_uuid_shaped(&session_id) {
+        return Err("Identifiant de session invalide".to_string());
+    }
+
+    let workspace_path = workspace_path.trim();
+    if workspace_path.is_empty() {
+        return Err("Le workspace cible est vide".to_string());
+    }
+    if workspace_path.len() > 4096 {
+        return Err("Le chemin du workspace est trop long".to_string());
+    }
+    let workspace = Path::new(workspace_path);
+    if !workspace.is_absolute() {
+        return Err("Le workspace cible doit etre un chemin absolu".to_string());
+    }
+    if !workspace.is_dir() {
+        return Err(format!("Workspace introuvable: {workspace_path}"));
+    }
+
+    let settings = settings::load_settings_for_terminal()?;
+    let account = settings
+        .accounts
+        .iter()
+        .find(|candidate| candidate.id == account_id)
+        .cloned()
+        .ok_or_else(|| "Compte introuvable".to_string())?;
+
+    match account.provider {
+        settings::Provider::Codex => {
+            move_codex_discussion_impl(&account, &session_id, workspace_path)
+        }
+        settings::Provider::Claude => {
+            move_claude_discussion_impl(&account, &session_id, workspace_path)
+        }
+    }
+}
+
+/// Codex conserve ses rollouts dans CODEX_HOME independamment du projet. On
+/// reecrit donc uniquement `payload.cwd` dans tous les forks utilisateur de la
+/// conversation. Les sous-agents historiques sont laisses intacts.
+fn move_codex_discussion_impl(
+    account: &AccountProfile,
+    session_id: &str,
+    workspace_path: &str,
+) -> Result<DiscussionSummary, String> {
+    let home = expand_home(&account.codex_home)?;
+    let sessions = home.join("sessions");
+    let targets = find_all_rollouts_for(&sessions, session_id);
+    if targets.is_empty() {
+        return Err("Discussion introuvable".to_string());
+    }
+
+    // Prepare toutes les nouvelles versions avant la premiere ecriture. En cas
+    // d'echec intermediaire, les fichiers deja remplaces sont restaures.
+    let mut rewrites: Vec<(PathBuf, String, String)> = Vec::new();
+    for path in targets {
+        let original = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        if let Some(updated) = rewrite_codex_rollout_cwd(&original, workspace_path)? {
+            rewrites.push((path, original, updated));
+        }
+    }
+    if rewrites.is_empty() {
+        return Err("Aucun rollout utilisateur deplacable".to_string());
+    }
+
+    for index in 0..rewrites.len() {
+        let (path, _, updated) = &rewrites[index];
+        if let Err(error) = crate::fs_util::atomic_write(path, updated) {
+            for (rollback_path, original, _) in rewrites.iter().take(index) {
+                let _ = crate::fs_util::atomic_write(rollback_path, original);
+            }
+            return Err(format!(
+                "Impossible de deplacer une conversation en cours d'utilisation: {error}"
+            ));
+        }
+    }
+
+    scan_codex_discussions(&home, account)
+        .into_iter()
+        .find(|summary| summary.session_id == session_id || summary.rollout_id == session_id)
+        .ok_or_else(|| "Discussion deplacee mais impossible a relire".to_string())
+}
+
+/// Renvoie `None` pour un rollout de sous-agent ; sinon une version dont seul
+/// le cwd de la ligne `session_meta` a change. Le reste du JSONL reste verbatim.
+fn rewrite_codex_rollout_cwd(
+    content: &str,
+    workspace_path: &str,
+) -> Result<Option<String>, String> {
+    let (line0_raw, rest) = match content.find('\n') {
+        Some(index) => (&content[..index], Some(&content[index + 1..])),
+        None => (content, None),
+    };
+    let had_cr = line0_raw.ends_with('\r');
+    let mut meta: Value = serde_json::from_str(line0_raw.trim_end_matches('\r'))
+        .map_err(|error| format!("ligne meta illisible: {error}"))?;
+    if meta.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Err("Ligne meta inattendue (type != session_meta)".to_string());
+    }
+    if is_subagent_rollout(&meta) {
+        return Ok(None);
+    }
+    let payload = meta
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Payload session_meta invalide".to_string())?;
+    payload.insert("cwd".to_string(), Value::String(workspace_path.to_string()));
+    let line0 = serde_json::to_string(&meta).map_err(|error| error.to_string())?;
+    Ok(Some(match rest {
+        Some(rest) if had_cr => format!("{line0}\r\n{rest}"),
+        Some(rest) => format!("{line0}\n{rest}"),
+        None => line0,
+    }))
+}
+
+/// Claude localise une session dans `projects/<cwd-echappe>`. Il faut donc
+/// reecrire les champs cwd ET deplacer le fichier principal (plus son dossier
+/// de sidechains eventuel) pour que `claude --resume` fonctionne depuis la
+/// nouvelle cible.
+fn move_claude_discussion_impl(
+    account: &AccountProfile,
+    session_id: &str,
+    workspace_path: &str,
+) -> Result<DiscussionSummary, String> {
+    let home = expand_home(&account.codex_home)?;
+    let projects = home.join("projects");
+    let source = find_claude_session_file(&projects, session_id)
+        .ok_or_else(|| "Discussion introuvable".to_string())?;
+    let original = fs::read_to_string(&source).map_err(|error| error.to_string())?;
+    let updated = rewrite_claude_session_cwd(&original, workspace_path)?;
+
+    let destination_dir = projects.join(crate::provider::claude_escaped_cwd(workspace_path));
+    let destination = destination_dir.join(format!("{session_id}.jsonl"));
+    let final_path = if source == destination {
+        crate::fs_util::atomic_write(&source, updated).map_err(|error| {
+            format!("Impossible de deplacer une conversation en cours d'utilisation: {error}")
+        })?;
+        source
+    } else {
+        fs::create_dir_all(&destination_dir).map_err(|error| error.to_string())?;
+        if destination.exists() {
+            return Err(
+                "Une conversation de meme identite existe deja dans ce workspace".to_string(),
+            );
+        }
+
+        let source_sidechains = source.with_extension("");
+        let destination_sidechains = destination.with_extension("");
+        if source_sidechains.is_dir() && destination_sidechains.exists() {
+            return Err(
+                "Les donnees annexes de cette conversation existent deja dans la cible".to_string(),
+            );
+        }
+
+        crate::fs_util::atomic_write(&destination, updated).map_err(|error| error.to_string())?;
+
+        let sidechains_moved = if source_sidechains.is_dir() {
+            if let Err(error) = fs::rename(&source_sidechains, &destination_sidechains) {
+                let _ = fs::remove_file(&destination);
+                return Err(format!(
+                    "Impossible de deplacer les donnees annexes Claude: {error}"
+                ));
+            }
+            true
+        } else {
+            false
+        };
+
+        if let Err(error) = fs::remove_file(&source) {
+            if sidechains_moved {
+                let _ = fs::rename(&destination_sidechains, &source_sidechains);
+            }
+            let _ = fs::remove_file(&destination);
+            return Err(format!(
+                "Impossible de deplacer une conversation en cours d'utilisation: {error}"
+            ));
+        }
+        if let Some(parent) = source.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        destination
+    };
+
+    scan_claude_session_file(&final_path, account)
+        .ok_or_else(|| "Discussion deplacee mais impossible a relire".to_string())
+}
+
+fn rewrite_claude_session_cwd(content: &str, workspace_path: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(content.len() + workspace_path.len());
+    let mut updated_lines = 0usize;
+
+    for segment in content.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let without_newline = if has_newline {
+            &segment[..segment.len() - 1]
+        } else {
+            segment
+        };
+        let has_cr = without_newline.ends_with('\r');
+        let raw = without_newline.trim_end_matches('\r');
+
+        let mut value = match serde_json::from_str::<Value>(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                output.push_str(segment);
+                continue;
+            }
+        };
+        if let Some(object) = value.as_object_mut() {
+            if object.contains_key("cwd") || object.contains_key("sessionId") {
+                object.insert("cwd".to_string(), Value::String(workspace_path.to_string()));
+                updated_lines += 1;
+            }
+        }
+        output.push_str(&serde_json::to_string(&value).map_err(|error| error.to_string())?);
+        if has_cr {
+            output.push('\r');
+        }
+        if has_newline {
+            output.push('\n');
+        }
+    }
+
+    if updated_lines == 0 {
+        return Err("Aucun cwd Claude modifiable dans cette discussion".to_string());
+    }
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// (e) delete_discussion
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
@@ -1163,6 +1513,21 @@ fn collect_transcript_turns(
     account_id: &str,
     session_id: &str,
 ) -> Result<Vec<TranscriptMessage>, String> {
+    let (provider, file) = discussion_source_for_account(account_id, session_id)?;
+
+    Ok(match provider {
+        settings::Provider::Codex => extract_codex_transcript(&file),
+        settings::Provider::Claude => extract_claude_transcript(&file),
+    })
+}
+
+/// Resout le fichier physique qui porte une discussion. Centraliser cette
+/// resolution garantit que le transcript HTTP et son flux temps reel observent
+/// exactement le meme rollout.
+fn discussion_source_for_account(
+    account_id: &str,
+    session_id: &str,
+) -> Result<(settings::Provider, PathBuf), String> {
     if !is_uuid_shaped(session_id) {
         return Err("Identifiant de session invalide".to_string());
     }
@@ -1175,18 +1540,13 @@ fn collect_transcript_turns(
         .ok_or_else(|| "Compte introuvable".to_string())?;
     let home = expand_home(&account.codex_home)?;
 
-    Ok(match account.provider {
-        settings::Provider::Codex => {
-            let file = find_rollout_by_id(&home.join("sessions"), session_id)
-                .ok_or_else(|| "Discussion introuvable".to_string())?;
-            extract_codex_transcript(&file)
-        }
-        settings::Provider::Claude => {
-            let file = find_claude_session_file(&home.join("projects"), session_id)
-                .ok_or_else(|| "Discussion introuvable".to_string())?;
-            extract_claude_transcript(&file)
-        }
-    })
+    let file = match account.provider {
+        settings::Provider::Codex => find_rollout_by_id(&home.join("sessions"), session_id)
+            .ok_or_else(|| "Discussion introuvable".to_string())?,
+        settings::Provider::Claude => find_claude_session_file(&home.join("projects"), session_id)
+            .ok_or_else(|| "Discussion introuvable".to_string())?,
+    };
+    Ok((account.provider, file))
 }
 
 /// Codex : `event_msg.user_message.message` (hors messages synthetiques) et
@@ -1881,6 +2241,83 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn move_codex_rewrites_cwd_and_preserves_transcript() {
+        let base = fresh_dir();
+        let home = base.join("home");
+        let sessions = home.join("sessions").join("2026").join("07").join("07");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let uuid = "019f0000-0000-7000-8000-0000000000e1";
+        let path = sessions.join(format!("rollout-2026-07-07T10-00-00-{uuid}.jsonl"));
+        let transcript =
+            "{\"type\":\"user_message\",\"payload\":{\"message\":\"conversation a deplacer\"}}";
+        let meta = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{uuid}\",\"id\":\"{uuid}\",\"cwd\":\"C:\\\\ancien\",\"thread_source\":\"user\"}}}}"
+        );
+        fs::write(&path, format!("{meta}\n{transcript}\n")).unwrap();
+
+        let account = test_account("acc", &home);
+        let summary = move_codex_discussion_impl(&account, uuid, "C:\\nouveau")
+            .expect("move Codex should succeed");
+
+        assert_eq!(summary.cwd.as_deref(), Some("C:\\nouveau"));
+        assert_eq!(summary.session_id, uuid);
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().nth(1), Some(transcript));
+        let meta: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            meta.pointer("/payload/cwd").and_then(Value::as_str),
+            Some("C:\\nouveau")
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_claude_relocates_session_to_target_project() {
+        let base = fresh_dir();
+        let home = base.join("claude-home");
+        let old_cwd = "C:\\ancien";
+        let new_cwd = "C:\\nouveau";
+        let uuid = "019f0000-0000-7000-8000-0000000000e2";
+        let source_dir = home
+            .join("projects")
+            .join(crate::provider::claude_escaped_cwd(old_cwd));
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join(format!("{uuid}.jsonl"));
+        let content = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{uuid}\",\"cwd\":\"C:\\\\ancien\",\"timestamp\":\"2026-07-07T10:00:00Z\",\"message\":{{\"content\":\"bonjour\"}}}}\n"
+        );
+        fs::write(&source, content).unwrap();
+
+        let mut account = test_account("claude", &home);
+        account.provider = settings::Provider::Claude;
+        let summary = move_claude_discussion_impl(&account, uuid, new_cwd)
+            .expect("move Claude should succeed");
+
+        assert_eq!(summary.cwd.as_deref(), Some(new_cwd));
+        assert_eq!(summary.session_id, uuid);
+        assert!(!source.exists());
+        let destination = home
+            .join("projects")
+            .join(crate::provider::claude_escaped_cwd(new_cwd))
+            .join(format!("{uuid}.jsonl"));
+        assert!(destination.exists());
+
+        let moved: Value = serde_json::from_str(
+            fs::read_to_string(destination)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(moved.get("cwd").and_then(Value::as_str), Some(new_cwd));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// Ecrit un rollout complet (session_meta + 1 user_message) en controlant les
     /// champs `session_id`/`id`/`thread_source`/`parent_thread_id` du meta.
     fn write_rollout_meta(
@@ -2296,6 +2733,36 @@ mod tests {
         assert_eq!(turns[1].role, TranscriptRole::Assistant);
         assert_eq!(turns[1].text, "salut !");
         assert!(turns[1].timestamp > turns[0].timestamp);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_revision_changes_when_live_transcript_grows() {
+        let dir = fresh_dir();
+        let path = dir.join("live.jsonl");
+        fs::write(&path, "premiere ligne\n").unwrap();
+
+        let revision = || {
+            let mut hasher = DefaultHasher::new();
+            hash_file_revision(&path, &mut hasher);
+            hasher.finish()
+        };
+        let before = revision();
+        assert_eq!(
+            before,
+            revision(),
+            "une source inchangee garde la meme empreinte"
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, b"nouveau message\n").unwrap();
+        std::io::Write::flush(&mut file).unwrap();
+        assert_ne!(
+            before,
+            revision(),
+            "un append doit reveiller le flux temps reel"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

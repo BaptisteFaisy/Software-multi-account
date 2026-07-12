@@ -145,6 +145,9 @@ fn read_json(path: &Path) -> Option<Value> {
 /// -> `C--Users`). C'est la cle pour poser un fichier de session la ou
 /// `claude --resume <id>` (qui ne cherche que dans le dossier projet courant)
 /// saura le retrouver.
+///
+/// Utilise notamment quand le drag-and-drop rattache une session Claude a un
+/// autre workspace : le fichier doit suivre cette cle pour rester reprenable.
 pub fn claude_escaped_cwd(cwd: &str) -> String {
     cwd.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -212,9 +215,7 @@ pub fn ensure_claude_account_config(
         return Ok(());
     }
 
-    let tmp = home.join("settings.json.cst-tmp");
-    fs::write(&tmp, serialized)?;
-    fs::rename(&tmp, &path)
+    crate::fs_util::atomic_write(&path, serialized)
 }
 
 #[cfg(test)]

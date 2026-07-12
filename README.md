@@ -33,14 +33,21 @@ Depuis PowerShell, une action peut etre lancee directement :
 
 ## Fonctionnement
 
+- L'interface propose deux modes persistants : `Simple` affiche un chat, tandis que `Expert` reprend exactement cette interface de conversation dans une grille paginee, sans plafond logiciel de chats ouverts.
+- La barre laterale commune aux deux modes affiche tous les workspaces simultanement. Chaque dossier regroupe ses conversations juste sous son nom et propose son propre bouton `+` ; la recherche traverse tous les groupes sans changer de workspace. Une conversation peut etre glissee sur un autre workspace pour y etre deplacee durablement.
+- Chaque chat Expert conserve independamment sa discussion, son brouillon, son compte, son mode de travail, son suivi temps reel, son tour en cours et sa position de lecture. Tous les chats restent visibles dans la grille, mais seule la conversation selectionnee affiche sa bulle de saisie.
+- `Ctrl+N`, le bouton de la barre laterale et le bouton `Nouveau chat` ajoutent une conversation a la fin du mode Expert sans fermer les autres. La grille affiche au choix 6 ou 9 chats de taille uniforme par page et ouvre automatiquement la page du nouveau chat.
+- Le composer des deux modes permet de choisir le modele et, pour Codex, l'intensite de raisonnement. Les intensites viennent du catalogue du modele (`model/list`) : GPT-5.6 Sol/Terra proposent donc aussi `max` et `ultra`, tandis que Luna propose `max` sans `ultra`. Ces choix sont enregistres comme valeurs du compte et transmis explicitement a chaque nouveau tour, en desktop comme en mode SaaS.
 - Les comptes Codex sont des dossiers utilises comme `CODEX_HOME`.
 - L'app detecte automatiquement les dossiers `~\.codex*` qui contiennent `auth.json` ou `config.toml`.
 - Les profils proxy sont detectes depuis les fichiers `proxy.txt` presents dans `~\.codex*`.
 - Le terminal lance un shell avec `CODEX_HOME`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` et leurs variantes minuscules selon le compte selectionne.
 - Chaque compte peut avoir un `Dossier projet`; les nouveaux terminaux demarrent directement dans ce dossier pour que Codex prenne ce workspace comme environnement.
+- Chaque terminal capture son propre workspace a la creation. Changer de workspace actif ne modifie donc pas les sessions deja ouvertes ni celles qui sont en train de demarrer.
+- La barre laterale regroupe les terminaux par workspace. Deux entrees qui designent le meme chemin sont fusionnees automatiquement avec tous leurs terminaux. Le bouton `+` d'un groupe cree directement une nouvelle session dans ce dossier, et les associations sont restaurees au prochain lancement.
 - A la creation d'un compte/environnement, l'interface demande le mode de securite (bypass ou sandbox), le modele Codex par defaut et son intensite de raisonnement. Ces choix sont propres au compte.
 - L'app synchronise ces choix dans le `config.toml` du `CODEX_HOME` (`approval_policy`, `sandbox_mode`, `model`, `model_reasoning_effort`), y compris lors du passage du bypass vers la sandbox.
-- Le bouton `Terminal` cree un nouvel onglet PTY sans fermer les sessions existantes.
+- Les terminaux PTY restent disponibles comme outil separe ; ils ne definissent plus le mode Expert.
 - Le bouton `Pool term` ouvre un nouvel onglet PTY en piochant le prochain compte qui possede un `auth.json` valide.
 - La vue `Pool` permet d'importer des fichiers JSON de comptes (`*_cpa.json`, exports avec `accounts[].credentials`, dossier de JSON ou wildcard `*.json`).
 - Il est aussi possible de coller directement un blob de session ChatGPT (copie de `chatgpt.com/api/auth/session`) dans la zone d'import : le champ `accessToken` est utilise comme jeton d'acces. Sans `refresh_token`, le compte est valide ~10 jours (jusqu'a l'expiration du JWT) et n'est pas renouvelable.
@@ -370,3 +377,52 @@ sudo systemctl enable --now codex-switch-terminal
 
 Le frontend doit etre copie dans `/opt/codex-switch-terminal/dist` et le binaire
 `cst-server` dans `/opt/codex-switch-terminal/cst-server`.
+
+## Execution multi-agents isolee (sans plafond logiciel)
+
+Chaque terminal et chaque tour de chat recoit desormais :
+
+- un worktree Git detache propre (ou une copie physique pour un dossier non-Git) ;
+- un `CODEX_HOME` / `CLAUDE_CONFIG_DIR` propre ;
+- `CST_AGENT_ID`, `CST_WORKSPACE_ID` et `CST_BASE_SHA` ;
+- les conventions `AGENTS.md` et `CLAUDE.md` dans son home isole ;
+- les outils MCP du salon pour les messages, le task board et la merge queue.
+
+En SaaS, un seul miroir bare est maintenu par URL de depot et les agents ne
+font plus chacun un clone complet. Les chemins runtime se trouvent sous
+`<CST_DATA_DIR>/agents/` (`mirrors`, `workspaces`, `agent-homes`, `recoveries`).
+Les transcripts sont recopies dans le home canonique a la fin du process ; les
+configs temporaires ne le sont jamais.
+
+Workflow agent recommande :
+
+1. `claim_task({ taskId, description })` ;
+2. travailler et committer dans le worktree courant ;
+3. `submit_for_merge({ verify: true|false })` ;
+4. suivre `merge_status({ id })` et `list_landed()` ;
+5. en cas de conflit, rebaser depuis la nouvelle base annoncee dans le salon et
+   resoumettre.
+
+La file est FIFO avec un seul worker. Elle rejoue les commits sur la tete
+courante, lance eventuellement le verify, puis effectue un CAS sur la ref cible.
+Le journal durable de merge est separe de `messages.jsonl`. Pour un miroir SaaS,
+le land met a jour la branche du miroir local ; le push/deploiement distant reste
+une etape explicite. Pour un checkout local dont `main` est actuellement ouvert,
+le fast-forward n'est accepte que si le checkout est propre.
+
+Variables utiles :
+
+- `CST_MAX_AGENTS` : `0`, absent ou `unlimited` = admission sans plafond
+  logiciel (comportement par defaut). Une valeur positive reactive un cap dur ;
+- `CST_NODE_CAPACITY` : indice de capacite utilise par le routage SaaS, sans
+  refuser la creation de nouveaux agents ;
+- `CST_MERGE_VERIFY_COMMAND` : commande executee dans le worktree d'integration
+  lorsque la soumission demande `verify: true`.
+
+Des verrous d'ownership OS garantissent qu'un seul processus ecrit un store
+`agent-room`/merge donne et qu'un seul processus admet/nettoie les worktrees
+d'un runtime agents. Les autres instances sont passives ou refusees au demarrage
+et doivent passer par l'endpoint REST/MCP du processus proprietaire. Le journal du salon est
+segmente a 16 Mio, garde huit segments et borne son index memoire a 20 000
+messages. Le sweeper ne supprime jamais un lease dont le PID proprietaire est
+encore vivant ; apres crash, commits et home sont conserves dans les recoveries.
