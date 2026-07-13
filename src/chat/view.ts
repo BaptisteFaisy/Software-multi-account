@@ -8,6 +8,7 @@ import { escapeHtml, renderMarkdown } from "./markdown";
 import {
   formatChatDuration,
   formatChatResetCountdown,
+  groupConsecutiveCommandParts,
   type RuntimeChatPart,
   type RuntimeChatMessage,
 } from "./runtime";
@@ -302,6 +303,41 @@ const renderOpenCodeToolPart = (part: ChatPart): string => {
   </details>`;
 };
 
+const renderOpenCodeCommandGroup = (parts: ChatPart[]): string => {
+  const running = parts.some((part) => part.status === "running" || part.status === "queued");
+  const failed = parts.some((part) => part.status === "error" || part.status === "failed");
+  const status = failed ? "error" : running ? "running" : "complete";
+  const title = running ? "Exécution de commandes" : "Commandes exécutées";
+  const trigger = `
+    <span class="chat-tool-icon" aria-hidden="true">${running ? `<span class="chat-tool-spinner"></span>` : `<i data-lucide="${failed ? "circle-alert" : "play"}"></i>`}</span>
+    <span class="chat-tool-copy"><strong>${title}</strong><small>${parts.length} commandes</small></span>
+    <i class="chat-tool-chevron" data-lucide="chevron-down"></i>`;
+  const commands = parts.map((part, index) => {
+    const command = part.detail || part.subtitle || `Commande ${index + 1}`;
+    const partRunning = part.status === "running" || part.status === "queued";
+    const partFailed = part.status === "error" || part.status === "failed";
+    const row = `
+      <span class="chat-command-state" aria-hidden="true">
+        ${partRunning ? `<span class="chat-tool-spinner"></span>` : `<i data-lucide="${partFailed ? "circle-alert" : "check"}"></i>`}
+      </span>
+      <code>${escapeHtml(command)}</code>`;
+    if (!part.output) {
+      return `<li class="chat-command-item chat-command-item--${escapeHtml(part.status)}"><div class="chat-command-row">${row}</div></li>`;
+    }
+    return `<li class="chat-command-item chat-command-item--${escapeHtml(part.status)}">
+      <details>
+        <summary class="chat-command-row">${row}<i class="chat-command-chevron" data-lucide="chevron-down"></i></summary>
+        <div class="chat-command-output"><span>Sortie</span><pre>${escapeHtml(part.output)}</pre></div>
+      </details>
+    </li>`;
+  }).join("");
+
+  return `<details data-component="tool-part" data-tool-kind="command-group" class="chat-tool-part chat-command-group chat-tool-part--${status}">
+    <summary>${trigger}</summary>
+    <ol class="chat-command-list">${commands}</ol>
+  </details>`;
+};
+
 const renderOpenCodeAssistantMeta = (
   providerLabel: string,
   timestamp: number,
@@ -349,15 +385,20 @@ const renderOpenCodeParts = (
   finishedAt: number | null = null,
 ): string => {
   const visible = parts.filter((part) => part.kind === "tool" || !!part.text?.trim());
-  const lastTextIndex = visible.map((part) => part.kind === "text").lastIndexOf(true);
+  const groups = groupConsecutiveCommandParts(visible);
+  const lastTextIndex = groups
+    .map((group) => group.length === 1 && group[0]?.kind === "text")
+    .lastIndexOf(true);
   return `<div data-component="assistant-parts" class="chat-assistant-parts">
-    ${visible.map((part, index) => renderOpenCodePart(part, {
-      finalText: index === lastTextIndex,
-      providerLabel,
-      timestamp,
-      startedAt,
-      finishedAt,
-    })).join("")}
+    ${groups.map((group, index) => group.length > 1
+      ? renderOpenCodeCommandGroup(group)
+      : renderOpenCodePart(group[0], {
+          finalText: index === lastTextIndex,
+          providerLabel,
+          timestamp,
+          startedAt,
+          finishedAt,
+        })).join("")}
   </div>`;
 };
 

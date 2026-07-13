@@ -7077,6 +7077,112 @@ div.chat-tool-part {
   white-space: pre-wrap;
 }
 
+.chat-command-list {
+  display: grid;
+  gap: 7px;
+  margin: 6px 0 4px 24px;
+  padding: 9px 11px 9px 30px;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  color: #777;
+}
+
+.chat-command-item {
+  min-width: 0;
+  padding-left: 2px;
+}
+
+.chat-command-item::marker {
+  color: #555;
+  font: 10px/1.5 var(--font-mono);
+}
+
+.chat-command-item > details > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.chat-command-item > details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-command-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  min-width: 0;
+  color: #999;
+}
+
+.chat-command-row code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font: 11px/1.5 var(--font-mono);
+  white-space: pre-wrap;
+}
+
+.chat-command-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 13px;
+  width: 13px;
+  height: 16px;
+  color: #666;
+}
+
+.chat-command-state svg {
+  width: 11px;
+  height: 11px;
+}
+
+.chat-command-state .chat-tool-spinner {
+  width: 10px;
+  height: 10px;
+}
+
+.chat-command-item--error .chat-command-state,
+.chat-command-item--failed .chat-command-state {
+  color: #d77878;
+}
+
+.chat-command-chevron {
+  flex: 0 0 12px;
+  width: 12px;
+  height: 12px;
+  margin: 2px 0 0 auto;
+  color: #555;
+  transition: transform 120ms ease;
+}
+
+.chat-command-item details[open] .chat-command-chevron {
+  transform: rotate(180deg);
+}
+
+.chat-command-output {
+  margin: 6px 0 3px 20px;
+  padding: 7px 9px;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.chat-command-output > span {
+  display: block;
+  margin-bottom: 4px;
+  color: #666;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.chat-command-output pre {
+  max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  color: #999;
+  font: 11px/1.5 var(--font-mono);
+  white-space: pre-wrap;
+}
+
 .chat-thinking-row {
   display: flex;
   align-items: center;

@@ -32,6 +32,22 @@ export const createGoalPrompt = (objective: string): string => {
   return `Crée un goal avec l'outil create_goal pour l'objectif suivant, puis commence à le poursuivre :\n\n${normalized}`;
 };
 
+const isCommandPart = (part: RuntimeChatPart): boolean =>
+  part.kind === "tool" && part.tool === "command";
+
+export const groupConsecutiveCommandParts = <T extends RuntimeChatPart>(parts: T[]): T[][] => {
+  const groups: T[][] = [];
+  parts.forEach((part) => {
+    const previous = groups[groups.length - 1];
+    if (isCommandPart(part) && previous?.every(isCommandPart)) {
+      previous.push(part);
+      return;
+    }
+    groups.push([part]);
+  });
+  return groups;
+};
+
 const sameMessageContent = (left: RuntimeChatMessage, right: RuntimeChatMessage): boolean =>
   left.role === right.role && left.text === right.text;
 

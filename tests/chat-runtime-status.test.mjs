@@ -7,6 +7,7 @@ import {
   conversationWaitsForUser,
   formatChatDuration,
   formatChatResetCountdown,
+  groupConsecutiveCommandParts,
   reconcileChatMessages,
 } from "../src/chat/runtime.ts";
 
@@ -140,6 +141,35 @@ test("le chat suit la timeline OpenCode au lieu de separer pensee et outils", ()
   assert.match(style, /\.chat-thinking-shimmer/);
   assert.match(chatBackend, /pub struct ChatPart/);
   assert.match(chatBackend, /upsert_part/);
+});
+
+test("les commandes consecutives sont regroupees dans une seule liste depliante", () => {
+  const command = (id) => ({
+    id,
+    kind: "tool",
+    tool: "command",
+    status: "complete",
+    title: "Commande executee",
+    detail: `npm run ${id}`,
+  });
+  const textPart = { id: "text", kind: "text", status: "complete", text: "Etape suivante" };
+  const groups = groupConsecutiveCommandParts([
+    command("lint"),
+    command("test"),
+    textPart,
+    command("build"),
+    command("preview"),
+  ]);
+
+  assert.deepEqual(groups.map((group) => group.map((part) => part.id)), [
+    ["lint", "test"],
+    ["text"],
+    ["build", "preview"],
+  ]);
+  assert.match(view, /data-tool-kind="command-group"/);
+  assert.match(view, /Commandes exécutées/);
+  assert.match(view, /<ol class="chat-command-list">/);
+  assert.match(style, /\.chat-command-list/);
 });
 
 test("le bouton d'envoi OpenCode reste sombre et conserve son icone", () => {
