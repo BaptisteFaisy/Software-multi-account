@@ -55,6 +55,13 @@ function Get-Healthz {
   try { return Invoke-RestMethod -Uri "$base/healthz" -TimeoutSec 3 } catch { return $null }
 }
 
+function Set-DrainState {
+  param([bool]$Draining)
+  $body = @{ draining = $Draining } | ConvertTo-Json -Compress
+  Invoke-RestMethod -Uri "$base/api/admin/drain" -Method Post -Headers $authHeaders `
+    -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
+}
+
 function Set-Junction {
   param([string]$Link, [string]$Target)
   # rmdir sur une jonction retire UNIQUEMENT le point de reparse (jamais la
@@ -188,41 +195,60 @@ $releaseDist = Join-Path $releaseDir "dist"
 if (Test-Path $releaseDist) { Remove-Item $releaseDist -Recurse -Force }
 Copy-Item $distSrc $releaseDist -Recurse -Force
 
-# --- 4. Drain (si un noeud tourne deja) ---
-$running = $null -ne (Get-Healthz)
-if ($running) {
-  Write-Host "Passage du noeud en drain..." -ForegroundColor Yellow
-  Invoke-RestMethod -Uri "$base/api/admin/drain" -Method Post -Headers $authHeaders `
-    -ContentType "application/json" -Body '{"draining":true}' -TimeoutSec 5 | Out-Null
+# Le drain est arme uniquement jusqu'au redemarrage. Toute erreur/annulation
+# avant celui-ci remet l'ancien noeud en service pour ne jamais le bloquer
+# indefiniment apres une mise a jour abandonnee.
+$drainArmed = $false
+try {
+  # --- 4. Drain (si un noeud tourne deja) ---
+  $running = $null -ne (Get-Healthz)
+  if ($running) {
+    Write-Host "Passage du noeud en drain..." -ForegroundColor Yellow
+    Set-DrainState -Draining $true
+    $drainArmed = $true
 
-  # --- 5. Attente activeTerminals==0 ---
-  $deadline = (Get-Date).AddSeconds($DrainTimeoutSec)
-  while ($true) {
-    $h = Get-Healthz
-    $active = if ($h) { [int]$h.activeTerminals } else { 0 }
-    if ($active -eq 0) { break }
-    if ((Get-Date) -ge $deadline) {
-      if ($Force) { Write-Warning "Timeout, -Force : on poursuit malgre $active session(s)."; break }
-      throw "Timeout: $active session(s) actives. Noeud laisse EN DRAIN, MAJ abandonnee (retente plus tard)."
+    # --- 5. Attente activeTerminals==0 ---
+    $deadline = (Get-Date).AddSeconds($DrainTimeoutSec)
+    while ($true) {
+      $h = Get-Healthz
+      $active = if ($h) { [int]$h.activeTerminals } else { 0 }
+      if ($active -eq 0) { break }
+      if ((Get-Date) -ge $deadline) {
+        if ($Force) { Write-Warning "Timeout, -Force : on poursuit malgre $active session(s)."; break }
+        throw "Timeout: $active session(s) actives. MAJ abandonnee ; remise en service automatique du noeud."
+      }
+      Start-Sleep -Seconds 3
     }
-    Start-Sleep -Seconds 3
+  }
+
+  # --- 6. Stop tache (l'exe est verrouille tant qu'il tourne) ---
+  $taskExists = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+  if ($taskExists) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+  }
+
+  # --- 7. Bascule de la jonction 'current' ---
+  Write-Host "Bascule current -> releases\$version" -ForegroundColor Cyan
+  Set-Junction -Link $CurrentLink -Target $releaseDir
+
+  # --- 8. (Re)creer + demarrer la tache ---
+  Register-NodeTask
+  Start-ScheduledTask -TaskName $TaskName
+  # Le nouvel executable repart non draine (etat uniquement en memoire).
+  $drainArmed = $false
+}
+finally {
+  if ($drainArmed) {
+    try {
+      Set-DrainState -Draining $false
+      Write-Warning "Mise a jour interrompue avant le redemarrage : noeud remis hors drain."
+    }
+    catch {
+      Write-Warning "ALERTE : impossible de sortir automatiquement le noeud du drain : $($_.Exception.Message)"
+    }
   }
 }
-
-# --- 6. Stop tache (l'exe est verrouille tant que le process tourne) ---
-$taskExists = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
-if ($taskExists) {
-  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 2
-}
-
-# --- 7. Bascule de la jonction 'current' ---
-Write-Host "Bascule current -> releases\$version" -ForegroundColor Cyan
-Set-Junction -Link $CurrentLink -Target $releaseDir
-
-# --- 8. (Re)creer + demarrer la tache ---
-Register-NodeTask
-Start-ScheduledTask -TaskName $TaskName
 
 # --- 9. Verification ---
 if (Test-NodeBack -Want $version) {

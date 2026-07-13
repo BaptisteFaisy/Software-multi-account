@@ -677,6 +677,7 @@ async function terminalNodeCandidates() {
       try {
         const health = await apiAt<RemoteNodeHealth>(route, "GET", "/api/health", undefined, 1200);
         const capacity = Math.max(1, health.capacity || 1);
+        const acceptingTerminals = health.draining !== true && health.ready !== false;
         return {
           node,
           route: {
@@ -684,20 +685,20 @@ async function terminalNodeCandidates() {
             label: health.nodeLabel || node.label,
           },
           score: (health.activeTerminals || 0) / capacity + node.priority / 100,
-          // Un noeud en drain ou non pret (mise a jour en cours) sort du tier
-          // "healthy" et retombe en fallback : on ne lui envoie de NOUVEAUX
-          // terminaux qu'en dernier recours. Retro-compatible : champs absents
-          // sur un ancien noeud -> considere pret et non draine.
-          healthy:
-            health.ok !== false &&
-            health.draining !== true &&
-            health.ready !== false,
+          // Un noeud explicitement en drain/non pret ne doit jamais recevoir un
+          // nouveau terminal, meme en dernier recours. Retro-compatible : des
+          // champs absents sur un ancien noeud signifient pret/non draine.
+          eligible: acceptingTerminals,
+          healthy: health.ok !== false && acceptingTerminals,
         };
       } catch {
         return {
           node,
           route,
           score: Number.POSITIVE_INFINITY,
+          // Une sonde peut echouer transitoirement alors que le POST fonctionne :
+          // on conserve uniquement ce cas inconnu comme fallback.
+          eligible: true,
           healthy: false,
         };
       }
@@ -708,9 +709,13 @@ async function terminalNodeCandidates() {
     .filter((result) => result.healthy)
     .sort((a, b) => a.score - b.score || a.node.priority - b.node.priority);
   const fallback = results
-    .filter((result) => !result.healthy)
+    .filter((result) => result.eligible && !result.healthy)
     .sort((a, b) => a.node.priority - b.node.priority);
-  return [...healthy, ...fallback].map((result) => result.route);
+  const candidates = [...healthy, ...fallback].map((result) => result.route);
+  if (candidates.length === 0 && results.some((result) => !result.eligible)) {
+    throw new Error("Tous les noeuds terminaux sont en drain ou en maintenance.");
+  }
+  return candidates;
 }
 
 function nodeToRoute(node: RemoteNodeConfig): RemoteTerminalRoute {

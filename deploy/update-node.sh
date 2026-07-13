@@ -33,6 +33,9 @@ CST_GIT_COMMIT="${CST_GIT_COMMIT:-}"
 DRAIN_TIMEOUT=300
 VERIFY_TIMEOUT=60
 FORCE=0
+DRAIN_ARMED=0
+DL=""
+STAGE=""
 
 # --- Mode release (Phase 2) ---
 MODE="build"                                   # build | release
@@ -82,6 +85,28 @@ BASE="http://127.0.0.1:$PORT"
 log() { echo "[update-node] $*"; }
 healthz() { curl -fsS --max-time 3 "$BASE/healthz" 2>/dev/null || true; }
 hfield() { jq -r --arg k "$2" '.[$k] // empty' <<<"${1:-}" 2>/dev/null || true; }
+set_drain() {
+  local draining="$1"
+  curl -fsS --max-time 5 -X POST "$BASE/api/admin/drain" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -d "{\"draining\":$draining}" >/dev/null
+}
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ "$DRAIN_ARMED" == "1" ]]; then
+    log "Mise a jour interrompue avant le redemarrage ; sortie automatique du drain."
+    if set_drain false; then
+      log "Noeud remis en service."
+    else
+      log "ALERTE : impossible de sortir automatiquement le noeud du drain."
+    fi
+  fi
+  if [[ -n "$DL" ]]; then rm -rf "$DL"; fi
+  if [[ -n "$STAGE" ]]; then rm -rf "$STAGE"; fi
+  exit "$status"
+}
+trap cleanup EXIT
 
 # --- Release actuellement active (cible du rollback) ---
 PREV_TARGET=""
@@ -90,7 +115,6 @@ PREV_TARGET=""
 # --- Peupler la nouvelle release : mode build OU mode release (download+verif) ---
 if [[ "$MODE" == "release" ]]; then
   DL="$(mktemp -d)"; STAGE="$(mktemp -d)"
-  trap 'rm -rf "$DL" "$STAGE"' EXIT
   base_url="https://github.com/$REPO/releases/download/$RELEASE_TAG"
   log "Telechargement de $ASSET depuis $REPO@$RELEASE_TAG"
   for suffix in "" ".sha256" ".minisig"; do
@@ -161,9 +185,8 @@ chown -R cst:cst "$RELEASE_DIR"
 
 # --- Drain ---
 log "Passage du noeud en drain"
-curl -fsS --max-time 5 -X POST "$BASE/api/admin/drain" \
-  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{"draining":true}' >/dev/null || { echo "Drain impossible (serveur injoignable ?)." >&2; exit 1; }
+set_drain true || { echo "Drain impossible (serveur injoignable ?)." >&2; exit 1; }
+DRAIN_ARMED=1
 
 # --- Attente activeTerminals==0 (borne) ---
 log "Attente des sessions ouvertes (timeout ${DRAIN_TIMEOUT}s)"
@@ -176,7 +199,7 @@ while :; do
       log "Timeout atteint ; --force : on poursuit malgre $active session(s)."
       break
     fi
-    log "Timeout : $active session(s) encore actives. Noeud LAISSE EN DRAIN, MAJ abandonnee (sera retentee)."
+    log "Timeout : $active session(s) encore actives. MAJ abandonnee ; le noeud va etre remis en service."
     exit 3
   fi
   sleep 3
@@ -191,6 +214,8 @@ chown -h cst:cst "$CURRENT_LINK"
 # --- Redemarrage (efface aussi le drain, etat en memoire) ---
 log "Redemarrage de $SERVICE"
 systemctl restart "$SERVICE"
+# Le nouveau processus repart non draine (etat uniquement en memoire).
+DRAIN_ARMED=0
 
 # --- Verification "vraiment revenu" ---
 verify() {

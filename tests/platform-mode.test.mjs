@@ -14,3 +14,9 @@ test("un lancement desktop local desactive le mode Cloud memorise", () => {
 test("un lancement desktop Cloud reactive explicitement le mode distant", () => {
   assert.match(platform, /localStorage\.setItem\(REMOTE_ENABLED_KEY, "1"\)/);
 });
+
+test("un noeud explicitement en drain n'est jamais utilise comme fallback terminal", () => {
+  assert.match(platform, /eligible: acceptingTerminals/);
+  assert.match(platform, /filter\(\(result\) => result\.eligible && !result\.healthy\)/);
+  assert.match(platform, /Tous les noeuds terminaux sont en drain ou en maintenance/);
+});
