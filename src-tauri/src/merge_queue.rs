@@ -1,6 +1,6 @@
-//! File d'integration serie, durable et independante du journal de chat.
+//! Arbitre d'integration durable, parallele en preparation et atomique par branche.
 
-use crate::worktree::{GitControl, MergeContext};
+use crate::worktree::{GitControl, GitPublishTarget, MergeContext};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,7 +20,9 @@ use std::{
 const JOURNAL_FILE: &str = "merge-queue.jsonl";
 const TASK_JOURNAL_FILE: &str = "tasks.jsonl";
 const JOURNAL_COMPACT_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_CAS_ATTEMPTS: u32 = 4;
+const DEFAULT_MERGE_WORKERS: usize = 4;
+const MAX_MERGE_WORKERS: usize = 32;
+const MAX_CAS_ATTEMPTS: u32 = 32;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -140,6 +142,8 @@ struct QueueInner {
     io_lock: Mutex<()>,
     task_io_lock: Mutex<()>,
     notifier: Mutex<Option<Notifier>>,
+    target_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    integration_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     owner_lock: Option<crate::fs_util::ProcessFileLock>,
     verify_command: Option<String>,
     ephemeral: bool,
@@ -154,6 +158,7 @@ impl MergeQueue {
             )),
             None,
             true,
+            merge_workers_from_env(),
         )
     }
 
@@ -166,10 +171,15 @@ impl MergeQueue {
     }
 
     fn build(data_dir: PathBuf, verify_command: Option<String>) -> Self {
-        Self::build_with_mode(data_dir, verify_command, false)
+        Self::build_with_mode(data_dir, verify_command, false, merge_workers_from_env())
     }
 
-    fn build_with_mode(data_dir: PathBuf, verify_command: Option<String>, ephemeral: bool) -> Self {
+    fn build_with_mode(
+        data_dir: PathBuf,
+        verify_command: Option<String>,
+        ephemeral: bool,
+        worker_count: usize,
+    ) -> Self {
         let _ = fs::create_dir_all(data_dir.join("integration"));
         let _ = fs::create_dir_all(data_dir.join("hooks-empty"));
         let owner_lock = crate::fs_util::try_process_lock(&data_dir.join(".owner.lock")).ok();
@@ -192,12 +202,14 @@ impl MergeQueue {
             io_lock: Mutex::new(()),
             task_io_lock: Mutex::new(()),
             notifier: Mutex::new(None),
+            target_locks: Mutex::new(HashMap::new()),
+            integration_locks: Mutex::new(HashMap::new()),
             owner_lock,
             verify_command,
             ephemeral,
         });
         if is_owner {
-            spawn_worker(Arc::downgrade(&inner), receiver);
+            spawn_workers(Arc::downgrade(&inner), receiver, worker_count);
         } else {
             drop(receiver);
             eprintln!(
@@ -210,6 +222,15 @@ impl MergeQueue {
             let _ = queue.inner.sender.send(id);
         }
         queue
+    }
+
+    #[cfg(test)]
+    fn build_with_workers(
+        data_dir: PathBuf,
+        verify_command: Option<String>,
+        worker_count: usize,
+    ) -> Self {
+        Self::build_with_mode(data_dir, verify_command, false, worker_count)
     }
 
     pub fn set_notifier(&self, notifier: Notifier) {
@@ -263,18 +284,24 @@ impl MergeQueue {
         }
 
         // Apres un conflit, l'agent peut avoir rebase sur la base annoncee dans
-        // le salon. Si la tete cible courante est bien son ancetre, elle devient
-        // la nouvelle base effective : on ne rejoue pas les commits deja landed.
+        // le salon. On ne remplace la base effective que si la cible a avance
+        // depuis l'ancienne base ET que le commit soumis contient deja cette
+        // nouvelle tete. Une cible en retard ne doit jamais faire rejouer puis
+        // reecrire des commits qui existent deja dans la base de l'agent.
         if let Ok(current_target) = resolve_control_ref(&context.control, &context.target_ref) {
-            if current_target != context.base_sha
-                && git_success(Command::new("git").arg("-C").arg(&context.worktree).args([
-                    "merge-base",
-                    "--is-ancestor",
-                    &current_target,
-                    &commit_sha,
-                ]))
-            {
-                context.base_sha = current_target;
+            if current_target != context.base_sha {
+                if is_control_ancestor(&context.control, &context.base_sha, &current_target)
+                    && is_control_ancestor(&context.control, &current_target, &commit_sha)
+                {
+                    context.base_sha = current_target;
+                } else if !is_control_ancestor(&context.control, &current_target, &context.base_sha)
+                    && !is_control_ancestor(&context.control, &context.base_sha, &current_target)
+                {
+                    return Err(
+                        "la branche cible a diverge de CST_BASE_SHA; resynchronise le worktree avant de soumettre"
+                            .to_string(),
+                    );
+                }
             }
         }
 
@@ -529,21 +556,33 @@ impl Default for MergeQueue {
     }
 }
 
-fn spawn_worker(inner: Weak<QueueInner>, receiver: mpsc::Receiver<u64>) {
-    thread::Builder::new()
-        .name("cst-merge-queue".to_string())
-        .spawn(move || {
-            while let Ok(id) = receiver.recv() {
+fn spawn_workers(inner: Weak<QueueInner>, receiver: mpsc::Receiver<u64>, worker_count: usize) {
+    let receiver = Arc::new(Mutex::new(receiver));
+    for worker_slot in 0..worker_count.clamp(1, MAX_MERGE_WORKERS) {
+        let inner = inner.clone();
+        let receiver = Arc::clone(&receiver);
+        thread::Builder::new()
+            .name(format!("cst-merge-{worker_slot}"))
+            .spawn(move || loop {
+                let id = {
+                    let Ok(receiver) = receiver.lock() else {
+                        break;
+                    };
+                    match receiver.recv() {
+                        Ok(id) => id,
+                        Err(_) => break,
+                    }
+                };
                 let Some(inner) = inner.upgrade() else {
                     break;
                 };
-                process_job(&inner, id);
-            }
-        })
-        .expect("demarrage du worker de merge impossible");
+                process_job(&inner, id, worker_slot);
+            })
+            .expect("demarrage d'un worker de merge impossible");
+    }
 }
 
-fn process_job(inner: &Arc<QueueInner>, id: u64) {
+fn process_job(inner: &Arc<QueueInner>, id: u64, worker_slot: usize) {
     let Some(mut job) = update_job(inner, id, |job| {
         job.status = MergeStatus::Running;
         job.error = None;
@@ -552,7 +591,7 @@ fn process_job(inner: &Arc<QueueInner>, id: u64) {
         return;
     };
 
-    let result = land_job(inner, &job);
+    let result = land_job(inner, &job, worker_slot);
     job = match result {
         Ok(landed_sha) => update_job(inner, id, |current| {
             current.status = MergeStatus::Landed;
@@ -560,10 +599,10 @@ fn process_job(inner: &Arc<QueueInner>, id: u64) {
             current.error = None;
             current.conflicts.clear();
         }),
-        Err(LandError::Conflict(files)) => update_job(inner, id, |current| {
+        Err(LandError::Conflict { files, error }) => update_job(inner, id, |current| {
             current.status = MergeStatus::Conflict;
             current.conflicts = files.clone();
-            current.error = Some("rebase non-clean; rebase le worktree puis resoumets".to_string());
+            current.error = Some(error.clone());
         }),
         Err(LandError::Verify(error)) => update_job(inner, id, |current| {
             current.status = MergeStatus::VerifyFailed;
@@ -607,19 +646,46 @@ fn update_job(
 }
 
 enum LandError {
-    Conflict(Vec<String>),
+    Conflict { files: Vec<String>, error: String },
     Verify(String),
     Failed(String),
 }
 
-fn land_job(inner: &QueueInner, job: &MergeJob) -> Result<String, LandError> {
-    let integration = integration_path(&inner.data_dir, &job.context.control);
+fn land_job(inner: &QueueInner, job: &MergeJob, worker_slot: usize) -> Result<String, LandError> {
+    let integration = integration_path(&inner.data_dir, &job.context.control, worker_slot);
     for _attempt in 0..MAX_CAS_ATTEMPTS {
         let expected_old = resolve_control_ref(&job.context.control, &job.context.target_ref)
             .map_err(LandError::Failed)?;
-        ensure_integration(inner, &job.context.control, &integration, &expected_old)
+
+        // L'arbitre n'integre que sur une histoire comparable. Si main a ete
+        // force-push/reset sur une branche divergente, aucun patch ancien ne
+        // doit pouvoir legitimiser cette reecriture ni ecraser silencieusement
+        // les commits qui etaient presents lors de la soumission.
+        let integration_base = if is_control_ancestor(
+            &job.context.control,
+            &job.context.base_sha,
+            &expected_old,
+        ) {
+            expected_old.clone()
+        } else if is_control_ancestor(&job.context.control, &expected_old, &job.context.base_sha) {
+            // La ref publiee est simplement en retard sur la base de l'agent :
+            // construire depuis la base preserve ses commits sans les rejouer.
+            job.context.base_sha.clone()
+        } else {
+            return Err(LandError::Conflict {
+                files: changed_paths(
+                    &job.context.control,
+                    &job.context.base_sha,
+                    &expected_old,
+                ),
+                error: "branche cible divergente ou reecrite depuis CST_BASE_SHA; integration refusee pour proteger les changements recents"
+                    .to_string(),
+            });
+        };
+
+        ensure_integration(inner, &job.context.control, &integration, &integration_base)
             .map_err(LandError::Failed)?;
-        reset_integration(&integration, &expected_old).map_err(LandError::Failed)?;
+        reset_integration(&integration, &integration_base).map_err(LandError::Failed)?;
 
         let commits = git_output(
             Command::new("git").arg("-C").arg(&integration).args([
@@ -671,23 +737,53 @@ fn land_job(inner: &QueueInner, job: &MergeJob) -> Result<String, LandError> {
                 if files.is_empty() {
                     return Err(LandError::Failed(error));
                 }
-                return Err(LandError::Conflict(files));
+                return Err(LandError::Conflict {
+                    files,
+                    error:
+                        "une zone modifiee depuis la base serait remplacee; rebase le worktree puis resoumets"
+                            .to_string(),
+                });
             }
+        }
+
+        let new_sha = resolve_commit(&integration, "HEAD").map_err(LandError::Failed)?;
+        if !git_success(Command::new("git").arg("-C").arg(&integration).args([
+            "merge-base",
+            "--is-ancestor",
+            &expected_old,
+            &new_sha,
+        ])) {
+            return Err(LandError::Failed(
+                "arbitre anti-reset: le resultat ne conserve pas la tete courante".to_string(),
+            ));
         }
 
         if job.verify {
             if let Err(error) = run_verify(&integration, inner.verify_command.as_deref()) {
-                let _ = reset_integration(&integration, &expected_old);
+                let _ = reset_integration(&integration, &integration_base);
                 return Err(LandError::Verify(error));
             }
         }
-        let new_sha = resolve_commit(&integration, "HEAD").map_err(LandError::Failed)?;
-        match cas_land(
-            &job.context.control,
-            &job.context.target_ref,
-            &new_sha,
-            &expected_old,
-        ) {
+        let target_lock = target_lock(inner, &job.context).map_err(LandError::Failed)?;
+        let landed = {
+            let _publish = target_lock
+                .lock()
+                .map_err(|_| LandError::Failed("arbitre de branche verrouille".to_string()))?;
+            let current = resolve_control_ref(&job.context.control, &job.context.target_ref)
+                .map_err(LandError::Failed)?;
+            if current != expected_old {
+                Ok(false)
+            } else {
+                cas_land(
+                    &job.context.control,
+                    &job.context.target_ref,
+                    job.context.publish.as_ref(),
+                    &new_sha,
+                    &expected_old,
+                )
+            }
+        };
+        match landed {
             Ok(true) => return Ok(new_sha),
             Ok(false) => {}
             Err(error) => return Err(LandError::Failed(error)),
@@ -700,17 +796,23 @@ fn land_job(inner: &QueueInner, job: &MergeJob) -> Result<String, LandError> {
     ))
 }
 
-/// Bare/mirror : CAS `update-ref` exact. Repo local dont la branche cible est
-/// checkout : `git merge --ff-only` met a jour ref + index + fichiers sous les
-/// locks Git natifs, uniquement si le checkout est propre et encore sur
-/// `expected_old`. Cela evite de laisser le checkout original incoherent apres
-/// un update-ref direct.
+/// Upstream configure : publication fast-forward non forcee, sans toucher au
+/// checkout utilisateur. Bare/mirror : CAS `update-ref` exact. Repo local sans
+/// upstream dont la branche cible est checkout : `git merge --ff-only` met a
+/// jour ref + index + fichiers uniquement si le checkout est propre.
 fn cas_land(
     control: &GitControl,
     target_ref: &str,
+    publish: Option<&GitPublishTarget>,
     new_sha: &str,
     expected_old: &str,
 ) -> Result<bool, String> {
+    if let Some(publish) = publish {
+        if target_ref != publish.tracking_ref {
+            return Err("cible de publication incoherente avec sa ref de suivi".to_string());
+        }
+        return publish_fast_forward(control, publish, new_sha, expected_old);
+    }
     if let GitControl::WorkTree { repo_root } = control {
         let checked_out = git_output(
             Command::new("git")
@@ -758,12 +860,133 @@ fn cas_land(
     .is_ok())
 }
 
+fn publish_fast_forward(
+    control: &GitControl,
+    publish: &GitPublishTarget,
+    new_sha: &str,
+    expected_old: &str,
+) -> Result<bool, String> {
+    let refspec = format!("{new_sha}:{}", publish.remote_ref);
+    let mut push = control_command(control);
+    push.args([
+        "push",
+        "--porcelain",
+        "--no-verify",
+        &publish.remote,
+        &refspec,
+    ]);
+    match git_run(&mut push, "publication fast-forward par l'arbitre") {
+        Ok(()) => {
+            // Git met normalement la remote-tracking ref a jour apres un push.
+            // Le CAS best-effort couvre aussi les remotes/configurations qui ne
+            // le font pas, sans jamais forcer une valeur plus recente.
+            if resolve_control_ref(control, &publish.tracking_ref).as_deref() != Ok(new_sha) {
+                let mut update = control_command(control);
+                let _ = git_run(
+                    update.args(["update-ref", &publish.tracking_ref, new_sha, expected_old]),
+                    "mise a jour de la ref de suivi",
+                );
+            }
+            Ok(true)
+        }
+        Err(push_error) => {
+            // Un push concurrent a pu gagner. On rafraichit uniquement la ref
+            // de suivi (jamais le checkout utilisateur), puis le worker rebase
+            // et revalide son patch sur cette nouvelle tete.
+            if let Err(fetch_error) = refresh_publish_target(control, publish) {
+                return Err(format!("{push_error}; {fetch_error}"));
+            }
+            let current = resolve_control_ref(control, &publish.tracking_ref)?;
+            if current != expected_old {
+                Ok(false)
+            } else {
+                Err(push_error)
+            }
+        }
+    }
+}
+
+fn refresh_publish_target(control: &GitControl, publish: &GitPublishTarget) -> Result<(), String> {
+    let refspec = format!("+{}:{}", publish.remote_ref, publish.tracking_ref);
+    let mut fetch = control_command(control);
+    git_run(
+        fetch.args(["fetch", "--quiet", "--no-tags", &publish.remote, &refspec]),
+        "actualisation de la tete publiee",
+    )
+}
+
+fn target_lock(inner: &QueueInner, context: &MergeContext) -> Result<Arc<Mutex<()>>, String> {
+    let control = control_key(&context.control);
+    let target = context
+        .publish
+        .as_ref()
+        .map(|publish| format!("{}:{}", publish.remote, publish.remote_ref))
+        .unwrap_or_else(|| context.target_ref.clone());
+    let key = format!("{control}\0{target}");
+    let mut locks = inner
+        .target_locks
+        .lock()
+        .map_err(|_| "registre des arbitres de branche verrouille".to_string())?;
+    Ok(Arc::clone(
+        locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))),
+    ))
+}
+
+fn integration_setup_lock(
+    inner: &QueueInner,
+    control: &GitControl,
+) -> Result<Arc<Mutex<()>>, String> {
+    let key = control_key(control);
+    let mut locks = inner
+        .integration_locks
+        .lock()
+        .map_err(|_| "registre de preparation des worktrees verrouille".to_string())?;
+    Ok(Arc::clone(
+        locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))),
+    ))
+}
+
+fn control_key(control: &GitControl) -> String {
+    match control {
+        GitControl::WorkTree { repo_root } => format!("worktree:{}", repo_root.display()),
+        GitControl::Bare { git_dir } => format!("bare:{}", git_dir.display()),
+    }
+}
+
+fn is_control_ancestor(control: &GitControl, ancestor: &str, descendant: &str) -> bool {
+    let mut command = control_command(control);
+    git_success(command.args(["merge-base", "--is-ancestor", ancestor, descendant]))
+}
+
+fn changed_paths(control: &GitControl, before: &str, after: &str) -> Vec<String> {
+    let mut command = control_command(control);
+    git_output(
+        command.args([
+            "diff",
+            "--name-only",
+            "--diff-filter=ACDMRTUXB",
+            before,
+            after,
+        ]),
+        "lecture des fichiers divergents",
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(ToString::to_string)
+    .collect()
+}
+
 fn ensure_integration(
     inner: &QueueInner,
     control: &GitControl,
     integration: &Path,
     expected: &str,
 ) -> Result<(), String> {
+    let setup_lock = integration_setup_lock(inner, control)?;
+    let _setup = setup_lock
+        .lock()
+        .map_err(|_| "preparation des worktrees d'integration verrouillee".to_string())?;
     if integration.join(".git").exists() {
         return Ok(());
     }
@@ -901,7 +1124,7 @@ fn persist_task(inner: &QueueInner, task: &TaskView) {
     }
 }
 
-fn integration_path(data_dir: &Path, control: &GitControl) -> PathBuf {
+fn integration_path(data_dir: &Path, control: &GitControl, worker_slot: usize) -> PathBuf {
     let identity = match control {
         GitControl::WorkTree { repo_root } => repo_root,
         GitControl::Bare { git_dir } => git_dir,
@@ -912,7 +1135,10 @@ fn integration_path(data_dir: &Path, control: &GitControl) -> PathBuf {
         .take(8)
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    data_dir.join("integration").join(key)
+    data_dir
+        .join("integration")
+        .join(format!("worker-{worker_slot}"))
+        .join(key)
 }
 
 fn resolve_control_ref(control: &GitControl, reference: &str) -> Result<String, String> {
@@ -1037,6 +1263,15 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+fn merge_workers_from_env() -> usize {
+    std::env::var("CST_MERGE_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MERGE_WORKERS)
+        .clamp(1, MAX_MERGE_WORKERS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,8 +1294,29 @@ mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
+    fn init_test_repo(root: &Path, name: &str) -> PathBuf {
+        let repo = root.join(name);
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("base.txt"), name).unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        repo
+    }
+
     fn wait_terminal(queue: &MergeQueue, id: u64) -> MergeStatusView {
-        for _ in 0..100 {
+        for _ in 0..500 {
             let status = queue.status(ROOM, id).unwrap();
             if !matches!(status.status, MergeStatus::Queued | MergeStatus::Running) {
                 return status;
@@ -1071,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn fifo_land_uses_cas_and_keeps_both_disjoint_changes() {
+    fn same_target_cas_keeps_both_disjoint_changes() {
         let root = temp("fifo");
         let repo = root.join("repo");
         let home = root.join("home");
@@ -1136,19 +1392,8 @@ mod tests {
         assert!(queue.status("other-room", first.id).is_err());
         assert_eq!(wait_terminal(&queue, second.id).status, MergeStatus::Landed);
         assert_eq!(queue.list_landed(ROOM, 10).len(), 2);
-        let target = git_output(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["rev-parse", "refs/heads/main"]),
-            "target",
-        )
-        .unwrap();
-        let integration =
-            integration_path(&root.join("queue"), &a.merge_context().unwrap().control);
-        git(&integration, &["reset", "--hard", &target]);
-        assert!(integration.join("a.txt").is_file());
-        assert!(integration.join("b.txt").is_file());
+        assert!(repo.join("a.txt").is_file());
+        assert!(repo.join("b.txt").is_file());
         drop(a);
         drop(b);
         drop(queue);
@@ -1162,6 +1407,249 @@ mod tests {
             MergeStatus::Landed
         );
         drop(reloaded);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn independent_targets_are_prepared_and_verified_in_parallel() {
+        let root = temp("parallel-workers");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let repo_a = init_test_repo(&root, "repo-a");
+        let repo_b = init_test_repo(&root, "repo-b");
+        let manager = WorktreeManager::new(root.join("runtime"), 2).unwrap();
+        let agent_a = manager.prepare_local("a", &home, Some(&repo_a)).unwrap();
+        let agent_b = manager.prepare_local("b", &home, Some(&repo_b)).unwrap();
+        for (agent, file) in [(&agent_a, "a.txt"), (&agent_b, "b.txt")] {
+            fs::write(agent.cwd().join(file), file).unwrap();
+            git(agent.cwd(), &["add", "."]);
+            git(
+                agent.cwd(),
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    file,
+                ],
+            );
+        }
+
+        let queue_dir = root.join("queue");
+        let integration_root = queue_dir.join("integration");
+        let verify = if cfg!(windows) {
+            let path = integration_root.to_string_lossy().replace('\'', "''");
+            format!(
+                "powershell -NoProfile -Command \"$deadline=(Get-Date).AddSeconds(5); Set-Content -LiteralPath 'cst-ready' -Value ready; while (@(Get-ChildItem -LiteralPath '{path}' -Filter 'cst-ready' -File -Recurse -ErrorAction SilentlyContinue).Count -lt 2) {{ if ((Get-Date) -gt $deadline) {{ exit 9 }}; Start-Sleep -Milliseconds 25 }}\""
+            )
+        } else {
+            let path = integration_root.to_string_lossy().replace('\'', "'\"'\"'");
+            format!(
+                "touch cst-ready; i=0; while [ \"$(find '{path}' -name cst-ready -type f | wc -l)\" -lt 2 ]; do i=$((i+1)); [ \"$i\" -lt 200 ] || exit 9; sleep 0.025; done"
+            )
+        };
+        let queue = MergeQueue::build_with_workers(queue_dir, Some(verify), 2);
+        let first = queue
+            .submit(
+                ROOM,
+                "a",
+                agent_a.workspace_id(),
+                agent_a.merge_context().unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+        let second = queue
+            .submit(
+                ROOM,
+                "b",
+                agent_b.workspace_id(),
+                agent_b.merge_context().unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(wait_terminal(&queue, first.id).status, MergeStatus::Landed);
+        assert_eq!(wait_terminal(&queue, second.id).status, MergeStatus::Landed);
+        drop(agent_a);
+        drop(agent_b);
+        drop(queue);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upstream_arbiter_publishes_without_touching_a_dirty_user_checkout() {
+        let root = temp("upstream-dirty-checkout");
+        let repo = root.join("repo");
+        let origin = root.join("origin.git");
+        let home = root.join("home");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&origin).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        git(&origin, &["init", "--bare"]);
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        let local_main = resolve_commit(&repo, "HEAD").unwrap();
+        let origin_url = origin.to_string_lossy().to_string();
+        git(&repo, &["remote", "add", "origin", &origin_url]);
+        git(&repo, &["push", "-u", "origin", "main"]);
+
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, Some(&repo)).unwrap();
+        assert!(agent.merge_context().unwrap().publish.is_some());
+        fs::write(repo.join("personal-uncommitted.txt"), "do not touch").unwrap();
+        fs::write(agent.cwd().join("agent.txt"), "agent change").unwrap();
+        git(agent.cwd(), &["add", "."]);
+        git(
+            agent.cwd(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "agent change",
+            ],
+        );
+
+        let queue = MergeQueue::build_with_workers(root.join("queue"), None, 2);
+        let submitted = queue
+            .submit(
+                ROOM,
+                "agent",
+                agent.workspace_id(),
+                agent.merge_context().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        let landed = wait_terminal(&queue, submitted.id);
+        assert_eq!(landed.status, MergeStatus::Landed, "{landed:?}");
+        assert_eq!(
+            fs::read_to_string(repo.join("personal-uncommitted.txt")).unwrap(),
+            "do not touch"
+        );
+        assert_eq!(
+            resolve_commit(&repo, "refs/heads/main").unwrap(),
+            local_main
+        );
+        assert_eq!(
+            git_output(
+                Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&origin)
+                    .args(["show", "refs/heads/main:agent.txt"]),
+                "lecture du fichier publie",
+            )
+            .unwrap(),
+            "agent change"
+        );
+        drop(agent);
+        drop(queue);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn target_behind_agent_base_is_fast_forwarded_without_rewriting_recent_commits() {
+        let root = temp("target-behind-base");
+        let repo = root.join("repo");
+        let home = root.join("home");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        let old_main = resolve_commit(&repo, "HEAD").unwrap();
+        fs::write(repo.join("recent.txt"), "recent user work").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=User",
+                "-c",
+                "user.email=user@example.com",
+                "commit",
+                "-m",
+                "recent user work",
+            ],
+        );
+        let recent_main = resolve_commit(&repo, "HEAD").unwrap();
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, Some(&repo)).unwrap();
+        fs::write(agent.cwd().join("agent.txt"), "agent").unwrap();
+        git(agent.cwd(), &["add", "."]);
+        git(
+            agent.cwd(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "agent",
+            ],
+        );
+        git(&repo, &["reset", "--hard", &old_main]);
+
+        let queue = MergeQueue::with_data_dir(root.join("queue"));
+        let submitted = queue
+            .submit(
+                ROOM,
+                "agent",
+                agent.workspace_id(),
+                agent.merge_context().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        let landed = wait_terminal(&queue, submitted.id);
+        assert_eq!(landed.status, MergeStatus::Landed, "{landed:?}");
+        let final_main = resolve_commit(&repo, "refs/heads/main").unwrap();
+        assert!(is_control_ancestor(
+            &agent.merge_context().unwrap().control,
+            &recent_main,
+            &final_main,
+        ));
+        assert_eq!(
+            fs::read_to_string(repo.join("recent.txt")).unwrap(),
+            "recent user work"
+        );
+        assert_eq!(fs::read_to_string(repo.join("agent.txt")).unwrap(), "agent");
+        drop(agent);
+        drop(queue);
+        drop(manager);
         let _ = fs::remove_dir_all(root);
     }
 

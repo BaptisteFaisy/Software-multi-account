@@ -474,12 +474,21 @@ Workflow agent recommande :
 5. en cas de conflit, rebaser depuis la nouvelle base annoncee dans le dossier et
    resoumettre.
 
-La file est FIFO avec un seul worker. Elle rejoue les commits sur la tete
-courante, lance eventuellement le verify, puis effectue un CAS sur la ref cible.
+Les agents ne poussent jamais directement la branche cible : la merge queue est
+l'arbitre et le publisher unique. Un pool de workers prepare, rebase et verifie
+les propositions dans des worktrees d'integration distincts. Seule la decision
+finale est serialisee par branche : relecture de la tete, controle que le resultat
+la conserve, puis fast-forward/CAS. Un push concurrent fait repartir la proposition
+sur la nouvelle tete ; une base divergente ou reecrite est refusee.
+
+Pour un depot local dont la branche possede un upstream, les nouveaux agents
+partent de la remote-tracking ref et l'arbitre publie par push fast-forward non
+force. Le checkout utilisateur n'est jamais modifie, meme s'il contient des
+changements locaux. Sans upstream, le mode local historique reste disponible et
+ne fast-forward une branche actuellement ouverte que si son checkout est propre.
 Le journal durable de merge est separe de `messages.jsonl`. Pour un miroir SaaS,
 le land met a jour la branche du miroir local ; le push/deploiement distant reste
-une etape explicite. Pour un checkout local dont `main` est actuellement ouvert,
-le fast-forward n'est accepte que si le checkout est propre.
+une etape explicite.
 
 Variables utiles :
 
@@ -487,6 +496,8 @@ Variables utiles :
   logiciel (comportement par defaut). Une valeur positive reactive un cap dur ;
 - `CST_NODE_CAPACITY` : indice de capacite utilise par le routage SaaS, sans
   refuser la creation de nouveaux agents ;
+- `CST_MERGE_WORKERS` : nombre de preparations de merge concurrentes (4 par
+  defaut, borne entre 1 et 32) ;
 - `CST_MERGE_VERIFY_COMMAND` : commande executee dans le worktree d'integration
   lorsque la soumission demande `verify: true`.
 
@@ -501,8 +512,9 @@ encore vivant ; apres crash, commits et home sont conserves dans les recoveries.
 ## Plan cible : datacenter elastique sans plafond fixe
 
 > **Statut : architecture cible, non encore implementee integralement.**
-> L'execution locale et la merge queue FIFO decrites dans la section precedente
-> restent le comportement actuel pendant la migration.
+> L'execution locale et le pool d'arbitrage decrit dans la section precedente
+> restent le comportement actuel pendant la migration. Le graphe de conflits et
+> la combinaison hierarchique multi-patches restent des etapes ulterieures.
 
 Dans ce plan, « nombre infini d'agents » signifie qu'aucun plafond n'est code
 dans l'application et que de nouveaux noeuds peuvent etre ajoutes

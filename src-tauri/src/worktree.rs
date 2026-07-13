@@ -27,11 +27,22 @@ pub enum GitControl {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitPublishTarget {
+    pub remote: String,
+    pub remote_ref: String,
+    pub tracking_ref: String,
+    pub local_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MergeContext {
     pub control: GitControl,
     pub worktree: PathBuf,
     pub base_sha: String,
     pub target_ref: String,
+    #[serde(default)]
+    pub publish: Option<GitPublishTarget>,
 }
 
 #[derive(Clone)]
@@ -265,6 +276,7 @@ impl WorktreeManager {
                             worktree: repo_path.clone(),
                             base_sha: local.base_sha,
                             target_ref: local.target_ref,
+                            publish: local.publish,
                         }),
                     )
                 }
@@ -336,6 +348,7 @@ impl WorktreeManager {
                 worktree: repo_path,
                 base_sha,
                 target_ref,
+                publish: None,
             }),
             room_id,
         )
@@ -541,6 +554,7 @@ struct LocalGit {
     control: GitControl,
     base_sha: String,
     target_ref: String,
+    publish: Option<GitPublishTarget>,
     relative_cwd: PathBuf,
 }
 
@@ -555,14 +569,29 @@ fn discover_local_git(project: &Path) -> Result<Option<LocalGit>, String> {
         Ok(root) => PathBuf::from(root),
         Err(_) => return Ok(None),
     };
-    let base_sha = git_output(
+    let local_base_sha = git_output(
         Command::new("git")
             .arg("-C")
             .arg(&root)
             .args(["rev-parse", "HEAD"]),
         "resolution de HEAD",
     )?;
-    let target_ref = resolve_local_target_ref(&root, &base_sha)?;
+    let local_target_ref = resolve_local_target_ref(&root, &local_base_sha)?;
+    let (base_sha, target_ref, publish) =
+        match resolve_local_publish_target(&root, &local_target_ref) {
+            Some(publish) => match git_output(
+                Command::new("git").arg("-C").arg(&root).args([
+                    "rev-parse",
+                    "--verify",
+                    &publish.tracking_ref,
+                ]),
+                "resolution de la branche upstream",
+            ) {
+                Ok(base) => (base, publish.tracking_ref.clone(), Some(publish)),
+                Err(_) => (local_base_sha, local_target_ref, None),
+            },
+            None => (local_base_sha, local_target_ref, None),
+        };
     let relative_cwd = project
         .canonicalize()
         .unwrap_or_else(|_| project.to_path_buf())
@@ -573,8 +602,39 @@ fn discover_local_git(project: &Path) -> Result<Option<LocalGit>, String> {
         control: GitControl::WorkTree { repo_root: root },
         base_sha,
         target_ref,
+        publish,
         relative_cwd,
     }))
+}
+
+fn resolve_local_publish_target(root: &Path, local_ref: &str) -> Option<GitPublishTarget> {
+    let upstream = git_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("for-each-ref")
+            .arg("--format=%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream)")
+            .arg(local_ref),
+        "resolution de l'upstream",
+    )
+    .ok()?;
+    let mut fields = upstream.split('\0');
+    let remote = fields.next()?.trim();
+    let remote_ref = fields.next()?.trim();
+    let tracking_ref = fields.next()?.trim();
+    if remote.is_empty()
+        || remote_ref.is_empty()
+        || tracking_ref.is_empty()
+        || fields.next().is_some()
+    {
+        return None;
+    }
+    Some(GitPublishTarget {
+        remote: remote.to_string(),
+        remote_ref: remote_ref.to_string(),
+        tracking_ref: tracking_ref.to_string(),
+        local_ref: local_ref.to_string(),
+    })
 }
 
 fn resolve_local_target_ref(root: &Path, base_sha: &str) -> Result<String, String> {
@@ -1126,8 +1186,8 @@ fn merge_provider_transcripts(
 }
 
 fn inject_agent_conventions(home: &Path) -> Result<(), String> {
-    const MARKER: &str = "<!-- CST-ISOLATED-AGENT -->";
-    const CONTENT: &str = r#"<!-- CST-ISOLATED-AGENT -->
+    const MARKER: &str = "<!-- CST-ISOLATED-AGENT-V2 -->";
+    const CONTENT: &str = r#"<!-- CST-ISOLATED-AGENT-V2 -->
 ## Codex Switch Terminal: isolated agent
 
 This process has a private worktree and provider home. Stay inside the current
@@ -1135,6 +1195,7 @@ working directory. Use the workspace_collab MCP tools to coordinate real work:
 
 - claim_task before starting shared work;
 - commit a clean, focused change before submit_for_merge;
+- never push the target branch directly: the merge arbiter publishes it safely;
 - use merge_status/list_landed and rebase from the announced base when needed;
 - never edit another agent's worktree or the original checkout by absolute path.
 "#;
@@ -1463,6 +1524,96 @@ mod tests {
     }
 
     #[test]
+    fn local_agent_uses_the_published_upstream_without_moving_local_main() {
+        let root = temp("worktree-upstream");
+        let repo = root.join("source");
+        let origin = root.join("origin.git");
+        let home = root.join("home");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&origin).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        git(&origin, &["init", "--bare"]);
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        let local_main = git_output(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD"]),
+            "local main",
+        )
+        .unwrap();
+        git(
+            &repo,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        git(&repo, &["push", "-u", "origin", "main"]);
+        fs::write(repo.join("published.txt"), "published").unwrap();
+        git(&repo, &["add", "."]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "published",
+            ],
+        );
+        git(&repo, &["push", "origin", "main"]);
+        let published = git_output(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "refs/remotes/origin/main"]),
+            "published main",
+        )
+        .unwrap();
+        git(&repo, &["reset", "--hard", &local_main]);
+
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, Some(&repo)).unwrap();
+        let context = agent.merge_context().unwrap();
+        assert_eq!(context.base_sha, published);
+        assert_eq!(context.target_ref, "refs/remotes/origin/main");
+        let publish = context.publish.unwrap();
+        assert_eq!(publish.remote, "origin");
+        assert_eq!(publish.remote_ref, "refs/heads/main");
+        assert_eq!(publish.local_ref, "refs/heads/main");
+        assert!(agent.cwd().join("published.txt").is_file());
+        assert!(!repo.join("published.txt").exists());
+        assert_eq!(
+            git_output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["rev-parse", "refs/heads/main"]),
+                "local main apres preparation",
+            )
+            .unwrap(),
+            local_main
+        );
+        drop(agent);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn transcripts_are_merged_back_but_config_is_not() {
         let root = temp("home-isolation");
         let home = root.join("home");
@@ -1709,9 +1860,12 @@ mod tests {
         assert!(is_transient_copy_race(&Error::from_raw_os_error(3))); // ERROR_PATH_NOT_FOUND
         assert!(is_transient_copy_race(&Error::from_raw_os_error(5))); // ERROR_ACCESS_DENIED
         assert!(is_transient_copy_race(&Error::from_raw_os_error(32))); // ERROR_SHARING_VIOLATION
+
         // Une vraie panne (ex. disque plein) doit rester fatale.
         assert!(!is_transient_copy_race(&Error::from_raw_os_error(112))); // ERROR_DISK_FULL
-        assert!(!is_transient_copy_race(&Error::from(ErrorKind::OutOfMemory)));
+        assert!(!is_transient_copy_race(&Error::from(
+            ErrorKind::OutOfMemory
+        )));
     }
 
     #[test]

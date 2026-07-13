@@ -1524,7 +1524,7 @@ fn tools_schema() -> Value {
         },
         {
             "name": "submit_for_merge",
-            "description": "Soumet les commits propres de ton worktree a la file FIFO. Le worker unique rebase, verifie optionnellement et met a jour la branche par CAS.",
+            "description": "Soumet les commits propres a l'arbitre de merge. Les preparations sont paralleles; le publisher unique rebase sur la tete courante et publie uniquement par fast-forward/CAS. Ne pousse jamais la branche cible directement.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
