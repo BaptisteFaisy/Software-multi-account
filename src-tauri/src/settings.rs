@@ -1329,6 +1329,13 @@ fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
 }
 
 fn settings_path() -> Result<PathBuf, String> {
+    // Une instance web portable peut partager les comptes/settings avec le
+    // noeud principal tout en gardant son runtime (agents, locks, salons)
+    // strictement isole dans CST_DATA_DIR.
+    if let Some(value) = env::var_os("CST_ACCOUNTS_DIR") {
+        return Ok(PathBuf::from(value).join("settings.json"));
+    }
+
     if let Some(value) = env::var_os("CST_DATA_DIR") {
         return Ok(PathBuf::from(value).join("settings.json"));
     }
@@ -1361,8 +1368,13 @@ pub fn agent_room_data_dir() -> Result<PathBuf, String> {
 }
 
 /// Racine des donnees runtime (worktrees, homes isoles, merge queue). Elle suit
-/// exactement la meme resolution que `settings.json` et `agent-room`.
+/// `CST_DATA_DIR` et reste donc isolee meme si `settings.json` provient d'un
+/// `CST_ACCOUNTS_DIR` partage.
 pub fn runtime_data_dir() -> Result<PathBuf, String> {
+    if let Some(value) = env::var_os("CST_DATA_DIR") {
+        return Ok(PathBuf::from(value));
+    }
+
     settings_path()?
         .parent()
         .map(Path::to_path_buf)
@@ -3347,7 +3359,41 @@ pub fn expand_home(value: &str) -> Result<PathBuf, String> {
         return Ok(home_dir()?.join(stripped.trim_start_matches(['\\', '/'])));
     }
 
+    #[cfg(target_os = "linux")]
+    if is_wsl() {
+        if let Some(path) = windows_drive_path_in_wsl(value) {
+            return Ok(path);
+        }
+    }
+
     Ok(PathBuf::from(value))
+}
+
+#[cfg(target_os = "linux")]
+fn is_wsl() -> bool {
+    env::var_os("WSL_DISTRO_NAME").is_some()
+        || fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|value| value.to_ascii_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+}
+
+/// Convertit `C:\\Users\\...` ou `C:/Users/...` en `/mnt/c/Users/...`.
+/// La fonction reste pure pour pouvoir tester la conversion hors d'un montage
+/// WSL reel ; l'appelant verifie lui-meme qu'il tourne bien sous WSL.
+#[cfg(target_os = "linux")]
+fn windows_drive_path_in_wsl(value: &str) -> Option<PathBuf> {
+    let value = value.trim().trim_matches('"');
+    let bytes = value.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase().to_string();
+    let remainder = value[3..].replace('\\', "/");
+    Some(PathBuf::from("/mnt").join(drive).join(remainder))
 }
 
 #[tauri::command]
@@ -3392,6 +3438,20 @@ fn default_shell() -> String {
 #[cfg(test)]
 mod delete_home_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn windows_drive_paths_map_to_their_wsl_mount() {
+        assert_eq!(
+            windows_drive_path_in_wsl(r"C:\Users\JeanP\Project"),
+            Some(PathBuf::from("/mnt/c/Users/JeanP/Project"))
+        );
+        assert_eq!(
+            windows_drive_path_in_wsl("d:/work/repo"),
+            Some(PathBuf::from("/mnt/d/work/repo"))
+        );
+        assert_eq!(windows_drive_path_in_wsl("relative/repo"), None);
+    }
 
     /// Base temporaire unique par test (pas de `Date`/`rand` : nom fixe + nettoyage).
     fn scratch(tag: &str) -> PathBuf {

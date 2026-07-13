@@ -670,10 +670,11 @@ fn resolve_local_target_ref(root: &Path, base_sha: &str) -> Result<String, Strin
 
 fn resolve_remote_target_ref(mirror: &Path, branch: Option<&str>) -> Result<String, String> {
     if let Some(branch) = branch.map(str::trim).filter(|value| !value.is_empty()) {
-        if !git_status(Command::new("git").args(["check-ref-format", "--branch", branch])) {
+        let target_ref = format!("refs/heads/{branch}");
+        if !git_status(Command::new("git").args(["check-ref-format", &target_ref])) {
             return Err(format!("branche git invalide: {branch}"));
         }
-        return Ok(format!("refs/heads/{branch}"));
+        return Ok(target_ref);
     }
     git_output(
         Command::new("git")
@@ -1374,8 +1375,23 @@ pub fn room_id_for_local_path(path: &Path) -> String {
     let mut identity = canonical.to_string_lossy().replace('\\', "/");
     if cfg!(windows) {
         identity.make_ascii_lowercase();
+    } else if let Some(windows_identity) = wsl_path_identity(&identity) {
+        // Le meme dossier doit conserver le meme salon avant et apres une
+        // bascule Windows -> WSL. Windows normalise deja cette identite en
+        // minuscules, donc on reproduit exactement cette forme.
+        identity = windows_identity;
     }
     hashed_room_id("local", &identity)
+}
+
+fn wsl_path_identity(value: &str) -> Option<String> {
+    let rest = value.strip_prefix("/mnt/")?;
+    let bytes = rest.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b'/' {
+        return None;
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    Some(format!("{drive}:/{}", &rest[2..]).to_ascii_lowercase())
 }
 
 fn room_id_for_remote(repo_key: &str, target_ref: &str) -> String {
@@ -1423,6 +1439,12 @@ fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
+    // `pid_t` est signe. Sans cette garde, u32::MAX devient -1 et
+    // `kill(-1, 0)` teste tous les processus accessibles, ce qui fait paraitre
+    // une lease corrompue/stale vivante pour toujours.
+    if pid == 0 || pid > libc::pid_t::MAX as u32 {
+        return false;
+    }
     // SAFETY: signal 0 ne modifie pas le processus, il teste son existence.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
@@ -1849,6 +1871,28 @@ mod tests {
         drop(private_b);
         drop(manager);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wsl_mount_identity_matches_windows_normalization() {
+        assert_eq!(
+            wsl_path_identity("/mnt/c/Users/JeanP/Project"),
+            Some("c:/users/jeanp/project".to_string())
+        );
+        assert_eq!(wsl_path_identity("/srv/cst/project"), None);
+
+        #[cfg(not(windows))]
+        assert_eq!(
+            room_id_for_local_path(Path::new("/mnt/c/Users/JeanP/Project")),
+            hashed_room_id("local", "c:/users/jeanp/project")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_unix_pids_are_never_considered_alive() {
+        assert!(!process_is_alive(0));
+        assert!(!process_is_alive(u32::MAX));
     }
 
     #[test]

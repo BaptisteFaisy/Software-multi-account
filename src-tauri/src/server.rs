@@ -1088,7 +1088,10 @@ fn resolve_within_root(root: &Path, requested: &str) -> Result<PathBuf, String> 
         return Ok(strip_extended_prefix(root));
     }
     let candidate = {
-        let path = Path::new(requested);
+        // `settings::expand_home` traduit aussi les chemins absolus Windows
+        // quand le serveur web tourne sous WSL (`C:\\...` -> `/mnt/c/...`).
+        let expanded = settings::expand_home(requested)?;
+        let path = expanded.as_path();
         if path.is_absolute() {
             path.to_path_buf()
         } else {
