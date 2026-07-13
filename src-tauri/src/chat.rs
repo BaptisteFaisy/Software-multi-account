@@ -5,7 +5,7 @@
 //! continuent donc d'alimenter l'historique et le WebSocket de discussions.
 
 use crate::{
-    agent_room::{AgentMeta, RoomState},
+    agent_room::{AgentMeta, PendingQuestion, QuestionAnswer, RoomState},
     discussions, metrics,
     settings::{self, AccountProfile, AppSettings, Provider},
     worktree::{AgentWorkspace, WorktreeManager},
@@ -31,6 +31,10 @@ use uuid::Uuid;
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_ERROR_BYTES: usize = 24 * 1024;
 const MAX_ACTIVITIES: usize = 32;
+const MAX_THOUGHTS: usize = 32;
+const MAX_PARTS: usize = 96;
+const MAX_THOUGHT_CHARS: usize = 4_000;
+const MAX_PART_DETAIL_CHARS: usize = 12_000;
 const MAX_MODEL_CHARS: usize = 160;
 const MAX_RETAINED_TURNS: usize = 500;
 
@@ -64,6 +68,40 @@ pub struct ChatActivity {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChatThought {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    pub status: String,
+}
+
+/// Element ordonne d'un tour, sur le modele de la timeline OpenCode.
+///
+/// `reasoning`, `text` et `tool` partagent volontairement une seule liste :
+/// l'interface peut ainsi conserver l'ordre exact dans lequel le provider a
+/// raisonne, explique sa progression, appele un outil puis repris sa reponse.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatPart {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChatTurnSnapshot {
     pub id: u64,
     pub account_id: String,
@@ -73,6 +111,10 @@ pub struct ChatTurnSnapshot {
     pub finished_at: Option<i64>,
     pub error: Option<String>,
     pub activities: Vec<ChatActivity>,
+    pub thoughts: Vec<ChatThought>,
+    pub parts: Vec<ChatPart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_question: Option<PendingQuestion>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -189,14 +231,6 @@ impl ChatTurnManager {
             account.provider,
         ))?;
         let mut command = Command::new(program);
-        configure_provider_command(
-            &mut command,
-            &account,
-            request.session_id.as_deref(),
-            request.mode,
-            model.as_deref(),
-            reasoning_effort.as_deref(),
-        );
         configure_environment(
             &mut command,
             &app_settings,
@@ -211,6 +245,7 @@ impl ChatTurnManager {
             command.env("CST_BASE_SHA", base_sha);
         }
         let mut room_token = None;
+        let mut workspace_collab_ready = false;
         // Collaboration workspace native sur desktop comme en SaaS.
         {
             let url = room_url.map(ToString::to_string).unwrap_or_else(|| {
@@ -219,6 +254,7 @@ impl ChatTurnManager {
             let cli_bin = settings::command_for_provider(&app_settings, account.provider);
             match room.provision_home(account.provider, &cli_bin, &account_home, &url) {
                 Ok(()) => {
+                    workspace_collab_ready = true;
                     let token = room.register(AgentMeta {
                         agent_id: format!("chat-{id}"),
                         provider: account.provider,
@@ -235,6 +271,15 @@ impl ChatTurnManager {
                 Err(error) => eprintln!("[workspace_collab] provisioning chat ignore: {error}"),
             }
         }
+        configure_provider_command(
+            &mut command,
+            &account,
+            request.session_id.as_deref(),
+            request.mode,
+            model.as_deref(),
+            reasoning_effort.as_deref(),
+            workspace_collab_ready,
+        );
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -256,6 +301,17 @@ impl ChatTurnManager {
                 detail: project_dir.as_ref().map(|path| display_path(path)),
                 status: "running".to_string(),
             }],
+            thoughts: vec![ChatThought {
+                id: "agent-thinking".to_string(),
+                kind: "reasoning".to_string(),
+                text: format!(
+                    "{} analyse la demande et prépare la prochaine étape.",
+                    provider_label(account.provider)
+                ),
+                status: "running".to_string(),
+            }],
+            parts: Vec::new(),
+            pending_question: None,
         };
         let turn = Arc::new(ChatTurn {
             snapshot: Mutex::new(snapshot.clone()),
@@ -293,7 +349,7 @@ impl ChatTurnManager {
                 .write_all(prompt.as_bytes())
                 .and_then(|_| writer.write_all(b"\n"))
             {
-                let _ = self.stop(id);
+                let _ = self.stop(id, room);
                 return Err(format!("Impossible d'envoyer le message : {error}"));
             }
         }
@@ -378,7 +434,7 @@ impl ChatTurnManager {
         Ok(snapshot)
     }
 
-    pub fn status(&self, id: u64) -> Result<ChatTurnSnapshot, String> {
+    pub fn status(&self, id: u64, room: &RoomState) -> Result<ChatTurnSnapshot, String> {
         let turn = self
             .turns
             .lock()
@@ -386,15 +442,16 @@ impl ChatTurnManager {
             .get(&id)
             .cloned()
             .ok_or_else(|| "Tour de conversation introuvable".to_string())?;
-        let snapshot = turn
+        let mut snapshot = turn
             .snapshot
             .lock()
             .map_err(|_| "Etat du tour verrouillé".to_string())?
             .clone();
+        snapshot.pending_question = room.pending_question_for_turn(id);
         Ok(snapshot)
     }
 
-    pub fn stop(&self, id: u64) -> Result<ChatTurnSnapshot, String> {
+    pub fn stop(&self, id: u64, room: &RoomState) -> Result<ChatTurnSnapshot, String> {
         let turn = self
             .turns
             .lock()
@@ -409,6 +466,7 @@ impl ChatTurnManager {
                 snapshot.finished_at = Some(metrics::now_ts());
                 snapshot.error = None;
                 complete_running_activities(&mut snapshot, "cancelled");
+                complete_running_thoughts(&mut snapshot, "cancelled");
             }
         }
         if let Ok(mut child) = turn.child.lock() {
@@ -416,7 +474,8 @@ impl ChatTurnManager {
                 let _ = child.kill();
             }
         }
-        self.status(id)
+        room.cancel_question_for_turn(id);
+        self.status(id, room)
     }
 
     fn reserve_turn(&self, request: &StartChatTurnRequest) -> Result<ChatClaim, String> {
@@ -527,17 +586,31 @@ pub fn start_chat_turn(
 #[tauri::command]
 pub fn chat_turn_status(
     state: State<'_, ChatTurnManager>,
+    room: State<'_, RoomState>,
     id: u64,
 ) -> Result<ChatTurnSnapshot, String> {
-    state.status(id)
+    state.status(id, &room)
 }
 
 #[tauri::command]
 pub fn stop_chat_turn(
     state: State<'_, ChatTurnManager>,
+    room: State<'_, RoomState>,
     id: u64,
 ) -> Result<ChatTurnSnapshot, String> {
-    state.stop(id)
+    state.stop(id, &room)
+}
+
+#[tauri::command]
+pub fn answer_chat_question(
+    state: State<'_, ChatTurnManager>,
+    room: State<'_, RoomState>,
+    id: u64,
+    question_id: u64,
+    answers: Vec<QuestionAnswer>,
+) -> Result<ChatTurnSnapshot, String> {
+    room.answer_question_for_turn(id, question_id, answers)?;
+    state.status(id, &room)
 }
 
 fn configure_provider_command(
@@ -547,6 +620,7 @@ fn configure_provider_command(
     mode: ChatTurnMode,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    workspace_collab_ready: bool,
 ) {
     match account.provider {
         Provider::Codex => {
@@ -555,6 +629,21 @@ fn configure_provider_command(
                 command.arg("resume");
             }
             command.arg("--json");
+            // Expose uniquement les resumes prevus pour l'utilisateur. Le
+            // raisonnement interne brut reste volontairement masque.
+            command
+                .arg("-c")
+                .arg("hide_agent_reasoning=false")
+                .arg("-c")
+                .arg("show_raw_agent_reasoning=false");
+            // Une question structuree reste un appel MCP ouvert jusqu'a la
+            // reponse de l'utilisateur. Le defaut Codex (60 s) est trop court
+            // pour une interaction humaine dans l'app.
+            if workspace_collab_ready {
+                command
+                    .arg("-c")
+                    .arg("mcp_servers.workspace_collab.tool_timeout_sec=86400");
+            }
             if matches!(mode, ChatTurnMode::Plan | ChatTurnMode::Ask) {
                 command.arg("-c").arg("sandbox_mode=\"read-only\"");
             } else if account.bypass {
@@ -777,17 +866,24 @@ fn finish_turn(turn: &Arc<ChatTurn>, exit: Result<ExitStatus, String>, stderr: &
         Ok(status) if status.success() => {
             snapshot.status = ChatTurnStatus::Completed;
             complete_running_activities(&mut snapshot, "complete");
+            complete_running_thoughts(&mut snapshot, "complete");
+            complete_running_parts(&mut snapshot, "complete");
+            remove_final_commentary(&mut snapshot);
         }
         Ok(status) => {
             snapshot.status = ChatTurnStatus::Failed;
             let fallback = format!("Le provider s'est arrêté avec le code {:?}", status.code());
             snapshot.error = Some(first_non_empty(&snapshot.error, stderr, &fallback));
             complete_running_activities(&mut snapshot, "error");
+            complete_running_thoughts(&mut snapshot, "error");
+            complete_running_parts(&mut snapshot, "error");
         }
         Err(error) => {
             snapshot.status = ChatTurnStatus::Failed;
             snapshot.error = Some(first_non_empty(&snapshot.error, stderr, &error));
             complete_running_activities(&mut snapshot, "error");
+            complete_running_thoughts(&mut snapshot, "error");
+            complete_running_parts(&mut snapshot, "error");
         }
     }
 }
@@ -808,6 +904,32 @@ fn complete_running_activities(snapshot: &mut ChatTurnSnapshot, status: &str) {
         if activity.status == "running" || activity.status == "queued" {
             activity.status = status.to_string();
         }
+    }
+}
+
+fn complete_running_thoughts(snapshot: &mut ChatTurnSnapshot, status: &str) {
+    for thought in &mut snapshot.thoughts {
+        if thought.status == "running" || thought.status == "queued" {
+            thought.status = status.to_string();
+        }
+    }
+}
+
+fn complete_running_parts(snapshot: &mut ChatTurnSnapshot, status: &str) {
+    for part in &mut snapshot.parts {
+        if part.status == "running" || part.status == "queued" {
+            part.status = status.to_string();
+        }
+    }
+}
+
+fn remove_final_commentary(snapshot: &mut ChatTurnSnapshot) {
+    if let Some(index) = snapshot
+        .thoughts
+        .iter()
+        .rposition(|thought| thought.kind == "commentary")
+    {
+        snapshot.thoughts.remove(index);
     }
 }
 
@@ -835,6 +957,15 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
         }
         return;
     }
+    if provider == Provider::Claude && event_type == "assistant" {
+        if let Some(part) = claude_part_from_event(&value) {
+            upsert_part(&mut snapshot, part);
+        }
+        if let Some(thought) = claude_commentary_from_event(&value) {
+            upsert_thought(&mut snapshot, thought);
+        }
+        return;
+    }
     if event_type == "turn.failed" || event_type == "error" {
         snapshot.error = event_error(&value);
         return;
@@ -846,8 +977,191 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
         return;
     };
     let completed = event_type == "item.completed";
+    if let Some(part) = part_from_item(item, completed) {
+        upsert_part(&mut snapshot, part);
+    }
+    if let Some(thought) = thought_from_item(item, completed) {
+        upsert_thought(&mut snapshot, thought);
+    }
     if let Some(activity) = activity_from_item(item, completed) {
         upsert_activity(&mut snapshot, activity);
+    }
+}
+
+fn part_status(item: &Value, completed: bool) -> &'static str {
+    let failed = item
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "failed" | "error"));
+    if failed {
+        "error"
+    } else if completed {
+        "complete"
+    } else {
+        "running"
+    }
+}
+
+fn part_from_item(item: &Value, completed: bool) -> Option<ChatPart> {
+    let item_kind = item.get("type").and_then(Value::as_str)?;
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or(item_kind)
+        .to_string();
+    let status = part_status(item, completed).to_string();
+
+    if matches!(item_kind, "agent_message" | "reasoning") {
+        let text = safe_item_text(item)?;
+        return Some(ChatPart {
+            id,
+            kind: if item_kind == "reasoning" {
+                "reasoning".to_string()
+            } else {
+                "text".to_string()
+            },
+            status,
+            text: Some(text),
+            tool: None,
+            title: None,
+            subtitle: None,
+            detail: None,
+            output: None,
+        });
+    }
+
+    let (tool, title, subtitle, detail, output) = match item_kind {
+        "command_execution" => {
+            let command = item.get("command").and_then(Value::as_str);
+            let output = first_item_string(item, &["aggregated_output", "output", "stdout"]);
+            (
+                "command",
+                if completed {
+                    "Commande executee"
+                } else {
+                    "Execution d'une commande"
+                },
+                command.map(short_detail),
+                command.map(limit_part_detail),
+                output.map(limit_part_detail),
+            )
+        }
+        "file_change" => {
+            let changes = item.get("changes");
+            let count = changes.and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+            (
+                "edit",
+                if completed {
+                    "Fichiers modifies"
+                } else {
+                    "Modification de fichiers"
+                },
+                Some(format!("{count} changement(s)")),
+                changes
+                    .and_then(compact_json)
+                    .map(|value| limit_part_detail(&value)),
+                None,
+            )
+        }
+        "mcp_tool_call" => {
+            let name = item
+                .get("tool")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str);
+            let detail = item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .and_then(compact_json)
+                .map(|value| limit_part_detail(&value));
+            let output = item
+                .get("result")
+                .or_else(|| item.get("output"))
+                .or_else(|| item.get("error"))
+                .and_then(compact_json)
+                .map(|value| limit_part_detail(&value));
+            (
+                "tool",
+                "Utilisation d'un outil",
+                name.map(short_detail),
+                detail,
+                output,
+            )
+        }
+        "web_search" => {
+            let query = item.get("query").and_then(Value::as_str);
+            (
+                "search",
+                "Recherche web",
+                query.map(short_detail),
+                query.map(limit_part_detail),
+                None,
+            )
+        }
+        "plan" => (
+            "plan",
+            "Mise a jour du plan",
+            None,
+            compact_json(item).map(|value| limit_part_detail(&value)),
+            None,
+        ),
+        _ => return None,
+    };
+
+    Some(ChatPart {
+        id,
+        kind: "tool".to_string(),
+        status,
+        text: None,
+        tool: Some(tool.to_string()),
+        title: Some(title.to_string()),
+        subtitle,
+        detail,
+        output,
+    })
+}
+
+fn claude_part_from_event(value: &Value) -> Option<ChatPart> {
+    let message = value.get("message")?;
+    let text = safe_text_value(message.get("content")?)?;
+    Some(ChatPart {
+        id: message
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("claude-commentary")
+            .to_string(),
+        kind: "text".to_string(),
+        status: "complete".to_string(),
+        text: Some(text),
+        tool: None,
+        title: None,
+        subtitle: None,
+        detail: None,
+        output: None,
+    })
+}
+
+fn compact_json(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.to_string()),
+        _ => serde_json::to_string_pretty(value).ok(),
+    }
+}
+
+fn first_item_string<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_str))
+}
+
+fn limit_part_detail(value: &str) -> String {
+    let clipped = value
+        .chars()
+        .take(MAX_PART_DETAIL_CHARS)
+        .collect::<String>();
+    if value.chars().count() > MAX_PART_DETAIL_CHARS {
+        format!("{clipped}...")
+    } else {
+        clipped
     }
 }
 
@@ -873,6 +1187,108 @@ fn event_error(value: &Value) -> Option<String> {
         })
         .or_else(|| value.get("message").and_then(Value::as_str))
         .map(|message| message.chars().take(1200).collect())
+}
+
+fn thought_from_item(item: &Value, completed: bool) -> Option<ChatThought> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    if !matches!(kind, "agent_message" | "reasoning") {
+        return None;
+    }
+    let failed = item
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "failed" | "error"));
+    let status = if failed {
+        "error"
+    } else if completed {
+        "complete"
+    } else {
+        "running"
+    };
+    let text = safe_item_text(item);
+    if kind == "agent_message" && text.is_none() {
+        return None;
+    }
+    let text = text.unwrap_or_else(|| "Analyse en cours…".to_string());
+    let id = if kind == "reasoning" && text == "Analyse en cours…" {
+        "agent-thinking".to_string()
+    } else {
+        item.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(kind)
+            .to_string()
+    };
+    Some(ChatThought {
+        id,
+        kind: if kind == "reasoning" {
+            "reasoning".to_string()
+        } else {
+            "commentary".to_string()
+        },
+        text,
+        status: status.to_string(),
+    })
+}
+
+fn claude_commentary_from_event(value: &Value) -> Option<ChatThought> {
+    let message = value.get("message")?;
+    let text = safe_text_value(message.get("content")?)?;
+    let id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("claude-commentary")
+        .to_string();
+    Some(ChatThought {
+        id,
+        kind: "commentary".to_string(),
+        text,
+        status: "complete".to_string(),
+    })
+}
+
+fn safe_item_text(item: &Value) -> Option<String> {
+    ["text", "summary_text", "summary", "content"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(safe_text_value))
+}
+
+fn safe_text_value(value: &Value) -> Option<String> {
+    let fragments = match value {
+        Value::String(text) => vec![text.trim().to_string()],
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| match value {
+                Value::String(text) => Some(text.trim().to_string()),
+                Value::Object(object) => object
+                    .get("text")
+                    .or_else(|| object.get("summary_text"))
+                    .and_then(Value::as_str)
+                    .map(|text| text.trim().to_string()),
+                _ => None,
+            })
+            .collect(),
+        Value::Object(object) => object
+            .get("text")
+            .or_else(|| object.get("summary_text"))
+            .and_then(Value::as_str)
+            .map(|text| vec![text.trim().to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let combined = fragments
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if combined.is_empty() {
+        return None;
+    }
+    let truncated = combined.chars().take(MAX_THOUGHT_CHARS).collect::<String>();
+    Some(if combined.chars().count() > MAX_THOUGHT_CHARS {
+        format!("{truncated}…")
+    } else {
+        truncated
+    })
 }
 
 fn activity_from_item(item: &Value, completed: bool) -> Option<ChatActivity> {
@@ -958,6 +1374,41 @@ fn upsert_activity(snapshot: &mut ChatTurnSnapshot, activity: ChatActivity) {
     }
 }
 
+fn upsert_thought(snapshot: &mut ChatTurnSnapshot, thought: ChatThought) {
+    if thought.id != "agent-thinking" {
+        if let Some(starter) = snapshot
+            .thoughts
+            .iter_mut()
+            .find(|item| item.id == "agent-thinking" && item.status == "running")
+        {
+            starter.status = "complete".to_string();
+        }
+    }
+    if let Some(existing) = snapshot
+        .thoughts
+        .iter_mut()
+        .find(|item| item.id == thought.id)
+    {
+        *existing = thought;
+        return;
+    }
+    if snapshot.thoughts.len() >= MAX_THOUGHTS {
+        snapshot.thoughts.remove(0);
+    }
+    snapshot.thoughts.push(thought);
+}
+
+fn upsert_part(snapshot: &mut ChatTurnSnapshot, part: ChatPart) {
+    if let Some(existing) = snapshot.parts.iter_mut().find(|item| item.id == part.id) {
+        *existing = part;
+        return;
+    }
+    if snapshot.parts.len() >= MAX_PARTS {
+        snapshot.parts.remove(0);
+    }
+    snapshot.parts.push(part);
+}
+
 fn short_detail(value: &str) -> String {
     let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if flattened.chars().count() > 120 {
@@ -1013,6 +1464,9 @@ mod tests {
                 finished_at: None,
                 error: None,
                 activities: Vec::new(),
+                thoughts: Vec::new(),
+                parts: Vec::new(),
+                pending_question: None,
             }),
             child: Mutex::new(None),
             workspace: Mutex::new(None),
@@ -1037,6 +1491,16 @@ mod tests {
             Provider::Codex,
             r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"npm test","status":"completed"}}"#,
         );
+        apply_provider_event(
+            &turn,
+            Provider::Codex,
+            r#"{"type":"item.completed","item":{"id":"reason_1","type":"reasoning","summary":[{"text":"Je vérifie les tests avant de conclure."}]}}"#,
+        );
+        apply_provider_event(
+            &turn,
+            Provider::Codex,
+            r#"{"type":"item.completed","item":{"id":"message_1","type":"agent_message","text":"Les tests sont terminés."}}"#,
+        );
 
         let snapshot = turn.snapshot.lock().unwrap();
         assert_eq!(
@@ -1045,6 +1509,18 @@ mod tests {
         );
         assert_eq!(snapshot.activities.len(), 1);
         assert_eq!(snapshot.activities[0].status, "complete");
+        assert_eq!(snapshot.thoughts.len(), 2);
+        assert_eq!(snapshot.thoughts[0].kind, "reasoning");
+        assert_eq!(
+            snapshot.thoughts[0].text,
+            "Je vérifie les tests avant de conclure."
+        );
+        assert_eq!(snapshot.thoughts[1].kind, "commentary");
+        assert_eq!(snapshot.parts.len(), 3);
+        assert_eq!(snapshot.parts[0].kind, "tool");
+        assert_eq!(snapshot.parts[0].status, "complete");
+        assert_eq!(snapshot.parts[1].kind, "reasoning");
+        assert_eq!(snapshot.parts[2].kind, "text");
     }
 
     #[test]
@@ -1058,6 +1534,7 @@ mod tests {
             ChatTurnMode::Build,
             Some("gpt-chat-test"),
             Some("ultra"),
+            true,
         );
 
         let args = command
@@ -1070,6 +1547,35 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-c", "model_reasoning_effort=\"ultra\""]));
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "mcp_servers.workspace_collab.tool_timeout_sec=86400"] }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "hide_agent_reasoning=false"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "show_raw_agent_reasoning=false"]));
+    }
+
+    #[test]
+    fn thought_parser_never_falls_back_to_encrypted_reasoning() {
+        let turn = test_turn();
+        apply_provider_event(
+            &turn,
+            Provider::Codex,
+            r#"{"type":"item.completed","item":{"id":"reason_1","type":"reasoning","summary":[],"encrypted_content":"private-payload"}}"#,
+        );
+
+        let snapshot = turn.snapshot.lock().unwrap();
+        assert_eq!(snapshot.thoughts.len(), 1);
+        assert_eq!(snapshot.thoughts[0].id, "agent-thinking");
+        assert_eq!(snapshot.thoughts[0].text, "Analyse en cours…");
+        assert!(!snapshot.thoughts[0].text.contains("private-payload"));
+        assert!(
+            snapshot.parts.is_empty(),
+            "un raisonnement chiffre sans resume visible ne devient jamais une part"
+        );
     }
 
     #[test]

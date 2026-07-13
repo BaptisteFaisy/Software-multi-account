@@ -1,6 +1,6 @@
 use crate::{
     account_usage,
-    agent_room::{self, AgentMeta, RoomState},
+    agent_room::{self, AgentMeta, QuestionAnswer, RoomState},
     chat::{ChatTurnManager, StartChatTurnRequest},
     discussions,
     kombai::{KombaiManager, KombaiStatus},
@@ -38,7 +38,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::sync::broadcast;
-use tower_http::{cors::CorsLayer, services::ServeDir};
+use tower_http::{compression::CompressionLayer, cors::CorsLayer, services::ServeDir};
 
 const WORKSPACE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 // Le receiver conserve les sorties produites entre le demarrage du PTY et
@@ -108,6 +108,8 @@ struct StartTerminalRequest {
     rows: u16,
     command: Option<String>,
     agent_id: Option<String>,
+    #[serde(default)]
+    login_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,7 +468,14 @@ impl RemoteTerminalManager {
         let repo_dir = workspace.cwd().to_path_buf();
         let workspace_id = workspace.workspace_id().to_string();
         let room_id = workspace.room_id().to_string();
-        let account_home = workspace.home().to_path_buf();
+        let runtime_home = workspace.home().to_path_buf();
+        // Un login doit persister dans le vrai CODEX_HOME du compte. Les
+        // terminaux ordinaires continuent d'utiliser leur copie isolee.
+        let account_home = if request.login_only {
+            canonical_home.clone()
+        } else {
+            runtime_home.clone()
+        };
 
         // Synchronise a chaque demarrage la config propre au compte, dans le
         // format du provider (Codex config.toml / Claude settings.json). Un echec
@@ -535,7 +544,7 @@ impl RemoteTerminalManager {
                 .unwrap_or(settings.agent_room.port);
             let url = format!("http://127.0.0.1:{port}/mcp");
             let cli_bin = settings::command_for_provider(&settings, provider);
-            match room.provision_home(provider, &cli_bin, &account_home, &url) {
+            match room.provision_home(provider, &cli_bin, &runtime_home, &url) {
                 Ok(()) => {
                     let token = room.register(AgentMeta {
                         agent_id: agent_id.clone(),
@@ -646,7 +655,14 @@ impl RemoteTerminalManager {
         );
         let _ = events.send(ServerWsMessage::Data { id, data: banner });
 
-        if let Some(command) = request.command.or_else(|| account.startup_command.clone()) {
+        let command = if request.login_only {
+            // Mode authentification strict : ne jamais retomber sur la commande
+            // de demarrage du compte, qui pourrait ouvrir Codex normalement.
+            request.command
+        } else {
+            request.command.or_else(|| account.startup_command.clone())
+        };
+        if let Some(command) = command {
             let line = format!("{}\r", command.trim());
             session
                 .writer
@@ -749,18 +765,34 @@ fn finish_session(session: &Arc<RemoteTerminalSession>) {
     );
 }
 
-async fn prevent_stale_frontend(request: Request, next: Next) -> Response {
+fn frontend_cache_control(path: &str) -> Option<&'static str> {
+    if path.starts_with("/api/")
+        || path.starts_with("/ws/")
+        || path.starts_with("/mcp")
+        || path == "/healthz"
+    {
+        return None;
+    }
+
+    // Vite ajoute un hash de contenu aux fichiers sous /assets/. Ils peuvent
+    // donc etre conserves tres longtemps sans jamais servir une ancienne
+    // version : chaque build produit une nouvelle URL.
+    if path.starts_with("/assets/") {
+        return Some("public, max-age=31536000, immutable");
+    }
+
+    // index.html, le service worker et les icones a nom stable doivent etre
+    // revalides pour que le navigateur decouvre immediatement un nouveau build.
+    Some("no-store, no-cache, must-revalidate")
+}
+
+async fn set_frontend_cache_control(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
-    if !path.starts_with("/api/")
-        && !path.starts_with("/ws/")
-        && !path.starts_with("/mcp")
-        && path != "/healthz"
-    {
-        response.headers_mut().insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("no-store, no-cache, must-revalidate"),
-        );
+    if let Some(cache_control) = frontend_cache_control(&path) {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
     }
     response
 }
@@ -817,6 +849,10 @@ pub async fn run_from_env() -> Result<(), String> {
             "/chat/turns/:id",
             get(api_chat_turn_status).delete(api_stop_chat_turn),
         )
+        .route(
+            "/chat/turns/:id/questions/:question_id/answer",
+            post(api_answer_chat_question),
+        )
         .route("/pool/status", get(api_pool_status))
         .route("/pool/start", post(api_pool_status))
         .route("/pool/stop", post(api_pool_stop))
@@ -861,7 +897,8 @@ pub async fn run_from_env() -> Result<(), String> {
         .merge(pool::router(pool_manager, Some(config.admin_token.clone())))
         .merge(agent_room::router(room))
         .fallback_service(static_service)
-        .layer(middleware::from_fn(prevent_stale_frontend))
+        .layer(middleware::from_fn(set_frontend_cache_control))
+        .layer(CompressionLayer::new())
         .layer(CorsLayer::very_permissive());
 
     let addr: SocketAddr = config
@@ -1486,7 +1523,7 @@ async fn api_chat_turn_status(
     AxumPath(id): AxumPath<u64>,
 ) -> Response {
     auth_or(&state, &headers, || {
-        state.chat.status(id).map(json_response)
+        state.chat.status(id, &state.room).map(json_response)
     })
 }
 
@@ -1495,7 +1532,29 @@ async fn api_stop_chat_turn(
     headers: HeaderMap,
     AxumPath(id): AxumPath<u64>,
 ) -> Response {
-    auth_or(&state, &headers, || state.chat.stop(id).map(json_response))
+    auth_or(&state, &headers, || {
+        state.chat.stop(id, &state.room).map(json_response)
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnswerChatQuestionRequest {
+    answers: Vec<QuestionAnswer>,
+}
+
+async fn api_answer_chat_question(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath((id, question_id)): AxumPath<(u64, u64)>,
+    Json(request): Json<AnswerChatQuestionRequest>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        state
+            .room
+            .answer_question_for_turn(id, question_id, request.answers)?;
+        state.chat.status(id, &state.room).map(json_response)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2267,6 +2326,24 @@ fn system_time_to_unix(value: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashed_frontend_assets_are_cached_but_entrypoints_are_revalidated() {
+        assert_eq!(
+            frontend_cache_control("/assets/index-ABC123.js"),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            frontend_cache_control("/"),
+            Some("no-store, no-cache, must-revalidate")
+        );
+        assert_eq!(
+            frontend_cache_control("/service-worker.js"),
+            Some("no-store, no-cache, must-revalidate")
+        );
+        assert_eq!(frontend_cache_control("/api/settings"), None);
+        assert_eq!(frontend_cache_control("/ws/discussions"), None);
+    }
 
     #[test]
     fn remote_live_terminal_id_is_reserved_atomically() {

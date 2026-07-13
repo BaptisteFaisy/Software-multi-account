@@ -1886,6 +1886,11 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
                         error = Some(message);
                         source = "unavailable";
                     } else {
+                        // Le snapshot local permet encore d'afficher les derniers
+                        // quotas connus, mais ne doit pas masquer une session
+                        // revoquee : l'UI a besoin de cette erreur pour proposer
+                        // une vraie reconnexion.
+                        error = Some(message);
                         refreshed_at = Some(snapshot.observed_at);
                         source = "session";
                     }

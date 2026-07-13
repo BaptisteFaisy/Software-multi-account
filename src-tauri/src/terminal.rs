@@ -146,6 +146,7 @@ pub fn start_terminal(
     rows: u16,
     command: Option<String>,
     project_dir: Option<String>,
+    login_only: bool,
 ) -> Result<StartTerminalResponse, String> {
     let settings = load_settings_for_terminal()?;
     let account = settings
@@ -183,7 +184,14 @@ pub fn start_terminal(
         &canonical_home,
         Some(&source_project_dir),
     )?;
-    let account_home = workspace.home().to_path_buf();
+    let runtime_home = workspace.home().to_path_buf();
+    // La reconnexion doit mettre a jour le CODEX_HOME permanent. Un terminal
+    // de travail normal reste isole dans son home de workspace.
+    let account_home = if login_only {
+        canonical_home.clone()
+    } else {
+        runtime_home.clone()
+    };
     let project_dir = Some(workspace.cwd().to_path_buf());
     let workspace_id = workspace.workspace_id().to_string();
     let room_id = workspace.room_id().to_string();
@@ -255,7 +263,7 @@ pub fn start_terminal(
     {
         let url = format!("http://127.0.0.1:{}/mcp", settings.agent_room.port);
         let cli_bin = crate::settings::command_for_provider(&settings, provider);
-        match room.provision_home(provider, &cli_bin, &account_home, &url) {
+        match room.provision_home(provider, &cli_bin, &runtime_home, &url) {
             Ok(()) => {
                 let token = room.register(AgentMeta {
                     agent_id: format!("desktop-terminal-{id}"),
@@ -359,7 +367,13 @@ pub fn start_terminal(
         proxy.map(|proxy| proxy.label.as_str()),
         project_dir.as_deref(),
     )?;
-    if let Some(command) = command.or_else(|| account.startup_command.clone()) {
+    let command = if login_only {
+        // Ne lance jamais la commande normale du compte apres une reconnexion.
+        command
+    } else {
+        command.or_else(|| account.startup_command.clone())
+    };
+    if let Some(command) = command {
         let line = format!("{}\r", command.trim());
         session
             .writer

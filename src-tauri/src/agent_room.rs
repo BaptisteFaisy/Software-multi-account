@@ -51,7 +51,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 /// Version du protocole MCP annoncee par defaut si le client n'en propose pas.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -76,6 +76,12 @@ const LOG_SEGMENTS_MAX: usize = 8;
 const AGENT_HISTORY_MAX: usize = 2_000;
 const COLLAB_MCP_NAME: &str = "workspace_collab";
 const LEGACY_MCP_NAME: &str = "agent_room";
+const QUESTION_MAX_COUNT: usize = 3;
+const QUESTION_MAX_OPTIONS: usize = 5;
+const QUESTION_HEADER_MAX_CHARS: usize = 80;
+const QUESTION_TEXT_MAX_CHARS: usize = 2_000;
+const QUESTION_OPTION_MAX_CHARS: usize = 160;
+const QUESTION_DESCRIPTION_MAX_CHARS: usize = 500;
 
 fn now_ts() -> i64 {
     SystemTime::now()
@@ -182,6 +188,71 @@ pub struct RoomSnapshot {
     pub store_owner: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionPrompt {
+    pub header: String,
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multiple: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingQuestion {
+    pub id: u64,
+    pub questions: Vec<QuestionPrompt>,
+    pub asked_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionAnswer {
+    #[serde(default)]
+    pub selected: Vec<String>,
+    #[serde(default)]
+    pub custom: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionRequest {
+    questions: Vec<QuestionPrompt>,
+}
+
+struct PendingQuestionSlot {
+    question: PendingQuestion,
+    answer: oneshot::Sender<Vec<QuestionAnswer>>,
+}
+
+struct PendingQuestionGuard {
+    state: RoomState,
+    agent_id: String,
+    question_id: u64,
+}
+
+impl Drop for PendingQuestionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.state.inner.pending_questions.lock() {
+            let matches = pending
+                .get(&self.agent_id)
+                .is_some_and(|slot| slot.question.id == self.question_id);
+            if matches {
+                pending.remove(&self.agent_id);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Etat du salon
 // ---------------------------------------------------------------------------
@@ -207,6 +278,10 @@ struct RoomInner {
     /// recus (preuve qu'un client MCP a bien parle au serveur).
     initialize_count: AtomicU64,
     tools_list_count: AtomicU64,
+    /// Question interactive bloquant le tour d'un agent jusqu'a la reponse UI.
+    /// Cle = agent_id public injecte par l'app (`chat-<turn id>` pour les chats).
+    pending_questions: Mutex<HashMap<String, PendingQuestionSlot>>,
+    question_seq: AtomicU64,
     /// Repertoire de persistance (`.../agent-room`) ; `None` = memoire seule.
     data_dir: Option<PathBuf>,
     /// Serialise les ecritures dans le journal JSONL.
@@ -278,6 +353,8 @@ impl RoomState {
                 notify,
                 initialize_count: AtomicU64::new(0),
                 tools_list_count: AtomicU64::new(0),
+                pending_questions: Mutex::new(HashMap::new()),
+                question_seq: AtomicU64::new(1),
                 data_dir,
                 io_lock: Mutex::new(()),
                 provisioned: Mutex::new(HashMap::new()),
@@ -501,6 +578,88 @@ impl RoomState {
         )
     }
 
+    fn begin_question(
+        &self,
+        agent: &AgentInfo,
+        args: &Value,
+    ) -> Result<(PendingQuestion, oneshot::Receiver<Vec<QuestionAnswer>>), String> {
+        if !agent.agent_id.starts_with("chat-") {
+            return Err(
+                "les questions interactives sont reservees aux chats de l'application".to_string(),
+            );
+        }
+        let questions = normalize_question_request(args)?;
+        let question = PendingQuestion {
+            id: self.inner.question_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            questions,
+            asked_at: now_ts(),
+        };
+        let (answer, receiver) = oneshot::channel();
+        let mut pending = self
+            .inner
+            .pending_questions
+            .lock()
+            .map_err(|_| "questions interactives verrouillees".to_string())?;
+        if pending.contains_key(&agent.agent_id) {
+            return Err("une question attend deja la reponse de l'utilisateur".to_string());
+        }
+        pending.insert(
+            agent.agent_id.clone(),
+            PendingQuestionSlot {
+                question: question.clone(),
+                answer,
+            },
+        );
+        Ok((question, receiver))
+    }
+
+    pub fn pending_question_for_turn(&self, turn_id: u64) -> Option<PendingQuestion> {
+        let key = format!("chat-{turn_id}");
+        self.inner
+            .pending_questions
+            .lock()
+            .ok()?
+            .get(&key)
+            .map(|slot| slot.question.clone())
+    }
+
+    pub fn answer_question_for_turn(
+        &self,
+        turn_id: u64,
+        question_id: u64,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<(), String> {
+        let key = format!("chat-{turn_id}");
+        let mut pending = self
+            .inner
+            .pending_questions
+            .lock()
+            .map_err(|_| "questions interactives verrouillees".to_string())?;
+        let slot = pending
+            .get(&key)
+            .ok_or_else(|| "cette question n'est plus en attente".to_string())?;
+        if slot.question.id != question_id {
+            return Err("identifiant de question obsolete".to_string());
+        }
+        let answers = normalize_question_answers(&slot.question, answers)?;
+        let slot = pending
+            .remove(&key)
+            .ok_or_else(|| "cette question n'est plus en attente".to_string())?;
+        slot.answer
+            .send(answers)
+            .map_err(|_| "le tour s'est termine avant de recevoir la reponse".to_string())
+    }
+
+    pub fn cancel_question_for_turn(&self, turn_id: u64) {
+        self.cancel_question_for_agent(&format!("chat-{turn_id}"));
+    }
+
+    fn cancel_question_for_agent(&self, agent_id: &str) {
+        if let Ok(mut pending) = self.inner.pending_questions.lock() {
+            pending.remove(agent_id);
+        }
+    }
+
     /// Enregistre un agent et renvoie son **token secret** (a injecter dans
     /// `CST_ROOM_TOKEN` du PTY). Idempotent si le meme token est fourni.
     pub fn register(&self, meta: AgentMeta) -> String {
@@ -561,14 +720,20 @@ impl RoomState {
                 Some(info) if info.present => {
                     info.present = false;
                     info.last_seen = now_ts();
-                    Some((info.room_id.clone(), info.ident.clone(), info.label.clone()))
+                    Some((
+                        info.room_id.clone(),
+                        info.ident.clone(),
+                        info.label.clone(),
+                        info.agent_id.clone(),
+                    ))
                 }
                 _ => None,
             }
         } else {
             None
         };
-        if let Some((room_id, ident, label)) = departed {
+        if let Some((room_id, ident, label, agent_id)) = departed {
+            self.cancel_question_for_agent(&agent_id);
             self.post_in_room(
                 &room_id,
                 &ident,
@@ -928,6 +1093,114 @@ fn frame_text(text: String) -> String {
     cleaned.chars().take(MESSAGE_MAX_CHARS).collect()
 }
 
+fn clean_limited(value: &str, max_chars: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+fn normalize_question_request(args: &Value) -> Result<Vec<QuestionPrompt>, String> {
+    let request: QuestionRequest = serde_json::from_value(args.clone())
+        .map_err(|error| format!("question invalide: {error}"))?;
+    if request.questions.is_empty() || request.questions.len() > QUESTION_MAX_COUNT {
+        return Err(format!(
+            "le champ 'questions' doit contenir entre 1 et {QUESTION_MAX_COUNT} questions"
+        ));
+    }
+
+    request
+        .questions
+        .into_iter()
+        .map(|question| {
+            let header = clean_limited(&question.header, QUESTION_HEADER_MAX_CHARS);
+            let text = clean_limited(&question.question, QUESTION_TEXT_MAX_CHARS);
+            if header.is_empty() || text.is_empty() {
+                return Err("chaque question exige un en-tete et un texte non vides".to_string());
+            }
+            if question.options.len() < 2 || question.options.len() > QUESTION_MAX_OPTIONS {
+                return Err(format!(
+                    "chaque question doit proposer entre 2 et {QUESTION_MAX_OPTIONS} options"
+                ));
+            }
+            let mut labels = std::collections::HashSet::new();
+            let options = question
+                .options
+                .into_iter()
+                .map(|option| {
+                    let label = clean_limited(&option.label, QUESTION_OPTION_MAX_CHARS);
+                    if label.is_empty() {
+                        return Err("le libelle d'une option ne peut pas etre vide".to_string());
+                    }
+                    if !labels.insert(label.to_lowercase()) {
+                        return Err(format!("option dupliquee: {label}"));
+                    }
+                    let description = option
+                        .description
+                        .as_deref()
+                        .map(|value| clean_limited(value, QUESTION_DESCRIPTION_MAX_CHARS))
+                        .filter(|value| !value.is_empty());
+                    Ok(QuestionOption { label, description })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(QuestionPrompt {
+                header,
+                question: text,
+                options,
+                multiple: question.multiple,
+            })
+        })
+        .collect()
+}
+
+fn normalize_question_answers(
+    question: &PendingQuestion,
+    answers: Vec<QuestionAnswer>,
+) -> Result<Vec<QuestionAnswer>, String> {
+    if answers.len() != question.questions.len() {
+        return Err("une reponse est requise pour chaque question".to_string());
+    }
+
+    answers
+        .into_iter()
+        .zip(&question.questions)
+        .map(|(answer, prompt)| {
+            let mut selected = Vec::new();
+            for value in answer.selected {
+                let value = clean_limited(&value, QUESTION_OPTION_MAX_CHARS);
+                let Some(option) = prompt
+                    .options
+                    .iter()
+                    .find(|option| option.label.eq_ignore_ascii_case(&value))
+                else {
+                    return Err(format!("option inconnue pour '{}': {value}", prompt.header));
+                };
+                if !selected.contains(&option.label) {
+                    selected.push(option.label.clone());
+                }
+            }
+            let custom = answer
+                .custom
+                .as_deref()
+                .map(|value| clean_limited(value, QUESTION_TEXT_MAX_CHARS))
+                .filter(|value| !value.is_empty());
+            let answer_count = selected.len() + usize::from(custom.is_some());
+            if answer_count == 0 {
+                return Err(format!("reponds a la question '{}'.", prompt.header));
+            }
+            if !prompt.multiple && answer_count > 1 {
+                return Err(format!(
+                    "la question '{}' n'accepte qu'une seule reponse",
+                    prompt.header
+                ));
+            }
+            Ok(QuestionAnswer { selected, custom })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Serveur MCP (JSON-RPC sur POST /mcp)
 // ---------------------------------------------------------------------------
@@ -986,8 +1259,12 @@ async fn mcp_post(State(state): State<RoomState>, headers: HeaderMap, body: Byte
             }
         }
         single => {
-            // `wait_for_messages` est le seul outil bloquant : traite en async,
-            // hors du chemin synchrone `handle_one`.
+            // Les outils bloquants sont traites en async, hors du chemin
+            // synchrone `handle_one`.
+            if let Some((id, args)) = blocking_tool_call(&single, "request_user_input") {
+                let result = run_request_user_input(&state, &agent, &args).await;
+                return rpc_http(&accept, rpc_ok(id, result));
+            }
             if let Some((id, args)) = wait_call(&single) {
                 let result = run_wait_for_messages(&state, &agent, &args).await;
                 return rpc_http(&accept, rpc_ok(id, result));
@@ -1001,12 +1278,11 @@ async fn mcp_post(State(state): State<RoomState>, headers: HeaderMap, body: Byte
     }
 }
 
-/// Detecte un appel unique a `wait_for_messages` et renvoie (id, arguments).
-fn wait_call(msg: &Value) -> Option<(Value, Value)> {
+fn blocking_tool_call(msg: &Value, tool_name: &str) -> Option<(Value, Value)> {
     if msg.get("method").and_then(Value::as_str) != Some("tools/call") {
         return None;
     }
-    if msg.pointer("/params/name").and_then(Value::as_str) != Some("wait_for_messages") {
+    if msg.pointer("/params/name").and_then(Value::as_str) != Some(tool_name) {
         return None;
     }
     let id = msg.get("id").cloned()?;
@@ -1015,6 +1291,48 @@ fn wait_call(msg: &Value) -> Option<(Value, Value)> {
         .cloned()
         .unwrap_or(json!({}));
     Some((id, args))
+}
+
+/// Detecte un appel unique a `wait_for_messages` et renvoie (id, arguments).
+fn wait_call(msg: &Value) -> Option<(Value, Value)> {
+    blocking_tool_call(msg, "wait_for_messages")
+}
+
+async fn run_request_user_input(state: &RoomState, agent: &AgentInfo, args: &Value) -> Value {
+    let (question, receiver) = match state.begin_question(agent, args) {
+        Ok(value) => value,
+        Err(error) => return tool_err(&error),
+    };
+    let _guard = PendingQuestionGuard {
+        state: state.clone(),
+        agent_id: agent.agent_id.clone(),
+        question_id: question.id,
+    };
+    let answers = match receiver.await {
+        Ok(answers) => answers,
+        Err(_) => return tool_err("la question a ete annulee avant la reponse"),
+    };
+    let answers = answers
+        .into_iter()
+        .zip(&question.questions)
+        .map(|(answer, prompt)| {
+            let mut text = answer.selected.join(", ");
+            if let Some(custom) = &answer.custom {
+                if !text.is_empty() {
+                    text.push_str(", ");
+                }
+                text.push_str(custom);
+            }
+            json!({
+                "header": prompt.header,
+                "question": prompt.question,
+                "selected": answer.selected,
+                "custom": answer.custom,
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+    tool_ok(json!({ "answers": answers }))
 }
 
 async fn run_wait_for_messages(state: &RoomState, agent: &AgentInfo, args: &Value) -> Value {
@@ -1099,6 +1417,46 @@ fn tools_schema() -> Value {
             "name": "list_agents",
             "description": "Liste uniquement les autres agents presents dans ton dossier logique.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "request_user_input",
+            "description": "Pose une a trois questions structurees a l'utilisateur et BLOQUE le tour jusqu'a sa reponse. Utilise cet outil, au lieu de terminer ton message par une question, lorsque la suite du travail depend d'un choix ou d'une information de l'utilisateur. L'interface ajoute toujours une reponse personnalisee en plus des options.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "header": { "type": "string", "description": "Titre court de la question." },
+                                "question": { "type": "string", "description": "Question complete affichee a l'utilisateur." },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 5,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["label"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "multiple": { "type": "boolean", "description": "Autorise plusieurs options si true." }
+                            },
+                            "required": ["header", "question", "options"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": false
+            }
         },
         {
             "name": "send_message",
@@ -1352,6 +1710,9 @@ fn call_tool(state: &RoomState, agent: &AgentInfo, token: &str, name: &str, args
             let cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
             tool_ok(json!({ "messages": messages, "cursor": cursor }))
         }
+        "request_user_input" => {
+            tool_err("request_user_input doit etre appele seul pour garder le tour en attente")
+        }
         _ => tool_err(&format!("outil inconnu: {name}")),
     }
 }
@@ -1433,7 +1794,7 @@ pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> R
     // ce process, jamais du home canonique de l'utilisateur.
     remove_mcp(provider, cli_bin, home, LEGACY_MCP_NAME);
 
-    let get = Command::new(cli_bin)
+    let get = mcp_cli_command(cli_bin)
         .args(["mcp", "get", COLLAB_MCP_NAME])
         .env(home_env, home)
         .output();
@@ -1451,7 +1812,7 @@ pub fn provision(provider: Provider, cli_bin: &str, home: &Path, url: &str) -> R
         }
     }
 
-    let mut add = Command::new(cli_bin);
+    let mut add = mcp_cli_command(cli_bin);
     match provider {
         Provider::Codex => {
             add.args([
@@ -1502,10 +1863,33 @@ pub fn deprovision(provider: Provider, cli_bin: &str, home: &Path) {
 }
 
 fn remove_mcp(provider: Provider, cli_bin: &str, home: &Path, name: &str) {
-    let _ = Command::new(cli_bin)
+    let _ = mcp_cli_command(cli_bin)
         .args(["mcp", "remove", name])
         .env(provider.home_env_var(), home)
         .output();
+}
+
+/// Les installations npm de Codex et Claude sont exposees par des shims
+/// `.cmd` sous Windows. `std::process::Command` ne resout pas un nom comme
+/// `codex` vers ce shim ; `cmd.exe` le fait via PATH/PATHEXT.
+fn mcp_cli_command(cli_bin: &str) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = Command::new("cmd.exe");
+        command
+            .arg("/D")
+            .arg("/C")
+            .arg(cli_bin.trim().trim_matches('"'));
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new(cli_bin)
+    }
 }
 
 fn unauthorized() -> Response {
@@ -1578,6 +1962,7 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"whoami"));
+        assert!(names.contains(&"request_user_input"));
         assert!(names.contains(&"send_message"));
         assert!(names.contains(&"read_messages"));
         assert!(names.contains(&"list_agents"));
@@ -1585,6 +1970,18 @@ mod tests {
         assert!(names.contains(&"submit_for_merge"));
         assert!(names.contains(&"merge_status"));
         assert!(names.contains(&"list_landed"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mcp_cli_uses_the_windows_command_shim_resolver() {
+        let command = mcp_cli_command("codex");
+        assert_eq!(command.get_program().to_string_lossy(), "cmd.exe");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args, ["/D", "/C", "codex"]);
     }
 
     #[test]
@@ -1614,6 +2011,61 @@ mod tests {
         let body = tool_json(&result);
         assert_eq!(body["label"], "Alice");
         assert!(body["ident"].as_str().unwrap().starts_with("alice-"));
+    }
+
+    #[tokio::test]
+    async fn structured_question_blocks_until_the_ui_answers() {
+        let state = RoomState::new();
+        let mut question_meta = meta("Question Agent");
+        question_meta.agent_id = "chat-42".to_string();
+        let token = state.register(question_meta);
+        let agent = state.lookup(&token).unwrap();
+        let waiting_state = state.clone();
+        let task = tokio::spawn(async move {
+            run_request_user_input(
+                &waiting_state,
+                &agent,
+                &json!({
+                    "questions": [{
+                        "header": "Direction",
+                        "question": "Quelle direction prendre ?",
+                        "options": [
+                            { "label": "Rapide", "description": "Correction ciblee" },
+                            { "label": "Complete", "description": "Refonte durable" }
+                        ],
+                        "multiple": false
+                    }]
+                }),
+            )
+            .await
+        });
+
+        for _ in 0..20 {
+            if state.pending_question_for_turn(42).is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let question = state
+            .pending_question_for_turn(42)
+            .expect("question visible dans le snapshot du tour");
+        assert_eq!(question.questions[0].header, "Direction");
+        assert!(!task.is_finished(), "le tool MCP doit attendre l'interface");
+
+        state
+            .answer_question_for_turn(
+                42,
+                question.id,
+                vec![QuestionAnswer {
+                    selected: vec!["Complete".to_string()],
+                    custom: None,
+                }],
+            )
+            .unwrap();
+        let result = task.await.unwrap();
+        let body = tool_json(&result);
+        assert_eq!(body["answers"][0]["text"], "Complete");
+        assert!(state.pending_question_for_turn(42).is_none());
     }
 
     #[test]

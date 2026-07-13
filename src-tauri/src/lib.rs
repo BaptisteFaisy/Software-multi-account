@@ -146,6 +146,7 @@ pub fn run() {
             chat::start_chat_turn,
             chat::chat_turn_status,
             chat::stop_chat_turn,
+            chat::answer_chat_question,
             terminal::start_terminal,
             terminal::write_terminal,
             terminal::resize_terminal,

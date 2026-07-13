@@ -1512,6 +1512,31 @@ pub struct TranscriptMessage {
     pub role: TranscriptRole,
     pub text: String,
     pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<TranscriptPart>,
+}
+
+/// Partie ordonnee d'un tour pour la vue conversation. La forme serialisee est
+/// identique a `chat::ChatPart`, afin que le direct et l'historique utilisent
+/// le meme renderer cote TypeScript.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptPart {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[tauri::command]
@@ -1627,6 +1652,7 @@ fn transcript_message(role: TranscriptRole, text: &str, line: &Value) -> Transcr
             .and_then(Value::as_str)
             .and_then(parse_rfc3339_secs)
             .unwrap_or(0),
+        parts: Vec::new(),
     }
 }
 
@@ -1725,7 +1751,11 @@ pub fn transcript_for_account(
     account_id: String,
     session_id: String,
 ) -> Result<DiscussionTranscript, String> {
-    let mut messages = collect_transcript_turns(&account_id, &session_id)?;
+    let (provider, file) = discussion_source_for_account(&account_id, &session_id)?;
+    let mut messages = match provider {
+        settings::Provider::Codex => extract_codex_display_transcript(&file),
+        settings::Provider::Claude => extract_claude_display_transcript(&file),
+    };
     let truncated = messages.len() > TRANSCRIPT_MAX_MESSAGES;
     if truncated {
         let skip = messages.len() - TRANSCRIPT_MAX_MESSAGES;
@@ -1736,6 +1766,475 @@ pub fn transcript_for_account(
         messages,
         truncated,
     })
+}
+
+/// Parse le JSONL Codex au niveau `response_item` pour reconstruire la timeline
+/// visible par OpenCode : textes de progression, resumes de raisonnement et
+/// outils restent dans leur ordre d'emission. Les `event_msg.agent_message`
+/// servent de repli pour les anciens rollouts qui ne contiennent pas de
+/// `response_item`, mais ne sont jamais dupliques.
+fn extract_codex_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
+    let mut messages = Vec::new();
+    let Ok(file) = fs::File::open(path) else {
+        return messages;
+    };
+    let mut parts = Vec::<TranscriptPart>::new();
+    let mut fallback_texts = Vec::<(String, i64)>::new();
+    let mut final_text: Option<String> = None;
+    let mut last_timestamp = 0;
+    let mut part_sequence = 0_u64;
+
+    let flush_assistant = |messages: &mut Vec<TranscriptMessage>,
+                           parts: &mut Vec<TranscriptPart>,
+                           fallback_texts: &mut Vec<(String, i64)>,
+                           final_text: &mut Option<String>,
+                           last_timestamp: &mut i64,
+                           part_sequence: &mut u64| {
+        if parts.is_empty() && !fallback_texts.is_empty() {
+            for (text, _) in fallback_texts.iter() {
+                *part_sequence += 1;
+                parts.push(transcript_text_part(
+                    format!("legacy-message-{part_sequence}"),
+                    text.clone(),
+                ));
+            }
+        }
+        if parts.is_empty() {
+            fallback_texts.clear();
+            *final_text = None;
+            return;
+        }
+        let visible_text = final_text
+            .take()
+            .or_else(|| {
+                parts
+                    .iter()
+                    .rev()
+                    .find(|part| part.kind == "text")
+                    .and_then(|part| part.text.clone())
+            })
+            .or_else(|| fallback_texts.last().map(|(text, _)| text.clone()))
+            .unwrap_or_default();
+        let timestamp = fallback_texts
+            .last()
+            .map(|(_, timestamp)| *timestamp)
+            .filter(|timestamp| *timestamp > 0)
+            .unwrap_or(*last_timestamp);
+        messages.push(TranscriptMessage {
+            role: TranscriptRole::Assistant,
+            text: visible_text,
+            timestamp,
+            parts: std::mem::take(parts),
+        });
+        fallback_texts.clear();
+    };
+
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_secs)
+            .unwrap_or(0);
+        if timestamp > 0 {
+            last_timestamp = timestamp;
+        }
+        let outer_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        let payload = value.get("payload").unwrap_or(&Value::Null);
+        let event_type = if outer_type == "event_msg" {
+            payload.get("type").and_then(Value::as_str).unwrap_or("")
+        } else {
+            outer_type
+        };
+
+        if event_type == "user_message" {
+            flush_assistant(
+                &mut messages,
+                &mut parts,
+                &mut fallback_texts,
+                &mut final_text,
+                &mut last_timestamp,
+                &mut part_sequence,
+            );
+            let Some(text) = payload.get("message").and_then(Value::as_str) else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() || is_synthetic_prompt(text) {
+                continue;
+            }
+            messages.push(TranscriptMessage {
+                role: TranscriptRole::User,
+                text: text.to_string(),
+                timestamp,
+                parts: Vec::new(),
+            });
+            continue;
+        }
+
+        if event_type == "agent_message" {
+            if let Some(text) = payload.get("message").and_then(Value::as_str) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    fallback_texts.push((text.to_string(), timestamp));
+                }
+            }
+            continue;
+        }
+
+        if outer_type != "response_item" {
+            continue;
+        }
+        let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        match item_type {
+            "reasoning" => {
+                let Some(text) = transcript_value_text(
+                    payload
+                        .get("summary")
+                        .or_else(|| payload.get("summary_text")),
+                ) else {
+                    // Ne jamais afficher `encrypted_content` : il ne s'agit pas
+                    // d'un resume destine a l'utilisateur.
+                    continue;
+                };
+                part_sequence += 1;
+                parts.push(TranscriptPart {
+                    id: transcript_item_id(payload, "reasoning", part_sequence),
+                    kind: "reasoning".to_string(),
+                    status: "complete".to_string(),
+                    text: Some(text),
+                    tool: None,
+                    title: None,
+                    subtitle: None,
+                    detail: None,
+                    output: None,
+                });
+            }
+            "message" if payload.get("role").and_then(Value::as_str) == Some("assistant") => {
+                let Some(text) = transcript_value_text(payload.get("content")) else {
+                    continue;
+                };
+                part_sequence += 1;
+                let id = transcript_item_id(payload, "message", part_sequence);
+                if payload.get("phase").and_then(Value::as_str) == Some("final_answer") {
+                    final_text = Some(text.clone());
+                }
+                parts.push(transcript_text_part(id, text));
+            }
+            "custom_tool_call" | "function_call" => {
+                part_sequence += 1;
+                let call_id = payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("tool-{part_sequence}"));
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("outil");
+                let input = payload
+                    .get("input")
+                    .or_else(|| payload.get("arguments"))
+                    .and_then(transcript_json_text);
+                parts.push(TranscriptPart {
+                    id: call_id,
+                    kind: "tool".to_string(),
+                    status: if payload.get("status").and_then(Value::as_str) == Some("completed") {
+                        "complete".to_string()
+                    } else {
+                        "running".to_string()
+                    },
+                    text: None,
+                    tool: Some(transcript_tool_kind(name).to_string()),
+                    title: Some(transcript_tool_title(name)),
+                    subtitle: input.as_deref().map(transcript_short),
+                    detail: input.map(|text| transcript_clip(&text)),
+                    output: None,
+                });
+            }
+            "custom_tool_call_output" | "function_call_output" => {
+                let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let output = payload
+                    .get("output")
+                    .and_then(transcript_json_text)
+                    .map(|text| transcript_clip(&text));
+                if let Some(part) = parts.iter_mut().rev().find(|part| part.id == call_id) {
+                    part.status = "complete".to_string();
+                    part.output = output;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    flush_assistant(
+        &mut messages,
+        &mut parts,
+        &mut fallback_texts,
+        &mut final_text,
+        &mut last_timestamp,
+        &mut part_sequence,
+    );
+    messages
+}
+
+fn extract_claude_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
+    let mut messages = Vec::new();
+    let Ok(file) = fs::File::open(path) else {
+        return messages;
+    };
+    let mut sequence = 0_u64;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_secs)
+            .unwrap_or(0);
+        let Some(role) = value.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let content_value = value.pointer("/message/content");
+        let content = content_value.and_then(Value::as_array);
+
+        if role == "user" {
+            if let Some(blocks) = content {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(tool_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let output = transcript_value_text(block.get("content"));
+                    'messages: for message in messages.iter_mut().rev() {
+                        if let Some(part) = message
+                            .parts
+                            .iter_mut()
+                            .rev()
+                            .find(|part| part.id == tool_id)
+                        {
+                            part.status = "complete".to_string();
+                            part.output = output.clone().map(|text| transcript_clip(&text));
+                            break 'messages;
+                        }
+                    }
+                }
+            }
+            let Some(text) = claude_message_text(&value) else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() || is_synthetic_prompt(text) {
+                continue;
+            }
+            messages.push(TranscriptMessage {
+                role: TranscriptRole::User,
+                text: text.to_string(),
+                timestamp,
+                parts: Vec::new(),
+            });
+            continue;
+        }
+        if role != "assistant" {
+            continue;
+        }
+
+        let mut parts = Vec::new();
+        let mut visible = Vec::new();
+        if let Some(text) = content_value.and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() {
+                sequence += 1;
+                visible.push(text.to_string());
+                parts.push(transcript_text_part(
+                    format!("message-{sequence}"),
+                    text.to_string(),
+                ));
+            }
+        }
+        for block in content.into_iter().flatten() {
+            sequence += 1;
+            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+            match block_type {
+                "thinking" => {
+                    let Some(text) = block.get("thinking").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    parts.push(TranscriptPart {
+                        id: transcript_item_id(block, "thinking", sequence),
+                        kind: "reasoning".to_string(),
+                        status: "complete".to_string(),
+                        text: Some(text.to_string()),
+                        tool: None,
+                        title: None,
+                        subtitle: None,
+                        detail: None,
+                        output: None,
+                    });
+                }
+                "text" => {
+                    let Some(text) = block.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    visible.push(text.to_string());
+                    parts.push(transcript_text_part(
+                        transcript_item_id(block, "message", sequence),
+                        text.to_string(),
+                    ));
+                }
+                "tool_use" => {
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("tool-{sequence}"));
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("outil");
+                    let input = block.get("input").and_then(transcript_json_text);
+                    parts.push(TranscriptPart {
+                        id,
+                        kind: "tool".to_string(),
+                        status: "running".to_string(),
+                        text: None,
+                        tool: Some(transcript_tool_kind(name).to_string()),
+                        title: Some(transcript_tool_title(name)),
+                        subtitle: input.as_deref().map(transcript_short),
+                        detail: input.map(|text| transcript_clip(&text)),
+                        output: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if !parts.is_empty() {
+            messages.push(TranscriptMessage {
+                role: TranscriptRole::Assistant,
+                text: visible.join("\n\n"),
+                timestamp,
+                parts,
+            });
+        }
+    }
+    messages
+}
+
+fn transcript_text_part(id: String, text: String) -> TranscriptPart {
+    TranscriptPart {
+        id,
+        kind: "text".to_string(),
+        status: "complete".to_string(),
+        text: Some(text),
+        tool: None,
+        title: None,
+        subtitle: None,
+        detail: None,
+        output: None,
+    }
+}
+
+fn transcript_item_id(item: &Value, prefix: &str, sequence: u64) -> String {
+    item.get("id")
+        .or_else(|| item.get("call_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("{prefix}-{sequence}"))
+}
+
+fn transcript_value_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let mut fragments = Vec::new();
+    match value {
+        Value::String(text) => fragments.push(text.trim().to_string()),
+        Value::Array(values) => {
+            for value in values {
+                if let Some(text) = value
+                    .as_str()
+                    .or_else(|| value.get("text").and_then(Value::as_str))
+                    .or_else(|| value.get("summary_text").and_then(Value::as_str))
+                {
+                    fragments.push(text.trim().to_string());
+                }
+            }
+        }
+        Value::Object(object) => {
+            if let Some(text) = object
+                .get("text")
+                .or_else(|| object.get("summary_text"))
+                .and_then(Value::as_str)
+            {
+                fragments.push(text.trim().to_string());
+            }
+        }
+        _ => {}
+    }
+    let text = fragments
+        .into_iter()
+        .filter(|fragment| !fragment.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn transcript_json_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.to_string()),
+        _ => serde_json::to_string_pretty(value).ok(),
+    }
+}
+
+fn transcript_clip(text: &str) -> String {
+    const MAX: usize = 12_000;
+    let clipped = text.chars().take(MAX).collect::<String>();
+    if text.chars().count() > MAX {
+        format!("{clipped}...")
+    } else {
+        clipped
+    }
+}
+
+fn transcript_short(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 120 {
+        format!("{}...", flat.chars().take(117).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+fn transcript_tool_kind(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("shell") || lower == "exec" || lower.contains("command") {
+        "command"
+    } else if lower.contains("edit") || lower.contains("patch") || lower.contains("write") {
+        "edit"
+    } else if lower.contains("search") || lower.contains("web") || lower.contains("find") {
+        "search"
+    } else if lower.contains("plan") {
+        "plan"
+    } else {
+        "tool"
+    }
+}
+
+fn transcript_tool_title(name: &str) -> String {
+    match transcript_tool_kind(name) {
+        "command" => "Commande executee".to_string(),
+        "edit" => "Fichiers modifies".to_string(),
+        "search" => "Recherche".to_string(),
+        "plan" => "Plan mis a jour".to_string(),
+        _ => name.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2781,6 +3280,91 @@ mod tests {
         assert_eq!(turns[1].role, TranscriptRole::Assistant);
         assert!(turns[1].timestamp > turns[0].timestamp);
         assert_eq!(turns[2].timestamp, 0, "ligne sans champ timestamp");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_display_transcript_preserves_reasoning_tool_and_text_order() {
+        let dir = fresh_dir();
+        let path = dir.join("timeline.jsonl");
+        let values = [
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:30.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "verifie le projet"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:31.000Z",
+                "type": "response_item",
+                "payload": {"type": "reasoning", "id": "r0", "summary": [], "encrypted_content": "secret"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:32.000Z",
+                "type": "response_item",
+                "payload": {"type": "reasoning", "id": "r1", "summary": [{"text": "Je lis les tests."}]}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:33.000Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "phase": "commentary", "content": [{"type": "output_text", "text": "Je lance la verification."}]}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:34.000Z",
+                "type": "response_item",
+                "payload": {"type": "custom_tool_call", "call_id": "call-1", "name": "exec", "status": "completed", "input": "npm test"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:35.000Z",
+                "type": "response_item",
+                "payload": {"type": "custom_tool_call_output", "call_id": "call-1", "output": [{"type": "input_text", "text": "91 tests ok"}]}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:36.000Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "phase": "final_answer", "content": [{"type": "output_text", "text": "Tout est valide."}]}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-07T16:11:36.000Z",
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "Tout est valide."}
+            }),
+        ];
+        fs::write(
+            &path,
+            values
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let messages = extract_codex_display_transcript(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, TranscriptRole::User);
+        assert_eq!(messages[1].role, TranscriptRole::Assistant);
+        assert_eq!(messages[1].text, "Tout est valide.");
+        assert_eq!(
+            messages[1]
+                .parts
+                .iter()
+                .map(|part| part.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["reasoning", "text", "tool", "text"]
+        );
+        let tool = &messages[1].parts[2];
+        assert_eq!(tool.status, "complete");
+        assert!(tool
+            .output
+            .as_deref()
+            .unwrap_or_default()
+            .contains("91 tests ok"));
+        assert!(messages[1].parts.iter().all(|part| !part
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("secret")));
 
         let _ = fs::remove_dir_all(&dir);
     }

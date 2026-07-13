@@ -862,10 +862,34 @@ fn git_status(command: &mut Command) -> bool {
         .unwrap_or(false)
 }
 
+/// Copie recursive **best-effort** d'un arbre, resiliente aux ecrivains
+/// concurrents.
+///
+/// `source` est un home provider canonique (`~/.codex`, `~/.claude`) que le CLI,
+/// le pool et les autres agents peuvent continuer d'ecrire pendant la copie :
+/// des fichiers ephemeres (`cache/`, `log/`, rollout en cours) apparaissent,
+/// tournent et disparaissent en permanence. Un fichier liste par `read_dir` peut
+/// donc s'evanouir avant son `fs::copy` (ERROR_FILE_NOT_FOUND -> « os error 2 »)
+/// ou etre temporairement verrouille (ERROR_SHARING_VIOLATION -> « os error 32 »).
+/// Faire echouer tout le lancement d'un chat/terminal pour un fichier jetable
+/// serait faux : on ignore ces courses par entree et on continue. Les fichiers
+/// qui comptent (auth.json/.credentials.json, config, sessions deja fermees)
+/// sont stables et copies normalement ; l'authentification a de toute facon deja
+/// ete validee avant d'arriver ici.
 fn copy_tree(source: &Path, target: &Path, excluded: Option<&Path>) -> Result<(), String> {
     fs::create_dir_all(target).map_err(|error| error.to_string())?;
-    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
+    let entries = match fs::read_dir(source) {
+        Ok(entries) => entries,
+        // Un sous-dossier disparu pendant la recursion n'est pas une erreur.
+        Err(error) if is_transient_copy_race(&error) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_transient_copy_race(&error) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         let from = entry.path();
         if excluded.is_some_and(|root| paths_equal_or_nested(&from, root)) {
             continue;
@@ -875,7 +899,12 @@ fn copy_tree(source: &Path, target: &Path, excluded: Option<&Path>) -> Result<()
             continue;
         }
         let to = target.join(name);
-        let metadata = fs::symlink_metadata(&from).map_err(|error| error.to_string())?;
+        let metadata = match fs::symlink_metadata(&from) {
+            Ok(metadata) => metadata,
+            // Evanoui/verrouille entre `read_dir` et `stat` : on saute l'entree.
+            Err(error) if is_transient_copy_race(&error) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         if metadata.file_type().is_symlink() {
             // Ne suit jamais un lien hors du home/workspace source.
             continue;
@@ -883,7 +912,99 @@ fn copy_tree(source: &Path, target: &Path, excluded: Option<&Path>) -> Result<()
         if metadata.is_dir() {
             copy_tree(&from, &to, excluded)?;
         } else if metadata.is_file() {
-            fs::copy(&from, &to).map_err(|error| error.to_string())?;
+            match fs::copy(&from, &to) {
+                Ok(_) => {}
+                // Fichier ephemere disparu/verrouille par un ecrivain concurrent.
+                Err(error) if is_transient_copy_race(&error) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Vrai pour les erreurs attendues quand on snapshote un dossier vivant : le
+/// fichier a disparu (`NotFound` / os error 2 / 3), l'acces est refuse le temps
+/// d'une suppression differee (os error 5) ou il est verrouille par un ecrivain
+/// (os error 32, `ERROR_SHARING_VIOLATION`). Toute autre erreur (disque plein,
+/// I/O materielle...) reste fatale afin de ne pas masquer un vrai probleme.
+fn is_transient_copy_race(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || matches!(error.raw_os_error(), Some(2 | 3 | 5 | 32))
+}
+
+/// Dossiers de premier niveau d'un home provider qui sont volumineux et/ou
+/// jetables et qui ne sont **jamais** refusionnes vers le home canonique (seuls
+/// `sessions/` et `projects/` le sont). Les copier a chaque lancement de
+/// chat/terminal coutait des centaines de Mo et plusieurs dizaines de secondes
+/// (un home Codex atteint facilement 1 Go), et elargissait la fenetre de course
+/// avec les ecrivains concurrents. On les omet du home isole ; le CLI les
+/// regenere au besoin. Les runtimes de plugins Codex sont de toute facon
+/// references par `config.toml` via un chemin absolu HORS du home
+/// (`~/.cache/codex-runtimes/...`), donc omettre `plugins/` (un simple cache
+/// local) n'en prive pas la session isolee.
+///
+/// Comparaison insensible a la casse, uniquement au premier niveau du home.
+const EPHEMERAL_HOME_DIRS: &[&str] = &[
+    "cache",
+    "plugins",
+    "log",
+    "logs",
+    "tmp",
+    ".tmp",
+    "archived_sessions",
+];
+
+/// Snapshot d'un home provider vers un home isole, en omettant les gros dossiers
+/// ephemeres de premier niveau (`EPHEMERAL_HOME_DIRS`). Les credentials, la
+/// config et `sessions/`/`projects/` (refusionnes ensuite) sont preserves. Comme
+/// `copy_tree`, la copie est best-effort et resiliente aux ecrivains concurrents.
+fn copy_home_snapshot(source: &Path, target: &Path, excluded: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|error| error.to_string())?;
+    let entries = match fs::read_dir(source) {
+        Ok(entries) => entries,
+        Err(error) if is_transient_copy_race(&error) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_transient_copy_race(&error) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        let from = entry.path();
+        if paths_equal_or_nested(&from, excluded) {
+            continue;
+        }
+        let name = entry.file_name();
+        let lossy = name.to_string_lossy();
+        if lossy.contains(".cst-tmp-") {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&from) {
+            Ok(metadata) => metadata,
+            Err(error) if is_transient_copy_race(&error) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let to = target.join(&name);
+        if metadata.is_dir() {
+            if EPHEMERAL_HOME_DIRS
+                .iter()
+                .any(|candidate| lossy.eq_ignore_ascii_case(candidate))
+            {
+                // Gros dossier ephemere/regenerable : omis du home isole.
+                continue;
+            }
+            copy_tree(&from, &to, Some(excluded))?;
+        } else if metadata.is_file() {
+            match fs::copy(&from, &to) {
+                Ok(_) => {}
+                Err(error) if is_transient_copy_race(&error) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
         }
     }
     Ok(())
@@ -1470,6 +1591,31 @@ mod tests {
         drop(private_a);
         drop(private_b);
         drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transient_copy_races_are_tolerated_but_real_errors_are_not() {
+        use std::io::{Error, ErrorKind};
+        // Fichier evanoui / verrouille par un ecrivain concurrent -> tolere.
+        assert!(is_transient_copy_race(&Error::from(ErrorKind::NotFound)));
+        assert!(is_transient_copy_race(&Error::from_raw_os_error(2))); // ERROR_FILE_NOT_FOUND
+        assert!(is_transient_copy_race(&Error::from_raw_os_error(3))); // ERROR_PATH_NOT_FOUND
+        assert!(is_transient_copy_race(&Error::from_raw_os_error(5))); // ERROR_ACCESS_DENIED
+        assert!(is_transient_copy_race(&Error::from_raw_os_error(32))); // ERROR_SHARING_VIOLATION
+        // Une vraie panne (ex. disque plein) doit rester fatale.
+        assert!(!is_transient_copy_race(&Error::from_raw_os_error(112))); // ERROR_DISK_FULL
+        assert!(!is_transient_copy_race(&Error::from(ErrorKind::OutOfMemory)));
+    }
+
+    #[test]
+    fn copy_tree_of_a_vanished_source_dir_is_not_fatal() {
+        let root = temp("copy-tree-missing");
+        let target = root.join("target");
+        // Un sous-dossier liste puis supprime pendant la recursion ne doit pas
+        // faire echouer la copie (cause de « os error 2 » au lancement d'un chat).
+        let result = copy_tree(&root.join("does-not-exist"), &target, None);
+        assert!(result.is_ok(), "copy_tree missing source: {result:?}");
         let _ = fs::remove_dir_all(root);
     }
 }

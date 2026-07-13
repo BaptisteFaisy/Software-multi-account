@@ -55,6 +55,36 @@ test("creer un compte ouvre une fenetre de connexion (login)", () => {
   assert.match(main, /await reloginAccount\(account\.id\)/);
 });
 
+test("reconnecter Codex supprime l'ancienne session avant le nouveau login", () => {
+  // Un auth.json revoque existe encore : `codex login` seul n'est pas une
+  // reconnexion fiable. Le terminal doit enchainer logout puis login.
+  assert.match(main, /provider === "codex"/);
+  assert.match(main, /agentSubcommand\(agent, "logout"\)/);
+  assert.match(main, /shellCommandSeparator\(\)/);
+  assert.match(main, /reconnectCommand,/);
+});
+
+test("la reconnexion Codex utilise la connexion classique (sans codes/device flow)", () => {
+  // Retour a la connexion classique : plus d'injection --device-auth ni de
+  // branche effectiveLoginSub, meme en mode remote. On ouvre le login OAuth
+  // standard directement a partir de loginSub.
+  assert.doesNotMatch(main, /--device-auth/);
+  assert.doesNotMatch(main, /effectiveLoginSub/);
+  assert.match(main, /const loginCommand = agentSubcommand\(agent, loginSub\);/);
+});
+
+test("la reconnexion utilise un terminal strictement reserve au login", () => {
+  assert.match(main, /environmentPath,\s*\n\s*true,\s*\n\s*\);/);
+  assert.match(main, /loginOnly,\s*\n\s*\}\);/);
+  assert.match(main, /!loginOnly && settings\.autoRunCodex/);
+  assert.match(main, /!loginOnly &&\s*\n\s*\(session\.resumeSessionId/);
+});
+
+test("une erreur d'auth reste prioritaire sur les limites locales en cache", () => {
+  assert.match(main, /account\.error && AUTH_LIMIT_ERROR\.test\(account\.error\)/);
+  assert.match(main, /return "session expiree"/);
+});
+
 test("l'editeur expose un bouton « Se connecter » par compte", () => {
   assert.match(main, /id="loginAccount"/);
   assert.match(
@@ -73,5 +103,19 @@ test("la suppression persiste vraiment (backend + repli)", () => {
     /querySelector<HTMLButtonElement>\("#removeAccount"\)\?\.addEventListener\(\s*"click",\s*\(\)\s*=>\s*\{\s*\n\s*void deleteSelectedAccount\(\);/,
   );
   // Suppression backend (compte persiste) avec repli save_settings (compte neuf).
-  assert.match(main, /invoke<AppSettings>\("remove_account", \{ accountId: id, deleteFiles: false \}\)/);
+  assert.match(main, /invoke<AppSettings>\("remove_account", \{ accountId: id, deleteFiles \}\)/);
+});
+
+test("la suppression tient compte de l'auto-detection (sinon le compte revient)", () => {
+  // Avec l'auto-detection active, on propose d'effacer aussi les fichiers, sinon
+  // le compte est re-decouvert au prochain chargement.
+  assert.match(main, /if \(settings\.autoDiscoverAccounts && target\)/);
+  assert.match(main, /deleteFiles = window\.confirm\(/);
+});
+
+test("le re-rendu preserve le scroll des vues admin (ne fait plus remonter)", () => {
+  // render() capture puis restaure le scrollTop de .chat-admin-panel autour du
+  // remplacement complet du DOM.
+  assert.match(main, /const adminScrollTop =\s*\n?\s*document\.querySelector<HTMLElement>\("\.chat-admin-panel"\)\?\.scrollTop \?\? 0;/);
+  assert.match(main, /restoredAdminPanel\.scrollTop = adminScrollTop;/);
 });

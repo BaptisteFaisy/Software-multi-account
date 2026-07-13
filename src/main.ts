@@ -23,15 +23,32 @@ import {
   chatSyncLabel,
   renderChatFeedInner,
   renderChatPanel,
+  renderChatRuntimeStatus,
   type ChatActivity,
+  type ChatPart,
+  type ChatThought,
   type ChatMode,
   type ChatMessage,
   type ChatPanelModel,
+  type ChatPendingQuestion,
   type ChatQuotaSuggestion,
+  type ChatQuotaStatus,
   type ChatSyncState,
   type ChatTurnStatus,
 } from "./chat/view";
-import { bestQuotaAccount, isQuotaExhaustionError } from "./chat/quota";
+import {
+  bestQuotaAccount,
+  isQuotaExhaustionError,
+  remainingQuotaPercent,
+} from "./chat/quota";
+import {
+  chatMessagesEqual,
+  conversationWaitsForUser,
+  formatChatDuration,
+  formatChatResetCountdown,
+  markLatestPendingMessageFailed,
+  reconcileChatMessages,
+} from "./chat/runtime";
 import {
   CHAT_SIDEBAR_DEFAULT_WIDTH,
   CHAT_SIDEBAR_MAX_WIDTH,
@@ -72,12 +89,16 @@ import { Terminal } from "@xterm/xterm";
 import {
   AppWindow,
   ArrowLeft,
+  ArrowUp,
   BadgeCheck,
   BarChart3,
   Bot,
+  BrainCircuit,
   CalendarClock,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
   CircleDollarSign,
   Clock3,
   FlaskConical,
@@ -111,7 +132,10 @@ import {
   FolderX,
   Library,
   ListChecks,
+  MessageCircleQuestion,
+  MessageSquareText,
   Square,
+  Reply,
   Wrench,
   Settings,
   Folder,
@@ -614,6 +638,9 @@ type ChatTurnSnapshot = {
   finishedAt?: number | null;
   error?: string | null;
   activities: ChatActivity[];
+  thoughts: ChatThought[];
+  parts: ChatPart[];
+  pendingQuestion?: ChatPendingQuestion | null;
 };
 
 type ExpertChatPane = {
@@ -755,6 +782,7 @@ let pendingDeleteAccountId: string | null = null;
 let limitStatus: AccountLimitView[] = [];
 let limitStatusLoaded = false;
 let limitPoll: number | null = null;
+let limitStatusInFlight = false;
 let usageDashboard: UsageDashboard | null = null;
 let usageLoaded = false;
 let usagePoll: number | null = null;
@@ -810,6 +838,7 @@ let chatLoadInFlight = false;
 let chatTurn: ChatTurnSnapshot | null = null;
 let chatTurnPoll: number | null = null;
 let chatTurnPollInFlight = false;
+let chatRuntimeClock: number | null = null;
 let chatDraft = "";
 let chatMode: ChatMode = "build";
 let chatAccountId: string | null = null;
@@ -884,12 +913,16 @@ let skillsError: string | null = null;
 const lucideIcons = {
   AppWindow,
   ArrowLeft,
+  ArrowUp,
   BadgeCheck,
   BarChart3,
   Bot,
+  BrainCircuit,
   CalendarClock,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
   CircleDollarSign,
   Clock3,
   FlaskConical,
@@ -923,7 +956,10 @@ const lucideIcons = {
   FolderX,
   Library,
   ListChecks,
+  MessageCircleQuestion,
+  MessageSquareText,
   Square,
+  Reply,
   Wrench,
   Settings,
   Folder,
@@ -1407,14 +1443,6 @@ const buildResumeCommand = (id: string, account: AccountProfile | null | undefin
   return provider === "claude" ? `${base} --resume ${id}` : `${base} resume ${id}`;
 };
 
-// Une reprise interactive restaure seulement le contexte puis attend une
-// saisie. Lors d'un deplacement explicite, ce premier message fait repartir
-// l'agent sans demander a l'utilisateur de taper « continue ».
-const buildResumeAndContinueCommand = (
-  id: string,
-  account: AccountProfile | null | undefined = null,
-) => `${buildResumeCommand(id, account)} continue`;
-
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const SESSION_CAPTURE_DELAYS_MS = [1200, 2000, 3000, 4500, 7000, 10000];
 
@@ -1716,6 +1744,15 @@ const agentSubcommand = (agent: AgentProfile | null | undefined, sub?: string | 
   const base = agentCommand(agent);
   const suffix = sub?.trim();
   return suffix ? `${base} ${suffix}` : base;
+};
+
+// Une reconnexion Codex doit d'abord retirer les credentials locaux : `codex
+// login` seul peut conserver un auth.json present mais revoque. Le separateur
+// `;` fonctionne avec PowerShell et les shells POSIX ; cmd.exe utilise `&`.
+const shellCommandSeparator = () => {
+  const shell = (settings?.shell ?? "").trim().toLowerCase().replaceAll("\\", "/");
+  const executable = shell.split("/").pop() ?? shell;
+  return executable === "cmd" || executable === "cmd.exe" ? " & " : "; ";
 };
 
 const setActiveAgent = (id: string | null) => {
@@ -2958,7 +2995,7 @@ const setActiveView = (view: AppView) => {
                             ? `Session terminal: ${workspaceBaseName(terminalFolderFilter)}`
                             : "Choisis un environnement terminal";
 
-  if (activeView === "limits") {
+  if (activeView === "limits" || activeView === "chat") {
     startLimitPoll();
   } else {
     stopLimitPoll();
@@ -2994,6 +3031,7 @@ const setActiveView = (view: AppView) => {
 
   if (activeView === "pool") void refreshPoolStatus();
   if (activeView === "limits") void refreshLimitStatus();
+  if (activeView === "chat" && !limitStatusLoaded) void refreshLimitStatus(true);
   if (activeView === "dashboard") {
     void refreshUsageDashboard();
     void refreshAccountUsage();
@@ -3006,20 +3044,27 @@ const setActiveView = (view: AppView) => {
 };
 
 const refreshLimitStatus = async (silent = false) => {
-  if (!silent && activeView === "limits") {
+  if (limitStatusInFlight) return;
+  limitStatusInFlight = true;
+  const announceInLimitsView = !silent && activeView === "limits";
+  if (announceInLimitsView) {
     statusText = "Lecture des limites serveur";
   }
   try {
     limitStatus = await invoke<AccountLimitView[]>("account_limit_status");
     limitStatusLoaded = true;
-    if (!silent) statusText = "Limites serveur actualisees";
+    if (announceInLimitsView) statusText = "Limites serveur actualisees";
   } catch (error) {
-    if (!silent) statusText = String(error);
+    if (announceInLimitsView) statusText = String(error);
     limitStatusLoaded = true;
+  } finally {
+    limitStatusInFlight = false;
   }
 
   if (activeView === "limits") {
     render();
+  } else if (activeView === "chat") {
+    refreshAllChatRuntimeStatus();
   }
 };
 
@@ -3039,6 +3084,13 @@ const reloginAccount = async (accountId: string) => {
   const agentId = providerAgentId(provider);
   const agent = agentById(agentId);
   const loginSub = agent?.loginCommand?.trim() || "login";
+  // Connexion classique : on ouvre le flux OAuth standard (callback navigateur),
+  // sans passer par les codes du device flow, y compris en mode remote/Tailscale.
+  const loginCommand = agentSubcommand(agent, loginSub);
+  const reconnectCommand =
+    provider === "codex"
+      ? `${agentSubcommand(agent, "logout")}${shellCommandSeparator()}${loginCommand}`
+      : loginCommand;
   const environmentPath =
     userEnvironmentPath(currentWorkspace()) ?? loadWorkspacePaths()[0] ?? null;
   if (!environmentPath) {
@@ -3051,15 +3103,16 @@ const reloginAccount = async (accountId: string) => {
   await createNewTerminal(
     accountId,
     true,
-    agentSubcommand(agent, loginSub),
+    reconnectCommand,
     agentId,
     null,
     environmentPath,
+    true,
   );
 };
 
 const startLimitPoll = () => {
-  stopLimitPoll();
+  if (limitPoll !== null) return;
   limitPoll = window.setInterval(() => void refreshLimitStatus(), LIMIT_POLL_INTERVAL_MS);
 };
 
@@ -3314,62 +3367,30 @@ const persistTerminalDiscussionFolder = async (session: TerminalSession): Promis
   }
 };
 
-const resumeSessionInTerminal = async (
-  accountId: string,
-  sessionId: string,
-  folderPath: string | null,
-) => {
-  if (!settings || !settings.accounts.some((account) => account.id === accountId)) {
-    statusText = "Compte introuvable pour cette discussion";
-    render();
-    return;
-  }
-  if (!isPlausibleSessionId(sessionId)) {
-    statusText = "Identifiant de session invalide";
-    render();
-    return;
-  }
-  const environmentPath = userEnvironmentPath(folderPath);
-  if (!environmentPath) {
-    statusText = "Reprise bloquee: cette discussion n'a pas d'environnement associe";
-    render();
-    return;
-  }
-  activeView = "terminal";
-  stopLimitPoll();
-  stopUsagePoll();
-  stopKombaiPoll();
-  stopDiscussionsPoll();
-  stopChatSync();
-  await createNewTerminal(
-    accountId,
-    true,
-    buildResumeCommand(sessionId, accountById(accountId)),
-    providerAgentId(accountProvider(accountById(accountId))),
-    sessionId,
-    environmentPath,
-  );
-};
-
-// Reprise dans le compte D'ORIGINE : on relance le fichier rollout HEAD (le
-// plus recent de la chaine) via son `rolloutId`, non ambigu.
+// Reprise dans le compte D'ORIGINE : ouvre le fil dans le chat classique et
+// lance automatiquement un nouveau tour sur le rollout HEAD. Aucun terminal
+// interactif n'est cree par ce bouton.
 const resumeDiscussion = async (discussion: DiscussionSummary) => {
   try {
-    const folderPath = await restoreDiscussionFolder(discussion);
-    await resumeSessionInTerminal(
+    const folderPath = userEnvironmentPath(await restoreDiscussionFolder(discussion));
+    if (!folderPath) {
+      throw new Error("la discussion n'a pas d'environnement associe");
+    }
+    const resumed = await resumeDiscussionInChat(
+      discussion,
       discussion.accountId,
-      discussion.rolloutId || discussion.sessionId,
       folderPath,
+      "continue",
     );
+    if (!resumed) {
+      statusText = "Le chat n'a pas pu demarrer cette discussion";
+      render();
+    }
   } catch (error) {
     statusText = `Impossible de restaurer l'environnement de la discussion : ${String(error)}`;
     render();
   }
 };
-
-// Delai (ms) avant d'injecter le transcript dans une session inter-provider
-// fraichement lancee, le temps que le CLI cible ait affiche son invite.
-const SEED_PASTE_DELAY_MS = 3500;
 
 // Archive la version source APRES que la continuation cible est prete. Elle
 // disparait ainsi de l'onglet Discussions, tout en restant recuperable dans le
@@ -3383,15 +3404,6 @@ const archiveTransferredDiscussion = async (discussion: DiscussionSummary): Prom
   });
   discussionTargetSel.delete(discussion.sessionId);
   return result?.count ?? 1;
-};
-
-const transferredTerminal = (
-  session: TerminalSession | null | undefined,
-  targetAccountId: string,
-) => {
-  return session?.accountId === targetAccountId && session.running && session.ptyId !== null
-    ? session
-    : null;
 };
 
 const transferredDiscussionStatus = (
@@ -3408,9 +3420,8 @@ const transferredDiscussionStatus = (
 //  - INTER-provider (ou impliquant Claude) : export du transcript, injection
 //    dans une session NEUVE du provider cible, puis archivage de la source.
 //
-// Dans les deux cas, la source n'est archivee qu'une fois le terminal cible
-// demarre (et, pour un transcript, l'injection reussie). Un echec conserve donc
-// l'ancienne discussion dans la liste.
+// Dans les deux cas, la source n'est archivee qu'une fois le tour du chat cible
+// demarre. Un echec conserve donc l'ancienne discussion dans la liste.
 const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccountId: string) => {
   if (discussionBusyId) return;
   if (!settings || !targetAccountId || targetAccountId === discussion.accountId) return;
@@ -3438,17 +3449,16 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
         await refreshDiscussions();
         return;
       }
-      const resumed = await createNewTerminal(
+      copied.folderPath = folderPath;
+      const resumed = await resumeDiscussionInChat(
+        copied,
         targetAccountId,
-        true,
-        buildResumeAndContinueCommand(resumeId, target),
-        providerAgentId("codex"),
-        resumeId,
         folderPath,
+        "continue",
       );
-      if (!transferredTerminal(resumed, targetAccountId)) {
+      if (!resumed) {
         discussionBusyId = null;
-        statusText = `La nouvelle discussion est disponible dans « ${target.label} », mais le terminal n'a pas demarre. L'ancienne a ete conservee.`;
+        statusText = `La nouvelle discussion est disponible dans « ${target.label} », mais le chat n'a pas demarre. L'ancienne a ete conservee.`;
         render();
         await refreshDiscussions();
         return;
@@ -3466,24 +3476,18 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
       accountId: discussion.accountId,
       sessionId: discussion.rolloutId || discussion.sessionId,
     });
-    // On lance explicitement le CLI cible (independamment de autoRunCodex) afin
-    // de pouvoir injecter le transcript juste apres.
-    const started = await createNewTerminal(
-      targetAccountId,
-      true,
-      agentRunCommand(agentById(providerAgentId(targetProvider)), target),
-      providerAgentId(targetProvider),
+    const resumed = await resumeDiscussionInChat(
       null,
+      targetAccountId,
       folderPath,
+      transcript,
     );
-    const seeded = transferredTerminal(started, targetAccountId);
-    if (!seeded) {
+    if (!resumed) {
       discussionBusyId = null;
-      statusText = "Le terminal cible n'a pas demarre. L'ancienne discussion a ete conservee.";
+      statusText = "Le chat cible n'a pas demarre. L'ancienne discussion a ete conservee.";
       render();
       return;
     }
-    await seedSessionWithTranscript(seeded, transcript);
     const archivedCount = await archiveTransferredDiscussion(discussion);
     discussionBusyId = null;
     statusText = transferredDiscussionStatus(target, archivedCount);
@@ -3494,23 +3498,6 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
     statusText = `Deplacement incomplet : ${String(error)}. L'ancienne discussion a ete conservee si son archivage n'avait pas commence.`;
     render();
   }
-};
-
-// Injecte puis soumet le transcript exporte dans une session fraichement
-// lancee, apres un court delai (boot du CLI).
-const seedSessionWithTranscript = async (
-  session: (typeof terminalSessions)[number] | null,
-  transcript: string,
-) => {
-  if (!session) throw new Error("Terminal cible introuvable");
-  await sleep(SEED_PASTE_DELAY_MS);
-  if (session.ptyId === null || !session.running) {
-    throw new Error("Le terminal cible s'est ferme avant l'injection du transcript");
-  }
-  await invoke("write_terminal", {
-    id: session.ptyId,
-    data: `\x1b[200~${transcript}\x1b[201~\r`,
-  });
 };
 
 const discussionHasRunningTurn = (discussion: DiscussionSummary): boolean =>
@@ -3590,7 +3577,6 @@ const removeArchivedDiscussionFromUi = (ids: ReadonlySet<string>) => {
   expertChatPanes = expertChatPanes.filter(
     (pane) => !discussionMatchesAnyId(pane.discussion, ids),
   );
-  if (expertChatsRestored && !expertChatPanes.length) expertChatPanes.push(createExpertChatPane());
   if (closedExpertPanes.some((pane) => pane.key === activeExpertChatKey)) {
     activeExpertChatKey = expertChatPanes[0]?.key ?? null;
   }
@@ -3709,6 +3695,92 @@ const quotaSuggestionFor = (
   };
 };
 
+const remainingFromUsedPercent = (value?: number | null): number | null =>
+  typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(100, 100 - value))
+    : null;
+
+const chatQuotaResetAt = (quota: AccountLimitView): number | null => {
+  const candidates: Array<{ remaining: number; resetAt: number }> = [];
+  const add = (usedPercent?: number | null, resetAt?: number | null, exhausted = false) => {
+    if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) return;
+    const remaining = exhausted ? 0 : remainingFromUsedPercent(usedPercent);
+    if (remaining !== null) candidates.push({ remaining, resetAt });
+  };
+
+  add(quota.sessionUsedPercent, quota.sessionResetAt);
+  add(quota.weeklyUsedPercent, quota.weeklyResetAt);
+  quota.buckets.forEach((bucket) => {
+    add(bucket.usedPercent, bucket.resetsAt, !!bucket.rateLimitReachedType?.trim());
+  });
+  candidates.sort((left, right) => left.remaining - right.remaining || left.resetAt - right.resetAt);
+  return candidates[0]?.resetAt ?? null;
+};
+
+const chatQuotaStatusFor = (account: AccountProfile | null): ChatQuotaStatus => {
+  if (!account) {
+    return {
+      state: "unavailable",
+      remainingPercent: null,
+      resetAt: null,
+      detail: "Aucun compte n'est associé à ce chat.",
+    };
+  }
+  if (!limitStatusLoaded) {
+    return {
+      state: "loading",
+      remainingPercent: null,
+      resetAt: null,
+      detail: `Lecture des limites de ${account.label}.`,
+    };
+  }
+
+  const quota = limitStatus.find((candidate) => candidate.id === account.id);
+  if (!quota) {
+    return {
+      state: "unavailable",
+      remainingPercent: null,
+      resetAt: null,
+      detail: `Aucune limite disponible pour ${account.label}.`,
+    };
+  }
+  if (!quota.hasTokens) {
+    return {
+      state: "disconnected",
+      remainingPercent: null,
+      resetAt: null,
+      detail: `${account.label} doit être connecté avant de pouvoir lire son quota.`,
+    };
+  }
+
+  const remainingPercent = remainingQuotaPercent(quota);
+  const resetAt = chatQuotaResetAt(quota);
+  const windows = [
+    remainingFromUsedPercent(quota.sessionUsedPercent) === null
+      ? ""
+      : `5 h : ${Math.round(remainingFromUsedPercent(quota.sessionUsedPercent) ?? 0)} % restant`,
+    remainingFromUsedPercent(quota.weeklyUsedPercent) === null
+      ? ""
+      : `semaine : ${Math.round(remainingFromUsedPercent(quota.weeklyUsedPercent) ?? 0)} % restant`,
+  ].filter(Boolean);
+  const detail = windows.join(" · ") || quota.error || `Limite fournie par ${quota.source}.`;
+
+  if (remainingPercent === null) {
+    return {
+      state: quota.error ? "error" : "unavailable",
+      remainingPercent: null,
+      resetAt,
+      detail,
+    };
+  }
+  return {
+    state: remainingPercent <= 0 ? "exhausted" : remainingPercent <= 15 ? "low" : "available",
+    remainingPercent,
+    resetAt,
+    detail,
+  };
+};
+
 let quotaAlternativeRefresh: Promise<void> | null = null;
 const refreshQuotaAlternatives = () => {
   if (quotaAlternativeRefresh) return;
@@ -3801,8 +3873,15 @@ const chatPanelModel = (): ChatPanelModel => {
     syncState: discussion ? chatSyncState : "closed",
     messages: chatMessages,
     activities: chatTurn?.activities ?? [],
+    thoughts: chatTurn?.thoughts ?? [],
+    parts: chatTurn?.parts ?? [],
     turnStatus: chatTurn?.status ?? "idle",
+    turnStartedAt: chatTurn?.startedAt ?? null,
+    turnFinishedAt: chatTurn?.finishedAt ?? null,
     turnError: chatTurn?.status === "failed" ? (chatTurn.error ?? "La reponse a echoue") : null,
+    waitingForUser: conversationWaitsForUser(chatMessages),
+    pendingQuestion: chatTurn?.pendingQuestion ?? null,
+    quotaStatus: chatQuotaStatusFor(account),
     quotaSuggestion: quotaSuggestionFor(chatTurn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
       id: candidate.id,
@@ -3829,6 +3908,185 @@ const chatPanelModel = (): ChatPanelModel => {
     workspaceLabel: workspace ? displayProjectDir(workspace) : "Environnement",
     historyOpen: chatHistoryOpen,
   };
+};
+
+const patchChatRuntimeStatus = (root: ParentNode, model: ChatPanelModel) => {
+  const current = root.querySelector<HTMLElement>("[data-chat-control='runtime']");
+  if (current) current.outerHTML = renderChatRuntimeStatus(model);
+};
+
+const refreshAllChatRuntimeStatus = () => {
+  if (activeView !== "chat") return;
+  const mainPanel = document.querySelector<HTMLElement>("#chatPanel");
+  if (mainPanel) patchChatRuntimeStatus(mainPanel, chatPanelModel());
+  expertChatPanes.forEach((pane) => {
+    const root = expertChatPaneRoot(pane);
+    if (root) patchChatRuntimeStatus(root, expertChatPanelModel(pane));
+  });
+  createIcons({ icons: lucideIcons });
+  refreshChatRuntimeClocks();
+};
+
+const refreshChatRuntimeClocks = () => {
+  const now = Date.now() / 1000;
+  document.querySelectorAll<HTMLElement>("[data-chat-elapsed]").forEach((element) => {
+    const startedAt = Number(element.dataset.chatStartedAt);
+    const finishedAt = Number(element.dataset.chatFinishedAt || 0);
+    if (!Number.isFinite(startedAt) || startedAt <= 0) return;
+    const value = element.querySelector<HTMLElement>("[data-chat-elapsed-value]");
+    if (value) {
+      value.textContent = formatChatDuration(Math.max(0, (finishedAt || now) - startedAt));
+    }
+  });
+  document.querySelectorAll<HTMLElement>("[data-chat-reset]").forEach((element) => {
+    const resetAt = Number(element.dataset.chatResetAt);
+    if (Number.isFinite(resetAt) && resetAt > 0) {
+      element.textContent = formatChatResetCountdown(resetAt, now);
+    }
+  });
+};
+
+const startChatRuntimeClock = () => {
+  if (chatRuntimeClock !== null) return;
+  refreshChatRuntimeClocks();
+  chatRuntimeClock = window.setInterval(refreshChatRuntimeClocks, 1000);
+};
+
+const stopChatRuntimeClock = () => {
+  if (chatRuntimeClock !== null) {
+    clearInterval(chatRuntimeClock);
+    chatRuntimeClock = null;
+  }
+};
+
+type ChatQuestionAnswerPayload = {
+  selected: string[];
+  custom: string | null;
+};
+
+const setChatQuestionStep = (root: ParentNode, requestedIndex: number) => {
+  const dock = root.querySelector<HTMLElement>("[data-chat-control='question']");
+  if (!dock) return;
+  const pages = Array.from(dock.querySelectorAll<HTMLElement>("[data-question-index]"));
+  if (!pages.length) return;
+  const activeIndex = Math.max(0, Math.min(pages.length - 1, requestedIndex));
+  dock.dataset.questionActive = String(activeIndex);
+  pages.forEach((page, index) => {
+    const active = index === activeIndex;
+    page.hidden = !active;
+    page.classList.toggle("is-active", active);
+  });
+  const progress = dock.querySelector<HTMLElement>("[data-question-progress]");
+  if (progress) progress.textContent = `${activeIndex + 1} / ${pages.length}`;
+  const previous = dock.querySelector<HTMLButtonElement>("[data-chat-action='question-prev']");
+  const next = dock.querySelector<HTMLButtonElement>("[data-chat-action='question-next']");
+  const submit = dock.querySelector<HTMLButtonElement>("[data-chat-action='answer-question']");
+  if (previous) previous.disabled = activeIndex === 0;
+  if (next) next.hidden = activeIndex >= pages.length - 1;
+  if (submit) submit.hidden = activeIndex < pages.length - 1;
+};
+
+const collectChatQuestionAnswers = (root: ParentNode): ChatQuestionAnswerPayload[] => {
+  const pages = Array.from(
+    root.querySelectorAll<HTMLElement>("[data-chat-control='question'] [data-question-index]"),
+  );
+  return pages.map((page) => {
+    let selected = Array.from(
+      page.querySelectorAll<HTMLInputElement>(".chat-question-option input:checked"),
+    ).map((input) => input.value);
+    const customValue = page.querySelector<HTMLInputElement>("[data-question-custom]")?.value.trim() ?? "";
+    const multiple = page.dataset.questionMultiple === "true";
+    if (customValue && !multiple) selected = [];
+    if (!selected.length && !customValue) {
+      const header = page.querySelector("legend")?.textContent?.trim() || "cette question";
+      throw new Error(`Choisissez une réponse pour « ${header} ».`);
+    }
+    return { selected, custom: customValue || null };
+  });
+};
+
+const answerStructuredChatQuestion = async (
+  root: HTMLElement,
+  turn: ChatTurnSnapshot | null,
+  applySnapshot: (snapshot: ChatTurnSnapshot) => Promise<void>,
+) => {
+  const dock = root.querySelector<HTMLElement>("[data-chat-control='question']");
+  const questionId = Number(dock?.dataset.questionId);
+  if (!dock || !turn || turn.status !== "running" || !Number.isFinite(questionId)) return;
+  const errorTarget = dock.querySelector<HTMLElement>("[data-question-error]");
+  let answers: ChatQuestionAnswerPayload[];
+  try {
+    answers = collectChatQuestionAnswers(root);
+  } catch (error) {
+    if (errorTarget) errorTarget.textContent = String(error).replace(/^Error:\s*/, "");
+    return;
+  }
+
+  dock.classList.add("is-submitting");
+  dock.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((control) => {
+    control.disabled = true;
+  });
+  if (errorTarget) errorTarget.textContent = "Envoi de votre réponse…";
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("answer_chat_question", {
+      id: turn.id,
+      questionId,
+      answers,
+    });
+    await applySnapshot(snapshot);
+  } catch (error) {
+    dock.classList.remove("is-submitting");
+    dock.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((control) => {
+      control.disabled = false;
+    });
+    setChatQuestionStep(root, Number(dock.dataset.questionActive || 0));
+    if (errorTarget) errorTarget.textContent = String(error);
+  }
+};
+
+const bindChatQuestionUi = (
+  root: HTMLElement,
+  currentTurn: () => ChatTurnSnapshot | null,
+  applySnapshot: (snapshot: ChatTurnSnapshot) => Promise<void>,
+) => {
+  root.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement | null;
+    const action = target?.closest<HTMLElement>("[data-chat-action]")?.dataset.chatAction;
+    const dock = root.querySelector<HTMLElement>("[data-chat-control='question']");
+    if (!dock) return;
+    const activeIndex = Number(dock.dataset.questionActive || 0);
+    if (action === "focus-question") {
+      dock.scrollIntoView({ behavior: "smooth", block: "center" });
+      dock.querySelector<HTMLInputElement>("input:not(:disabled)")?.focus();
+    } else if (action === "question-prev") {
+      setChatQuestionStep(root, activeIndex - 1);
+    } else if (action === "question-next") {
+      setChatQuestionStep(root, activeIndex + 1);
+    } else if (action === "answer-question") {
+      void answerStructuredChatQuestion(root, currentTurn(), applySnapshot);
+    }
+  });
+  root.addEventListener("input", (event) => {
+    const custom = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
+      "[data-question-custom]",
+    );
+    const page = custom?.closest<HTMLElement>("[data-question-index]");
+    if (custom?.value.trim() && page && page.dataset.questionMultiple !== "true") {
+      page.querySelectorAll<HTMLInputElement>(".chat-question-option input").forEach((input) => {
+        input.checked = false;
+      });
+    }
+  });
+  root.addEventListener("change", (event) => {
+    const option = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
+      ".chat-question-option input",
+    );
+    const page = option?.closest<HTMLElement>("[data-question-index]");
+    if (option?.checked && page && page.dataset.questionMultiple !== "true") {
+      const custom = page.querySelector<HTMLInputElement>("[data-question-custom]");
+      if (custom) custom.value = "";
+    }
+  });
 };
 
 const refreshChatSyncIndicator = () => {
@@ -3932,9 +4190,12 @@ const refreshChatFeed = () => {
     return;
   }
   chatScrollTop = feed.scrollTop;
-  feed.innerHTML = renderChatFeedInner(chatPanelModel());
+  const model = chatPanelModel();
+  feed.innerHTML = renderChatFeedInner(model);
+  const panel = document.querySelector<HTMLElement>("#chatPanel");
+  if (panel) patchChatRuntimeStatus(panel, model);
   const subtitle = document.querySelector<HTMLSpanElement>("#chatSubtitle");
-  if (subtitle) subtitle.textContent = chatPanelModel().subtitle;
+  if (subtitle) subtitle.textContent = model.subtitle;
   const historyCount = document.querySelector<HTMLElement>("#chatHistoryToggle small");
   if (historyCount) {
     historyCount.textContent = String(chatMessages.filter((message) => message.role === "user").length);
@@ -3989,7 +4250,17 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   }
   if (chatTurn && chatTurn.id !== 0 && snapshot.id !== chatTurn.id) return;
   const previousStatus = chatTurn?.status;
+  const previousQuestionId = chatTurn?.pendingQuestion?.id ?? null;
+  const previousStartedAt = chatTurn?.startedAt;
+  const previousTurnId = chatTurn?.id;
+  if (
+    previousStartedAt != null &&
+    (previousTurnId === 0 || previousTurnId === snapshot.id)
+  ) {
+    snapshot = { ...snapshot, startedAt: Math.min(previousStartedAt, snapshot.startedAt) };
+  }
   chatTurn = snapshot;
+  const questionChanged = previousQuestionId !== (snapshot.pendingQuestion?.id ?? null);
   const quotaExhausted =
     snapshot.status === "failed" &&
     previousStatus !== "failed" &&
@@ -4003,6 +4274,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
       stopChatTurnPoll();
     }
   } else if (snapshot.status === "failed") {
+    chatMessages = markLatestPendingMessageFailed(chatMessages);
     statusText = snapshot.error || "La reponse a echoue";
     stopChatTurnPoll();
   } else if (snapshot.status === "cancelled") {
@@ -4012,8 +4284,11 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     statusText = `${chatPanelModel().providerLabel} travaille…`;
   }
 
+  if (previousStatus === "running" && snapshot.status !== "running") {
+    void refreshLimitStatus(true);
+  }
   if (activeView === "chat") {
-    if (previousStatus !== snapshot.status) render();
+    if (previousStatus !== snapshot.status || questionChanged) render();
     else refreshChatFeed();
   }
   if (quotaExhausted) refreshQuotaAlternatives();
@@ -4060,7 +4335,12 @@ const sendChatMessage = async () => {
   chatError = null;
   chatMessages = [
     ...chatMessages,
-    { role: "user", text: prompt, timestamp: Math.floor(Date.now() / 1000) },
+    {
+      role: "user",
+      text: prompt,
+      timestamp: Math.floor(Date.now() / 1000),
+      deliveryState: "pending",
+    },
   ];
   chatTurn = {
     id: 0,
@@ -4079,6 +4359,15 @@ const sendChatMessage = async () => {
         status: "running",
       },
     ],
+    thoughts: [
+      {
+        id: "preparing-thought",
+        kind: "reasoning",
+        text: `${providerLabel(accountProvider(account))} analyse la demande et prépare la prochaine étape.`,
+        status: "running",
+      },
+    ],
+    parts: [],
   };
   statusText = `${providerLabel(accountProvider(account))} travaille…`;
   resetChatFeedScroll();
@@ -4102,15 +4391,22 @@ const sendChatMessage = async () => {
         candidate.turn.accountId === snapshot.accountId,
     );
     if (pane) {
-      pane.turn = snapshot;
+      const optimisticStartedAt = pane.turn?.startedAt;
+      pane.turn = optimisticStartedAt == null
+        ? snapshot
+        : { ...snapshot, startedAt: Math.min(optimisticStartedAt, snapshot.startedAt) };
       startExpertChatTurnPoll(pane);
-      await applyExpertChatTurnSnapshot(pane, snapshot);
+      await applyExpertChatTurnSnapshot(pane, pane.turn);
       return;
     }
-    chatTurn = snapshot;
+    const optimisticStartedAt = chatTurn?.startedAt;
+    chatTurn = optimisticStartedAt == null
+      ? snapshot
+      : { ...snapshot, startedAt: Math.min(optimisticStartedAt, snapshot.startedAt) };
     startChatTurnPoll();
-    await applyChatTurnSnapshot(snapshot);
+    await applyChatTurnSnapshot(chatTurn);
   } catch (error) {
+    chatMessages = markLatestPendingMessageFailed(chatMessages);
     const pane = expertChatPanes.find(
       (candidate) =>
         candidate.turn?.status === "running" &&
@@ -4236,24 +4532,20 @@ const openNewChat = () => {
   openNewChatModal();
 };
 
-const sameChatMessages = (left: ChatMessage[], right: ChatMessage[]) =>
-  left.length === right.length &&
-  left.every(
-    (message, index) =>
-      message.role === right[index]?.role &&
-      message.timestamp === right[index]?.timestamp &&
-      message.text === right[index]?.text,
-  );
-
 const applyChatTranscript = (
   discussion: DiscussionSummary,
   transcript: DiscussionTranscriptView,
 ) => {
   if (chatDiscussion !== discussion) return;
   const wasLoading = chatLoading;
-  const changed = !sameChatMessages(chatMessages, transcript.messages);
+  const nextMessages = reconcileChatMessages(
+    chatMessages,
+    transcript.messages,
+    true,
+  );
+  const changed = !chatMessagesEqual(chatMessages, nextMessages);
   const truncationChanged = chatTruncated !== transcript.truncated;
-  chatMessages = transcript.messages;
+  chatMessages = nextMessages;
   chatTruncated = transcript.truncated;
   chatLoading = false;
   chatError = null;
@@ -4501,8 +4793,15 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     syncState: discussion ? pane.syncState : "closed",
     messages: pane.messages,
     activities: pane.turn?.activities ?? [],
+    thoughts: pane.turn?.thoughts ?? [],
+    parts: pane.turn?.parts ?? [],
     turnStatus: pane.turn?.status ?? "idle",
+    turnStartedAt: pane.turn?.startedAt ?? null,
+    turnFinishedAt: pane.turn?.finishedAt ?? null,
     turnError: pane.turn?.status === "failed" ? (pane.turn.error ?? "La reponse a echoue") : null,
+    waitingForUser: conversationWaitsForUser(pane.messages),
+    pendingQuestion: pane.turn?.pendingQuestion ?? null,
+    quotaStatus: chatQuotaStatusFor(account),
     quotaSuggestion: quotaSuggestionFor(pane.turn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
       id: candidate.id,
@@ -4569,7 +4868,6 @@ const restoreExpertChats = () => {
       if (record.sessionId && !discussion) return [];
       return [createExpertChatPane(discussion, record)];
     });
-  if (!expertChatPanes.length) expertChatPanes = [createExpertChatPane()];
   activeExpertChatKey =
     (persisted?.activeKey && expertChatPanes.some((pane) => pane.key === persisted.activeKey)
       ? persisted.activeKey
@@ -4623,6 +4921,7 @@ const refreshExpertChatFeed = (pane: ExpertChatPane) => {
   pane.scrollTop = feed.scrollTop;
   const model = expertChatPanelModel(pane);
   feed.innerHTML = renderChatFeedInner(model, pane.key);
+  patchChatRuntimeStatus(root, model);
   const subtitle = root.querySelector<HTMLElement>("[data-chat-control='subtitle']");
   if (subtitle) subtitle.textContent = model.subtitle;
   const historyCount = root.querySelector<HTMLElement>("[data-chat-action='history-toggle'] small");
@@ -4677,9 +4976,14 @@ const applyExpertChatTranscript = (
 ) => {
   if (!expertChatPanes.includes(pane) || pane.discussion !== discussion) return;
   const wasLoading = pane.loading;
-  const changed = !sameChatMessages(pane.messages, transcript.messages);
+  const nextMessages = reconcileChatMessages(
+    pane.messages,
+    transcript.messages,
+    true,
+  );
+  const changed = !chatMessagesEqual(pane.messages, nextMessages);
   const truncationChanged = pane.truncated !== transcript.truncated;
-  pane.messages = transcript.messages;
+  pane.messages = nextMessages;
   pane.truncated = transcript.truncated;
   pane.loading = false;
   pane.error = null;
@@ -4794,7 +5098,17 @@ const applyExpertChatTurnSnapshot = async (
   if (!expertChatPanes.includes(pane)) return;
   if (pane.turn && pane.turn.id !== 0 && snapshot.id !== pane.turn.id) return;
   const previousStatus = pane.turn?.status;
+  const previousQuestionId = pane.turn?.pendingQuestion?.id ?? null;
+  const previousStartedAt = pane.turn?.startedAt;
+  const previousTurnId = pane.turn?.id;
+  if (
+    previousStartedAt != null &&
+    (previousTurnId === 0 || previousTurnId === snapshot.id)
+  ) {
+    snapshot = { ...snapshot, startedAt: Math.min(previousStartedAt, snapshot.startedAt) };
+  }
   pane.turn = snapshot;
+  const questionChanged = previousQuestionId !== (snapshot.pendingQuestion?.id ?? null);
   const quotaExhausted =
     snapshot.status === "failed" &&
     previousStatus !== "failed" &&
@@ -4808,6 +5122,7 @@ const applyExpertChatTurnSnapshot = async (
     if (attached) await loadExpertChatTranscript(pane);
     stopExpertChatTurnPoll(pane);
   } else if (snapshot.status === "failed") {
+    pane.messages = markLatestPendingMessageFailed(pane.messages);
     statusText = snapshot.error || "La reponse a echoue";
     stopExpertChatTurnPoll(pane);
   } else if (snapshot.status === "cancelled") {
@@ -4817,8 +5132,11 @@ const applyExpertChatTurnSnapshot = async (
     statusText = `${expertChatPanelModel(pane).providerLabel} travaille…`;
   }
 
+  if (previousStatus === "running" && snapshot.status !== "running") {
+    void refreshLimitStatus(true);
+  }
   if (activeView === "chat") {
-    if (previousStatus !== snapshot.status) refreshExpertChatPane(pane);
+    if (previousStatus !== snapshot.status || questionChanged) refreshExpertChatPane(pane);
     else refreshExpertChatFeed(pane);
   }
   if (quotaExhausted) refreshQuotaAlternatives();
@@ -4842,14 +5160,18 @@ const startExpertChatTurnPoll = (pane: ExpertChatPane) => {
   pane.turnPoll = window.setInterval(() => void pollExpertChatTurn(pane), 550);
 };
 
-const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) => {
-  if (pane.turn?.status === "running") return;
+const sendExpertChatMessage = async (
+  pane: ExpertChatPane,
+  root: HTMLElement,
+  promptOverride?: string,
+): Promise<boolean> => {
+  if (pane.turn?.status === "running") return false;
   const input = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
-  const prompt = (input?.value ?? pane.draft).trim();
+  const prompt = (promptOverride ?? input?.value ?? pane.draft).trim();
   const account = expertChatSelectedAccount(pane);
   if (!prompt || !account) {
     statusText = account ? "Ecrivez un message" : "Ajoutez d'abord un compte agent";
-    return;
+    return false;
   }
   const preferences = readChatPreferences(account, root);
   if (preferences.error) {
@@ -4857,7 +5179,7 @@ const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) =>
     modelInput?.setCustomValidity(preferences.error);
     modelInput?.reportValidity();
     statusText = preferences.error;
-    return;
+    return false;
   }
   if (preferences.changed) persistChatPreferences(account.id);
 
@@ -4865,7 +5187,12 @@ const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) =>
   pane.error = null;
   pane.messages = [
     ...pane.messages,
-    { role: "user", text: prompt, timestamp: Math.floor(Date.now() / 1000) },
+    {
+      role: "user",
+      text: prompt,
+      timestamp: Math.floor(Date.now() / 1000),
+      deliveryState: "pending",
+    },
   ];
   pane.turn = {
     id: 0,
@@ -4884,6 +5211,15 @@ const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) =>
         status: "running",
       },
     ],
+    thoughts: [
+      {
+        id: "preparing-thought",
+        kind: "reasoning",
+        text: `${providerLabel(accountProvider(account))} analyse la demande et prépare la prochaine étape.`,
+        status: "running",
+      },
+    ],
+    parts: [],
   };
   pane.followLatest = true;
   pane.scrollTop = 0;
@@ -4902,12 +5238,17 @@ const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) =>
       model: preferences.model,
       reasoningEffort: preferences.reasoningEffort,
     });
-    if (!expertChatPanes.includes(pane)) return;
-    pane.turn = snapshot;
+    if (!expertChatPanes.includes(pane)) return false;
+    const optimisticStartedAt = pane.turn?.startedAt;
+    pane.turn = optimisticStartedAt == null
+      ? snapshot
+      : { ...snapshot, startedAt: Math.min(optimisticStartedAt, snapshot.startedAt) };
     startExpertChatTurnPoll(pane);
-    await applyExpertChatTurnSnapshot(pane, snapshot);
+    await applyExpertChatTurnSnapshot(pane, pane.turn);
+    return true;
   } catch (error) {
-    if (!expertChatPanes.includes(pane)) return;
+    if (!expertChatPanes.includes(pane)) return false;
+    pane.messages = markLatestPendingMessageFailed(pane.messages);
     pane.turn = {
       ...pane.turn,
       id: 0,
@@ -4918,6 +5259,7 @@ const sendExpertChatMessage = async (pane: ExpertChatPane, root: HTMLElement) =>
     statusText = String(error);
     if (isQuotaExhaustionError(String(error))) refreshQuotaAlternatives();
     refreshExpertChatPane(pane);
+    return false;
   }
 };
 
@@ -5006,7 +5348,7 @@ const addExpertChatPane = (
   return pane;
 };
 
-const openDiscussionInExpert = (discussion: DiscussionSummary) => {
+const openDiscussionInExpert = (discussion: DiscussionSummary): ExpertChatPane => {
   const existing = expertChatPanes.find(
     (pane) => pane.discussion?.sessionId === discussion.sessionId,
   );
@@ -5015,7 +5357,7 @@ const openDiscussionInExpert = (discussion: DiscussionSummary) => {
     activateExpertChatPane(existing);
     statusText = expertChatStatusText();
     render();
-    return;
+    return existing;
   }
   const pane = createExpertChatPane(discussion);
   expertChatPanes.push(pane);
@@ -5028,6 +5370,38 @@ const openDiscussionInExpert = (discussion: DiscussionSummary) => {
   render();
   startExpertChatSync(pane);
   void loadExpertChatTranscript(pane);
+  return pane;
+};
+
+// Ouvre la continuation dans la grille de chats et demarre son premier tour en
+// arriere-plan. Les boutons « Reprendre » et « Deplacer + reprendre » restent
+// ainsi dans l'interface de chat, sans creer de terminal interactif.
+const resumeDiscussionInChat = async (
+  discussion: DiscussionSummary | null,
+  accountId: string,
+  folderPath: string,
+  prompt: string,
+): Promise<ExpertChatPane | null> => {
+  if (discussion) discussion.folderPath = folderPath;
+  const pane = discussion
+    ? openDiscussionInExpert(discussion)
+    : addExpertChatPane(accountId, { mode: "build", pendingWorkspace: folderPath });
+  if (!pane) return null;
+
+  pane.accountId = accountId;
+  pane.pendingWorkspace = folderPath;
+  pane.mode = "build";
+  persistExpertChats();
+
+  let root = expertChatPaneRoot(pane);
+  if (!root) {
+    render();
+    await waitForFrame();
+    root = expertChatPaneRoot(pane);
+  }
+  if (!root) return null;
+
+  return (await sendExpertChatMessage(pane, root, prompt)) ? pane : null;
 };
 
 const toggleExpertChatFullscreen = (pane: ExpertChatPane) => {
@@ -5066,8 +5440,14 @@ const closeExpertChatPane = (pane: ExpertChatPane) => {
 };
 
 const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
+  bindChatQuestionUi(root, () => pane.turn, (snapshot) => applyExpertChatTurnSnapshot(pane, snapshot));
   root.addEventListener("pointerdown", () => {
     if (pane.key !== activeExpertChatKey) activateExpertChatPane(pane);
+  });
+  root.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement | null;
+    if (!target?.closest("[data-chat-action='focus-prompt']")) return;
+    activateExpertChatPane(pane, true);
   });
 
   root.querySelector<HTMLButtonElement>("[data-chat-action='back']")?.addEventListener("click", () => {
@@ -5199,9 +5579,11 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
     }
   }, { passive: true });
   feed?.addEventListener("click", (event) => {
-    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>(".chat-code-copy");
+    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>(".chat-code-copy, [data-chat-copy]");
     if (!button) return;
-    const code = button.closest(".chat-code")?.querySelector("code")?.textContent ?? "";
+    const code = button.matches("[data-chat-copy]")
+      ? button.closest(".chat-user-message, [data-chat-copy-source]")?.querySelector<HTMLElement>(".chat-msg-body, .chat-assistant-markdown")?.innerText ?? ""
+      : button.closest(".chat-code")?.querySelector("code")?.textContent ?? "";
     if (!code) return;
     void navigator.clipboard.writeText(code).then(() => {
       button.classList.add("copied");
@@ -5273,7 +5655,7 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
             ${options}
           </select>
         </label>
-        <button class="tool-button" data-resume-session="${escapeAttr(discussion.sessionId)}" title="${willCopy ? "Déplacer la discussion dans le compte choisi puis la reprendre automatiquement" : "Reprendre dans un terminal"}">
+        <button class="tool-button" data-resume-session="${escapeAttr(discussion.sessionId)}" title="${willCopy ? "Déplacer la discussion dans le compte choisi puis la reprendre automatiquement" : "Reprendre automatiquement dans le chat"}">
           <i data-lucide="${willCopy ? "copy" : "play"}"></i><span data-resume-label>${willCopy ? "Déplacer + reprendre" : "Reprendre"}</span>
         </button>
         <button class="tool-button primary" data-open-chat="${escapeAttr(discussion.sessionId)}" title="Ouvrir cette conversation dans le chat">
@@ -5551,7 +5933,7 @@ const bindDiscussionRowUi = () => {
       if (button) {
         button.title = willCopy
           ? "Déplacer la discussion dans le compte choisi puis la reprendre automatiquement"
-          : "Reprendre dans un terminal";
+          : "Reprendre automatiquement dans le chat";
       }
     });
   });
@@ -7119,7 +7501,7 @@ const renderExpertChatGrid = () => {
         </div>
       </header>
       <div class="expert-chat-wall" style="--expert-chat-columns: ${columns}; --expert-chat-rows: ${rows}" aria-label="Chats ${firstVisible} a ${lastVisible}">
-        ${pagePanes.map(renderExpertChatPane).join("") || `<div class="expert-chat-environment-empty"><i data-lucide="bot"></i><strong>Aucun chat ouvert</strong><small>Choisissez un agent puis ouvrez un chat.</small></div>`}
+        ${pagePanes.map(renderExpertChatPane).join("") || `<div class="expert-chat-environment-empty"><i data-lucide="bot"></i><strong>Aucun chat ouvert</strong><small>Cliquez sur « Ouvrir un chat » pour commencer.</small></div>`}
       </div>
     </section>`;
 };
@@ -7227,11 +7609,23 @@ const render = () => {
     return;
   }
 
+  // Plusieurs raccourcis ouvrent directement un chat sans passer par
+  // setActiveView. Le polling suit donc aussi la vue réellement rendue.
+  if (activeView === "chat" || activeView === "limits") startLimitPoll();
+  else stopLimitPoll();
+
   const activeEl = document.activeElement;
   focusedTerminalKeyBeforeRender =
     (activeEl &&
       terminalSessions.find((session) => session.terminal.element?.contains(activeEl))?.key) ||
     null;
+
+  // Preserve la position de defilement des vues admin (Comptes & pool, limites,
+  // stats…). renderChatFirstShell remplace tout le DOM (app.innerHTML), ce qui
+  // remettrait sinon le scroll a 0 et "ferait remonter" l'utilisateur a chaque
+  // re-rendu — tres visible en supprimant un compte en bas de page.
+  const adminScrollTop =
+    document.querySelector<HTMLElement>(".chat-admin-panel")?.scrollTop ?? 0;
 
   terminalSessions.forEach((session) => {
     const element = session.terminal.element;
@@ -7239,6 +7633,11 @@ const render = () => {
   });
 
   renderChatFirstShell();
+
+  if (adminScrollTop > 0) {
+    const restoredAdminPanel = document.querySelector<HTMLElement>(".chat-admin-panel");
+    if (restoredAdminPanel) restoredAdminPanel.scrollTop = adminScrollTop;
+  }
 };
 
 // Ancienne coque plein ecran des terminaux, conservee pour les outils PTY
@@ -7563,6 +7962,7 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
           <div class="account-list">${accounts || `<div class="empty">Aucun compte</div>`}</div>
         </section>
 
+        <div class="account-editor-stack">
         <section class="account-editor">
           <div class="section-row">
             <span>Compte selectionne</span>
@@ -7651,6 +8051,7 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
             </label>
           </div>
         </section>
+        </div>
       </div>
     </section>
   `;
@@ -7660,6 +8061,9 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
 // suppression via renderAccountsPanel) en tete, suivi du pool de service. Le
 // panneau editeur exige la liste d'options du proxy du compte selectionne, qui
 // n'etait construite nulle part depuis que la vue etait cablee sur le seul pool.
+// IMPORTANT : les deux panneaux sont enveloppes dans un conteneur unique, car
+// `.terminal-shell` est une grille a 2 lignes (auto / 1fr) qui placerait sinon
+// chaque <section> dans une ligne differente (editeur ecrase, pool etire).
 const renderAccountsAndPool = (): string => {
   if (!settings) return renderPoolPanel();
   const proxiesEnabled = proxyControlsEnabled();
@@ -7671,7 +8075,7 @@ const renderAccountsAndPool = (): string => {
         `<option value="${escapeAttr(item.id)}" ${item.id === account?.proxyId ? "selected" : ""}>${escapeHtml(item.label)}</option>`,
     ),
   ].join("");
-  return `${renderAccountsPanel(proxyOptions, proxiesEnabled)}${renderPoolPanel()}`;
+  return `<div class="accounts-pool-view">${renderAccountsPanel(proxyOptions, proxiesEnabled)}${renderPoolPanel()}</div>`;
 };
 
 const renderNewChatModal = () => {
@@ -8349,6 +8753,7 @@ const renderLimitRow = (account: AccountLimitView) => `
 
 const limitBadgeClass = (account: AccountLimitView) => {
   if (!account.hasTokens) return "missing";
+  if (account.error && AUTH_LIMIT_ERROR.test(account.error)) return "error";
   if (account.source === "server" || account.source === "session") return "connected";
   if (account.source === "server-empty") return "empty";
   return "error";
@@ -8356,6 +8761,7 @@ const limitBadgeClass = (account: AccountLimitView) => {
 
 const limitSourceLabel = (account: AccountLimitView) => {
   if (!account.hasTokens) return "non connecte";
+  if (account.error && AUTH_LIMIT_ERROR.test(account.error)) return "session expiree";
   if (account.source === "server") return "serveur";
   if (account.source === "session") return "session Codex";
   if (account.source === "server-empty") return "vide";
@@ -8371,6 +8777,7 @@ const AUTH_LIMIT_ERROR =
 // lisibles : jamais connecte, ou lecture serveur echouee sur une erreur d'auth.
 const limitNeedsRelogin = (account: AccountLimitView): boolean => {
   if (!account.hasTokens || account.source === "none") return true;
+  if (account.error && AUTH_LIMIT_ERROR.test(account.error)) return true;
   if (account.source === "unavailable") {
     return !account.error || AUTH_LIMIT_ERROR.test(account.error);
   }
@@ -9186,15 +9593,34 @@ const addAccountAndLogin = async () => {
 
 // Suppression depuis l'editeur : suppression backend d'abord (compte persiste),
 // avec repli en memoire + save_settings pour un compte tout juste cree que le
-// backend ne connait pas encore (« Compte introuvable »). deleteFiles reste
-// false : on retire l'entree sans toucher au CODEX_HOME (non destructif).
+// backend ne connait pas encore (« Compte introuvable »). Par defaut on ne
+// touche pas au CODEX_HOME ; si l'auto-detection est active on propose de l'effacer
+// aussi, sans quoi le compte serait re-decouvert et reapparaitrait.
 const deleteSelectedAccount = async () => {
   if (!settings || !selectedAccountId) return;
   const id = selectedAccountId;
-  const label = settings.accounts.find((account) => account.id === id)?.label ?? "";
+  const target = settings.accounts.find((account) => account.id === id);
+  const label = target?.label ?? "";
+
+  // Avec l'auto-detection active, un compte dont le CODEX_HOME existe encore est
+  // re-decouvert au prochain chargement et "revient" : suppression sans effet
+  // ressenti. On propose alors d'effacer aussi le dossier pour que ce soit
+  // definitif (sinon on previent que le compte peut reapparaitre).
+  let deleteFiles = false;
+  if (settings.autoDiscoverAccounts && target) {
+    deleteFiles = window.confirm(
+      `L'auto-détection des comptes est active.\n\n` +
+        `Pour supprimer DÉFINITIVEMENT « ${label} », il faut aussi effacer son dossier :\n${target.codexHome}\n\n` +
+        `• OK : supprimer le compte ET ses fichiers (auth, sessions, config…).\n` +
+        `• Annuler : garder les fichiers — le compte réapparaîtra au prochain scan.`,
+    );
+  }
+
   try {
-    settings = await invoke<AppSettings>("remove_account", { accountId: id, deleteFiles: false });
-    statusText = `Compte « ${label} » supprime`;
+    settings = await invoke<AppSettings>("remove_account", { accountId: id, deleteFiles });
+    statusText = deleteFiles
+      ? `Compte « ${label} » supprime (fichiers effaces)`
+      : `Compte « ${label} » supprime`;
   } catch {
     settings.accounts = settings.accounts.filter((account) => account.id !== id);
     if (settings.defaultAccountId === id) {
@@ -9940,6 +10366,15 @@ const bindUi = () => {
   document.querySelector<HTMLButtonElement>("#chatStop")?.addEventListener("click", () => {
     void stopCurrentChatTurn();
   });
+  const mainChatPanel = document.querySelector<HTMLElement>("#chatPanel");
+  if (mainChatPanel) {
+    bindChatQuestionUi(mainChatPanel, () => chatTurn, applyChatTurnSnapshot);
+  }
+  mainChatPanel?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement | null;
+    if (!target?.closest("[data-chat-action='focus-prompt']")) return;
+    document.querySelector<HTMLTextAreaElement>("#chatPrompt")?.focus();
+  });
 
   document.querySelector<HTMLButtonElement>("#closeWorkspaceLiveGraph")?.addEventListener("click", () => {
     closeWorkspaceLiveGraph();
@@ -10022,9 +10457,11 @@ const bindUi = () => {
   // patch du fil, le listener sur #chatFeed (stable) les couvre tous.
   document.querySelector<HTMLDivElement>("#chatFeed")?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
-    const button = target?.closest<HTMLButtonElement>(".chat-code-copy");
+    const button = target?.closest<HTMLButtonElement>(".chat-code-copy, [data-chat-copy]");
     if (!button) return;
-    const code = button.closest(".chat-code")?.querySelector("code")?.textContent ?? "";
+    const code = button.matches("[data-chat-copy]")
+      ? button.closest(".chat-user-message, [data-chat-copy-source]")?.querySelector<HTMLElement>(".chat-msg-body, .chat-assistant-markdown")?.innerText ?? ""
+      : button.closest(".chat-code")?.querySelector("code")?.textContent ?? "";
     if (!code) return;
     void navigator.clipboard.writeText(code).then(() => {
       button.classList.add("copied");
@@ -10410,6 +10847,7 @@ const createNewTerminal = async (
   agentId: string | null = null,
   resumeSessionId: string | null = null,
   folderPath: string | null | undefined = undefined,
+  loginOnly = false,
 ) => {
   if (!settings) return null;
   const environmentPath = userEnvironmentPath(folderPath);
@@ -10504,12 +10942,16 @@ const createNewTerminal = async (
   statusText = "Demarrage terminal";
   render();
 
-  await startTerminalSession(session, commandOverride);
+  await startTerminalSession(session, commandOverride, loginOnly);
   persistTerminalSessions();
   return session;
 };
 
-const startTerminalSession = async (session: TerminalSession, commandOverride: string | null = null) => {
+const startTerminalSession = async (
+  session: TerminalSession,
+  commandOverride: string | null = null,
+  loginOnly = false,
+) => {
   if (!settings) return;
   const folder = userEnvironmentPath(session.folderPath);
   if (!folder) {
@@ -10535,7 +10977,7 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
   const isIde = agentIsIde(sessionAgent);
   // Un agent IDE ne se tape pas dans le PTY : on ouvre l'editeur apres coup.
   const autoRunCommand =
-    settings.autoRunCodex && !isIde
+    !loginOnly && settings.autoRunCodex && !isIde
       ? agentRunCommand(sessionAgent, accountById(session.accountId))
       : null;
 
@@ -10555,6 +10997,7 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
       rows: session.terminal.rows,
       command: commandOverride ?? autoRunCommand,
       agentId: session.agentId,
+      loginOnly,
     });
     const ptyId = typeof started === "number" ? started : started.id;
     session.ptyId = ptyId;
@@ -10563,7 +11006,7 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
     session.running = true;
     session.status = "Actif";
     statusText = "Terminal actif";
-    if (settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
+    if (!loginOnly && settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
       // Utilise le workspace capture par cette session, meme si l'utilisateur
       // en a selectionne un autre pendant le demarrage du PTY.
       void launchIde(sessionAgent, session.workspacePath ?? session.folderPath ?? session.projectDir);
@@ -10571,7 +11014,10 @@ const startTerminalSession = async (session: TerminalSession, commandOverride: s
     persistTerminalSessions();
     const startedAccount = settings.accounts.find((candidate) => candidate.id === session.accountId) ?? null;
     const effectiveCommand = commandOverride ?? autoRunCommand ?? startedAccount?.startupCommand ?? null;
-    if (session.resumeSessionId || (isCodexAgent(sessionAgent) && !isIde && !!effectiveCommand)) {
+    if (
+      !loginOnly &&
+      (session.resumeSessionId || (isCodexAgent(sessionAgent) && !isIde && !!effectiveCommand))
+    ) {
       void captureCodexSessionId(session);
     }
   } catch (error) {
@@ -10972,6 +11418,9 @@ const boot = async () => {
   await refreshDiscussions();
   restoreExpertChats();
   render();
+  startChatRuntimeClock();
+  startLimitPoll();
+  void refreshLimitStatus(true);
   startDiscussionsPoll();
   startAllExpertChatWork();
   expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
@@ -10989,6 +11438,7 @@ window.addEventListener("beforeunload", () => {
   stopDiscussionsPoll();
   stopChatSync();
   stopChatTurnPoll();
+  stopChatRuntimeClock();
   stopAllExpertChatWork();
   // Best-effort : evite de laisser un code-server orphelin apres fermeture.
   void invoke("kombai_stop").catch(() => undefined);

@@ -505,6 +505,12 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return api<T>("GET", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
     case "stop_chat_turn":
       return api<T>("DELETE", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
+    case "answer_chat_question":
+      return api<T>(
+        "POST",
+        `/api/chat/turns/${encodeURIComponent(String(args.id))}/questions/${encodeURIComponent(String(args.questionId))}/answer`,
+        { answers: args.answers ?? [] },
+      );
     case "list_prompt_history":
       return {
         generatedAt: Math.floor(Date.now() / 1000),
@@ -736,6 +742,7 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
     rows: args.rows,
     command: args.command,
     agentId: args.agentId,
+    loginOnly: args.loginOnly ?? false,
   };
   let lastError: unknown = null;
 

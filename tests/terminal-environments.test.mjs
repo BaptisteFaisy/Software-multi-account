@@ -68,6 +68,16 @@ test("un nouveau chat s'ouvre via une fenetre de choix du compte", () => {
   assert.match(style, /\.new-chat-account-option/);
 });
 
+test("un environnement vide ne recoit jamais de chat de base", () => {
+  assert.doesNotMatch(main, /createExpertChatPane\(\s*\)/);
+  assert.doesNotMatch(
+    main,
+    /!expertChatPanes\.length\)[^\n]*createExpertChatPane/,
+  );
+  assert.match(main, /<strong>Aucun chat ouvert<\/strong>/);
+  assert.match(main, /Cliquez sur « Ouvrir un chat » pour commencer\./);
+});
+
 test("le choix d'environnement propose un explorateur de dossiers navigable", () => {
   for (const marker of [
     "Parcourir les dossiers",

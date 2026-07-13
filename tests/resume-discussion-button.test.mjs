@@ -17,13 +17,40 @@ test("le bandeau de la grille ouvre la meme liste de discussions", () => {
   assert.match(main, /querySelectorAll<HTMLButtonElement>\("\[data-open-discussions\]"\)/);
 });
 
-test("une discussion reprise restaure son environnement et donc sa room", () => {
+test("le bouton simple reprendre restaure la room puis continue dans le chat", () => {
   assert.match(main, /const activateDiscussionFolder/);
   assert.match(main, /setCurrentWorkspace\(folderPath\)/);
-  assert.match(main, /createNewTerminal\([\s\S]*?sessionId,[\s\S]*?folderPath,/);
-  assert.match(main, /const persistTerminalDiscussionFolder/);
   assert.match(chatBackend, /move_discussion_for_account/);
   assert.match(chatBackend, /CST_ROOM_ID/);
+
+  const start = main.indexOf("const resumeDiscussion = async");
+  const end = main.indexOf("\n// Archive la version source", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const resume = main.slice(start, end);
+
+  assert.match(resume, /restoreDiscussionFolder\(discussion\)/);
+  assert.match(
+    resume,
+    /resumeDiscussionInChat\(\s*discussion,\s*discussion\.accountId,\s*folderPath,\s*"continue"/,
+  );
+  assert.doesNotMatch(resume, /createNewTerminal|activeView\s*=\s*"terminal"/);
+  assert.doesNotMatch(main, /resumeSessionInTerminal|Reprendre dans un terminal/);
+});
+
+test("deplacer et reprendre continue dans un chat normal sans terminal", () => {
+  const start = main.indexOf("const continueDiscussionWith = async");
+  const end = main.indexOf("\nconst discussionHasRunningTurn", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const moveAndResume = main.slice(start, end);
+
+  assert.doesNotMatch(moveAndResume, /createNewTerminal/);
+  assert.equal((moveAndResume.match(/resumeDiscussionInChat\(/g) ?? []).length, 2);
+  assert.match(
+    main,
+    /const resumeDiscussionInChat = async[\s\S]*?openDiscussionInExpert\(discussion\)[\s\S]*?sendExpertChatMessage\(pane, root, prompt\)/,
+  );
 });
 
 test("un chat refuse clairement un compte sans authentification", () => {
