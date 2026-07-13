@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   closeWorkspaceRegistry,
   draftEnvironmentChatPanes,
-  isEphemeralChatWorkspacePath,
   mergeWorkspaceProfiles,
   normalizeWorkspacePath,
   openWorkspaceRegistry,
@@ -88,28 +87,28 @@ test("rouvrir un dossier retire son tombstone et restaure son profil", () => {
   ]);
 });
 
-test("un dossier regroupe plusieurs agents sans fusionner leurs workspaces", () => {
+test("un dossier regroupe plusieurs terminaux dans le meme projet", () => {
   const terminals = [
     {
       key: "terminal-codex",
       agentId: "codex",
       folderPath: "C:\\Projects\\Produit",
-      workspaceId: "ws-codex",
-      workspacePath: "C:\\runtime\\workspaces\\ws-codex\\repo",
+      workspaceId: "c:/projects/produit",
+      workspacePath: "C:\\Projects\\Produit",
     },
     {
       key: "terminal-claude",
       agentId: "claude",
       folderPath: "c:/projects/produit/",
-      workspaceId: "ws-claude",
-      workspacePath: "C:\\runtime\\workspaces\\ws-claude\\repo",
+      workspaceId: "c:/projects/produit",
+      workspacePath: "C:\\Projects\\Produit",
     },
     {
       key: "terminal-autre",
       agentId: "codex",
       folderPath: "C:\\Projects\\Autre",
-      workspaceId: "ws-autre",
-      workspacePath: "C:\\runtime\\workspaces\\ws-autre\\repo",
+      workspaceId: "c:/projects/autre",
+      workspacePath: "C:\\Projects\\Autre",
     },
   ];
 
@@ -118,7 +117,7 @@ test("un dossier regroupe plusieurs agents sans fusionner leurs workspaces", () 
     "terminal-codex",
     "terminal-claude",
   ]);
-  assert.equal(new Set(associated.map((terminal) => terminal.workspaceId)).size, 2);
+  assert.equal(new Set(associated.map((terminal) => terminal.workspaceId)).size, 1);
 });
 
 test("un environnement de terminal doit contenir un dossier explicite", () => {
@@ -152,46 +151,10 @@ test("le navigateur construit aussi un fil d'Ariane Unix", () => {
   ]);
 });
 
-test("un worktree de chat ephemere n'est jamais pris pour un environnement", () => {
+test("un chemin choisi est conserve directement comme environnement", () => {
   assert.equal(
-    isEphemeralChatWorkspacePath(
-      "C:\\runtime\\agents\\workspaces\\desktop-chat-3-828787c2865f45cbb99d51a3e127811e\\repo",
-    ),
-    true,
-  );
-  assert.equal(
-    isEphemeralChatWorkspacePath(
-      "/srv/runtime/workspaces/desktop-chat-12-828787c2865f45cbb99d51a3e127811e/repo/packages/app",
-    ),
-    true,
-  );
-  assert.equal(
-    isEphemeralChatWorkspacePath(
-      "C:\\runtime\\workspaces\\1783872478683-9a0beba066544160bd50b41bd3864737\\repo",
-    ),
-    true,
-  );
-  assert.equal(
-    isEphemeralChatWorkspacePath(
-      "C:\\runtime\\agents\\workspaces\\codex-e28ffd81abb14bd7ba7e53fd742e7bcb\\repo",
-    ),
-    true,
-  );
-  assert.equal(
-    isEphemeralChatWorkspacePath(
-      "C:\\Users\\jeanp\\AppData\\Roaming\\codex-switch-terminal-server\\workspaces",
-    ),
-    true,
-  );
-  assert.equal(
-    isEphemeralChatWorkspacePath("C:\\Users\\jeanp\\codex-switch-terminal"),
-    false,
-  );
-  assert.equal(
-    userEnvironmentPath(
-      "C:\\Users\\jeanp\\AppData\\Roaming\\codex-switch-terminal-server\\agents\\workspaces\\desktop-chat-2-1b6f99e95df64caab03c31a1907aaae5\\repo",
-    ),
-    null,
+    userEnvironmentPath("  C:\\Users\\jeanp\\codex-switch-terminal  "),
+    "C:\\Users\\jeanp\\codex-switch-terminal",
   );
 });
 
@@ -212,31 +175,4 @@ test("les chats ouverts sans discussion listee restent des brouillons visibles",
 test("un chat deja liste n'est jamais duplique en brouillon", () => {
   const panes = [{ key: "pane-liste", discussion: { sessionId: "s-liste" } }];
   assert.deepEqual(draftEnvironmentChatPanes(panes, ["s-liste"]), []);
-});
-
-test("le registre supprime les anciens environnements techniques", () => {
-  const technical =
-    "C:\\Users\\jeanp\\AppData\\Roaming\\codex-switch-terminal-server\\workspaces\\1783851915932-1784c9e325794eea96db0bdfa0c22928\\repo";
-  const project = "C:\\Users\\jeanp\\codex-switch-terminal";
-  const merged = mergeWorkspaceProfiles([
-    { id: technical.toLowerCase(), label: "repo", path: technical },
-    { id: "ancien", label: "Projet", path: project },
-  ]);
-
-  assert.equal(merged.changed, true);
-  assert.deepEqual(merged.workspaces, [
-    {
-      id: "c:/users/jeanp/codex-switch-terminal",
-      label: "Projet",
-      path: project,
-    },
-  ]);
-
-  const opened = openWorkspaceRegistry(
-    merged.workspaces,
-    [technical, "c:/users/jeanp/ferme"],
-    technical,
-  );
-  assert.deepEqual(opened.workspaces, merged.workspaces);
-  assert.deepEqual(opened.closedWorkspaceIds, ["c:/users/jeanp/ferme"]);
 });

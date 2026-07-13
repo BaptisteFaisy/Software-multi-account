@@ -1,13 +1,11 @@
 use crate::{
     account_usage,
-    agent_room::{self, AgentMeta, QuestionAnswer, RoomState},
     chat::{ChatTurnManager, StartChatTurnRequest},
     discussions,
     kombai::{KombaiManager, KombaiStatus},
     metrics,
     pool::{self, AccountStatus, PoolManager},
     settings::{self, AppSettings},
-    worktree::{AgentWorkspace, WorktreeManager},
 };
 use axum::{
     extract::{
@@ -30,6 +28,7 @@ use std::{
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
@@ -39,6 +38,7 @@ use std::{
 };
 use tokio::sync::broadcast;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, services::ServeDir};
+use uuid::Uuid;
 
 const WORKSPACE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_DRAIN_LEASE_SECS: u64 = 20;
@@ -81,9 +81,6 @@ struct ServerState {
     terminals: RemoteTerminalManager,
     chat: ChatTurnManager,
     kombai: Arc<KombaiManager>,
-    /// Salon d'agents partage (serveur MCP monte a `/mcp`).
-    room: RoomState,
-    worktrees: WorktreeManager,
     started_at: i64,
     /// Echeance Unix de la courte lease de drain. Une lease bornee evite qu'un
     /// updater interrompu laisse le noeud ferme aux autres agents. Les sessions
@@ -96,8 +93,8 @@ struct ServerState {
 struct StartTerminalRequest {
     id: Option<u64>,
     account_id: String,
-    /// Depot git a cloner dans un workspace EPHEMERE (purge 7j). Optionnel :
-    /// ignore si `workspace_path` est fourni.
+    /// Depot Git a cloner normalement sur le serveur. Les clones inutilises
+    /// depuis sept jours sont nettoyes. Ignore si `workspace_path` est fourni.
     #[serde(default)]
     repo_url: Option<String>,
     /// Dossier EXISTANT sur le serveur (dans la racine autorisee) a utiliser
@@ -108,7 +105,6 @@ struct StartTerminalRequest {
     cols: u16,
     rows: u16,
     command: Option<String>,
-    agent_id: Option<String>,
     #[serde(default)]
     login_only: bool,
 }
@@ -118,7 +114,6 @@ struct StartTerminalRequest {
 struct StartTerminalResponse {
     id: u64,
     workspace_id: String,
-    room_id: String,
     workspace_path: String,
 }
 
@@ -335,7 +330,6 @@ struct RemoteTerminalSession {
     workspace_id: String,
     workspace_path: PathBuf,
     recorded_end: AtomicBool,
-    _workspace: AgentWorkspace,
 }
 
 impl Drop for RemoteTerminalSession {
@@ -352,6 +346,25 @@ struct RemoteTerminalIdReservation {
 }
 
 impl RemoteTerminalManager {
+    fn active_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.len())
+            .unwrap_or_default()
+    }
+
+    fn active_workspace_ids(&self) -> HashSet<String> {
+        self.sessions
+            .lock()
+            .map(|sessions| {
+                sessions
+                    .values()
+                    .map(|session| session.workspace_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn reserve_id(&self, requested: Option<u64>) -> Result<RemoteTerminalIdReservation, String> {
         let mut reservations = self
             .reservations
@@ -400,8 +413,6 @@ impl RemoteTerminalManager {
     fn start(
         &self,
         config: &ServerConfig,
-        room: &RoomState,
-        worktrees: &WorktreeManager,
         request: StartTerminalRequest,
     ) -> Result<StartTerminalResponse, String> {
         let settings = settings::load_settings_for_terminal()?;
@@ -425,63 +436,46 @@ impl RemoteTerminalManager {
 
         let id_reservation = self.reserve_id(request.id)?;
         let id = id_reservation.id;
-        let agent_id = request
-            .agent_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| format!("saas-terminal-{id}"));
         let canonical_home = settings::expand_home(&account.codex_home)?;
         fs::create_dir_all(&canonical_home).map_err(|error| error.to_string())?;
 
-        // Un dossier serveur et un repo distant convergent tous deux vers un
-        // worktree/home uniques. Pour les repos distants, le clone couteux est
-        // remplace par un miroir bare partage + un checkout leger par agent.
+        // Un dossier existant est utilise directement. Un depot distant est
+        // clone normalement avec sa branche et son upstream : les commandes Git
+        // standard (pull, push, rebase) fonctionnent directement.
         let selected_workspace = request
             .workspace_path
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        let (workspace, repo_label) = if let Some(raw) = selected_workspace {
+        let (repo_dir, workspace_id, repo_label) = if let Some(raw) = selected_workspace {
             let dir = resolve_within_root(&config.workspaces_root, raw)?;
             let label = display_path(&dir);
-            (
-                worktrees.prepare_local(&agent_id, &canonical_home, Some(&dir))?,
-                label,
-            )
+            let workspace_id = workspace_id_for_dir(&dir);
+            (dir, workspace_id, label)
         } else {
             let repo_url = request.repo_url.as_deref().unwrap_or("").trim();
             if repo_url.is_empty() {
                 return Err("Environnement obligatoire avant d'ouvrir un terminal".to_string());
             } else {
-                let repo_url = validate_repo_url(repo_url)?;
-                let fetch_url = authenticated_repo_url(&repo_url, &config.git_pat);
-                let workspace = worktrees
-                    .prepare_remote(
-                        &agent_id,
-                        &canonical_home,
-                        &repo_url,
-                        &fetch_url,
-                        request.branch.as_deref(),
-                    )
-                    .map_err(|error| redact_secrets(&error, config))?;
-                (workspace, repo_url)
+                let workspace_id = format!("{id}-{}", Uuid::new_v4().simple());
+                let repo_dir = config
+                    .data_dir
+                    .join("workspaces")
+                    .join(&workspace_id)
+                    .join("repo");
+                let repo_label = prepare_workspace(
+                    repo_url,
+                    request.branch.as_deref(),
+                    &repo_dir,
+                    &config.git_pat,
+                )
+                .map_err(|error| redact_secrets(&error, config))?;
+                (repo_dir, workspace_id, repo_label)
             }
         };
 
-        let repo_dir = workspace.cwd().to_path_buf();
-        let workspace_id = workspace.workspace_id().to_string();
-        let room_id = workspace.room_id().to_string();
-        let runtime_home = workspace.home().to_path_buf();
-        // Un login doit persister dans le vrai CODEX_HOME du compte. Les
-        // terminaux ordinaires continuent d'utiliser leur copie isolee.
-        let account_home = if request.login_only {
-            canonical_home.clone()
-        } else {
-            runtime_home.clone()
-        };
+        let account_home = canonical_home;
 
         // Synchronise a chaque demarrage la config propre au compte, dans le
         // format du provider (Codex config.toml / Claude settings.json). Un echec
@@ -518,12 +512,6 @@ impl RemoteTerminalManager {
         builder.env("TERM", "xterm-256color");
         builder.env("COLORTERM", "truecolor");
         builder.env("PWD", repo_dir.to_string_lossy().to_string());
-        builder.env("CST_WORKSPACE_ID", workspace_id.clone());
-        builder.env("CST_AGENT_ID", &agent_id);
-        builder.env("CST_ROOM_ID", &room_id);
-        if let Some(base_sha) = workspace.base_sha() {
-            builder.env("CST_BASE_SHA", base_sha);
-        }
 
         if let Some(proxy) = proxy {
             for key in [
@@ -535,39 +523,6 @@ impl RemoteTerminalManager {
                 "all_proxy",
             ] {
                 builder.env(key, proxy.proxy_url.clone());
-            }
-        }
-
-        // Salon d'agents (SaaS) : le serveur MCP tourne dans CE process, les
-        // agents server-spawned l'atteignent en loopback. On provisionne le
-        // CODEX_HOME et on injecte un token unique par terminal.
-        let mut room_token: Option<String> = None;
-        {
-            let port = config
-                .bind
-                .parse::<SocketAddr>()
-                .map(|addr| addr.port())
-                .unwrap_or(settings.agent_room.port);
-            let url = format!("http://127.0.0.1:{port}/mcp");
-            let cli_bin = settings::command_for_provider(&settings, provider);
-            match room.provision_home(provider, &cli_bin, &runtime_home, &url) {
-                Ok(()) => {
-                    let token = room.register(AgentMeta {
-                        agent_id: agent_id.clone(),
-                        provider,
-                        account_id: account.id.clone(),
-                        label: account.label.clone(),
-                        cwd: Some(repo_dir.to_string_lossy().to_string()),
-                        workspace_id: Some(workspace_id.clone()),
-                        room_id: room_id.clone(),
-                        merge_context: workspace.merge_context(),
-                    });
-                    builder.env("CST_ROOM_TOKEN", token.clone());
-                    room_token = Some(token);
-                }
-                Err(error) => {
-                    eprintln!("[workspace_collab] provisioning ignore (SaaS): {error}");
-                }
             }
         }
 
@@ -602,7 +557,6 @@ impl RemoteTerminalManager {
             workspace_id: workspace_id.clone(),
             workspace_path: repo_dir.clone(),
             recorded_end: AtomicBool::new(false),
-            _workspace: workspace,
         });
 
         {
@@ -619,8 +573,6 @@ impl RemoteTerminalManager {
 
         let sessions = self.sessions.clone();
         let reader_events = events.clone();
-        let room_clone = room.clone();
-        let room_token_thread = room_token.clone();
         thread::spawn(move || {
             let mut buffer = [0_u8; 8192];
             loop {
@@ -647,9 +599,6 @@ impl RemoteTerminalManager {
             if let Some(session) = ended {
                 finish_session(&session);
                 let _ = session.events.send(ServerWsMessage::Exit { id });
-            }
-            if let Some(token) = &room_token_thread {
-                room_clone.deregister(token);
             }
         });
 
@@ -681,7 +630,6 @@ impl RemoteTerminalManager {
         Ok(StartTerminalResponse {
             id,
             workspace_id,
-            room_id,
             workspace_path: repo_dir.to_string_lossy().to_string(),
         })
     }
@@ -822,22 +770,16 @@ pub async fn run_from_env() -> Result<(), String> {
 
     let settings = settings::load_settings_for_terminal()?;
     let pool_manager = Arc::new(PoolManager::build(&settings)?);
-    let room = RoomState::with_data_dir(config.data_dir.join("agent-room"));
-    // L'admission est illimitee par defaut. `CST_NODE_CAPACITY` reste un indice
-    // de routage pour repartir la charge, pas une barriere de creation.
-    let worktrees = WorktreeManager::from_env(config.data_dir.join("agents"))?;
     let state = Arc::new(ServerState {
         config: config.clone(),
         terminals: RemoteTerminalManager::default(),
         chat: ChatTurnManager::default(),
         kombai: Arc::new(KombaiManager::default()),
-        room: room.clone(),
-        worktrees,
         started_at: metrics::now_ts(),
         drain_until: Arc::new(AtomicI64::new(0)),
     });
 
-    spawn_workspace_cleanup(config.data_dir.clone(), state.worktrees.clone());
+    spawn_workspace_cleanup(config.data_dir.clone(), state.terminals.clone());
 
     let api = Router::new()
         .route("/health", get(api_health))
@@ -866,10 +808,6 @@ pub async fn run_from_env() -> Result<(), String> {
             "/chat/turns/:id",
             get(api_chat_turn_status).delete(api_stop_chat_turn),
         )
-        .route(
-            "/chat/turns/:id/questions/:question_id/answer",
-            post(api_answer_chat_question),
-        )
         .route("/pool/status", get(api_pool_status))
         .route("/pool/start", post(api_pool_status))
         .route("/pool/stop", post(api_pool_stop))
@@ -887,9 +825,6 @@ pub async fn run_from_env() -> Result<(), String> {
         .route("/workspaces", get(api_workspaces))
         .route("/workspaces/:id", delete(api_delete_workspace))
         .route("/fs/list", get(api_fs_list))
-        .route("/room/status", get(api_room_status))
-        .route("/room/messages", get(api_room_messages))
-        .route("/room/send", post(api_room_send))
         .with_state(state.clone());
 
     let ws = Router::new()
@@ -912,7 +847,6 @@ pub async fn run_from_env() -> Result<(), String> {
         .nest("/api", api)
         .nest("/ws", ws)
         .merge(pool::router(pool_manager, Some(config.admin_token.clone())))
-        .merge(agent_room::router(room))
         .fallback_service(static_service)
         .layer(middleware::from_fn(set_frontend_cache_control))
         .layer(CompressionLayer::new())
@@ -1140,7 +1074,6 @@ fn list_subdirs(dir: &Path) -> Result<Vec<FsEntry>, String> {
 /// Identifiant stable (sans separateur de chemin) pour un workspace pointant un
 /// dossier existant. Sert d'etiquette de routage ; n'est jamais utilise pour
 /// supprimer quoi que ce soit (la purge ne touche que `data_dir/workspaces`).
-#[cfg(test)]
 fn workspace_id_for_dir(dir: &Path) -> String {
     let mut id = String::from("dir-");
     for character in dir.to_string_lossy().chars() {
@@ -1165,7 +1098,7 @@ async fn api_healthz(State(state): State<Arc<ServerState>>) -> Response {
         // vivant pour ses sessions en cours.
         ready: !draining,
         draining,
-        active_terminals: state.worktrees.active_count(),
+        active_terminals: state.terminals.active_count(),
         capacity: state.config.node_capacity,
     })
 }
@@ -1204,7 +1137,7 @@ async fn api_health(State(state): State<Arc<ServerState>>, headers: HeaderMap) -
             commit: COMMIT,
             ready: !draining,
             draining,
-            active_terminals: state.worktrees.active_count(),
+            active_terminals: state.terminals.active_count(),
             capacity: state.config.node_capacity,
             started_at: state.started_at,
         }))
@@ -1230,7 +1163,7 @@ async fn api_admin_drain(
         Ok(json_response(json!({
             "draining": request.draining,
             "drainUntil": (drain_until > 0).then_some(drain_until),
-            "activeTerminals": state.worktrees.active_count(),
+            "activeTerminals": state.terminals.active_count(),
         })))
     })
 }
@@ -1468,12 +1401,7 @@ async fn api_start_terminal(
     }
     let start_state = state.clone();
     match tokio::task::spawn_blocking(move || {
-        start_state.terminals.start(
-            &start_state.config,
-            &start_state.room,
-            &start_state.worktrees,
-            request,
-        )
+        start_state.terminals.start(&start_state.config, request)
     })
     .await
     {
@@ -1514,24 +1442,8 @@ async fn api_start_chat_turn(
         };
         request.project_dir = Some(resolved.to_string_lossy().to_string());
     }
-    let port = state
-        .config
-        .bind
-        .parse::<SocketAddr>()
-        .map(|addr| addr.port())
-        .unwrap_or(8123);
-    let room_url = format!("http://127.0.0.1:{port}/mcp");
     let start_state = state.clone();
-    match tokio::task::spawn_blocking(move || {
-        start_state.chat.start(
-            request,
-            &start_state.worktrees,
-            &start_state.room,
-            Some(&room_url),
-        )
-    })
-    .await
-    {
+    match tokio::task::spawn_blocking(move || start_state.chat.start(request)).await {
         Ok(Ok(value)) => json_response(value),
         Ok(Err(error)) => api_error(agent_start_status(&error), &error, &state.config),
         Err(error) => api_error(
@@ -1577,7 +1489,7 @@ async fn api_chat_turn_status(
     AxumPath(id): AxumPath<u64>,
 ) -> Response {
     auth_or(&state, &headers, || {
-        state.chat.status(id, &state.room).map(json_response)
+        state.chat.status(id).map(json_response)
     })
 }
 
@@ -1586,115 +1498,7 @@ async fn api_stop_chat_turn(
     headers: HeaderMap,
     AxumPath(id): AxumPath<u64>,
 ) -> Response {
-    auth_or(&state, &headers, || {
-        state.chat.stop(id, &state.room).map(json_response)
-    })
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AnswerChatQuestionRequest {
-    answers: Vec<QuestionAnswer>,
-}
-
-async fn api_answer_chat_question(
-    State(state): State<Arc<ServerState>>,
-    headers: HeaderMap,
-    AxumPath((id, question_id)): AxumPath<(u64, u64)>,
-    Json(request): Json<AnswerChatQuestionRequest>,
-) -> Response {
-    auth_or(&state, &headers, || {
-        state
-            .room
-            .answer_question_for_turn(id, question_id, request.answers)?;
-        state.chat.status(id, &state.room).map(json_response)
-    })
-}
-
-#[derive(Debug, Deserialize)]
-struct RoomMessagesQuery {
-    since: Option<u64>,
-    #[serde(rename = "workspacePath")]
-    workspace_path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RoomScopeQuery {
-    #[serde(rename = "workspacePath")]
-    workspace_path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RoomSendRequest {
-    text: String,
-    to: Option<String>,
-    workspace_path: Option<String>,
-}
-
-async fn api_room_status(
-    State(state): State<Arc<ServerState>>,
-    headers: HeaderMap,
-    Query(query): Query<RoomScopeQuery>,
-) -> Response {
-    auth_or(&state, &headers, || {
-        let room_id = server_room_id(&state.config, query.workspace_path.as_deref())?;
-        Ok(json_response(json!({
-            "running": true,
-            "snapshot": state.room.snapshot_for_room(&room_id),
-        })))
-    })
-}
-
-async fn api_room_messages(
-    State(state): State<Arc<ServerState>>,
-    headers: HeaderMap,
-    Query(query): Query<RoomMessagesQuery>,
-) -> Response {
-    auth_or(&state, &headers, || {
-        let since = query.since.unwrap_or(0);
-        let room_id = server_room_id(&state.config, query.workspace_path.as_deref())?;
-        let messages = state
-            .room
-            .messages_for_room(&room_id, agent_room::OPERATOR_IDENT, since);
-        let cursor = messages.iter().map(|m| m.id).max().unwrap_or(since);
-        Ok(json_response(
-            json!({ "messages": messages, "cursor": cursor }),
-        ))
-    })
-}
-
-async fn api_room_send(
-    State(state): State<Arc<ServerState>>,
-    headers: HeaderMap,
-    Json(request): Json<RoomSendRequest>,
-) -> Response {
-    auth_or(&state, &headers, || {
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err("message vide".to_string());
-        }
-        let room_id = server_room_id(&state.config, request.workspace_path.as_deref())?;
-        if let Some(target) = request.to.as_deref() {
-            if !state.room.ident_exists_in_room(&room_id, target) {
-                return Err("destinataire absent du dossier actif".to_string());
-            }
-        }
-        Ok(json_response(
-            state.room.operator_post_in_room(&room_id, request.to, text),
-        ))
-    })
-}
-
-fn server_room_id(config: &ServerConfig, workspace_path: Option<&str>) -> Result<String, String> {
-    let Some(raw) = workspace_path
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(agent_room::DEFAULT_ROOM_ID.to_string());
-    };
-    let path = resolve_within_root(&config.workspaces_root, raw)?;
-    Ok(crate::worktree::room_id_for_local_path(&path))
+    auth_or(&state, &headers, || state.chat.stop(id).map(json_response))
 }
 
 async fn api_write_terminal(
@@ -1794,7 +1598,7 @@ async fn api_delete_workspace(
         delete_workspace(
             &state.config.data_dir,
             &id,
-            &state.worktrees.active_workspace_ids(),
+            &state.terminals.active_workspace_ids(),
         )?;
         Ok(json_response(json!({ "ok": true })))
     })
@@ -2235,6 +2039,61 @@ fn shell_command(settings: &AppSettings) -> CommandBuilder {
     builder
 }
 
+fn prepare_workspace(
+    repo_url: &str,
+    branch: Option<&str>,
+    target: &Path,
+    git_pat: &str,
+) -> Result<String, String> {
+    let repo_url = repo_url.trim();
+    if repo_url.is_empty() {
+        fs::create_dir_all(target).map_err(|error| error.to_string())?;
+        return Ok("workspace vide".to_string());
+    }
+
+    clone_repo(repo_url, branch, target, git_pat)?;
+    Ok(repo_url.to_string())
+}
+
+fn clone_repo(
+    repo_url: &str,
+    branch: Option<&str>,
+    target: &Path,
+    git_pat: &str,
+) -> Result<(), String> {
+    let repo_url = validate_repo_url(repo_url)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let authed_url = authenticated_repo_url(&repo_url, git_pat);
+    let mut command = Command::new("git");
+    command.arg("clone");
+    if let Some(branch) = branch.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("--branch").arg(branch);
+    }
+    command
+        .arg(&authed_url)
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .map_err(|error| format!("git clone impossible: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!(
+        "git clone a echoue ({}): {}{}",
+        output.status, stdout, stderr
+    ))
+}
+
 fn validate_repo_url(repo_url: &str) -> Result<String, String> {
     let value = repo_url.trim();
     if value.is_empty() {
@@ -2283,19 +2142,16 @@ fn redact_secrets(value: &str, config: &ServerConfig) -> String {
     redacted
 }
 
-fn spawn_workspace_cleanup(data_dir: PathBuf, worktrees: WorktreeManager) {
+fn spawn_workspace_cleanup(data_dir: PathBuf, terminals: RemoteTerminalManager) {
     tokio::spawn(async move {
         loop {
-            // Ancien format (< worktree manager) uniquement. Les workspaces
-            // actifs courants sont balayes par `sweep_stale`, qui verifie le PID.
-            let _ = cleanup_legacy_workspaces(&data_dir);
-            let _ = worktrees.sweep_stale(WORKSPACE_RETENTION_SECS);
+            let _ = cleanup_old_workspaces(&data_dir, &terminals.active_workspace_ids());
             tokio::time::sleep(Duration::from_secs(60 * 60)).await;
         }
     });
 }
 
-fn cleanup_legacy_workspaces(data_dir: &Path) -> Result<(), String> {
+fn cleanup_old_workspaces(data_dir: &Path, active: &HashSet<String>) -> Result<(), String> {
     let now = SystemTime::now();
     let root = data_dir.join("workspaces");
     if !root.is_dir() {
@@ -2304,6 +2160,9 @@ fn cleanup_legacy_workspaces(data_dir: &Path) -> Result<(), String> {
 
     for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
+        if active.contains(&entry.file_name().to_string_lossy().to_string()) {
+            continue;
+        }
         let metadata = entry.metadata().map_err(|error| error.to_string())?;
         if !metadata.is_dir() {
             continue;
@@ -2321,10 +2180,7 @@ fn cleanup_legacy_workspaces(data_dir: &Path) -> Result<(), String> {
 
 fn list_workspaces(data_dir: &Path) -> Result<Vec<WorkspaceView>, String> {
     let mut views = Vec::new();
-    for root in [
-        data_dir.join("agents").join("workspaces"),
-        data_dir.join("workspaces"),
-    ] {
+    for root in [data_dir.join("workspaces")] {
         if !root.is_dir() {
             continue;
         }
@@ -2354,10 +2210,7 @@ fn delete_workspace(data_dir: &Path, id: &str, active: &HashSet<String>) -> Resu
     if active.contains(id) {
         return Err("dossier encore utilise par un agent actif".to_string());
     }
-    for target in [
-        data_dir.join("agents").join("workspaces").join(id),
-        data_dir.join("workspaces").join(id),
-    ] {
+    for target in [data_dir.join("workspaces").join(id)] {
         if target.is_dir() {
             let root = target
                 .parent()

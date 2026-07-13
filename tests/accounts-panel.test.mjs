@@ -80,7 +80,7 @@ test("la reconnexion utilise un terminal strictement reserve au login", () => {
   assert.match(main, /!loginOnly &&\s*\n\s*\(session\.resumeSessionId/);
 });
 
-test("une reconnexion ne peut ouvrir qu'un terminal ephemere a la fois", () => {
+test("une reconnexion ne peut ouvrir qu'un terminal temporaire a la fois", () => {
   // Le login ne restaure pas implicitement les terminaux de travail et ne sera
   // lui-meme jamais sauvegarde pour une restauration ulterieure.
   assert.match(
@@ -117,8 +117,8 @@ test("le login depuis Nouveau terminal persiste aussi dans le home du compte", (
   assert.ok(handlerStart >= 0 && handlerEnd > handlerStart, "gestionnaire login introuvable");
   const handler = main.slice(handlerStart, handlerEnd);
 
-  // Le meme logout + login est utilise, et loginOnly=true force le backend a
-  // exposer le CODEX_HOME permanent plutot que la copie jetable du workspace.
+  // Le meme logout + login est utilise, et loginOnly=true empeche le lancement
+  // automatique de la commande de travail du compte.
   assert.match(handler, /reconnectCommandForAccount\(account, agent\)/);
   assert.match(handler, /newTerminalWorkspacePath,\s*\n\s*true,\s*\n\s*\);/);
 });

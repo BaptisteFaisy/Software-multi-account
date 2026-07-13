@@ -83,7 +83,7 @@ un `latest.json` signé. Étapes :
    ```bash
    git commit -am "release: v0.1.1"
    git tag v0.1.1
-   git push origin feat/agent-room --tags
+   git push origin ma-branche --tags
    ```
 
 4. La CI compile, **signe** l'installeur, génère `latest.json`, et **publie** la

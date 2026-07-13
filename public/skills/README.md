@@ -1,9 +1,9 @@
-# Skills (bibliothèque intégrée, indépendante d'AgentsRoom)
+# Skills (bibliothèque intégrée)
 
 Ces fichiers **sont** la source des skills de l'app codex (vue « Skills » de la
 barre d'outils). Ils sont embarqués dans l'app : Vite copie `public/skills/` dans
 `dist/`, servi à `/skills/…`. Le front les lit par `fetch` — identique en desktop
-(webview Tauri), web et mobile, **sans backend et sans dépendance à AgentsRoom**.
+(webview Tauri), web et mobile, sans backend supplémentaire.
 
 ## Format
 - `index.json` : le manifeste.
@@ -24,4 +24,4 @@ barre d'outils). Ils sont embarqués dans l'app : Vite copie `public/skills/` da
 3. Rebâtir le front (`npm run build:frontend`) pour recopier dans `dist/`.
    En dev (`npm run dev`), Vite sert `public/` directement.
 
-Aucune régénération depuis AgentsRoom : ces fichiers sont autonomes et versionnés.
+Ces fichiers sont autonomes et versionnés.

@@ -76,40 +76,17 @@ export const workspacePathBreadcrumbs = (
   return breadcrumbs;
 };
 
-/**
- * Les agents sont executes dans un worktree prive dont le chemin peut apparaitre
- * brievement dans un transcript. Ni la racine technique ni ses `repo` ne sont
- * des environnements que l'utilisateur peut selectionner ou memoriser.
- */
-export const isEphemeralChatWorkspacePath = (
-  path: string | null | undefined,
-): boolean => {
-  const normalized = path ? normalizeWorkspacePath(path) : "";
-  return (
-    /(?:^|\/)codex-switch-terminal-server\/(?:agents\/)?workspaces(?:\/|$)/i.test(
-      normalized,
-    ) ||
-    /(?:^|\/)(?:agents\/)?workspaces\/[a-z0-9][a-z0-9-]{0,31}-[0-9a-f]{32}(?:\/repo(?:\/|$)|\/?$)/i.test(
-      normalized,
-    )
-  );
-};
-
-/** Chemin d'environnement explicitement choisi, jamais un runtime d'agent. */
+/** Chemin d'environnement explicitement choisi. */
 export const userEnvironmentPath = (
   path: string | null | undefined,
-): string | null => {
-  const environment = terminalEnvironmentPath(path);
-  return environment && !isEphemeralChatWorkspacePath(environment) ? environment : null;
-};
+): string | null => terminalEnvironmentPath(path);
 
 export type FolderLinkedTerminal = {
   folderPath?: string | null;
 };
 
 /**
- * L'appartenance se calcule depuis le Dossier logique, jamais depuis le
- * workspace physique propre a l'agent.
+ * L'appartenance se calcule depuis le dossier choisi par l'utilisateur.
  */
 export const terminalBelongsToFolder = (
   terminal: FolderLinkedTerminal,
@@ -134,8 +111,8 @@ export type DraftableChatPane = {
  * Selectionne, parmi les chats ouverts d'un environnement, ceux qui ne sont pas
  * deja representes par une discussion listee dans la barre laterale : soit un
  * nouveau chat sans premier message (pas encore de discussion), soit un chat
- * dont la discussion n'a pas de dossier resolu cote serveur (ex. worktree
- * ephemere) et qui a donc ete ecarte de la liste persistee. Sans cette union, la
+ * dont la discussion n'a pas de dossier resolu cote serveur et qui a donc ete
+ * ecarte de la liste persistee. Sans cette union, la
  * grille compte « 1 chat » pendant que la barre laterale affiche « Aucun chat ».
  */
 export const draftEnvironmentChatPanes = <T extends DraftableChatPane>(
@@ -200,7 +177,7 @@ export const mergeClosedWorkspaceIds = (ids: readonly string[]): string[] => {
   const merged: string[] = [];
   ids.forEach((rawId) => {
     const id = workspaceIdForPath(rawId);
-    if (!id || isEphemeralChatWorkspacePath(id) || seen.has(id)) return;
+    if (!id || seen.has(id)) return;
     seen.add(id);
     merged.push(id);
   });

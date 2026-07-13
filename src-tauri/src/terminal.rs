@@ -1,8 +1,6 @@
 use crate::{
-    agent_room::{AgentMeta, RoomState},
     metrics,
     settings::{expand_home, load_settings_for_terminal, AccountProfile, AppSettings},
-    worktree::{AgentWorkspace, WorktreeManager},
 };
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::Serialize;
@@ -34,14 +32,10 @@ struct TerminalSession {
     account_id: String,
     account_label: String,
     recorded_end: AtomicBool,
-    /// Le Drop du lease fusionne les transcripts et nettoie worktree/home.
-    _workspace: AgentWorkspace,
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        // Toujours tuer le CLI avant que `_workspace` ne libere/recycle son
-        // home et son worktree (y compris a la fermeture globale de l'app).
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
@@ -130,7 +124,6 @@ struct PtyExitEvent {
 pub struct StartTerminalResponse {
     id: u64,
     workspace_id: String,
-    room_id: String,
     workspace_path: String,
 }
 
@@ -138,8 +131,6 @@ pub struct StartTerminalResponse {
 pub fn start_terminal(
     app: AppHandle,
     state: State<'_, TerminalManager>,
-    worktrees: State<'_, WorktreeManager>,
-    room: State<'_, RoomState>,
     id: Option<u64>,
     account_id: String,
     cols: u16,
@@ -175,30 +166,14 @@ pub fn start_terminal(
     // Le dossier est une frontiere de session, pas un simple defaut de compte.
     // Refuser ici les anciens clients qui tenteraient encore un demarrage sans
     // selection empeche tout cwd implicite ou melange entre deux projets.
-    let source_project_dir = resolve_terminal_environment(project_dir.as_deref())?;
+    let project_dir = resolve_terminal_environment(project_dir.as_deref())?;
 
-    let canonical_home = expand_home(&account.codex_home)?;
-    std::fs::create_dir_all(&canonical_home).map_err(|error| error.to_string())?;
-    let workspace = worktrees.prepare_local(
-        &format!("desktop-terminal-{id}"),
-        &canonical_home,
-        Some(&source_project_dir),
-    )?;
-    let runtime_home = workspace.home().to_path_buf();
-    // La reconnexion doit mettre a jour le CODEX_HOME permanent. Un terminal
-    // de travail normal reste isole dans son home de workspace.
-    let account_home = if login_only {
-        canonical_home.clone()
-    } else {
-        runtime_home.clone()
-    };
-    let project_dir = Some(workspace.cwd().to_path_buf());
-    let workspace_id = workspace.workspace_id().to_string();
-    let room_id = workspace.room_id().to_string();
-    let workspace_path = workspace.cwd().to_string_lossy().to_string();
+    let account_home = expand_home(&account.codex_home)?;
+    std::fs::create_dir_all(&account_home).map_err(|error| error.to_string())?;
+    let workspace_path = project_dir.to_string_lossy().to_string();
+    let workspace_id = workspace_path.clone();
 
-    // La configuration est ecrite dans le home ISOLE, jamais dans celui qu'un
-    // autre agent utilise simultanement.
+    // Le terminal utilise le home permanent du compte et le dossier choisi.
     if let Err(error) = provider.write_account_config(
         &account_home,
         account.bypass,
@@ -231,18 +206,8 @@ pub fn start_terminal(
     );
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
-    builder.env("CST_AGENT_ID", format!("desktop-terminal-{id}"));
-    builder.env("CST_WORKSPACE_ID", workspace.workspace_id());
-    builder.env("CST_ROOM_ID", workspace.room_id());
-    if let Some(base_sha) = workspace.base_sha() {
-        builder.env("CST_BASE_SHA", base_sha);
-    }
-
-    if let Some(project_dir) = &project_dir {
-        let project_dir_string = project_dir.to_string_lossy().to_string();
-        builder.cwd(project_dir.as_os_str());
-        builder.env("PWD", project_dir_string);
-    }
+    builder.cwd(project_dir.as_os_str());
+    builder.env("PWD", &workspace_path);
 
     if let Some(proxy) = proxy {
         for key in [
@@ -254,40 +219,6 @@ pub fn start_terminal(
             "all_proxy",
         ] {
             builder.env(key, proxy.proxy_url.clone());
-        }
-    }
-
-    // Collaboration workspace native : provisionnee dans le home ISOLE puis
-    // authentifiee par un token unique a ce terminal.
-    let mut room_token: Option<String> = None;
-    {
-        let url = format!("http://127.0.0.1:{}/mcp", settings.agent_room.port);
-        let cli_bin = crate::settings::command_for_provider(&settings, provider);
-        match room.provision_home(provider, &cli_bin, &runtime_home, &url) {
-            Ok(()) => {
-                let token = room.register(AgentMeta {
-                    agent_id: format!("desktop-terminal-{id}"),
-                    provider,
-                    account_id: account.id.clone(),
-                    label: account.label.clone(),
-                    cwd: project_dir
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().to_string()),
-                    workspace_id: Some(workspace.workspace_id().to_string()),
-                    room_id: workspace.room_id().to_string(),
-                    merge_context: workspace.merge_context(),
-                });
-                builder.env("CST_ROOM_TOKEN", token.clone());
-                room_token = Some(token);
-            }
-            // Non bloquant : le terminal demarre sans collaboration si le provisioning
-            // echoue (ex. binaire CLI introuvable depuis ce process).
-            Err(error) => {
-                eprintln!(
-                    "[workspace_collab] provisioning ignore pour {}: {error}",
-                    account.label
-                );
-            }
         }
     }
 
@@ -314,7 +245,6 @@ pub fn start_terminal(
         account_id: account.id.clone(),
         account_label: account.label.clone(),
         recorded_end: AtomicBool::new(false),
-        _workspace: workspace,
     });
 
     {
@@ -331,8 +261,6 @@ pub fn start_terminal(
 
     let sessions = state.sessions.clone();
     let reader_app = app.clone();
-    let room_state = (*room).clone();
-    let room_token_thread = room_token.clone();
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -353,10 +281,6 @@ pub fn start_terminal(
         if let Some(session) = ended {
             finish_session(&session);
         }
-        // Le PTY s'est ferme (fin naturelle ou kill) : on retire l'agent du workspace.
-        if let Some(token) = &room_token_thread {
-            room_state.deregister(token);
-        }
         let _ = reader_app.emit("pty-exit", PtyExitEvent { id });
     });
 
@@ -365,7 +289,7 @@ pub fn start_terminal(
         id,
         &account,
         proxy.map(|proxy| proxy.label.as_str()),
-        project_dir.as_deref(),
+        Some(&project_dir),
     )?;
     let command = if login_only {
         // Ne lance jamais la commande normale du compte apres une reconnexion.
@@ -386,7 +310,6 @@ pub fn start_terminal(
     Ok(StartTerminalResponse {
         id,
         workspace_id,
-        room_id,
         workspace_path,
     })
 }
@@ -627,22 +550,17 @@ mod tests {
     }
 
     #[test]
-    fn start_response_distinguishes_terminal_and_physical_workspace() {
+    fn start_response_uses_selected_directory_directly() {
         let value = serde_json::to_value(StartTerminalResponse {
             id: 42,
-            workspace_id: "ws-agent-a".to_string(),
-            room_id: "room-folder".to_string(),
-            workspace_path: "C:/runtime/workspaces/ws-agent-a/repo".to_string(),
+            workspace_id: "C:/projects/app".to_string(),
+            workspace_path: "C:/projects/app".to_string(),
         })
         .unwrap();
 
         assert_eq!(value["id"], 42);
-        assert_eq!(value["workspaceId"], "ws-agent-a");
-        assert_eq!(value["roomId"], "room-folder");
-        assert_eq!(
-            value["workspacePath"],
-            "C:/runtime/workspaces/ws-agent-a/repo"
-        );
+        assert_eq!(value["workspaceId"], "C:/projects/app");
+        assert_eq!(value["workspacePath"], "C:/projects/app");
     }
 
     #[test]

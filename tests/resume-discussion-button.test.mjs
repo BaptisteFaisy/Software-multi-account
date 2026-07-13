@@ -17,11 +17,11 @@ test("le bandeau de la grille ouvre la meme liste de discussions", () => {
   assert.match(main, /querySelectorAll<HTMLButtonElement>\("\[data-open-discussions\]"\)/);
 });
 
-test("le bouton simple reprendre restaure la room puis continue dans le chat", () => {
+test("le bouton simple reprendre restaure le dossier puis continue dans le chat", () => {
   assert.match(main, /const activateDiscussionFolder/);
   assert.match(main, /setCurrentWorkspace\(folderPath\)/);
-  assert.match(chatBackend, /move_discussion_for_account/);
-  assert.match(chatBackend, /CST_ROOM_ID/);
+  assert.match(main, /invoke<DiscussionSummary>\("move_discussion"/);
+  assert.match(chatBackend, /resolve_project_dir\(&account, request\.project_dir\.as_deref\(\)\)/);
 
   const start = main.indexOf("const resumeDiscussion = async");
   const end = main.indexOf("\n// Archive la version source", start);

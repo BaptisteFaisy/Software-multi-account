@@ -27,7 +27,7 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// Identifiant stable (utilise pour les logs, l'agent-room, l'UI).
+    /// Identifiant stable (utilise pour les logs et l'UI).
     pub fn as_str(self) -> &'static str {
         match self {
             Provider::Codex => "codex",
@@ -211,9 +211,6 @@ pub struct AppSettings {
     pub active_agent_id: Option<String>,
     #[serde(default)]
     pub kombai: KombaiConfig,
-    /// Salon de communication inter-agents (serveur MCP + provisioning).
-    #[serde(default)]
-    pub agent_room: AgentRoomConfig,
     /// Ajoute `--dangerously-bypass-approvals-and-sandbox` quand l'app lance
     /// Codex (bouton Run + auto-run). Actif par defaut.
     #[serde(default = "default_true")]
@@ -234,37 +231,6 @@ pub struct AppSettings {
     /// recreer automatiquement ; une ouverture explicite retire le tombstone.
     #[serde(default)]
     pub closed_workspace_ids: Vec<String>,
-}
-
-/// Reglages historiques du transport MCP. `enabled` est conserve uniquement
-/// pour relire les anciens settings ; la collaboration workspace est desormais
-/// native et toujours disponible dans les homes isoles.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentRoomConfig {
-    /// Champ de compatibilite, ignore par le runtime natif.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Port loopback du serveur MCP du salon (desktop).
-    #[serde(default = "default_room_port")]
-    pub port: u16,
-    /// Secret partage optionnel (second facteur en plus du token par agent).
-    #[serde(default)]
-    pub secret: String,
-}
-
-impl Default for AgentRoomConfig {
-    fn default() -> Self {
-        AgentRoomConfig {
-            enabled: false,
-            port: default_room_port(),
-            secret: String::new(),
-        }
-    }
-}
-
-fn default_room_port() -> u16 {
-    8123
 }
 
 /// Reglages du VS Code embarque (code-server) qui heberge l'extension Kombai
@@ -554,7 +520,7 @@ fn guard_deletable_codex_home(path: &Path) -> Result<(), String> {
         }
     }
 
-    // Dossier de configuration de l'app (settings.json, agent-room...).
+    // Dossier de configuration de l'app (settings.json, caches...).
     if let Ok(settings_file) = settings_path() {
         if let Some(app_dir) = settings_file.parent() {
             let app_key = guard_key(app_dir);
@@ -799,7 +765,7 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(
             home.join("config.toml"),
-            "[mcp_servers.agent_room]\nurl = \"http://127.0.0.1:8123/mcp\"\n",
+            "[mcp_servers.example]\nurl = \"http://127.0.0.1:8123/mcp\"\n",
         )
         .unwrap();
 
@@ -811,7 +777,7 @@ mod tests {
         let twice = fs::read_to_string(home.join("config.toml")).unwrap();
 
         assert_eq!(once, twice);
-        assert!(twice.contains("[mcp_servers.agent_room]"));
+        assert!(twice.contains("[mcp_servers.example]"));
         assert!(twice.contains("url = \"http://127.0.0.1:8123/mcp\""));
 
         let _ = fs::remove_dir_all(home);
@@ -906,11 +872,11 @@ mod tests {
 
     #[test]
     fn upsert_prefixes_key_before_existing_tables() {
-        let existing = "[mcp_servers.agent_room]\nurl = \"http://127.0.0.1:8123/mcp\"\n";
+        let existing = "[mcp_servers.example]\nurl = \"http://127.0.0.1:8123/mcp\"\n";
         let out = upsert_top_level_string(existing, "sandbox_mode", "danger-full-access");
         // La cle racine doit preceder la table pour rester du TOML valide.
         assert!(out.starts_with("sandbox_mode = \"danger-full-access\"\n"));
-        assert!(out.contains("[mcp_servers.agent_room]"));
+        assert!(out.contains("[mcp_servers.example]"));
     }
 
     #[test]
@@ -1011,7 +977,6 @@ mod tests {
             agents,
             active_agent_id: active.map(ToString::to_string),
             kombai: KombaiConfig::default(),
-            agent_room: AgentRoomConfig::default(),
             codex_bypass: true,
             auto_discover_accounts: false,
             workspaces: Vec::new(),
@@ -1421,36 +1386,6 @@ fn settings_path() -> Result<PathBuf, String> {
     Ok(base.join("codex-switch-terminal").join("settings.json"))
 }
 
-/// Repertoire de persistance du salon d'agents (`.../agent-room`), aligne sur la
-/// meme resolution que `settings_path` (honore `CST_DATA_DIR`).
-pub fn agent_room_data_dir() -> Result<PathBuf, String> {
-    if let Some(value) = env::var_os("CST_DATA_DIR") {
-        return Ok(PathBuf::from(value).join("agent-room"));
-    }
-    let base = if let Some(value) = env::var_os("APPDATA") {
-        PathBuf::from(value)
-    } else if let Some(value) = env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(value)
-    } else {
-        home_dir()?.join(".config")
-    };
-    Ok(base.join("codex-switch-terminal").join("agent-room"))
-}
-
-/// Racine des donnees runtime (worktrees, homes isoles, merge queue). Elle suit
-/// `CST_DATA_DIR` et reste donc isolee meme si `settings.json` provient d'un
-/// `CST_ACCOUNTS_DIR` partage.
-pub fn runtime_data_dir() -> Result<PathBuf, String> {
-    if let Some(value) = env::var_os("CST_DATA_DIR") {
-        return Ok(PathBuf::from(value));
-    }
-
-    settings_path()?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "repertoire de donnees CST introuvable".to_string())
-}
-
 fn discover_initial_settings() -> Result<AppSettings, String> {
     let mut settings = AppSettings {
         accounts: Vec::new(),
@@ -1464,7 +1399,6 @@ fn discover_initial_settings() -> Result<AppSettings, String> {
         agents: Vec::new(),
         active_agent_id: None,
         kombai: KombaiConfig::default(),
-        agent_room: AgentRoomConfig::default(),
         codex_bypass: true,
         auto_discover_accounts: false,
         workspaces: Vec::new(),

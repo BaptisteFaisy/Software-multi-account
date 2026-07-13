@@ -30,7 +30,6 @@ import {
   type ChatMode,
   type ChatMessage,
   type ChatPanelModel,
-  type ChatPendingQuestion,
   type ChatQuotaSuggestion,
   type ChatQuotaStatus,
   type ChatSyncState,
@@ -80,7 +79,6 @@ import {
 import {
   closeWorkspaceRegistry,
   draftEnvironmentChatPanes,
-  isEphemeralChatWorkspacePath,
   mergeClosedWorkspaceIds,
   mergeWorkspaceProfiles,
   normalizeWorkspacePath,
@@ -280,12 +278,6 @@ type KombaiStatus = {
   message?: string | null;
 };
 
-type AgentRoomConfig = {
-  enabled: boolean;
-  port: number;
-  secret: string;
-};
-
 // Entree/reponse du navigateur de dossiers du serveur (mode web). En desktop on
 // utilise le dialogue natif (`pick_project_dir`), pas cette API.
 type FsEntry = { name: string; path: string; isDir: boolean };
@@ -308,7 +300,6 @@ type AppSettings = {
   agents: AgentProfile[];
   activeAgentId?: string | null;
   kombai: KombaiConfig;
-  agentRoom: AgentRoomConfig;
   codexBypass: boolean;
   autoDiscoverAccounts: boolean;
   // Registre synchronise des workspaces (dossiers projets ouverts). Optionnel
@@ -319,67 +310,6 @@ type AppSettings = {
   // Tombstones synchronises : une ancienne discussion ne doit pas rouvrir un
   // workspace que l'utilisateur a explicitement ferme.
   closedWorkspaceIds?: string[];
-};
-
-type RoomAgent = {
-  ident: string;
-  agentId: string;
-  accountId: string;
-  label: string;
-  cwd?: string | null;
-  workspaceId?: string | null;
-  present: boolean;
-  joinedAt: number;
-  lastSeen: number;
-};
-
-type RoomMerge = {
-  id: number;
-  status: "queued" | "running" | "landed" | "conflict" | "verifyFailed" | "failed";
-  agentIdent: string;
-  targetRef: string;
-  landedSha?: string | null;
-};
-
-type RoomTask = {
-  id: string;
-  description: string;
-  status: "claimed" | "completed";
-  claimedBy: string;
-};
-
-type RoomMessage = {
-  id: number;
-  ts: number;
-  roomId: string;
-  from: string;
-  fromLabel: string;
-  to?: string | null;
-  kind: "room" | "dm" | "system";
-  text: string;
-};
-
-type RoomStatus = {
-  running: boolean;
-  port: number;
-  url: string;
-  snapshot: {
-    roomId: string;
-    agents: RoomAgent[];
-    present: number;
-    totalMessages: number;
-    cursor: number;
-    oldestCursor: number;
-    coordination: {
-      queued: number;
-      running: number;
-      landed: number;
-      attention: number;
-      recentLanded: RoomMerge[];
-      tasks: RoomTask[];
-    };
-    storeOwner: boolean;
-  };
 };
 
 type PoolConfig = {
@@ -535,7 +465,6 @@ type TerminalStartResponse = {
   id: number;
   workspaceId: string;
   workspacePath: string;
-  roomId?: string;
 };
 
 type TerminalSession = {
@@ -547,9 +476,7 @@ type TerminalSession = {
   // Un terminal d'authentification est temporaire : il ne doit jamais etre
   // restaure comme un terminal de travail au prochain login / rechargement.
   loginOnly: boolean;
-  // Dossier logique choisi par l'utilisateur. Plusieurs agents/terminaux
-  // partagent ce dossier tout en travaillant dans des workspaces physiques
-  // differents, crees par le gestionnaire de worktrees.
+  // Dossier choisi par l'utilisateur et utilise directement par le terminal.
   folderPath: string | null;
   workspaceId: string | null;
   workspacePath: string | null;
@@ -590,7 +517,6 @@ type AppView =
   | "kombai"
   | "discussions"
   | "history"
-  | "room"
   | "audit"
   | "skills"
   | "settings"
@@ -611,8 +537,7 @@ type DiscussionSummary = {
   accountLabel: string;
   codexHome: string;
   filePath: string;
-  // Dossier logique restaure par l'UI. Le backend persiste ensuite cette
-  // valeur dans `cwd`, qui peut initialement viser un worktree ephemere.
+  // Dossier restaure par l'UI et persiste dans `cwd` par le backend.
   folderPath?: string | null;
   cwd: string | null;
   startedAt: number;
@@ -659,7 +584,6 @@ type ChatTurnSnapshot = {
   activities: ChatActivity[];
   thoughts: ChatThought[];
   parts: ChatPart[];
-  pendingQuestion?: ChatPendingQuestion | null;
 };
 
 type ExpertChatPane = {
@@ -892,17 +816,6 @@ let expertChatsRestored = false;
 let promptHistory: PromptHistoryView | null = null;
 let promptHistoryLoaded = false;
 let promptSearch = "";
-let roomStatus: RoomStatus | null = null;
-let roomMessages: RoomMessage[] = [];
-let roomPoll: number | null = null;
-let roomRefreshInFlight = false;
-let roomRenderSignature = "";
-let roomMessageCursor = 0;
-let roomMessageWorkspace = "";
-let workspaceLiveGraphOpen = false;
-// Destinataire choisi dans le composer : "" = diffusion workspace, sinon ident d'un
-// agent (DM). Conserve entre les rendus complets.
-let roomComposeTarget = "";
 // Selecteur de workspace (mode web) : modale de navigation de dossiers serveur.
 type WorkspacePickerTarget = "active" | "new-terminal";
 let workspaceModalOpen = false;
@@ -934,7 +847,7 @@ let auditViewLabel: string | null = null;
 // Chargement mémoïsé du bundle détecteur (injecté à la demande, une seule fois).
 let impeccableLoadPromise: Promise<void> | null = null;
 
-// --- Bibliothèque de skills (fichiers embarqués, indépendants d'AgentsRoom) --
+// --- Bibliothèque de skills (fichiers embarqués) -----------------------------
 type SkillEntry = {
   id: string;
   name: string;
@@ -1055,7 +968,6 @@ const chatFeedRenderSignature = (model: ChatPanelModel) => JSON.stringify([
   model.turnFinishedAt,
   model.turnError,
   model.waitingForUser,
-  model.pendingQuestion,
   model.quotaSuggestion,
 ]);
 
@@ -1064,7 +976,6 @@ const chatRuntimeRenderSignature = (model: ChatPanelModel) => JSON.stringify([
   model.turnStartedAt,
   model.turnFinishedAt,
   model.waitingForUser,
-  model.pendingQuestion,
   model.activities.at(-1),
   model.parts.at(-1),
   model.turnError,
@@ -1273,10 +1184,6 @@ const chatWorkspaceFilterRaw = (): string | null =>
   localStorage.getItem(CHAT_WS_FILTER_KEY);
 const activeChatWorkspaceFilter = (): string => {
   const stored = chatWorkspaceFilterRaw();
-  if (stored && isEphemeralChatWorkspacePath(stored)) {
-    localStorage.setItem(CHAT_WS_FILTER_KEY, WORKSPACE_ALL);
-    return WORKSPACE_ALL;
-  }
   return stored || WORKSPACE_ALL;
 };
 const setChatWorkspaceFilter = (value: string) => {
@@ -1295,9 +1202,8 @@ const closedWorkspaceIds = (): Set<string> =>
 const workspaceIsClosed = (path: string): boolean =>
   closedWorkspaceIds().has(workspaceIdForPath(path));
 
-// Un transcript enregistre le cwd physique de l'agent. Tant que l'association
-// terminal est connue (y compris apres restauration v4), on le rattache au
-// Dossier logique au lieu de creer un faux Dossier par worktree.
+// Un transcript enregistre le dossier courant. Une ancienne association de
+// terminal reste prioritaire pour conserver la compatibilite des sessions.
 const folderPathForRuntimePath = (rawPath: string | null | undefined): string | null => {
   const path = rawPath?.trim();
   if (!path) return null;
@@ -1314,9 +1220,8 @@ const discussionFolderPath = (
 ): string | null =>
   userEnvironmentPath(discussion?.folderPath) ?? folderPathForRuntimePath(discussion?.cwd);
 
-// Une reouverture explicite restaure aussi le contexte global du dossier : la
-// room, le mur de terminaux et les prochains messages pointent tous au meme
-// dossier logique, jamais au worktree physique de l'ancien agent.
+// Une reouverture explicite restaure aussi le contexte global du dossier pour
+// les terminaux et les prochains messages.
 const activateDiscussionFolder = (discussion: DiscussionSummary): string | null => {
   const folderPath = discussionFolderPath(discussion);
   if (!folderPath) return null;
@@ -1520,7 +1425,7 @@ const saveOpenTerminalRecords = (state: PersistedTerminalState) => {
 const persistTerminalSessions = () => {
   // Les PTY sont charges paresseusement. Ne jamais ecraser leur etat persiste
   // tant que le mur de terminaux n'a pas ete ouvert. Un terminal de login peut
-  // exister avant cette restauration, mais il est volontairement ephemere.
+  // exister avant cette restauration, mais il est volontairement temporaire.
   if (!terminalRestoreAttempted) return;
   saveOpenTerminalRecords({
     v: 4,
@@ -2029,8 +1934,7 @@ const terminalEnvironmentGroups = (): TerminalEnvironmentGroup[] =>
       normalizeWorkspacePath(left.path).localeCompare(normalizeWorkspacePath(right.path)),
   );
 
-// L'environnement est le contexte global de travail : conversations, agents,
-// collaboration et terminaux suivent tous cette selection unique.
+// L'environnement est le contexte global de travail des conversations et terminaux.
 const selectEnvironment = (path: string): void => {
   const environmentPath = userEnvironmentPath(path);
   if (!environmentPath) {
@@ -2046,8 +1950,6 @@ const selectEnvironment = (path: string): void => {
   terminalEnvironmentMenuOpen = false;
   expertChatFullscreenKey = null;
   expertTerminalFullscreenKey = null;
-  roomStatus = null;
-  roomMessages = [];
   void upsertWorkspaceRegistry(environmentPath);
   expertChatPage = 0;
   reconcileExpertChatPage();
@@ -2295,102 +2197,6 @@ const stopPoolPoll = () => {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Collaboration native entre agents du workspace actif
-// ---------------------------------------------------------------------------
-
-const roomPresentAgents = (): RoomAgent[] =>
-  roomStatus?.snapshot.agents.filter((agent) => agent.present) ?? [];
-
-const roomAgentLabel = (ident: string): string => {
-  if (ident === "operator") return "Opérateur";
-  return roomStatus?.snapshot.agents.find((agent) => agent.ident === ident)?.label ?? ident;
-};
-
-const renderRoomAgentsInner = (): string => {
-  const agents = roomPresentAgents();
-  if (!agents.length) return `<div class="empty">Aucun agent présent</div>`;
-  return agents
-    .map(
-      (agent) => `
-        <div class="room-agent">
-          <span class="live-dot on"></span>
-          <div class="room-agent-main">
-            <strong>${escapeHtml(agent.label)}</strong>
-            <small>${escapeHtml(agent.ident)}${agent.cwd ? ` · ${escapeHtml(agent.cwd)}` : ""}</small>
-          </div>
-        </div>`,
-    )
-    .join("");
-};
-
-const renderRoomFeedInner = (): string => {
-  if (!roomMessages.length) return `<div class="empty">Aucun message pour l'instant</div>`;
-  return roomMessages
-    .map((message) => {
-      if (message.kind === "system") {
-        return `<div class="room-msg system"><em>${escapeHtml(message.text)}</em></div>`;
-      }
-      const target = message.to ? ` → ${escapeHtml(roomAgentLabel(message.to))}` : "";
-      const tag = message.kind === "dm" ? ` <span class="room-tag">privé</span>` : "";
-      return `
-        <div class="room-msg ${message.kind}">
-          <div class="room-msg-head"><strong>${escapeHtml(message.fromLabel)}</strong>${target}${tag}</div>
-          <div class="room-msg-body">${escapeHtml(message.text)}</div>
-        </div>`;
-    })
-    .join("");
-};
-
-const renderRoomCoordinationInner = (): string => {
-  const coordination = roomStatus?.snapshot.coordination;
-  if (!coordination) return "";
-  const tasks = coordination.tasks.slice(0, 6);
-  const landed = coordination.recentLanded.slice(0, 6);
-  return `
-    <div class="room-coordination-summary">
-      <span><strong>${coordination.queued}</strong> en attente</span>
-      <span><strong>${coordination.running}</strong> en intégration</span>
-      <span class="ok"><strong>${coordination.landed}</strong> landed</span>
-      <span class="${coordination.attention ? "warn" : ""}"><strong>${coordination.attention}</strong> à reprendre</span>
-    </div>
-    <div class="room-coordination-lists">
-      <div>
-        <small>Task board</small>
-        ${
-          tasks.length
-            ? tasks
-                .map(
-                  (task) =>
-                    `<span class="room-coordination-item ${task.status}"><b>${escapeHtml(task.id)}</b> · ${escapeHtml(task.claimedBy)}</span>`,
-                )
-                .join("")
-            : `<span class="room-coordination-empty">Aucune tâche claimée</span>`
-        }
-      </div>
-      <div>
-        <small>Derniers landed</small>
-        ${
-          landed.length
-            ? landed
-                .map(
-                  (merge) =>
-                    `<span class="room-coordination-item landed"><b>#${merge.id}</b> · ${escapeHtml((merge.landedSha ?? "").slice(0, 10))}</span>`,
-                )
-                .join("")
-            : `<span class="room-coordination-empty">Aucun merge atterri</span>`
-        }
-      </div>
-    </div>`;
-};
-
-const roomTargetOptions = (): string =>
-  roomPresentAgents()
-    .map(
-      (agent) =>
-        `<option value="${escapeAttr(agent.ident)}" ${agent.ident === roomComposeTarget ? "selected" : ""}>${escapeHtml(agent.label)} (privé)</option>`,
-    )
-    .join("");
 
 // ---------------------------------------------------------------------------
 // Audit design (détecteur Impeccable, exécuté côté navigateur)
@@ -2428,8 +2234,6 @@ const auditViewLabelFor = (view: AppView): string => {
       return "vue Discussions";
     case "history":
       return "vue Historique";
-    case "room":
-      return "vue Salon";
     case "settings":
       return "vue Paramètres";
     case "chat":
@@ -2641,7 +2445,7 @@ const renderAuditPanel = (): string => {
 // ---------------------------------------------------------------------------
 // Bibliothèque de skills (vue « Skills »)
 // ---------------------------------------------------------------------------
-// Source INDÉPENDANTE (aucune dépendance à AgentsRoom) : fichiers statiques
+// Source indépendante du backend : fichiers statiques
 // embarqués sous public/skills/ (copiés dans dist/ au build, servis à /skills/…).
 // On lit le manifeste index.json puis le contenu .md de chaque skill par fetch —
 // identique en desktop (webview), web et mobile, sans backend. Ajouter un skill =
@@ -2814,301 +2618,6 @@ const renderSkillsPanel = (): string => {
     </div>`;
 };
 
-const roomStatusSummary = (): string => {
-  const running = roomStatus?.running ?? false;
-  const present = roomStatus?.snapshot.present ?? 0;
-  const workspace = currentWorkspace();
-  return `${running ? "Active automatiquement" : "Service indisponible"} · ${present} agent(s) présent(s) · ${workspace ? workspaceBaseName(workspace) : "aucun environnement actif"}${roomStatus?.snapshot.storeOwner === false ? " · store passif" : ""}`;
-};
-
-const renderRoomPanel = (): string => {
-  const sub = roomStatusSummary();
-  return `
-    <div class="panel room-panel">
-      <div class="panel-head">
-        <div>
-          <h2>Collaboration de l'environnement</h2>
-          <p id="roomStatusSummary" class="panel-sub">${escapeHtml(sub)}</p>
-        </div>
-        <div class="panel-actions">
-          <button id="roomRefresh" class="icon-button wide" title="Rafraîchir"><i data-lucide="refresh-ccw"></i></button>
-        </div>
-      </div>
-      <section id="roomCoordination" class="room-coordination">${renderRoomCoordinationInner()}</section>
-      <div class="room-grid">
-        <aside class="room-agents">
-          <div class="section-row"><span>Présents</span></div>
-          <div id="roomAgents">${renderRoomAgentsInner()}</div>
-        </aside>
-        <div class="room-main">
-          <div id="roomFeed" class="room-feed">${renderRoomFeedInner()}</div>
-          <form id="roomComposer" class="room-composer">
-            <select id="roomTarget" class="agent-select" title="Destinataire" aria-label="Destinataire">
-              <option value="">Environnement (tous)</option>
-              ${roomTargetOptions()}
-            </select>
-            <input id="roomText" type="text" placeholder="Message en tant qu'opérateur…" autocomplete="off" />
-            <button type="submit" class="tool-button primary" title="Envoyer"><i data-lucide="send"></i><span>Envoyer</span></button>
-          </form>
-        </div>
-      </div>
-    </div>`;
-};
-
-const renderWorkspaceLiveGraphContent = (): string => {
-  const workspace = currentWorkspace();
-  const agents = roomPresentAgents();
-  const coordination = roomStatus?.snapshot.coordination;
-  const tasks = coordination?.tasks ?? [];
-  const landed = coordination?.recentLanded ?? [];
-  const queued = coordination?.queued ?? 0;
-  const running = coordination?.running ?? 0;
-  const attention = coordination?.attention ?? 0;
-  const recentMessages = roomMessages.slice(-8).reverse();
-  const roomId = roomStatus?.snapshot.roomId ?? "";
-
-  const agentNodes = agents.length
-    ? agents
-        .slice(0, 12)
-        .map(
-          (agent) => `<div class="workspace-live-agent-node">
-            <span class="live-dot on"></span>
-            <span><strong>${escapeHtml(agent.label)}</strong><small>${escapeHtml(agent.ident)}</small></span>
-          </div>`,
-        )
-        .join("") +
-      (agents.length > 12
-        ? `<div class="workspace-live-overflow">+${agents.length - 12} autres</div>`
-        : "")
-    : `<div class="workspace-live-empty">Aucun agent actif</div>`;
-
-  const taskItems = tasks.length
-    ? tasks
-        .slice(0, 6)
-        .map(
-          (task) => `<span class="workspace-live-task ${task.status}">
-            <b>${escapeHtml(task.id)}</b><small>${escapeHtml(task.claimedBy)}</small>
-          </span>`,
-        )
-        .join("")
-    : `<span class="workspace-live-empty">Aucune tâche</span>`;
-
-  const messageItems = recentMessages.length
-    ? recentMessages
-        .map((message) => {
-          const target = message.to ? ` → ${roomAgentLabel(message.to)}` : " → environnement";
-          const time = new Date(message.ts * 1000).toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-          });
-          return `<div class="workspace-live-event ${message.kind}">
-            <span class="workspace-live-event-time">${escapeHtml(time)}</span>
-            <strong>${escapeHtml(message.fromLabel)}</strong>
-            <span>${escapeHtml(target)}</span>
-            <p>${escapeHtml(message.text)}</p>
-          </div>`;
-        })
-        .join("")
-    : `<div class="workspace-live-empty">Aucun événement récent</div>`;
-
-  return `
-    <div class="workspace-live-kpis">
-      <span><b>${agents.length}</b> agents</span>
-      <span><b>${tasks.filter((task) => task.status === "claimed").length}</b> tâches actives</span>
-      <span><b>${queued}</b> en attente</span>
-      <span class="${running ? "is-running" : ""}"><b>${running}</b> en intégration</span>
-      <span class="${attention ? "needs-attention" : ""}"><b>${attention}</b> à reprendre</span>
-    </div>
-    <div class="workspace-live-topology">
-      <section class="workspace-live-stage workspace-live-agents">
-        <header><i data-lucide="bot"></i><span>Agents actifs</span></header>
-        <div class="workspace-live-agent-list">${agentNodes}</div>
-      </section>
-      <div class="workspace-live-link ${agents.length ? "active" : ""}"><i data-lucide="arrow-right"></i></div>
-      <section class="workspace-live-core ${agents.length ? "active" : ""}">
-        <span class="workspace-live-core-icon"><i data-lucide="folder-git-2"></i></span>
-        <strong>${escapeHtml(workspace ? workspaceBaseName(workspace) : "Environnement")}</strong>
-        <small>${escapeHtml(roomId ? roomId.slice(0, 18) : "scope indisponible")}</small>
-        <em>${agents.length ? "synchronisation active" : "en attente d'agents"}</em>
-      </section>
-      <div class="workspace-live-link ${tasks.length || queued || running ? "active" : ""}"><i data-lucide="arrow-right"></i></div>
-      <section class="workspace-live-pipeline">
-        <div class="workspace-live-pipeline-node">
-          <header><i data-lucide="list-checks"></i><span>Task board</span><b>${tasks.length}</b></header>
-          <div class="workspace-live-task-list">${taskItems}</div>
-        </div>
-        <div class="workspace-live-pipeline-arrow"><i data-lucide="chevron-down"></i></div>
-        <div class="workspace-live-pipeline-node ${running ? "running" : ""}">
-          <header><i data-lucide="git-merge"></i><span>Merge queue</span><b>${queued + running}</b></header>
-          <small>${running ? `${running} intégration(s) en cours` : queued ? `${queued} soumission(s) en attente` : "File vide"}</small>
-        </div>
-        <div class="workspace-live-pipeline-arrow"><i data-lucide="chevron-down"></i></div>
-        <div class="workspace-live-pipeline-node landed">
-          <header><i data-lucide="git-commit-horizontal"></i><span>Intégrés</span><b>${coordination?.landed ?? 0}</b></header>
-          <small>${landed[0]?.landedSha ? `Dernier ${escapeHtml(landed[0].landedSha!.slice(0, 10))}` : "Aucun merge récent"}</small>
-        </div>
-      </section>
-    </div>
-    <section class="workspace-live-events">
-      <header><span><i data-lucide="radio"></i> Événements temps réel</span><small>Actualisation 1 s</small></header>
-      <div class="workspace-live-event-list">${messageItems}</div>
-    </section>`;
-};
-
-const renderWorkspaceLiveGraphModal = (): string => {
-  if (!workspaceLiveGraphOpen) return "";
-  const workspace = currentWorkspace();
-  return `<div class="modal-backdrop workspace-live-backdrop" id="workspaceLiveGraphBackdrop">
-    <section class="modal workspace-live-modal" role="dialog" aria-modal="true" aria-labelledby="workspaceLiveGraphTitle">
-      <header class="modal-head workspace-live-head">
-        <div>
-          <span class="workspace-live-eyebrow"><i data-lucide="activity"></i> Temps réel</span>
-          <h2 id="workspaceLiveGraphTitle">Activité de l'environnement</h2>
-          <p>${escapeHtml(workspace ?? "Aucun environnement actif")}</p>
-        </div>
-        <button class="icon-button" id="closeWorkspaceLiveGraph" title="Fermer"><i data-lucide="x"></i></button>
-      </header>
-      <div class="workspace-live-content" id="workspaceLiveGraphContent">${renderWorkspaceLiveGraphContent()}</div>
-    </section>
-  </div>`;
-};
-
-const openWorkspaceLiveGraph = () => {
-  if (!currentWorkspace()) {
-    statusText = "Choisis d'abord un environnement";
-    render();
-    return;
-  }
-  workspaceLiveGraphOpen = true;
-  render();
-  startRoomPoll();
-  void refreshRoom();
-};
-
-const closeWorkspaceLiveGraph = () => {
-  workspaceLiveGraphOpen = false;
-  if (activeView !== "room") stopRoomPoll();
-  render();
-};
-
-const syncRoomTargetOptions = () => {
-  const select = document.querySelector<HTMLSelectElement>("#roomTarget");
-  if (!select) return;
-  // Ne reconstruit que si le nombre d'agents a change (evite de casser une
-  // selection en cours d'ouverture a chaque poll).
-  if (select.options.length - 1 === roomPresentAgents().length) return;
-  const current = select.value;
-  select.innerHTML = `<option value="">Environnement (tous)</option>${roomTargetOptions()}`;
-  select.value = current;
-};
-
-const refreshRoom = async () => {
-  if (roomRefreshInFlight) return;
-  roomRefreshInFlight = true;
-  try {
-    const workspacePath = currentWorkspace();
-    const workspaceKey = workspacePath ?? "";
-    if (roomMessageWorkspace !== workspaceKey) {
-      roomMessageWorkspace = workspaceKey;
-      roomMessageCursor = 0;
-      roomMessages = [];
-      roomRenderSignature = "";
-    }
-    try {
-      roomStatus = await invoke<RoomStatus>("room_status", {
-        workspacePath,
-      });
-    } catch {
-      return;
-    }
-    if (
-      roomMessageCursor > 0
-      && roomStatus.snapshot.oldestCursor > 0
-      && roomMessageCursor < roomStatus.snapshot.oldestCursor - 1
-    ) {
-      roomMessageCursor = 0;
-      roomMessages = [];
-    }
-    try {
-      const result = await invoke<{ messages: RoomMessage[]; cursor: number }>("room_messages", {
-        since: roomMessageCursor,
-        workspacePath,
-      });
-      const incoming = result.messages ?? [];
-      if (roomMessageCursor === 0) {
-        roomMessages = incoming.slice(-500);
-      } else if (incoming.length) {
-        const known = new Set(roomMessages.map((message) => message.id));
-        roomMessages = [...roomMessages, ...incoming.filter((message) => !known.has(message.id))]
-          .slice(-500);
-      }
-      roomMessageCursor = Math.max(roomMessageCursor, result.cursor ?? 0);
-    } catch {
-      // le fil reste tel quel
-    }
-    if ((currentWorkspace() ?? "") !== workspaceKey) return;
-    const nextRenderSignature = JSON.stringify([roomStatus, roomMessages]);
-    if (nextRenderSignature === roomRenderSignature) return;
-    roomRenderSignature = nextRenderSignature;
-    const summaryEl = document.querySelector<HTMLElement>("#roomStatusSummary");
-    if (summaryEl) summaryEl.textContent = roomStatusSummary();
-    const liveGraph = document.querySelector<HTMLElement>("#workspaceLiveGraphContent");
-    if (liveGraph) {
-      liveGraph.innerHTML = renderWorkspaceLiveGraphContent();
-      renderIcons(liveGraph);
-    }
-    if (activeView !== "room") return;
-    const agentsEl = document.querySelector<HTMLDivElement>("#roomAgents");
-    const feedEl = document.querySelector<HTMLDivElement>("#roomFeed");
-    const coordinationEl = document.querySelector<HTMLElement>("#roomCoordination");
-    if (agentsEl && feedEl) {
-      const atBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 40;
-      agentsEl.innerHTML = renderRoomAgentsInner();
-      feedEl.innerHTML = renderRoomFeedInner();
-      if (coordinationEl) coordinationEl.innerHTML = renderRoomCoordinationInner();
-      syncRoomTargetOptions();
-      renderIcons(agentsEl.parentElement ?? agentsEl);
-      if (atBottom) feedEl.scrollTop = feedEl.scrollHeight;
-    } else {
-      render();
-    }
-  } finally {
-    roomRefreshInFlight = false;
-  }
-};
-
-const startRoomPoll = () => {
-  stopRoomPoll();
-  roomPoll = window.setInterval(
-    () => runWhenPageVisible(() => void refreshRoom()),
-    1000,
-  );
-};
-
-const stopRoomPoll = () => {
-  if (roomPoll !== null) {
-    clearInterval(roomPoll);
-    roomPoll = null;
-  }
-};
-
-const sendRoomMessage = async () => {
-  const input = document.querySelector<HTMLInputElement>("#roomText");
-  const target = document.querySelector<HTMLSelectElement>("#roomTarget");
-  const text = input?.value.trim() ?? "";
-  if (!text) return;
-  const to = target?.value || null;
-  try {
-    await invoke("room_send", { text, to, workspacePath: currentWorkspace() });
-    if (input) input.value = "";
-  } catch (error) {
-    statusText = String(error);
-    render();
-    return;
-  }
-  await refreshRoom();
-};
 
 const removeAccount = async (id: string | null, deleteFiles = false) => {
   if (!settings || !id) return;
@@ -3169,9 +2678,7 @@ const setActiveView = (view: AppView) => {
               ? "Vue discussions"
               : activeView === "history"
                 ? "Vue historique"
-                : activeView === "room"
-                  ? "Vue collaboration"
-                  : activeView === "audit"
+                : activeView === "audit"
                     ? "Audit design"
                     : activeView === "skills"
                       ? "Skills"
@@ -3187,12 +2694,6 @@ const setActiveView = (view: AppView) => {
     startLimitPoll();
   } else {
     stopLimitPoll();
-  }
-
-  if (activeView === "room") {
-    startRoomPoll();
-  } else {
-    stopRoomPoll();
   }
 
   if (activeView === "dashboard") {
@@ -3228,7 +2729,6 @@ const setActiveView = (view: AppView) => {
   if (activeView === "kombai") void refreshKombaiStatus();
   if (activeView === "discussions") void refreshDiscussions();
   if (activeView === "history" && !promptHistoryLoaded) void refreshPromptHistory();
-  if (activeView === "room") void refreshRoom();
   if (activeView === "skills") void refreshSkills();
 };
 
@@ -3557,10 +3057,9 @@ const restoreDiscussionFolder = async (
   return folderPath;
 };
 
-// Quand un terminal isole se ferme, son transcript vient d'etre fusionne dans
-// le home canonique avec le cwd du worktree. On le retrouve par son id (ou par
-// ce cwd pour une nouvelle session), puis on persiste le dossier logique afin
-// que la prochaine reprise retrouve la meme room.
+// Quand un terminal se ferme, on retrouve son transcript par son id (ou par le
+// dossier courant pour une nouvelle session), puis on persiste ce dossier afin
+// que la prochaine reprise restaure le meme contexte.
 const persistTerminalDiscussionFolder = async (session: TerminalSession): Promise<void> => {
   const folderPath = session.folderPath?.trim();
   if (!folderPath) return;
@@ -4108,7 +3607,6 @@ const chatPanelModel = (): ChatPanelModel => {
     turnFinishedAt: chatTurn?.finishedAt ?? null,
     turnError: chatTurn?.status === "failed" ? (chatTurn.error ?? "La reponse a echoue") : null,
     waitingForUser: conversationWaitsForUser(chatMessages),
-    pendingQuestion: chatTurn?.pendingQuestion ?? null,
     quotaStatus: chatQuotaStatusFor(account),
     quotaSuggestion: quotaSuggestionFor(chatTurn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
@@ -4195,136 +3693,6 @@ const stopChatRuntimeClock = () => {
     clearInterval(chatRuntimeClock);
     chatRuntimeClock = null;
   }
-};
-
-type ChatQuestionAnswerPayload = {
-  selected: string[];
-  custom: string | null;
-};
-
-const setChatQuestionStep = (root: ParentNode, requestedIndex: number) => {
-  const dock = root.querySelector<HTMLElement>("[data-chat-control='question']");
-  if (!dock) return;
-  const pages = Array.from(dock.querySelectorAll<HTMLElement>("[data-question-index]"));
-  if (!pages.length) return;
-  const activeIndex = Math.max(0, Math.min(pages.length - 1, requestedIndex));
-  dock.dataset.questionActive = String(activeIndex);
-  pages.forEach((page, index) => {
-    const active = index === activeIndex;
-    page.hidden = !active;
-    page.classList.toggle("is-active", active);
-  });
-  const progress = dock.querySelector<HTMLElement>("[data-question-progress]");
-  if (progress) progress.textContent = `${activeIndex + 1} / ${pages.length}`;
-  const previous = dock.querySelector<HTMLButtonElement>("[data-chat-action='question-prev']");
-  const next = dock.querySelector<HTMLButtonElement>("[data-chat-action='question-next']");
-  const submit = dock.querySelector<HTMLButtonElement>("[data-chat-action='answer-question']");
-  if (previous) previous.disabled = activeIndex === 0;
-  if (next) next.hidden = activeIndex >= pages.length - 1;
-  if (submit) submit.hidden = activeIndex < pages.length - 1;
-};
-
-const collectChatQuestionAnswers = (root: ParentNode): ChatQuestionAnswerPayload[] => {
-  const pages = Array.from(
-    root.querySelectorAll<HTMLElement>("[data-chat-control='question'] [data-question-index]"),
-  );
-  return pages.map((page) => {
-    let selected = Array.from(
-      page.querySelectorAll<HTMLInputElement>(".chat-question-option input:checked"),
-    ).map((input) => input.value);
-    const customValue = page.querySelector<HTMLInputElement>("[data-question-custom]")?.value.trim() ?? "";
-    const multiple = page.dataset.questionMultiple === "true";
-    if (customValue && !multiple) selected = [];
-    if (!selected.length && !customValue) {
-      const header = page.querySelector("legend")?.textContent?.trim() || "cette question";
-      throw new Error(`Choisissez une réponse pour « ${header} ».`);
-    }
-    return { selected, custom: customValue || null };
-  });
-};
-
-const answerStructuredChatQuestion = async (
-  root: HTMLElement,
-  turn: ChatTurnSnapshot | null,
-  applySnapshot: (snapshot: ChatTurnSnapshot) => Promise<void>,
-) => {
-  const dock = root.querySelector<HTMLElement>("[data-chat-control='question']");
-  const questionId = Number(dock?.dataset.questionId);
-  if (!dock || !turn || turn.status !== "running" || !Number.isFinite(questionId)) return;
-  const errorTarget = dock.querySelector<HTMLElement>("[data-question-error]");
-  let answers: ChatQuestionAnswerPayload[];
-  try {
-    answers = collectChatQuestionAnswers(root);
-  } catch (error) {
-    if (errorTarget) errorTarget.textContent = String(error).replace(/^Error:\s*/, "");
-    return;
-  }
-
-  dock.classList.add("is-submitting");
-  dock.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((control) => {
-    control.disabled = true;
-  });
-  if (errorTarget) errorTarget.textContent = "Envoi de votre réponse…";
-  try {
-    const snapshot = await invoke<ChatTurnSnapshot>("answer_chat_question", {
-      id: turn.id,
-      questionId,
-      answers,
-    });
-    await applySnapshot(snapshot);
-  } catch (error) {
-    dock.classList.remove("is-submitting");
-    dock.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button").forEach((control) => {
-      control.disabled = false;
-    });
-    setChatQuestionStep(root, Number(dock.dataset.questionActive || 0));
-    if (errorTarget) errorTarget.textContent = String(error);
-  }
-};
-
-const bindChatQuestionUi = (
-  root: HTMLElement,
-  currentTurn: () => ChatTurnSnapshot | null,
-  applySnapshot: (snapshot: ChatTurnSnapshot) => Promise<void>,
-) => {
-  root.addEventListener("click", (event) => {
-    const target = event.target as HTMLElement | null;
-    const action = target?.closest<HTMLElement>("[data-chat-action]")?.dataset.chatAction;
-    const dock = root.querySelector<HTMLElement>("[data-chat-control='question']");
-    if (!dock) return;
-    const activeIndex = Number(dock.dataset.questionActive || 0);
-    if (action === "focus-question") {
-      dock.scrollIntoView({ behavior: "smooth", block: "center" });
-      dock.querySelector<HTMLInputElement>("input:not(:disabled)")?.focus();
-    } else if (action === "question-prev") {
-      setChatQuestionStep(root, activeIndex - 1);
-    } else if (action === "question-next") {
-      setChatQuestionStep(root, activeIndex + 1);
-    } else if (action === "answer-question") {
-      void answerStructuredChatQuestion(root, currentTurn(), applySnapshot);
-    }
-  });
-  root.addEventListener("input", (event) => {
-    const custom = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
-      "[data-question-custom]",
-    );
-    const page = custom?.closest<HTMLElement>("[data-question-index]");
-    if (custom?.value.trim() && page && page.dataset.questionMultiple !== "true") {
-      page.querySelectorAll<HTMLInputElement>(".chat-question-option input").forEach((input) => {
-        input.checked = false;
-      });
-    }
-  });
-  root.addEventListener("change", (event) => {
-    const option = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
-      ".chat-question-option input",
-    );
-    const page = option?.closest<HTMLElement>("[data-question-index]");
-    if (option?.checked && page && page.dataset.questionMultiple !== "true") {
-      const custom = page.querySelector<HTMLInputElement>("[data-question-custom]");
-      if (custom) custom.value = "";
-    }
-  });
 };
 
 const refreshChatSyncIndicator = () => {
@@ -4458,7 +3826,7 @@ const bindChatFeedScroll = (
   }, { passive: true });
 };
 
-// Patch CIBLE du fil (pattern #roomFeed) : pas de re-render global. Le suivi
+// Patch cible du fil (#chatFeed) : pas de re-render global. Le suivi
 // reste actif jusqu'a une remontee explicite, puis reprend quand le bas est
 // atteint. La position absolue est conservee pendant le remplacement du HTML.
 const refreshChatFeed = () => {
@@ -4534,7 +3902,6 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   }
   if (chatTurn && chatTurn.id !== 0 && snapshot.id !== chatTurn.id) return;
   const previousStatus = chatTurn?.status;
-  const previousQuestionId = chatTurn?.pendingQuestion?.id ?? null;
   const previousStartedAt = chatTurn?.startedAt;
   const previousTurnId = chatTurn?.id;
   if (
@@ -4544,7 +3911,6 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     snapshot = { ...snapshot, startedAt: Math.min(previousStartedAt, snapshot.startedAt) };
   }
   chatTurn = snapshot;
-  const questionChanged = previousQuestionId !== (snapshot.pendingQuestion?.id ?? null);
   const quotaExhausted =
     snapshot.status === "failed" &&
     previousStatus !== "failed" &&
@@ -4572,7 +3938,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     void refreshLimitStatus(true);
   }
   if (activeView === "chat") {
-    if (previousStatus !== snapshot.status || questionChanged) render();
+    if (previousStatus !== snapshot.status) render();
     else refreshChatFeed();
   }
   if (quotaExhausted) refreshQuotaAlternatives();
@@ -4788,10 +4154,6 @@ const closeWorkspace = async (
   const closedActiveWorkspace = !!activePath && workspaceIdForPath(activePath) === id;
   if (closedActiveWorkspace) {
     setCurrentWorkspace(null);
-    workspaceLiveGraphOpen = false;
-    roomStatus = null;
-    roomMessages = [];
-    stopRoomPoll();
   }
   if (terminalFolderFilter && workspaceIdForPath(terminalFolderFilter) === id) {
     terminalFolderFilter = null;
@@ -4980,11 +4342,7 @@ const createExpertChatPane = (
   persisted: Partial<PersistedExpertChatPane> = {},
 ): ExpertChatPane => {
   const capturedWorkspace = userEnvironmentPath(persisted.pendingWorkspace);
-  if (
-    discussion &&
-    capturedWorkspace &&
-    isEphemeralChatWorkspacePath(discussion.cwd)
-  ) {
+  if (discussion && capturedWorkspace && !discussion.folderPath) {
     discussion.folderPath = capturedWorkspace;
   }
 
@@ -5119,7 +4477,6 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     turnFinishedAt: pane.turn?.finishedAt ?? null,
     turnError: pane.turn?.status === "failed" ? (pane.turn.error ?? "La reponse a echoue") : null,
     waitingForUser: conversationWaitsForUser(pane.messages),
-    pendingQuestion: pane.turn?.pendingQuestion ?? null,
     quotaStatus: chatQuotaStatusFor(account),
     quotaSuggestion: quotaSuggestionFor(pane.turn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
@@ -5397,9 +4754,8 @@ const attachCreatedExpertChat = async (
   if (!discussion || !expertChatPanes.includes(pane)) return false;
   const capturedWorkspace = userEnvironmentPath(pane.pendingWorkspace);
   if (capturedWorkspace) {
-    // Le premier snapshot pointe encore vers le worktree physique. Conserver
-    // l'environnement capture a la creation empeche le panneau de disparaitre
-    // de la grille pendant que le backend restaure le cwd logique du JSONL.
+    // Conserver l'environnement capture a la creation empeche le panneau de
+    // disparaitre de la grille avant la persistance du cwd dans le JSONL.
     discussion.folderPath = capturedWorkspace;
     pane.pendingWorkspace = capturedWorkspace;
   }
@@ -5421,7 +4777,6 @@ const applyExpertChatTurnSnapshot = async (
   if (!expertChatPanes.includes(pane)) return;
   if (pane.turn && pane.turn.id !== 0 && snapshot.id !== pane.turn.id) return;
   const previousStatus = pane.turn?.status;
-  const previousQuestionId = pane.turn?.pendingQuestion?.id ?? null;
   const previousStartedAt = pane.turn?.startedAt;
   const previousTurnId = pane.turn?.id;
   if (
@@ -5431,7 +4786,6 @@ const applyExpertChatTurnSnapshot = async (
     snapshot = { ...snapshot, startedAt: Math.min(previousStartedAt, snapshot.startedAt) };
   }
   pane.turn = snapshot;
-  const questionChanged = previousQuestionId !== (snapshot.pendingQuestion?.id ?? null);
   const quotaExhausted =
     snapshot.status === "failed" &&
     previousStatus !== "failed" &&
@@ -5461,7 +4815,7 @@ const applyExpertChatTurnSnapshot = async (
     void refreshLimitStatus(true);
   }
   if (activeView === "chat") {
-    if (previousStatus !== snapshot.status || questionChanged) refreshExpertChatPane(pane);
+    if (previousStatus !== snapshot.status) refreshExpertChatPane(pane);
     else refreshExpertChatFeed(pane);
   }
   if (quotaExhausted) refreshQuotaAlternatives();
@@ -5796,7 +5150,6 @@ const closeExpertChatPane = (pane: ExpertChatPane) => {
 };
 
 const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
-  bindChatQuestionUi(root, () => pane.turn, (snapshot) => applyExpertChatTurnSnapshot(pane, snapshot));
   root.addEventListener("pointerdown", () => {
     if (pane.key !== activeExpertChatKey) activateExpertChatPane(pane);
   });
@@ -6124,7 +5477,6 @@ const bindWorkspaceSwitcherUi = (root: ParentNode = document) => {
       stopUsagePoll();
       stopKombaiPoll();
       stopDiscussionsPoll();
-      stopRoomPoll();
       stopChatSync();
       statusText = `Terminal actif: ${terminalTitle(session)}`;
       render();
@@ -6155,10 +5507,6 @@ const bindWorkspaceSwitcherUi = (root: ParentNode = document) => {
   root.querySelector<HTMLButtonElement>("#wsOpenFolder")?.addEventListener("click", () => {
     openTerminalEnvironmentMenu();
   });
-  root.querySelector<HTMLButtonElement>("#workspaceLiveGraph")?.addEventListener("click", () => {
-    openWorkspaceLiveGraph();
-  });
-
   root
     .querySelectorAll<HTMLElement>("[data-drag-chat][draggable=\"true\"]")
     .forEach((row) => {
@@ -6532,7 +5880,7 @@ const restoreTerminals = async () => {
       settings!.accounts.some((account) => account.id === record.accountId) &&
       !!userEnvironmentPath(record.folderPath),
   );
-  // Un login ephemere peut deja etre affiche sans avoir declenche la
+  // Un login temporaire peut deja etre affiche sans avoir declenche la
   // restauration. Ne jamais depasser la limite en ajoutant les sessions
   // sauvegardees a celles qui sont deja en memoire / en cours de creation.
   const availableSlots = Math.max(
@@ -6846,7 +6194,6 @@ const openFolderTerminals = async (value: string): Promise<void> => {
   stopUsagePoll();
   stopKombaiPoll();
   stopDiscussionsPoll();
-  stopRoomPoll();
   stopChatSync();
   statusText = `Ouverture de l'environnement ${workspace.label}`;
   render();
@@ -7069,8 +6416,6 @@ function mobileViewLabel(view: AppView): string {
       return "Conversation";
     case "history":
       return "Historique";
-    case "room":
-      return "Salon";
     case "audit":
       return "Audit";
     case "skills":
@@ -7150,7 +6495,6 @@ function ensureMobileChrome(): void {
       <button class="m-tab" type="button" data-view="terminal"><i data-lucide="square-terminal"></i><span>Terminal</span></button>
       <button class="m-tab" type="button" data-view="pool"><i data-lucide="server"></i><span>Pool</span></button>
       <button class="m-tab" type="button" data-view="dashboard"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
-      <button class="m-tab" type="button" data-view="room"><i data-lucide="users"></i><span>Salon</span></button>
       <button class="m-tab" type="button" data-m="menu"><i data-lucide="layout-grid"></i><span>Menu</span></button>
     </nav>
     <div class="m-scrim" data-m="scrim"></div>
@@ -7318,12 +6662,6 @@ const chatWorkspaceSidebarGroups = (): ChatWorkspaceSidebarGroup[] => {
   return result;
 };
 
-const compactWorkspaceId = (session: TerminalSession): string => {
-  const id = session.workspaceId?.trim();
-  if (!id) return session.running ? "preparation" : "en attente";
-  return id.length > 12 ? id.slice(-8) : id;
-};
-
 const terminalSearchValues = (session: TerminalSession): string[] => {
   const agent = agentById(session.agentId);
   const account = accountById(session.accountId);
@@ -7353,12 +6691,12 @@ const renderFolderTerminalGroups = (sessions: TerminalSession[]): string => {
       const items = agentSessions
         .sort((left, right) => (right.startedAtUnix ?? 0) - (left.startedAtUnix ?? 0))
         .map((session) => {
-          const workspaceDetail = session.workspacePath ?? "Workspace physique en preparation";
+          const workspaceDetail = session.workspacePath ?? session.folderPath ?? "Dossier en preparation";
           return `<button type="button" class="chat-folder-terminal ${session.key === activeTerminalKey ? "active" : ""}" data-open-folder-terminal="${escapeAttr(session.key)}" title="${escapeAttr(workspaceDetail)}">
             <span class="live-dot ${session.running ? "on" : ""}"></span>
             <span class="chat-folder-terminal-copy">
               <strong>${escapeHtml(terminalTitle(session))}</strong>
-              <small>${escapeHtml(session.status)} · WS ${escapeHtml(compactWorkspaceId(session))}</small>
+              <small>${escapeHtml(session.status)} · ${escapeHtml(workspaceBaseName(workspaceDetail))}</small>
             </span>
             <i data-lucide="square-terminal"></i>
           </button>`;
@@ -7506,7 +6844,7 @@ const renderWorkspaceSwitcher = (): string => {
     ? knownWorkspaces().find((workspace) => workspace.id === workspaceIdForPath(environmentPath))
     : null;
   const label = environment?.label ?? (environmentPath ? workspaceBaseName(environmentPath) : "Choisir un environnement");
-  const detail = environmentPath ?? "Chats, agents et collaboration";
+  const detail = environmentPath ?? "Chats et terminaux";
 
   return `
     <section class="chat-workspace-overview" id="chatWsSwitcher" data-ws-sig="${escapeAttr(workspaceSwitcherSignature())}">
@@ -7520,11 +6858,6 @@ const renderWorkspaceSwitcher = (): string => {
         <kbd aria-label="Raccourci accent grave">&#96;</kbd>
         <i data-lucide="chevrons-up-down"></i>
       </button>
-      ${environmentPath
-        ? `<button type="button" id="workspaceLiveGraph" class="chat-workspace-add workspace-live-launch" title="Voir l'activité temps réel de l'environnement" aria-label="Activité temps réel de l'environnement">
-          <i data-lucide="activity"></i>
-        </button>`
-        : ""}
     </section>`;
 };
 
@@ -7546,8 +6879,6 @@ const appViewTitle = (view: AppView): string => {
       return "Toutes les conversations";
     case "history":
       return "Historique";
-    case "room":
-      return "Collaboration de l'environnement";
     case "audit":
       return "Audit de l'interface";
     case "skills":
@@ -7609,8 +6940,6 @@ const renderActiveAppPanel = (): string => {
       return renderDiscussionsPanel();
     case "history":
       return renderPromptHistoryPanel();
-    case "room":
-      return renderRoomPanel();
     case "audit":
       return renderAuditPanel();
     case "skills":
@@ -7682,7 +7011,7 @@ const renderTerminalEnvironmentMenu = (): string => {
         <span class="terminal-environment-menu-mark"><i data-lucide="folders"></i></span>
         <span>
           <h2 id="terminalEnvironmentMenuTitle">Choisir un environnement</h2>
-          <p>Un environnement regroupe ses chats, ses agents et leur collaboration.</p>
+          <p>Un environnement regroupe ses chats et ses terminaux.</p>
         </span>
         <kbd aria-label="Raccourci accent grave">&#96;</kbd>
         <button type="button" class="icon-button" id="closeTerminalEnvironmentMenu" title="Fermer le menu" aria-label="Fermer le menu">
@@ -7739,8 +7068,8 @@ const renderExpertTerminalGrid = () => {
   const panes = sessions
     .map((session, index) => {
       const sessionAgentLabel = agentById(session.agentId)?.label ?? session.agentId;
-      const workspaceLabel = `WS ${compactWorkspaceId(session)}`;
-      const workspaceDetail = session.workspacePath ?? "Workspace physique en preparation";
+      const workspaceDetail = session.workspacePath ?? session.folderPath ?? "Dossier en preparation";
+      const workspaceLabel = workspaceBaseName(workspaceDetail);
       return `
         <article class="expert-terminal-pane ${session.key === activeTerminalKey ? "active" : ""} ${session.running ? "running" : ""} ${session.key === expertTerminalFullscreenKey ? "is-fullscreen" : ""}" data-expert-terminal-pane="${escapeAttr(session.key)}">
           <header class="expert-terminal-pane-head">
@@ -7859,9 +7188,6 @@ const renderExpertChatGrid = () => {
           <button type="button" data-open-discussions class="tool-button resume-discussion-button" title="Choisir une discussion a reprendre">
             <i data-lucide="messages-square"></i><span>Reprendre une discussion</span>
           </button>
-          <button id="openEnvironmentCollaboration" type="button" class="tool-button" title="Ouvrir l'espace ou les agents de cet environnement se parlent">
-            <i data-lucide="users"></i><span>Collaboration</span>
-          </button>
           <button id="addExpertChat" type="button" class="tool-button primary" title="Ouvrir un nouveau chat dans cet environnement" ${hasAccounts ? "" : "disabled"}>
             <i data-lucide="plus"></i><span>Ouvrir un chat</span>
           </button>
@@ -7912,7 +7238,6 @@ const renderChatFirstShell = () => {
           <button id="sideDiscussions" class="${activeView === "discussions" ? "active" : ""}" title="Discussions — reprendre une conversation dans un autre compte"><i data-lucide="messages-square"></i><span>Discussions</span></button>
           <button id="dashboardToggle" class="${activeView === "dashboard" ? "active" : ""}" title="Statistiques"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
           <button id="limitsToggle" class="${activeView === "limits" ? "active" : ""}" title="Limites"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
-          <button id="roomToggle" class="${activeView === "room" ? "active" : ""}" title="Collaboration de l'environnement"><i data-lucide="users"></i><span>Collab</span></button>
           <button id="skillsToggle" class="${activeView === "skills" ? "active" : ""}" title="Skills"><i data-lucide="library"></i><span>Skills</span></button>
         </nav>
 
@@ -7959,7 +7284,6 @@ const renderChatFirstShell = () => {
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
     ${renderTerminalEnvironmentMenu()}
-    ${renderWorkspaceLiveGraphModal()}
     ${renderCodexModelSuggestions()}
   `;
 
@@ -8156,11 +7480,6 @@ const renderLegacyTerminalShell = () => {
               </button>`
                 : ""}
             </div>
-            ${workspacePath
-              ? `<button id="workspaceLiveGraph" class="tool-button workspace-live-button" title="Activité temps réel de l'environnement">
-                <i data-lucide="activity"></i><span>Activité live</span>
-              </button>`
-              : ""}
             <button id="fullscreenToggle" class="icon-button wide ${isFullscreen ? "active" : ""}" title="${isFullscreen ? "Quitter plein ecran (F11)" : "Plein ecran (F11)"}" aria-label="${isFullscreen ? "Quitter plein ecran" : "Plein ecran"}" aria-pressed="${isFullscreen}">
               <i data-lucide="${isFullscreen ? "minimize-2" : "maximize-2"}"></i>
             </button>
@@ -8187,10 +7506,6 @@ const renderLegacyTerminalShell = () => {
             <button id="historyToggle" class="tool-button ${activeView === "history" ? "primary" : ""}" title="Historique des demandes (recherche)">
               <i data-lucide="history"></i>
               <span>Historique</span>
-            </button>
-            <button id="roomToggle" class="tool-button ${activeView === "room" ? "primary" : ""}" title="Collaboration native de l'environnement">
-              <i data-lucide="users"></i>
-              <span>Collab</span>
             </button>
             <button id="auditToggle" class="tool-button ${activeView === "audit" ? "primary" : ""}" title="Audit design de la vue affichée (détecteur Impeccable)">
               <i data-lucide="scan-eye"></i>
@@ -8248,9 +7563,7 @@ const renderLegacyTerminalShell = () => {
                       ? renderDiscussionsPanel()
                       : activeView === "history"
                         ? renderPromptHistoryPanel()
-                        : activeView === "room"
-                          ? renderRoomPanel()
-                          : activeView === "audit"
+                        : activeView === "audit"
                             ? renderAuditPanel()
                             : activeView === "skills"
                               ? renderSkillsPanel()
@@ -8268,7 +7581,6 @@ const renderLegacyTerminalShell = () => {
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
     ${renderTerminalEnvironmentMenu()}
-    ${renderWorkspaceLiveGraphModal()}
     ${renderCodexModelSuggestions()}
   `;
 
@@ -8613,7 +7925,7 @@ const renderNewTerminalModal = () => {
                   <i data-lucide="folder-open"></i>
                 </button>
               </div>
-              <small class="new-terminal-environment-help">Les fichiers, le cwd, le worktree et le home de l'agent seront separes des autres onglets.</small>
+              <small class="new-terminal-environment-help">Le terminal utilisera directement ce dossier avec le home habituel du compte.</small>
             </label>
             <label>
               <span>2. Agent</span>
@@ -8797,9 +8109,7 @@ const renderWorkspaceModal = () => {
   if (!workspaceModalOpen) return "";
 
   const data = workspaceBrowse;
-  const entries = (data?.entries ?? []).filter(
-    (entry) => !isEphemeralChatWorkspacePath(entry.path),
-  );
+  const entries = data?.entries ?? [];
   const selectableBrowsePath = userEnvironmentPath(data?.path);
   const breadcrumbs = workspacePathBreadcrumbs(data?.root, data?.path);
   const breadcrumbTrail = breadcrumbs
@@ -10105,10 +9415,6 @@ const bindUi = () => {
   document.querySelector<HTMLButtonElement>("#addExpertChat")?.addEventListener("click", () => {
     openNewChatModal();
   });
-  document.querySelector<HTMLButtonElement>("#openEnvironmentCollaboration")?.addEventListener("click", () => {
-    setActiveView("room");
-  });
-
   document.querySelectorAll<HTMLButtonElement>("[data-add-expert-terminal]").forEach((button) => {
     button.addEventListener("click", () => openNewTerminalModal(terminalFolderFilter ?? undefined));
   });
@@ -10190,7 +9496,6 @@ const bindUi = () => {
       stopUsagePoll();
       stopKombaiPoll();
       stopDiscussionsPoll();
-      stopRoomPoll();
       stopChatSync();
       statusText = "Terminal selectionne";
       render();
@@ -10219,7 +9524,6 @@ const bindUi = () => {
       stopUsagePoll();
       stopKombaiPoll();
       stopDiscussionsPoll();
-      stopRoomPoll();
       stopChatSync();
       statusText = `Environnement actif: ${group.label}`;
       render();
@@ -10624,11 +9928,6 @@ const bindUi = () => {
     setActiveView("kombai");
   });
 
-  document.querySelector<HTMLButtonElement>("#roomToggle")?.addEventListener("click", () => {
-    if (userEnvironmentPath(currentWorkspace())) setActiveView("room");
-    else openTerminalEnvironmentMenu();
-  });
-
   document.querySelector<HTMLButtonElement>("#auditToggle")?.addEventListener("click", () => {
     void toggleAudit();
   });
@@ -10659,19 +9958,6 @@ const bindUi = () => {
     }
     const copyEl = target.closest<HTMLElement>("[data-skill-copy]");
     if (copyEl?.dataset.skillCopy) void copySkill(copyEl.dataset.skillCopy);
-  });
-
-  document.querySelector<HTMLButtonElement>("#roomRefresh")?.addEventListener("click", () => {
-    void refreshRoom();
-  });
-
-  document.querySelector<HTMLSelectElement>("#roomTarget")?.addEventListener("change", (event) => {
-    roomComposeTarget = (event.target as HTMLSelectElement).value;
-  });
-
-  document.querySelector<HTMLFormElement>("#roomComposer")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    void sendRoomMessage();
   });
 
   document.querySelector<HTMLButtonElement>("#kombaiStart")?.addEventListener("click", () => {
@@ -10776,7 +10062,6 @@ const bindUi = () => {
   });
   const mainChatPanel = document.querySelector<HTMLElement>("#chatPanel");
   if (mainChatPanel) {
-    bindChatQuestionUi(mainChatPanel, () => chatTurn, applyChatTurnSnapshot);
   }
   mainChatPanel?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
@@ -10784,12 +10069,6 @@ const bindUi = () => {
     document.querySelector<HTMLTextAreaElement>("#chatPrompt")?.focus();
   });
 
-  document.querySelector<HTMLButtonElement>("#closeWorkspaceLiveGraph")?.addEventListener("click", () => {
-    closeWorkspaceLiveGraph();
-  });
-  document.querySelector<HTMLDivElement>("#workspaceLiveGraphBackdrop")?.addEventListener("click", (event) => {
-    if (event.target === event.currentTarget) closeWorkspaceLiveGraph();
-  });
   document
     .querySelector<HTMLButtonElement>("#chatPanel [data-chat-action='quota-switch'][data-quota-account]")
     ?.addEventListener("click", (event) => {
@@ -11325,7 +10604,6 @@ const createNewTerminalOnce = async (
   stopLimitPoll();
   stopUsagePoll();
   stopDiscussionsPoll();
-  stopRoomPoll();
   stopChatSync();
   stopChatTurnPoll();
   statusText = "Demarrage terminal";
@@ -11614,7 +10892,6 @@ const setupEvents = async () => {
     if (activeView === "pool") void refreshPoolStatus();
     if (activeView === "dashboard") void refreshUsageDashboard();
     if (activeView === "kombai") void refreshKombaiStatus();
-    if (activeView === "room") void refreshRoom();
     if (activeView === "chat") {
       if (chatTurn?.status === "running") void pollChatTurn();
       visibleExpertChatPanes().forEach((pane) => {
@@ -11686,7 +10963,7 @@ const setupEvents = async () => {
     if (!isEnvironmentShortcut || event.repeat || !settings) return;
     if (
       !terminalEnvironmentMenuOpen &&
-      (newTerminalModalOpen || agentsModalOpen || workspaceModalOpen || workspaceLiveGraphOpen)
+      (newTerminalModalOpen || agentsModalOpen || workspaceModalOpen)
     ) {
       return;
     }
@@ -11775,12 +11052,6 @@ const setupEvents = async () => {
     if (event.key === "Escape" && newTerminalModalOpen) {
       event.preventDefault();
       closeNewTerminalModal();
-      return;
-    }
-
-    if (event.key === "Escape" && workspaceLiveGraphOpen) {
-      event.preventDefault();
-      closeWorkspaceLiveGraph();
       return;
     }
 

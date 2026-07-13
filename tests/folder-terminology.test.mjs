@@ -6,14 +6,11 @@ const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const chatView = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
 const platform = readFileSync(new URL("../src/platform.ts", import.meta.url), "utf8");
 
-test("l'interface presente les workspaces techniques comme des environnements", () => {
+test("l'interface presente les projets comme des environnements", () => {
   for (const label of [
     "Choisir un environnement",
-    "Chats, agents et collaboration",
     "Choisir l'environnement actif",
     "Environnement de ce terminal",
-    "Collaboration de l'environnement",
-    "Activité de l'environnement",
   ]) {
     assert.ok(main.includes(label), `libelle manquant: ${label}`);
   }
@@ -28,7 +25,6 @@ test("les anciens libelles workspace ne reapparaissent pas dans l'interface", ()
     "<strong>Workspaces</strong>",
     "Workspace de ce terminal",
     "Choisir le workspace actif",
-    "Collaboration du workspace",
     "Aucun workspace actif",
     "Workspace actif:",
     "Choisir ou ajouter un workspace",
@@ -38,8 +34,6 @@ test("les anciens libelles workspace ne reapparaissent pas dans l'interface", ()
     "<strong>Dossiers</strong>",
     "Choisir le dossier actif",
     "Dossier de ce terminal",
-    "Collaboration du dossier",
-    "Activité du dossier",
     "explore le dossier",
     "travaille dans le dossier",
   ]) {
@@ -52,7 +46,7 @@ test("un terminal reste rattache a l'environnement actif", () => {
     "openFolderTerminals",
     "data-open-folder-terminal",
     "folder-terminal-panel",
-    "Workspace physique en preparation",
+    "Dossier en preparation",
     "Environnement actif",
   ]) {
     assert.ok(main.includes(marker), `parcours environnement/terminal incomplet: ${marker}`);

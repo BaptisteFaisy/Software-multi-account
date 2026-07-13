@@ -14,7 +14,6 @@ import {
 
 const view = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-const platform = readFileSync(new URL("../src/platform.ts", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 const chatBackend = readFileSync(new URL("../src-tauri/src/chat.rs", import.meta.url), "utf8");
 
@@ -97,14 +96,14 @@ test("les durees et resets sont lisibles pendant un long tour", () => {
   assert.equal(formatChatResetCountdown(10_000, 6_400), "dans 1 h");
 });
 
-test("le chat expose le chronometre, le quota et le dock de question", () => {
+test("le chat expose le chronometre, le quota et la reponse classique", () => {
   assert.match(view, /data-chat-control="runtime"/);
   assert.match(view, /data-chat-elapsed/);
   assert.match(view, /data-chat-elapsed-value/);
   assert.match(view, /Temps écoulé depuis le début du tour/);
   assert.match(view, /Quota épuisé/);
   assert.match(view, /Votre réponse est attendue/);
-  assert.match(view, /structuredWaiting \? "focus-question" : "focus-prompt"/);
+  assert.match(view, /data-chat-action="focus-prompt"/);
   assert.match(main, /activeView === "limits" \|\| activeView === "chat"/);
   assert.match(main, /startedAt: Math\.floor\(Date\.now\(\) \/ 1000\)/);
   assert.match(main, /startedAt: Math\.min\(previousStartedAt, snapshot\.startedAt\)/);
@@ -122,21 +121,6 @@ test("le bandeau du chat indique en couleur si le tour est en cours", () => {
   assert.match(style, /\.chat-turn-status--running \{[\s\S]*?background: #f59e0b;/);
   assert.match(style, /\.chat-turn-status--finalizing \{[\s\S]*?background: #22c55e;/);
   assert.match(main, /\[data-chat-control='turn-status'\]/);
-});
-
-test("une question structuree suspend le tour et propose choix plus reponse libre", () => {
-  assert.match(view, /data-chat-control="question"/);
-  assert.match(view, /Le même tour reprendra/);
-  assert.match(view, /question\.options\.map/);
-  assert.match(view, /data-question-custom/);
-  assert.match(view, /data-chat-action="answer-question"/);
-  assert.match(view, /model\.pendingQuestion \? "is-question-pending"/);
-  assert.match(view, /turnStatus === "running" && !pendingQuestion/);
-  assert.match(style, /\.chat-composer\.is-question-pending \{ display: none; \}/);
-  assert.match(main, /answerStructuredChatQuestion/);
-  assert.match(main, /collectChatQuestionAnswers/);
-  assert.match(platform, /answer_chat_question/);
-  assert.match(platform, /questions\/\$\{encodeURIComponent\(String\(args\.questionId\)\)\}\/answer/);
 });
 
 test("la pensee visible diffuse les resumes sans exposer le raisonnement brut", () => {

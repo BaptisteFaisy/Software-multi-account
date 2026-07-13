@@ -5,10 +5,9 @@ import test from "node:test";
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 
-test("l'etat de la collaboration est rafraichi apres la reponse serveur", () => {
-  assert.match(main, /const roomStatusSummary = \(\): string =>/);
-  assert.match(main, /id="roomStatusSummary"/);
-  assert.match(main, /summaryEl\.textContent = roomStatusSummary\(\);/);
+test("l'interface charge directement la grille de chats", () => {
+  assert.match(main, /const renderChatFirstShell = \(\) =>/);
+  assert.match(style, /\.chat-app-layout/);
 });
 
 test("la navigation mobile reste disponible dans la coque multi-chat", () => {

@@ -12,8 +12,8 @@ $StaticDir = Join-Path $Root "dist"
 $ServerExe = Join-Path $Root "src-tauri\target\release\cst-server.exe"
 
 function Assert-CheckoutIsNotStale {
-  # Tous les worktrees partagent refs/remotes/origin/main. Les pushes des agents
-  # mettent donc cette ref a jour meme si le checkout principal n'a pas suivi.
+  # Un autre checkout peut avancer refs/remotes/origin/main meme si ce dossier
+  # n'a pas encore ete synchronise.
   # Refuser un ancetre connu evite qu'un simple restart republie une vieille UI.
   if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     return

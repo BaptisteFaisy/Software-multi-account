@@ -1,7 +1,7 @@
 # Thermo-Nuclear Code Quality Review
 
 > Source: https://github.com/cursor/plugins/tree/main/cursor-team-kit/skills/thermo-nuclear-code-quality-review
-> Original frontmatter had `disable-model-invocation: true`. In AgentsRoom this is saved as an always-available skill so it can be applied to every code review across the app and the website.
+> Original frontmatter had `disable-model-invocation: true`. This copy is saved as an always-available skill so it can be applied to every code review across the app and the website.
 
 Use this skill for an unusually strict review focused on implementation quality, maintainability, abstraction quality, and codebase health.
 

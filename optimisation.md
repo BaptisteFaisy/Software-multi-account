@@ -33,18 +33,16 @@ La dépendance aux polices Google a été supprimée du chemin critique. Le navi
 ### Rendu, DOM et utilisation CPU
 
 - Remplacement du passage global de Lucide par un rendu d'icônes limité au sous-arbre réellement modifié. Les SVG déjà présents ne sont plus détruits et recréés à chaque rafraîchissement.
-- Signatures de rendu pour les flux de chat, états d'exécution, discussions, limites, usage, pool et collaboration. Un état identique ne déclenche plus de reconstruction DOM.
+- Signatures de rendu pour les flux de chat, états d'exécution, discussions, limites, usage et pool. Un état identique ne déclenche plus de reconstruction DOM.
 - Cache LRU du rendu Markdown, limité à 128 entrées et à un poids cumulé d'environ un million de caractères. Les anciens messages ne sont plus reparsés à chaque fragment reçu, et la mémoire reste bornée.
 - `content-visibility: auto` sur les anciens tours de chat et les longues listes. Le navigateur peut ignorer le layout et la peinture des éléments hors écran.
 - Synchronisation et polling limités aux chats visibles sur la page courante. Les réponses continuent côté backend ; leur état est resynchronisé lorsque le chat redevient visible.
 - Remplacement de la recherche linéaire d'un terminal pour chaque paquet PTY par une `Map` indexée par identifiant.
-- Vérification de l'environnement avant d'appliquer une réponse asynchrone de collaboration, afin de ne pas peindre les données de l'environnement précédent.
 
 ### Polling, réseau et tâches en arrière-plan
 
 - Tous les intervalles coûteux sont suspendus lorsque la page est masquée, puis les données utiles sont actualisées dès le retour au premier plan.
-- Protection « single flight » sur les scans de discussions et les requêtes pool, usage, Kombai et collaboration : deux ticks ne peuvent plus lancer la même opération simultanément.
-- La collaboration demande uniquement les messages postérieurs au dernier curseur, déduplique les réponses et conserve au maximum 500 messages dans le DOM, au lieu de recharger tout l'historique chaque seconde.
+- Protection « single flight » sur les scans de discussions et les requêtes pool, usage et Kombai : deux ticks ne peuvent plus lancer la même opération simultanément.
 - Le polling local des transcripts inactifs passe de 1 à 2 secondes. Le statut d'un tour actif garde sa fréquence de 550 ms pour préserver la réactivité.
 - Les sondes de santé simultanées des nœuds de terminal distants sont fusionnées. Le résultat n'est volontairement pas conservé après le vol courant : une nouvelle ouverture revalide immédiatement l'état `draining/ready` et ne peut pas réintroduire un nœud en maintenance.
 - Les fallbacks de polling restent présents si un WebSocket est indisponible, mais ils ne travaillent plus en arrière-plan lorsque l'onglet est caché.
@@ -110,7 +108,7 @@ Sans ces données réelles, les réductions de bundle ci-dessus sont certaines, 
 - Découper/purger `src/style.css` (environ 213 Ko source) par fonctionnalité. Le CSS produit reste le plus gros bloc bloquant après le JavaScript initial.
 - Remplacer les reconstructions `innerHTML` restantes des longues conversations par une liste virtualisée avec patchs indexés par identifiant de message.
 - Côté desktop, suivre la fin des JSONL de façon incrémentale et utiliser un watcher de fichiers au lieu de relire un transcript complet à chaque changement.
-- Remplacer les derniers fallbacks de polling par des événements Tauri ou des flux WebSocket, notamment pour la collaboration locale et les limites.
+- Remplacer les derniers fallbacks de polling par des événements Tauri ou des flux WebSocket, notamment pour les limites.
 - Pour des dizaines de milliers de sessions, maintenir un index persistant des métadonnées de discussions au lieu d'énumérer tous les chemins afin de calculer chaque révision.
 
 ### Priorité 2 — livraison et budgets

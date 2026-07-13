@@ -36,19 +36,16 @@ test("la touche accent grave ouvre le menu des environnements", () => {
   assert.match(style, /\.terminal-environment-menu-backdrop/);
 });
 
-test("l'environnement actif contient ses propres chats et sa collaboration", () => {
+test("l'environnement actif contient ses propres chats", () => {
   for (const marker of [
     "expertChatPanesForCurrentEnvironment",
     "expertChatPaneEnvironmentPath",
     "Chats de cet environnement",
-    "openEnvironmentCollaboration",
-    "Collaboration de l'environnement",
   ]) {
     assert.ok(main.includes(marker), `contexte d'environnement incomplet: ${marker}`);
   }
   assert.match(main, /workspaceIdForPath\(panePath\) === environmentId/);
   assert.match(main, /discussion\.folderPath = capturedWorkspace/);
-  assert.match(main, /isEphemeralChatWorkspacePath\(discussion\.cwd\)/);
 });
 
 test("un nouveau chat s'ouvre via une fenetre de choix du compte", () => {
@@ -94,11 +91,11 @@ test("le choix d'environnement propose un explorateur de dossiers navigable", ()
   assert.match(style, /\.ws-folder-toolbar/);
 });
 
-test("les workspaces temporaires des agents ne deviennent jamais des environnements", () => {
+test("les dossiers choisis sont utilises directement", () => {
   assert.match(main, /userEnvironmentPath\(stored\)/);
   assert.match(main, /userEnvironmentPath\(discussion\?\.folderPath\)/);
-  assert.match(main, /!isEphemeralChatWorkspacePath\(entry\.path\)/);
-  assert.match(main, /workspace technique temporaire et ne peut pas etre ajoute/);
+  assert.match(desktop, /provider\.home_env_var\(\)/);
+  assert.match(desktop, /builder\.cwd\(project_dir\.as_os_str\(\)\)/);
 });
 
 test("un environnement peut etre retire depuis son menu sans effacer ses fichiers", () => {

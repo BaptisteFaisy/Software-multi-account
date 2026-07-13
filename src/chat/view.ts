@@ -68,24 +68,6 @@ export type ChatQuotaStatus = {
   detail: string;
 };
 
-export type ChatQuestionOption = {
-  label: string;
-  description?: string | null;
-};
-
-export type ChatQuestionPrompt = {
-  header: string;
-  question: string;
-  options: ChatQuestionOption[];
-  multiple: boolean;
-};
-
-export type ChatPendingQuestion = {
-  id: number;
-  questions: ChatQuestionPrompt[];
-  askedAt: number;
-};
-
 export type ChatSyncState =
   | "connecting"
   | "live"
@@ -112,7 +94,6 @@ export type ChatPanelModel = {
   turnFinishedAt: number | null;
   turnError: string | null;
   waitingForUser: boolean;
-  pendingQuestion: ChatPendingQuestion | null;
   quotaStatus: ChatQuotaStatus;
   quotaSuggestion: ChatQuotaSuggestion | null;
   accounts: ChatAccountOption[];
@@ -222,9 +203,8 @@ const renderActivities = (activities: ChatActivity[]): string => {
 const renderThoughtStream = (
   thoughts: ChatThought[],
   turnStatus: ChatTurnStatus,
-  pendingQuestion: ChatPendingQuestion | null,
 ): string => {
-  const live = turnStatus === "running" && !pendingQuestion;
+  const live = turnStatus === "running";
   if (!live && !thoughts.length) return "";
   const visibleThoughts = thoughts.length
     ? thoughts
@@ -410,7 +390,7 @@ const renderOpenCodeParts = (
 };
 
 const renderOpenCodeThinking = (model: ChatPanelModel): string => {
-  if (model.turnStatus !== "running" || model.pendingQuestion || model.parts.length) return "";
+  if (model.turnStatus !== "running" || model.parts.length) return "";
   return `<div data-component="thinking-row" class="chat-thinking-row" aria-live="polite">
     <span class="chat-thinking-shimmer">Thinking</span>
   </div>`;
@@ -496,8 +476,7 @@ const quotaStatusLabel = (quota: ChatQuotaStatus): string => {
 };
 
 const renderLegacyChatRuntimeStatus = (model: ChatPanelModel): string => {
-  const structuredWaiting = !!model.pendingQuestion;
-  const waitingForUser = structuredWaiting || (model.waitingForUser && model.turnStatus !== "running");
+  const waitingForUser = model.waitingForUser && model.turnStatus !== "running";
   const runningActivity = [...model.activities]
     .reverse()
     .find((activity) => activity.status === "running" || activity.status === "queued");
@@ -510,9 +489,7 @@ const renderLegacyChatRuntimeStatus = (model: ChatPanelModel): string => {
   if (waitingForUser) {
     state = "idle";
     title = "Votre réponse est attendue";
-    detail = structuredWaiting
-      ? "Le tour est en pause et reprendra avec votre réponse."
-      : "L'assistant vous a posé une question dans son dernier message.";
+    detail = "L'assistant vous a posé une question dans son dernier message.";
     icon = "message-circle-question";
   } else if (model.turnStatus === "running") {
     title = `${model.providerLabel || "L'agent"} travaille`;
@@ -566,13 +543,12 @@ const renderLegacyChatRuntimeStatus = (model: ChatPanelModel): string => {
         ${quota.resetAt ? `<small data-chat-reset data-chat-reset-at="${quota.resetAt}">${escapeHtml(quotaReset)}</small>` : ""}
       </span>
     </span>
-    ${waitingForUser ? `<button type="button" class="tool-button primary chat-runtime-reply" data-chat-action="${structuredWaiting ? "focus-question" : "focus-prompt"}"><i data-lucide="reply"></i><span>Répondre</span></button>` : ""}
+    ${waitingForUser ? `<button type="button" class="tool-button primary chat-runtime-reply" data-chat-action="focus-prompt"><i data-lucide="reply"></i><span>Répondre</span></button>` : ""}
   </section>`;
 };
 
 export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
-  const structuredWaiting = !!model.pendingQuestion;
-  const waitingForUser = structuredWaiting || (model.waitingForUser && model.turnStatus !== "running");
+  const waitingForUser = model.waitingForUser && model.turnStatus !== "running";
   const runningActivity = [...model.activities]
     .reverse()
     .find((activity) => activity.status === "running" || activity.status === "queued");
@@ -612,7 +588,7 @@ export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
       ${quotaPercent === null ? "" : `<span class="chat-runtime-quota-meter" aria-hidden="true"><span style="width:${quotaPercent}%"></span></span>`}
       ${quota.resetAt ? `<small data-chat-reset data-chat-reset-at="${quota.resetAt}">${escapeHtml(quotaReset)}</small>` : ""}
     </span>
-    ${waitingForUser ? `<button type="button" class="chat-runtime-reply" data-chat-action="${structuredWaiting ? "focus-question" : "focus-prompt"}"><i data-lucide="reply"></i><span>Repondre</span></button>` : ""}
+    ${waitingForUser ? `<button type="button" class="chat-runtime-reply" data-chat-action="focus-prompt"><i data-lucide="reply"></i><span>Repondre</span></button>` : ""}
   </div>`;
 };
 
@@ -630,47 +606,6 @@ export const renderChatTurnStatus = (model: ChatPanelModel): string => {
     <span class="chat-turn-status-dot" aria-hidden="true"></span>
     <span class="chat-turn-status-label">${label}</span>
   </button>`;
-};
-
-const renderChatQuestionDock = (model: ChatPanelModel, instanceId: string): string => {
-  const pending = model.pendingQuestion;
-  if (!pending?.questions.length) return "";
-  const inputPrefix = `${instanceId || "main"}-question-${pending.id}`;
-  return `<section class="chat-question-dock" data-component="dock-prompt" data-kind="question" data-chat-control="question" data-question-id="${pending.id}" data-question-count="${pending.questions.length}" data-question-active="0" aria-live="assertive">
-    <div class="chat-question-shell" data-slot="question-body">
-    <header class="chat-question-head" data-slot="question-header">
-      <span class="chat-question-icon"><i data-lucide="message-circle-question"></i></span>
-      <span><strong>Décision requise</strong><small>Le même tour reprendra après votre réponse.</small></span>
-      <span class="chat-question-progress" data-question-progress>1 / ${pending.questions.length}</span>
-    </header>
-    <div class="chat-question-pages" data-slot="question-content">
-      ${pending.questions.map((question, questionIndex) => {
-        const inputType = question.multiple ? "checkbox" : "radio";
-        const inputName = `${inputPrefix}-${questionIndex}`;
-        return `<fieldset class="chat-question-page ${questionIndex === 0 ? "is-active" : ""}" data-question-index="${questionIndex}" data-question-multiple="${question.multiple ? "true" : "false"}" ${questionIndex === 0 ? "" : "hidden"}>
-          <legend>${escapeHtml(question.header)}</legend>
-          <p>${escapeHtml(question.question)}</p>
-          <div class="chat-question-options">
-            ${question.options.map((option) => `<label class="chat-question-option">
-              <input type="${inputType}" name="${escapeHtml(inputName)}" value="${escapeHtml(option.label)}" />
-              <span><strong>${escapeHtml(option.label)}</strong>${option.description ? `<small>${escapeHtml(option.description)}</small>` : ""}</span>
-            </label>`).join("")}
-            <label class="chat-question-custom">
-              <span>Autre réponse</span>
-              <input type="text" data-question-custom maxlength="2000" placeholder="Écrivez votre propre réponse…" autocomplete="off" />
-            </label>
-          </div>
-        </fieldset>`;
-      }).join("")}
-    </div>
-    </div>
-    <footer class="chat-question-actions" data-slot="question-footer">
-      <span class="chat-question-error" data-question-error role="alert"></span>
-      <button type="button" class="tool-button" data-chat-action="question-prev" disabled><i data-lucide="chevron-left"></i><span>Précédente</span></button>
-      <button type="button" class="tool-button" data-chat-action="question-next" ${pending.questions.length === 1 ? "hidden" : ""}><span>Suivante</span><i data-lucide="chevron-right"></i></button>
-      <button type="button" class="tool-button primary" data-chat-action="answer-question" ${pending.questions.length === 1 ? "" : "hidden"}><i data-lucide="send"></i><span>Envoyer la réponse</span></button>
-    </footer>
-  </section>`;
 };
 
 const renderWelcome = (): string => `
@@ -715,7 +650,7 @@ const renderLegacyChatFeedInner = (model: ChatPanelModel, instanceId = ""): stri
         })
         .join("")
     : renderWelcome();
-  const thinking = renderThoughtStream(model.thoughts, model.turnStatus, model.pendingQuestion);
+  const thinking = renderThoughtStream(model.thoughts, model.turnStatus);
   const turnError = model.turnError
     ? `<div class="chat-error chat-turn-error">${escapeHtml(model.turnError)}</div>`
     : "";
@@ -895,8 +830,7 @@ export const renderChatPanel = (
       <div id="${id("chatFeed")}" data-chat-control="feed" class="chat-feed" tabindex="0" aria-label="Messages de la conversation">${renderChatFeedInner(model, instanceId)}</div>
       ${renderChatHistory(model, instanceId)}
     </div>
-    ${renderChatQuestionDock(model, instanceId)}
-    <form id="${id("chatComposer")}" data-chat-control="composer" class="chat-composer ${busy ? "is-running" : ""} ${model.pendingQuestion ? "is-question-pending" : ""}">
+    <form id="${id("chatComposer")}" data-chat-control="composer" class="chat-composer ${busy ? "is-running" : ""}">
       <div class="chat-composer-box">
         <textarea id="${id("chatPrompt")}" data-chat-control="prompt" rows="1" placeholder="Demandez a ${escapeHtml(model.providerLabel || "l'agent")} de construire quelque chose…" ${busy ? "disabled" : ""}>${escapeHtml(model.draft)}</textarea>
         <div class="chat-composer-toolbar">

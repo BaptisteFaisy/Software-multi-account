@@ -509,12 +509,6 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return api<T>("GET", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
     case "stop_chat_turn":
       return api<T>("DELETE", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
-    case "answer_chat_question":
-      return api<T>(
-        "POST",
-        `/api/chat/turns/${encodeURIComponent(String(args.id))}/questions/${encodeURIComponent(String(args.questionId))}/answer`,
-        { answers: args.answers ?? [] },
-      );
     case "list_prompt_history":
       return {
         generatedAt: Math.floor(Date.now() / 1000),
@@ -547,24 +541,6 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         accountId: args.accountId,
         sessionId: args.sessionId,
         archive: args.archive,
-      });
-    case "room_status":
-      return api<T>(
-        "GET",
-        `/api/room/status${args.workspacePath ? `?workspacePath=${encodeURIComponent(args.workspacePath)}` : ""}`,
-      );
-    case "room_messages":
-      {
-        const query = new URLSearchParams();
-        if (args.since) query.set("since", String(args.since));
-        if (args.workspacePath) query.set("workspacePath", String(args.workspacePath));
-        return api<T>("GET", `/api/room/messages${query.size ? `?${query}` : ""}`);
-      }
-    case "room_send":
-      return api<T>("POST", "/api/room/send", {
-        text: args.text,
-        to: args.to ?? null,
-        workspacePath: args.workspacePath ?? null,
       });
     default:
       throw new Error(`Commande remote non supportee: ${command}`);
@@ -844,7 +820,7 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
     } else if (message.type === "status") {
       // Message de controle uniquement. L'injecter dans xterm deplace le
       // curseur a l'insu de la TUI et son prochain redraw peut alors effacer la
-      // ligne en cours. Le chemin du workspace figure deja dans la banniere PTY.
+      // ligne en cours. Le chemin du dossier figure deja dans la banniere PTY.
     }
   });
 

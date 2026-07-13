@@ -38,7 +38,6 @@ test("les taches de fond et les scans couteux sont dedupliques", async () => {
 
   assert.match(main, /document\.visibilityState === "visible"/);
   assert.match(main, /discussionsRefreshPromise/);
-  assert.match(main, /roomMessageCursor/);
   assert.match(discussions, /static SUMMARY_CACHE:/);
   assert.match(discussions, /static DASHBOARD_CACHE:/);
   assert.match(discussions, /cached_file_summary/);

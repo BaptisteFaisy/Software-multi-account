@@ -5,10 +5,8 @@
 //! continuent donc d'alimenter l'historique et le WebSocket de discussions.
 
 use crate::{
-    agent_room::{AgentMeta, PendingQuestion, QuestionAnswer, RoomState},
-    discussions, metrics,
+    metrics,
     settings::{self, AccountProfile, AppSettings, Provider},
-    worktree::{AgentWorkspace, WorktreeManager},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,8 +113,6 @@ pub struct ChatTurnSnapshot {
     pub activities: Vec<ChatActivity>,
     pub thoughts: Vec<ChatThought>,
     pub parts: Vec<ChatPart>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_question: Option<PendingQuestion>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,7 +135,6 @@ pub struct StartChatTurnRequest {
 struct ChatTurn {
     snapshot: Mutex<ChatTurnSnapshot>,
     child: Mutex<Option<Child>>,
-    workspace: Mutex<Option<AgentWorkspace>>,
     provider_terminal: Mutex<Option<ProviderTerminalEvent>>,
 }
 
@@ -178,13 +173,7 @@ struct ChatClaim {
 }
 
 impl ChatTurnManager {
-    pub fn start(
-        &self,
-        request: StartChatTurnRequest,
-        worktrees: &WorktreeManager,
-        room: &RoomState,
-        room_url: Option<&str>,
-    ) -> Result<ChatTurnSnapshot, String> {
+    pub fn start(&self, request: StartChatTurnRequest) -> Result<ChatTurnSnapshot, String> {
         self.prune_finished_turns();
         let prompt = request.prompt.trim().to_string();
         if prompt.is_empty() {
@@ -223,18 +212,11 @@ impl ChatTurnManager {
 
         let canonical_home = settings::expand_home(&account.codex_home)?;
         std::fs::create_dir_all(&canonical_home).map_err(|error| error.to_string())?;
-        let source_project_dir = resolve_project_dir(&account, request.project_dir.as_deref())?;
-        let workspace = worktrees.prepare_local(
-            &format!("desktop-chat-{id}"),
-            &canonical_home,
-            source_project_dir.as_deref(),
-        )?;
-        let account_home = workspace.home().to_path_buf();
-        let project_dir = Some(workspace.cwd().to_path_buf());
+        let project_dir = resolve_project_dir(&account, request.project_dir.as_deref())?;
         account
             .provider
             .write_account_config(
-                &account_home,
+                &canonical_home,
                 account.bypass,
                 account.model.as_deref(),
                 account.reasoning_effort.as_deref(),
@@ -250,42 +232,9 @@ impl ChatTurnManager {
             &mut command,
             &app_settings,
             &account,
-            &account_home,
+            &canonical_home,
             project_dir.as_deref(),
         );
-        command.env("CST_AGENT_ID", format!("desktop-chat-{id}"));
-        command.env("CST_WORKSPACE_ID", workspace.workspace_id());
-        command.env("CST_ROOM_ID", workspace.room_id());
-        if let Some(base_sha) = workspace.base_sha() {
-            command.env("CST_BASE_SHA", base_sha);
-        }
-        let mut room_token = None;
-        let mut workspace_collab_ready = false;
-        // Collaboration workspace native sur desktop comme en SaaS.
-        {
-            let url = room_url.map(ToString::to_string).unwrap_or_else(|| {
-                format!("http://127.0.0.1:{}/mcp", app_settings.agent_room.port)
-            });
-            let cli_bin = settings::command_for_provider(&app_settings, account.provider);
-            match room.provision_home(account.provider, &cli_bin, &account_home, &url) {
-                Ok(()) => {
-                    workspace_collab_ready = true;
-                    let token = room.register(AgentMeta {
-                        agent_id: format!("chat-{id}"),
-                        provider: account.provider,
-                        account_id: account.id.clone(),
-                        label: account.label.clone(),
-                        cwd: Some(workspace.cwd().to_string_lossy().to_string()),
-                        workspace_id: Some(workspace.workspace_id().to_string()),
-                        room_id: workspace.room_id().to_string(),
-                        merge_context: workspace.merge_context(),
-                    });
-                    command.env("CST_ROOM_TOKEN", &token);
-                    room_token = Some(token);
-                }
-                Err(error) => eprintln!("[workspace_collab] provisioning chat ignore: {error}"),
-            }
-        }
         configure_provider_command(
             &mut command,
             &account,
@@ -293,7 +242,6 @@ impl ChatTurnManager {
             request.mode,
             model.as_deref(),
             reasoning_effort.as_deref(),
-            workspace_collab_ready,
         );
         command
             .stdin(Stdio::piped())
@@ -326,21 +274,16 @@ impl ChatTurnManager {
                 status: "running".to_string(),
             }],
             parts: Vec::new(),
-            pending_question: None,
         };
         let turn = Arc::new(ChatTurn {
             snapshot: Mutex::new(snapshot.clone()),
             child: Mutex::new(None),
-            workspace: Mutex::new(Some(workspace)),
             provider_terminal: Mutex::new(None),
         });
 
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                if let Some(token) = room_token.as_deref() {
-                    room.deregister(token);
-                }
                 return Err(format!(
                     "Impossible de lancer {} : {error}",
                     provider_label(account.provider)
@@ -365,7 +308,7 @@ impl ChatTurnManager {
                 .write_all(prompt.as_bytes())
                 .and_then(|_| writer.write_all(b"\n"))
             {
-                let _ = self.stop(id, room);
+                let _ = self.stop(id);
                 return Err(format!("Impossible d'envoyer le message : {error}"));
             }
         }
@@ -395,10 +338,6 @@ impl ChatTurnManager {
         let supervisor_turn = turn.clone();
         let account_id = account.id.clone();
         let account_label = account.label.clone();
-        let logical_project_dir = source_project_dir
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string());
-        let supervisor_room = room.clone();
         thread::spawn(move || {
             let exit = wait_for_child(&supervisor_turn);
             // Un evenement terminal est la derniere sortie utile du provider.
@@ -417,34 +356,6 @@ impl ChatTurnManager {
                 .lock()
                 .map(|value| value.clone())
                 .unwrap_or_default();
-            // Le process est fini : fusionne les transcripts avant d'exposer
-            // l'etat terminal, puis nettoie le home et le worktree isoles.
-            if let Ok(mut workspace) = supervisor_turn.workspace.lock() {
-                drop(workspace.take());
-            }
-            // Le provider a ecrit le cwd du worktree physique dans son JSONL.
-            // Une fois le transcript fusionne dans le home canonique, remplace
-            // ce chemin ephemere par le dossier logique choisi dans l'UI. La
-            // prochaine reprise recreera ainsi un workspace dans la meme room.
-            let completed_session_id = supervisor_turn
-                .snapshot
-                .lock()
-                .ok()
-                .and_then(|snapshot| snapshot.session_id.clone());
-            if let (Some(folder), Some(session_id)) =
-                (logical_project_dir.as_deref(), completed_session_id)
-            {
-                if let Err(error) = discussions::move_discussion_for_account(
-                    account_id.clone(),
-                    session_id,
-                    folder.to_string(),
-                ) {
-                    eprintln!("[chat] dossier logique du transcript non restaure: {error}");
-                }
-            }
-            if let Some(token) = room_token.as_deref() {
-                supervisor_room.deregister(token);
-            }
             finish_turn(&supervisor_turn, exit, &stderr);
             let _ = metrics::record_agent_run(
                 &account_id,
@@ -457,7 +368,7 @@ impl ChatTurnManager {
         Ok(snapshot)
     }
 
-    pub fn status(&self, id: u64, room: &RoomState) -> Result<ChatTurnSnapshot, String> {
+    pub fn status(&self, id: u64) -> Result<ChatTurnSnapshot, String> {
         let turn = self
             .turns
             .lock()
@@ -465,16 +376,15 @@ impl ChatTurnManager {
             .get(&id)
             .cloned()
             .ok_or_else(|| "Tour de conversation introuvable".to_string())?;
-        let mut snapshot = turn
+        let snapshot = turn
             .snapshot
             .lock()
             .map_err(|_| "Etat du tour verrouillé".to_string())?
             .clone();
-        snapshot.pending_question = room.pending_question_for_turn(id);
         Ok(snapshot)
     }
 
-    pub fn stop(&self, id: u64, room: &RoomState) -> Result<ChatTurnSnapshot, String> {
+    pub fn stop(&self, id: u64) -> Result<ChatTurnSnapshot, String> {
         let turn = self
             .turns
             .lock()
@@ -497,8 +407,7 @@ impl ChatTurnManager {
                 let _ = child.kill();
             }
         }
-        room.cancel_question_for_turn(id);
-        self.status(id, room)
+        self.status(id)
     }
 
     fn reserve_turn(&self, request: &StartChatTurnRequest) -> Result<ChatClaim, String> {
@@ -582,8 +491,6 @@ impl Drop for ChatClaim {
 #[tauri::command]
 pub fn start_chat_turn(
     state: State<'_, ChatTurnManager>,
-    worktrees: State<'_, WorktreeManager>,
-    room: State<'_, RoomState>,
     account_id: String,
     session_id: Option<String>,
     prompt: String,
@@ -592,50 +499,31 @@ pub fn start_chat_turn(
     model: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<ChatTurnSnapshot, String> {
-    state.start(
-        StartChatTurnRequest {
-            account_id,
-            session_id,
-            prompt,
-            project_dir,
-            mode: mode.unwrap_or_default(),
-            model,
-            reasoning_effort,
-        },
-        &worktrees,
-        &room,
-        None,
-    )
+    state.start(StartChatTurnRequest {
+        account_id,
+        session_id,
+        prompt,
+        project_dir,
+        mode: mode.unwrap_or_default(),
+        model,
+        reasoning_effort,
+    })
 }
 
 #[tauri::command]
 pub fn chat_turn_status(
     state: State<'_, ChatTurnManager>,
-    room: State<'_, RoomState>,
     id: u64,
 ) -> Result<ChatTurnSnapshot, String> {
-    state.status(id, &room)
+    state.status(id)
 }
 
 #[tauri::command]
 pub fn stop_chat_turn(
     state: State<'_, ChatTurnManager>,
-    room: State<'_, RoomState>,
     id: u64,
 ) -> Result<ChatTurnSnapshot, String> {
-    state.stop(id, &room)
-}
-
-#[tauri::command]
-pub fn answer_chat_question(
-    state: State<'_, ChatTurnManager>,
-    room: State<'_, RoomState>,
-    id: u64,
-    question_id: u64,
-    answers: Vec<QuestionAnswer>,
-) -> Result<ChatTurnSnapshot, String> {
-    room.answer_question_for_turn(id, question_id, answers)?;
-    state.status(id, &room)
+    state.stop(id)
 }
 
 fn configure_provider_command(
@@ -645,7 +533,6 @@ fn configure_provider_command(
     mode: ChatTurnMode,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
-    workspace_collab_ready: bool,
 ) {
     match account.provider {
         Provider::Codex => {
@@ -661,14 +548,6 @@ fn configure_provider_command(
                 .arg("hide_agent_reasoning=false")
                 .arg("-c")
                 .arg("show_raw_agent_reasoning=false");
-            // Une question structuree reste un appel MCP ouvert jusqu'a la
-            // reponse de l'utilisateur. Le defaut Codex (60 s) est trop court
-            // pour une interaction humaine dans l'app.
-            if workspace_collab_ready {
-                command
-                    .arg("-c")
-                    .arg("mcp_servers.workspace_collab.tool_timeout_sec=86400");
-            }
             if matches!(mode, ChatTurnMode::Plan | ChatTurnMode::Ask) {
                 command.arg("-c").arg("sandbox_mode=\"read-only\"");
             } else if account.bypass {
@@ -1603,10 +1482,8 @@ mod tests {
                 activities: Vec::new(),
                 thoughts: Vec::new(),
                 parts: Vec::new(),
-                pending_question: None,
             }),
             child: Mutex::new(None),
-            workspace: Mutex::new(None),
             provider_terminal: Mutex::new(None),
         })
     }
@@ -1742,7 +1619,6 @@ mod tests {
             ChatTurnMode::Build,
             Some("gpt-chat-test"),
             Some("ultra"),
-            true,
         );
 
         let args = command
@@ -1755,9 +1631,6 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-c", "model_reasoning_effort=\"ultra\""]));
-        assert!(args
-            .windows(2)
-            .any(|pair| { pair == ["-c", "mcp_servers.workspace_collab.tool_timeout_sec=86400"] }));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-c", "hide_agent_reasoning=false"]));
