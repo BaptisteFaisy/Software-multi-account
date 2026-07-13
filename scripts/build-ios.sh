@@ -12,6 +12,13 @@ if ! command -v xcodebuild >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ "$MODE" != "simulator" && "$MODE" != "archive" ]]; then
+  echo "Usage: bash scripts/build-ios.sh [simulator|archive]" >&2
+  exit 2
+fi
+
+node "$ROOT_DIR/scripts/clean-build-artifacts.mjs" ios
+
 case "$MODE" in
   simulator)
     xcodebuild \
@@ -36,9 +43,5 @@ case "$MODE" in
       PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
       -allowProvisioningUpdates \
       archive
-    ;;
-  *)
-    echo "Usage: bash scripts/build-ios.sh [simulator|archive]" >&2
-    exit 2
     ;;
 esac

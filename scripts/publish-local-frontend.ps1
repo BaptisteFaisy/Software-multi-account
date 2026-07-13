@@ -8,8 +8,9 @@ param(
 
 # Publication frontend multi-agents sur le noeud local, sans drain ni restart.
 # Vite produit des assets hashes : on les copie d'abord puis on remplace
-# index.html atomiquement en dernier. L'ancien index reste donc toujours valide
-# pendant la copie. Le mutex ne couvre que cette publication, jamais le build.
+# index.html atomiquement en dernier. Une fois le nouvel index actif, les
+# fichiers absents du nouveau dist sont retires sous le meme mutex. Le mutex ne
+# couvre que cette publication, jamais le build.
 
 $ErrorActionPreference = "Stop"
 
@@ -41,6 +42,52 @@ function Copy-TreeEntry {
   foreach ($child in Get-ChildItem -LiteralPath $Source -Force) {
     Copy-TreeEntry -Source $child.FullName -Destination (Join-Path $Destination $child.Name)
   }
+}
+
+function Get-TreeRelativePath {
+  param(
+    [Parameter(Mandatory = $true)][string]$Root,
+    [Parameter(Mandatory = $true)][string]$FullName
+  )
+
+  $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd(
+    [IO.Path]::DirectorySeparatorChar,
+    [IO.Path]::AltDirectorySeparatorChar
+  )
+  $normalizedName = [IO.Path]::GetFullPath($FullName)
+  $prefix = $normalizedRoot + [IO.Path]::DirectorySeparatorChar
+  if (-not $normalizedName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Chemin hors du dist pendant le nettoyage: $normalizedName"
+  }
+  return $normalizedName.Substring($prefix.Length)
+}
+
+function Remove-StaleTreeEntries {
+  param(
+    [Parameter(Mandatory = $true)][string]$SourceRoot,
+    [Parameter(Mandatory = $true)][string]$TargetRoot
+  )
+
+  $sourceEntries = @{}
+  foreach ($entry in Get-ChildItem -LiteralPath $SourceRoot -Recurse -Force) {
+    $relative = Get-TreeRelativePath -Root $SourceRoot -FullName $entry.FullName
+    $sourceEntries[$relative] = $true
+  }
+
+  $removed = 0
+  $targetEntries = @(
+    Get-ChildItem -LiteralPath $TargetRoot -Recurse -Force |
+      Sort-Object { $_.FullName.Length } -Descending
+  )
+  foreach ($entry in $targetEntries) {
+    $relative = Get-TreeRelativePath -Root $TargetRoot -FullName $entry.FullName
+    if ($sourceEntries.ContainsKey($relative)) { continue }
+    if (Test-Path -LiteralPath $entry.FullName) {
+      Remove-Item -LiteralPath $entry.FullName -Recurse -Force
+      $removed++
+    }
+  }
+  return $removed
 }
 
 function Test-ServerReady {
@@ -90,6 +137,7 @@ $targetIndex = Join-Path $TargetDir "index.html"
 $nonce = "$PID-$([Guid]::NewGuid().ToString('N'))"
 $tempIndex = Join-Path $TargetDir ".index-$nonce.tmp"
 $backupIndex = Join-Path $TargetDir ".index-$nonce.bak"
+$staleCount = 0
 
 try {
   try {
@@ -105,8 +153,7 @@ try {
   $timer.Start()
 
   # Tous les fichiers pointes par le nouvel index sont presents avant que cet
-  # index devienne visible. Les anciens assets ne sont pas supprimes : les
-  # onglets deja ouverts peuvent finir leurs chargements sans 404.
+  # index devienne visible.
   foreach ($entry in Get-ChildItem -LiteralPath $SourceDir -Force) {
     if ($entry.Name -eq "index.html") { continue }
     Copy-TreeEntry -Source $entry.FullName -Destination (Join-Path $TargetDir $entry.Name)
@@ -133,6 +180,11 @@ try {
   else {
     [IO.File]::Move($tempIndex, $targetIndex)
   }
+
+  # Le nouvel index ne reference plus les anciens assets hashes. Les retirer
+  # ici garantit que le dist actif est le miroir exact du dernier build, sans
+  # laisser une version precedente s'accumuler a chaque publication.
+  $staleCount = Remove-StaleTreeEntries -SourceRoot $SourceDir -TargetRoot $TargetDir
 }
 finally {
   $timer.Stop()
@@ -150,6 +202,6 @@ if ($served.StatusCode -ne 200) {
 }
 
 Write-Host (
-  "Frontend publie sur {0} sans drain ni restart (mutex {1:N0} ms)." -f `
-    $LocalUrl, $timer.Elapsed.TotalMilliseconds
+  "Frontend publie sur {0} sans drain ni restart (mutex {1:N0} ms, {2} ancien(s) fichier(s) supprime(s))." -f `
+    $LocalUrl, $timer.Elapsed.TotalMilliseconds, $staleCount
 ) -ForegroundColor Green

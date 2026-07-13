@@ -1,5 +1,6 @@
 const CACHE_PREFIX = "codex-terminal-static-";
-const CACHE_NAME = `${CACHE_PREFIX}v5-environment-delete`;
+const BUILD_ID = new URL(self.location.href).searchParams.get("build") || "legacy";
+const CACHE_NAME = `${CACHE_PREFIX}${BUILD_ID}`;
 const PRECACHE_URLS = [
   "/offline.html",
   "/manifest.webmanifest",

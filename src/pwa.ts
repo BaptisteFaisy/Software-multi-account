@@ -1,4 +1,5 @@
 const IOS_INSTALL_HINT_DISMISSED = "codex-switch-terminal.ios-install-hint-dismissed";
+const SERVICE_WORKER_URL = `/service-worker.js?build=${encodeURIComponent(__CST_BUILD_ID__)}`;
 
 type NativeBridgeWindow = Window & {
   CstAndroid?: unknown;
@@ -78,7 +79,7 @@ const registerServiceWorker = () => {
   ) {
     return;
   }
-  void navigator.serviceWorker.register("/service-worker.js", {
+  void navigator.serviceWorker.register(SERVICE_WORKER_URL, {
     scope: "/",
     updateViaCache: "none",
   })

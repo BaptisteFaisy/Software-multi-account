@@ -31,6 +31,8 @@ test("la page declare le manifeste et l'icone Apple", async () => {
 
 test("le service worker ne met jamais les API privees en cache", async () => {
   const worker = await read("public/service-worker.js");
+  assert.match(worker, /new URL\(self\.location\.href\)\.searchParams\.get\("build"\)/);
+  assert.match(worker, /key\.startsWith\(CACHE_PREFIX\) && key !== CACHE_NAME/);
   assert.match(worker, /url\.origin !== self\.location\.origin/);
   assert.match(worker, /url\.pathname\.startsWith\("\/api\/"\)/);
   assert.match(worker, /url\.pathname\.startsWith\("\/ws\/"\)/);
@@ -45,7 +47,8 @@ test("l'aide Safari reconnait aussi le user-agent iPad de bureau", async () => {
   assert.match(source, /display-mode: standalone/);
   assert.match(source, /CstIOS \|\| nativeWindow\.CstAndroid/);
   assert.match(source, /window\.location\.protocol === "https:"/);
-  assert.match(source, /serviceWorker\.register\("\/service-worker\.js"/);
+  assert.match(source, /service-worker\.js\?build=/);
+  assert.match(source, /serviceWorker\.register\(SERVICE_WORKER_URL/);
 });
 
 test("le workflow iOS utilise un Mac distant et publie le build simulateur", async () => {

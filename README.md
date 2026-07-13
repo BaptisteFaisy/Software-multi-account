@@ -353,6 +353,11 @@ npm run build:frontend
 npm run build:server
 ```
 
+`build:frontend` supprime explicitement l'ancien `dist` avant de compiler. Le
+build Tauri (`npm run build`) retire aussi les anciens bundles desktop avant de
+produire la nouvelle application. Pour tout nettoyer manuellement (web,
+desktop, Android et iOS), utilise `npm run clean`.
+
 #### Verification web avec plusieurs agents
 
 Pour publier un changement **uniquement frontend** sur le noeud de test
@@ -364,15 +369,23 @@ npm run deploy:web:local
 
 Le build est effectue dans le worktree isole de l'agent, sans verrou. Le script
 prend ensuite un mutex de publication tres court, copie d'abord les assets Vite
-hashes et remplace `index.html` atomiquement en dernier. Il ne draine pas le
-noeud, ne coupe aucun terminal et ne redemarre pas le serveur. Les agents ne
-doivent donc pas arreter le PID de `8080` pour verifier une modification web.
+hashes et remplace `index.html` atomiquement en dernier. Sous le meme mutex, il
+supprime ensuite tous les fichiers absents du nouveau `dist`, afin qu'aucune
+ancienne version web ne s'accumule. Le cache PWA porte aussi un identifiant
+unique par build et efface le cache du build precedent a son activation. Le
+script ne draine pas le noeud, ne coupe aucun terminal et ne redemarre pas le
+serveur. Les agents ne doivent donc pas arreter le PID de `8080` pour verifier
+une modification web.
 
 Pour une modification **backend**, `scripts/update-node.ps1` reste le point
 d'entree. Il attend desormais un instant sans terminal tout en laissant le noeud
 accepter les autres agents. Le drain n'est active qu'apres cette attente, sous
 forme de lease courte de 20 secondes, juste le temps de la bascule. Une
 interruption ou un crash ne peut ainsi plus laisser `8080` verrouille.
+L'ancienne release web/app reste disponible uniquement pendant la verification
+et le rollback eventuel. Des que la nouvelle release est saine, les autres
+dossiers locaux sont supprimes ; les releases encore construites par un autre
+agent sont protegees par un marqueur de travail.
 
 Au demarrage, `npm run server:local` compare aussi le commit du checkout avec le
 `origin/main` deja connu localement. Si le checkout est un ancetre strict, le

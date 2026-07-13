@@ -38,6 +38,8 @@ FORCE=0
 DRAIN_ARMED=0
 DL=""
 STAGE=""
+RELEASE_DIR=""
+RELEASE_MARKER=""
 
 # --- Mode release (Phase 2) ---
 MODE="build"                                   # build | release
@@ -100,8 +102,38 @@ set_drain() {
     -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
     -d "{\"draining\":$draining,\"ttlSeconds\":$DRAIN_LEASE}" >/dev/null
 }
+release_update_in_progress() {
+  local release_dir="$1" marker owner_pid owner_start current_start
+  marker="$release_dir/.update-in-progress"
+  [[ -f "$marker" ]] || return 1
+  IFS='|' read -r owner_pid owner_start <"$marker" || true
+  if [[ "$owner_pid" =~ ^[0-9]+$ && "$owner_start" =~ ^[0-9]+$ ]] &&
+     kill -0 "$owner_pid" 2>/dev/null && [[ -r "/proc/$owner_pid/stat" ]]; then
+    current_start="$(awk '{print $22}' "/proc/$owner_pid/stat" 2>/dev/null || true)"
+    [[ "$current_start" == "$owner_start" ]] && return 0
+  fi
+  rm -f -- "$marker"
+  return 1
+}
+prune_obsolete_releases() {
+  local keep="$1" candidate removed=0
+  for candidate in "$RELEASES_DIR"/*; do
+    [[ -d "$candidate" ]] || continue
+    [[ "$candidate" == "$keep" ]] && continue
+    if release_update_in_progress "$candidate"; then
+      log "Release conservee car une mise a jour l'utilise: ${candidate##*/}"
+      continue
+    fi
+    if rm -rf -- "$candidate"; then
+      removed=$((removed + 1))
+    else
+      log "ATTENTION: ancienne release impossible a supprimer: $candidate"
+    fi
+  done
+  log "Nettoyage local : $removed ancienne(s) release(s) web/app supprimee(s)."
+}
 cleanup() {
-  local status=$?
+  local status=$? current_real release_real
   trap - EXIT
   if [[ "$DRAIN_ARMED" == "1" ]]; then
     log "Mise a jour interrompue avant le redemarrage ; sortie automatique du drain."
@@ -109,6 +141,14 @@ cleanup() {
       log "Noeud remis en service."
     else
       log "Sortie explicite impossible ; la lease expirera sous ${DRAIN_LEASE}s."
+    fi
+  fi
+  if [[ -n "$RELEASE_MARKER" ]]; then
+    rm -f -- "$RELEASE_MARKER"
+    current_real="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+    release_real="$(readlink -f "$RELEASE_DIR" 2>/dev/null || true)"
+    if [[ -n "$release_real" && "$current_real" != "$release_real" ]]; then
+      rm -rf -- "$RELEASE_DIR"
     fi
   fi
   if [[ -n "$DL" ]]; then rm -rf "$DL"; fi
@@ -195,8 +235,16 @@ if [[ -e "$RELEASE_DIR" ]]; then
   RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
 fi
 install -d -o cst -g cst "$RELEASES_DIR" "$RELEASE_DIR"
-install -m 0755 "$BUILT_BIN" "$RELEASE_DIR/cst-server"
-cp -a "$DIST_SRC" "$RELEASE_DIR/dist"
+RELEASE_MARKER="$RELEASE_DIR/.update-in-progress"
+PROCESS_START="$(awk '{print $22}' "/proc/$$/stat")"
+printf '%s|%s\n' "$$" "$PROCESS_START" >"$RELEASE_MARKER"
+if ! install -m 0755 "$BUILT_BIN" "$RELEASE_DIR/cst-server" ||
+   ! cp -a "$DIST_SRC" "$RELEASE_DIR/dist"; then
+  rm -rf -- "$RELEASE_DIR"
+  RELEASE_MARKER=""
+  echo "Installation de la release locale impossible." >&2
+  exit 1
+fi
 chown -R cst:cst "$RELEASE_DIR"
 
 # --- Attente NON BLOQUANTE, puis mutex court de bascule ---
@@ -306,6 +354,9 @@ verify() {
 }
 
 if verify "$VERSION" "$COMMIT"; then
+  rm -f -- "$RELEASE_MARKER"
+  RELEASE_MARKER=""
+  prune_obsolete_releases "$RELEASE_DIR"
   log "OK : noeud en $VERSION ($COMMIT), pret et non draine."
   exit 0
 fi

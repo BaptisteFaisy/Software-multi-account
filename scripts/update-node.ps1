@@ -81,6 +81,64 @@ function Set-Junction {
   if ($LASTEXITCODE -ne 0) { throw "mklink /J a echoue: $Link -> $Target" }
 }
 
+function Test-ReleaseUpdateInProgress {
+  param([Parameter(Mandatory = $true)][string]$ReleasePath)
+
+  $marker = Join-Path $ReleasePath ".update-in-progress"
+  if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { return $false }
+
+  try {
+    $parts = ([string](Get-Content -LiteralPath $marker -Raw)).Trim() -split '\|'
+    if ($parts.Count -ne 2) { throw "Marqueur incomplet" }
+    $ownerPid = [int]$parts[0]
+    $ownerStartTicks = [long]$parts[1]
+    $owner = Get-Process -Id $ownerPid -ErrorAction Stop
+    if ($owner.StartTime.ToUniversalTime().Ticks -eq $ownerStartTicks) {
+      return $true
+    }
+  }
+  catch {
+    # Processus termine ou marqueur incomplet : cette release est orpheline.
+  }
+
+  Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+  return $false
+}
+
+function Remove-ObsoleteLocalReleases {
+  param([Parameter(Mandatory = $true)][string]$Keep)
+
+  if (-not (Test-Path -LiteralPath $ReleasesDir -PathType Container)) { return }
+  $keepPath = [IO.Path]::GetFullPath($Keep).TrimEnd(
+    [IO.Path]::DirectorySeparatorChar,
+    [IO.Path]::AltDirectorySeparatorChar
+  )
+  $removed = 0
+
+  foreach ($candidate in Get-ChildItem -LiteralPath $ReleasesDir -Directory -Force) {
+    $candidatePath = [IO.Path]::GetFullPath($candidate.FullName).TrimEnd(
+      [IO.Path]::DirectorySeparatorChar,
+      [IO.Path]::AltDirectorySeparatorChar
+    )
+    if ([string]::Equals($candidatePath, $keepPath, [StringComparison]::OrdinalIgnoreCase)) {
+      continue
+    }
+    if (Test-ReleaseUpdateInProgress -ReleasePath $candidatePath) {
+      Write-Host "Release conservee car une mise a jour l'utilise: $($candidate.Name)" -ForegroundColor DarkGray
+      continue
+    }
+    try {
+      Remove-Item -LiteralPath $candidatePath -Recurse -Force -ErrorAction Stop
+      $removed++
+    }
+    catch {
+      Write-Warning "Ancienne release impossible a supprimer ($candidatePath): $($_.Exception.Message)"
+    }
+  }
+
+  Write-Host "Nettoyage local : $removed ancienne(s) release(s) web/app supprimee(s)." -ForegroundColor Green
+}
+
 function Register-NodeTask {
   $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   $powershell = Join-Path $PSHOME "powershell.exe"
@@ -125,6 +183,8 @@ function Test-NodeBack {
 # --- 1. Peupler la release : mode build OU mode release (download + verif) ---
 $distSrc = $null
 $builtExe = $null
+$releaseDir = $null
+$releaseMarker = $null
 
 if ($IsReleaseMode) {
   if (-not $MinisignPubKey) { $MinisignPubKey = $env:CST_MINISIGN_PUBKEY }
@@ -206,10 +266,21 @@ if (Test-Path $releaseDir) {
   $releaseDir = Join-Path $ReleasesDir $releaseId
 }
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-Copy-Item $builtExe (Join-Path $releaseDir "cst-server.exe") -Force
-$releaseDist = Join-Path $releaseDir "dist"
-if (Test-Path $releaseDist) { Remove-Item $releaseDist -Recurse -Force }
-Copy-Item $distSrc $releaseDist -Recurse -Force
+$releaseMarker = Join-Path $releaseDir ".update-in-progress"
+$thisProcess = Get-Process -Id $PID
+"$PID|$($thisProcess.StartTime.ToUniversalTime().Ticks)" |
+  Set-Content -LiteralPath $releaseMarker -Encoding ASCII -NoNewline
+try {
+  Copy-Item $builtExe (Join-Path $releaseDir "cst-server.exe") -Force
+  $releaseDist = Join-Path $releaseDir "dist"
+  if (Test-Path $releaseDist) { Remove-Item $releaseDist -Recurse -Force }
+  Copy-Item $distSrc $releaseDist -Recurse -Force
+}
+catch {
+  Remove-Item -LiteralPath $releaseDir -Recurse -Force -ErrorAction SilentlyContinue
+  $releaseMarker = $null
+  throw
+}
 
 # Le mutex ne couvre ni le build ni l'attente d'inactivite. Il serialise
 # seulement la bascule de quelques secondes entre deux agents deployeurs.
@@ -313,6 +384,9 @@ try {
 
   # --- 9. Verification exacte version + commit ---
   if (Test-NodeBack -WantVersion $version -WantCommit $commit) {
+    Remove-Item -LiteralPath $releaseMarker -Force -ErrorAction SilentlyContinue
+    $releaseMarker = $null
+    Remove-ObsoleteLocalReleases -Keep $releaseDir
     Write-Host "OK : noeud en $version ($commit), pret et non draine." -ForegroundColor Green
     exit 0
   }
@@ -342,6 +416,29 @@ try {
   exit 1
 }
 finally {
+  if ($releaseMarker) {
+    Remove-Item -LiteralPath $releaseMarker -Force -ErrorAction SilentlyContinue
+    if ($releaseDir -and (Test-Path -LiteralPath $releaseDir -PathType Container)) {
+      $activeRelease = $null
+      if (Test-Path -LiteralPath $CurrentLink) {
+        $currentItem = Get-Item -LiteralPath $CurrentLink -Force
+        if ($currentItem.Target) {
+          $activeRelease = [string](@($currentItem.Target)[0])
+          if (-not [IO.Path]::IsPathRooted($activeRelease)) {
+            $activeRelease = Join-Path (Split-Path -Parent $CurrentLink) $activeRelease
+          }
+          $activeRelease = [IO.Path]::GetFullPath($activeRelease)
+        }
+      }
+      if (-not $activeRelease -or -not [string]::Equals(
+        $activeRelease,
+        [IO.Path]::GetFullPath($releaseDir),
+        [StringComparison]::OrdinalIgnoreCase
+      )) {
+        Remove-Item -LiteralPath $releaseDir -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    }
+  }
   if ($drainArmed) {
     try {
       Set-DrainState -Draining $false

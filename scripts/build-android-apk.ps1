@@ -51,6 +51,17 @@ $env:JAVA_HOME = $Jbr
 $env:ANDROID_HOME = $Sdk
 $env:ANDROID_SDK_ROOT = $Sdk
 
+& node (Join-Path $ScriptDir "clean-build-artifacts.mjs") android
+if ($LASTEXITCODE -ne 0) { throw "Le nettoyage des anciens builds Android a echoue." }
+
+$DesktopDir = [Environment]::GetFolderPath("Desktop")
+foreach ($oldApk in @(
+  (Join-Path $DesktopDir "CodexTerminal-debug.apk"),
+  (Join-Path $DesktopDir "CodexTerminal-release.apk")
+)) {
+  Remove-Item -LiteralPath $oldApk -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "JDK  : $Jbr"       -ForegroundColor Cyan
 Write-Host "SDK  : $Sdk"       -ForegroundColor Cyan
 Write-Host "Proj : $AndroidDir" -ForegroundColor Cyan
@@ -79,7 +90,7 @@ if (-not $ApkPath -or -not (Test-Path $ApkPath)) {
 }
 
 $Dest1 = Join-Path $Root "CodexTerminal-$Variant.apk"
-$Dest2 = Join-Path ([Environment]::GetFolderPath("Desktop")) "CodexTerminal-$Variant.apk"
+$Dest2 = Join-Path $DesktopDir "CodexTerminal-$Variant.apk"
 Copy-Item $ApkPath $Dest1 -Force
 Copy-Item $ApkPath $Dest2 -Force
 

@@ -64,13 +64,29 @@ test("la publication frontend ne bloque jamais le serveur 8080", () => {
   const lock = frontendPublisher.indexOf("$mutex.WaitOne", build);
   const copy = frontendPublisher.indexOf("Copy-TreeEntry -Source", lock);
   const replace = frontendPublisher.indexOf("[IO.File]::Replace", copy);
-  const unlock = frontendPublisher.indexOf("$mutex.ReleaseMutex()", replace);
+  const prune = frontendPublisher.indexOf("$staleCount = Remove-StaleTreeEntries", replace);
+  const unlock = frontendPublisher.indexOf("$mutex.ReleaseMutex()", prune);
   const verify = frontendPublisher.indexOf("Invoke-WebRequest", unlock);
 
   assert.ok(build >= 0 && lock > build, "le build doit rester hors mutex");
   assert.ok(copy > lock && replace > copy, "les assets doivent preceder l'index atomique");
-  assert.ok(unlock > replace && verify > unlock, "la verification HTTP doit etre hors mutex");
+  assert.ok(prune > replace && unlock > prune, "les anciens assets doivent etre retires avant le deverrouillage");
+  assert.ok(verify > unlock, "la verification HTTP doit etre hors mutex");
   assert.doesNotMatch(frontendPublisher, /Set-DrainState|Stop-ScheduledTask|Stop-Process/);
+});
+
+test("les anciennes releases web/app sont purgees seulement apres verification", () => {
+  const windowsVerify = windowsUpdater.indexOf("if (Test-NodeBack -WantVersion $version -WantCommit $commit)");
+  const windowsPrune = windowsUpdater.indexOf("Remove-ObsoleteLocalReleases -Keep $releaseDir", windowsVerify);
+  const linuxVerify = linuxUpdater.indexOf('if verify "$VERSION" "$COMMIT"');
+  const linuxPrune = linuxUpdater.indexOf('prune_obsolete_releases "$RELEASE_DIR"', linuxVerify);
+
+  assert.ok(windowsVerify >= 0 && windowsPrune > windowsVerify);
+  assert.ok(linuxVerify >= 0 && linuxPrune > linuxVerify);
+  assert.match(windowsUpdater, /\.update-in-progress/);
+  assert.match(windowsUpdater, /Test-ReleaseUpdateInProgress/);
+  assert.match(linuxUpdater, /\.update-in-progress/);
+  assert.match(linuxUpdater, /release_update_in_progress/);
 });
 
 test("le serveur local refuse de republier un checkout connu comme obsolete", () => {
