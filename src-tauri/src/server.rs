@@ -31,7 +31,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
