@@ -92,8 +92,8 @@ risque de corrompre la saisie.
 
 ### Ce que les agents peuvent faire
 
-Chaque agent Codex ou Claude voit automatiquement les outils MCP internes
-`workspace_collab` :
+Chaque agent Codex ou Claude peut utiliser les outils MCP internes optionnels
+`workspace_collab` pour se coordonner avec d'autres agents :
 
 - `list_agents` / `whoami` : lister les agents presents / connaitre sa propre
   identite (son `ident` public).
@@ -130,8 +130,9 @@ merges integres et flux recent de messages.
 - L'app lance un petit **serveur MCP en HTTP**, en local uniquement
   (`http://127.0.0.1:8123/mcp` par defaut ; en mode SaaS il tourne dans
   `cst-server`). Tous les agents s'y connectent.
-- A l'ouverture d'un agent, l'app ajoute `workspace_collab` uniquement dans son
-  home isole ephemere. Le home canonique du compte n'est pas modifie.
+- A l'ouverture d'un agent, l'app peut ajouter `workspace_collab` uniquement
+  dans son home isole ephemere. Le home canonique du compte n'est pas modifie et
+  une panne ou une absence du MCP ne bloque jamais le travail ni la livraison.
 - Chaque terminal recoit un **jeton unique** (`CST_ROOM_TOKEN`) injecte dans son
   environnement : c'est ce qui permet au serveur de distinguer deux agents, meme
   quand ils partagent un meme `CODEX_HOME`.
@@ -448,9 +449,11 @@ Chaque terminal et chaque tour de chat recoit desormais :
 
 - un worktree Git detache propre (ou une copie physique pour un dossier non-Git) ;
 - un `CODEX_HOME` / `CLAUDE_CONFIG_DIR` propre ;
-- `CST_AGENT_ID`, `CST_WORKSPACE_ID`, `CST_ROOM_ID` et `CST_BASE_SHA` ;
+- des metadonnees runtime internes, qui ne sont jamais requises par le workflow
+  Git de l'agent ;
 - les conventions `AGENTS.md` et `CLAUDE.md` dans son home isole ;
-- les outils MCP internes de collaboration pour les messages, le task board et la merge queue.
+- les outils MCP internes optionnels de collaboration pour les messages, le task
+  board et la merge queue.
 
 `CST_WORKSPACE_ID` identifie le checkout physique unique de l'agent, tandis que
 `CST_ROOM_ID` identifie le dossier logique. Deux chats ouverts sur le meme
@@ -465,30 +468,27 @@ font plus chacun un clone complet. Les chemins runtime se trouvent sous
 Les transcripts sont recopies dans le home canonique a la fin du process ; les
 configs temporaires ne le sont jamais.
 
-Workflow agent recommande :
+Workflow agent par defaut, sans MCP ni variable `CST_*` :
 
-1. `claim_task({ taskId, description })` ;
-2. travailler et committer dans le worktree courant ;
-3. `submit_for_merge({ verify: true|false })` ;
-4. suivre `merge_status({ id })` et `list_landed()` ;
-5. en cas de conflit, rebaser depuis la nouvelle base annoncee dans le dossier et
-   resoumettre.
+1. travailler dans le worktree courant, verifier puis creer un commit propre ;
+2. recuperer la branche cible distante et rebaser le commit dessus ;
+3. pousser directement par fast-forward, sans `--force` ;
+4. si le remote a avance, recuperer, rebaser, rejouer les controles affectes et
+   reessayer.
 
-Les agents ne poussent jamais directement la branche cible : la merge queue est
-l'arbitre et le publisher unique. Un pool de workers prepare, rebase et verifie
-les propositions dans des worktrees d'integration distincts. Seule la decision
-finale est serialisee par branche : relecture de la tete, controle que le resultat
-la conserve, puis fast-forward/CAS. Un push concurrent fait repartir la proposition
-sur la nouvelle tete ; une base divergente ou reecrite est refusee.
+`workspace_collab`, le task board et la merge queue restent disponibles quand une
+tache les demande explicitement, mais ne sont jamais un prealable au push. Dans ce
+mode optionnel, un pool de workers prepare, rebase et verifie les propositions dans
+des worktrees d'integration distincts, puis publie par fast-forward/CAS.
 
-Pour un depot local dont la branche possede un upstream, les nouveaux agents
-partent de la remote-tracking ref et l'arbitre publie par push fast-forward non
-force. Le checkout utilisateur n'est jamais modifie, meme s'il contient des
-changements locaux. Sans upstream, le mode local historique reste disponible et
-ne fast-forward une branche actuellement ouverte que si son checkout est propre.
-Le journal durable de merge est separe de `messages.jsonl`. Pour un miroir SaaS,
-le land met a jour la branche du miroir local ; le push/deploiement distant reste
-une etape explicite.
+Dans le mode merge queue optionnel, pour un depot local dont la branche possede
+un upstream, les nouveaux agents partent de la remote-tracking ref et l'arbitre
+publie par push fast-forward non force. Le checkout utilisateur n'est jamais
+modifie, meme s'il contient des changements locaux. Sans upstream, le mode local
+historique ne fast-forward une branche actuellement ouverte que si son checkout
+est propre. Le journal durable de merge est separe de `messages.jsonl`. Pour un
+miroir SaaS, le land met a jour la branche du miroir local ; le push/deploiement
+distant reste une etape explicite.
 
 Variables utiles :
 
@@ -615,7 +615,11 @@ agents actifs = min(
 )
 ```
 
-### Reservations distribuees et application obligatoire
+### Reservations distribuees optionnelles
+
+Cette section concerne uniquement le mode de coordination explicite a tres grand
+nombre d'agents. Le workflow Git direct ne cree aucun lease et ne depend pas du
+task board.
 
 Une tache d'ecriture obtient un lease sur un fichier, un symbole ou un bloc
 stable. Les numeros de lignes seuls ne sont pas suffisants, car ils changent
@@ -626,7 +630,8 @@ Chaque lease possede une expiration, un heartbeat et un fencing token monotone.
 Si un agent disparait, sa ressource est liberee automatiquement. S'il revient
 apres l'expiration, son ancien token ne peut plus autoriser une integration.
 
-`submit_for_merge` recalcule le diff reel et le compare aux reservations :
+Quand ce mode est active, `submit_for_merge` recalcule le diff reel et le compare
+aux reservations :
 
 - un patch conforme poursuit son integration ;
 - une modification hors perimetre est refusee ou demande une extension ;

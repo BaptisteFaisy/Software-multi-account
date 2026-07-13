@@ -1186,9 +1186,7 @@ fn merge_provider_transcripts(
     }
 }
 
-fn inject_agent_conventions(home: &Path) -> Result<(), String> {
-    const MARKER: &str = "<!-- CST-ISOLATED-AGENT-V2 -->";
-    const CONTENT: &str = r#"<!-- CST-ISOLATED-AGENT-V2 -->
+const LEGACY_AGENT_CONVENTIONS: &str = r#"<!-- CST-ISOLATED-AGENT-V2 -->
 ## Codex Switch Terminal: isolated agent
 
 This process has a private worktree and provider home. Stay inside the current
@@ -1200,18 +1198,40 @@ working directory. Use the workspace_collab MCP tools to coordinate real work:
 - use merge_status/list_landed and rebase from the announced base when needed;
 - never edit another agent's worktree or the original checkout by absolute path.
 "#;
+const AGENT_CONVENTIONS_MARKER: &str = "<!-- CST-ISOLATED-AGENT-V3 -->";
+const AGENT_CONVENTIONS: &str = r#"<!-- CST-ISOLATED-AGENT-V3 -->
+## Codex Switch Terminal: isolated agent
+
+This process has a private worktree and provider home. Stay inside the current
+working directory. Delivery must work with standard Git alone; do not depend on
+workspace_collab or any CST_* environment variable:
+
+- commit a clean, focused change after running the relevant verification;
+- fetch the configured remote and rebase on the target branch before publishing;
+- push the verified commit directly with a normal, non-forced fast-forward push;
+- if the remote advanced, fetch, rebase, re-run affected checks, and retry;
+- never edit another agent's worktree or the original checkout by absolute path.
+
+Collaboration and the merge queue remain optional tools. Use them only when the
+task explicitly requests them; their absence must never block delivery.
+"#;
+
+fn inject_agent_conventions(home: &Path) -> Result<(), String> {
     for name in ["AGENTS.md", "CLAUDE.md"] {
         let path = home.join(name);
-        let existing = fs::read_to_string(&path).unwrap_or_default();
-        if existing.contains(MARKER) {
+        let mut existing = fs::read_to_string(&path).unwrap_or_default();
+        if existing.contains(AGENT_CONVENTIONS_MARKER) {
             continue;
+        }
+        if existing.contains(LEGACY_AGENT_CONVENTIONS) {
+            existing = existing.replace(LEGACY_AGENT_CONVENTIONS, "");
         }
         let separator = if existing.is_empty() || existing.ends_with('\n') {
             ""
         } else {
             "\n"
         };
-        crate::fs_util::atomic_write(&path, format!("{existing}{separator}{CONTENT}"))
+        crate::fs_util::atomic_write(&path, format!("{existing}{separator}{AGENT_CONVENTIONS}"))
             .map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -1492,6 +1512,52 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn agent_conventions_use_direct_git_without_mcp_or_cst_dependencies() {
+        let root = temp("direct-git-conventions");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        inject_agent_conventions(&home).unwrap();
+
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let content = fs::read_to_string(home.join(name)).unwrap();
+            assert!(content.contains(AGENT_CONVENTIONS_MARKER));
+            assert!(content.contains("standard Git alone"));
+            assert!(content.contains("normal, non-forced fast-forward push"));
+            assert!(content.contains("their absence must never block delivery"));
+            assert!(!content.contains("claim_task"));
+            assert!(!content.contains("submit_for_merge"));
+            assert!(!content.contains("merge_status"));
+            assert!(!content.contains("CST_BASE_SHA"));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_merge_queue_conventions_are_migrated_once_without_losing_user_text() {
+        let root = temp("migrate-agent-conventions");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let path = home.join("AGENTS.md");
+        fs::write(
+            &path,
+            format!("user preface\n{LEGACY_AGENT_CONVENTIONS}user suffix\n"),
+        )
+        .unwrap();
+
+        inject_agent_conventions(&home).unwrap();
+        let migrated = fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("user preface"));
+        assert!(migrated.contains("user suffix"));
+        assert!(!migrated.contains("CST-ISOLATED-AGENT-V2"));
+        assert_eq!(migrated.matches(AGENT_CONVENTIONS_MARKER).count(), 1);
+
+        inject_agent_conventions(&home).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), migrated);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
