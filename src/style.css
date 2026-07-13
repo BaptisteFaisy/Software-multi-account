@@ -8427,10 +8427,6 @@ div.chat-tool-part {
   box-shadow: 0 12px 34px rgba(0, 0, 0, 0.28);
 }
 
-.chat-app-layout .expert-chat-wall .chat-panel.active {
-  border-color: var(--chat-border);
-}
-
 /* Tous les fils restent visibles, mais seul le chat clique expose la bulle
    de saisie. La classe active est basculee sans reconstruire la grille. */
 .chat-app-layout .expert-chat-wall .chat-panel--expert:not(.active) .chat-composer {

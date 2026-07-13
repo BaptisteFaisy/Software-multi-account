@@ -137,6 +137,13 @@ test("un chat actif sans discussion listee reste visible dans la barre laterale"
   );
 });
 
+test("le chat actif n'est pas entoure d'un cadre de selection", () => {
+  assert.doesNotMatch(
+    style,
+    /\.expert-chat-wall\s+\.chat-panel\.active\s*\{[^}]*\bborder(?:-color)?\s*:/,
+  );
+});
+
 test("les backends desktop et serveur refusent un environnement implicite", () => {
   const error = "Environnement obligatoire avant d'ouvrir un terminal";
   assert.ok(desktop.includes(error));
