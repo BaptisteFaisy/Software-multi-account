@@ -5026,7 +5026,8 @@ body:has(.boot) .m-chrome {
   color: #241400;
 }
 
-.chat-turn-status--idle {
+.chat-turn-status--idle,
+.chat-turn-status--finalizing {
   border-color: #4ade80;
   background: #22c55e;
   color: #03150a;

@@ -23,7 +23,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::State;
 use uuid::Uuid;
@@ -37,6 +37,7 @@ const MAX_THOUGHT_CHARS: usize = 4_000;
 const MAX_PART_DETAIL_CHARS: usize = 12_000;
 const MAX_MODEL_CHARS: usize = 160;
 const MAX_RETAINED_TURNS: usize = 500;
+const PROVIDER_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -51,6 +52,7 @@ pub enum ChatTurnMode {
 #[serde(rename_all = "lowercase")]
 pub enum ChatTurnStatus {
     Running,
+    Finalizing,
     Completed,
     Failed,
     Cancelled,
@@ -138,6 +140,19 @@ struct ChatTurn {
     snapshot: Mutex<ChatTurnSnapshot>,
     child: Mutex<Option<Child>>,
     workspace: Mutex<Option<AgentWorkspace>>,
+    provider_terminal: Mutex<Option<ProviderTerminalEvent>>,
+}
+
+#[derive(Debug, Clone)]
+enum ProviderTerminalOutcome {
+    Completed,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct ProviderTerminalEvent {
+    outcome: ProviderTerminalOutcome,
+    observed_at: Instant,
 }
 
 impl Drop for ChatTurn {
@@ -317,6 +332,7 @@ impl ChatTurnManager {
             snapshot: Mutex::new(snapshot.clone()),
             child: Mutex::new(None),
             workspace: Mutex::new(Some(workspace)),
+            provider_terminal: Mutex::new(None),
         });
 
         let mut child = match command.spawn() {
@@ -385,8 +401,15 @@ impl ChatTurnManager {
         let supervisor_room = room.clone();
         thread::spawn(move || {
             let exit = wait_for_child(&supervisor_turn);
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            // Un evenement terminal est la derniere sortie utile du provider.
+            // Ne pas attendre indefiniment la fermeture de pipes herites par un
+            // sous-processus : les handles de thread sont alors simplement
+            // detaches. Sans evenement terminal, on conserve le drain complet
+            // historique afin de ne perdre aucune derniere ligne JSON.
+            if provider_terminal_event(&supervisor_turn).is_none() {
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+            }
             if let Ok(mut child) = supervisor_turn.child.lock() {
                 child.take();
             }
@@ -499,8 +522,10 @@ impl ChatTurnManager {
             turn.snapshot
                 .lock()
                 .map(|snapshot| {
-                    snapshot.status == ChatTurnStatus::Running
-                        && snapshot.account_id == request.account_id
+                    matches!(
+                        snapshot.status,
+                        ChatTurnStatus::Running | ChatTurnStatus::Finalizing
+                    ) && snapshot.account_id == request.account_id
                         && snapshot.session_id == request.session_id
                 })
                 .unwrap_or(false)
@@ -839,29 +864,64 @@ fn hide_process_window(_command: &mut Command) {}
 
 fn wait_for_child(turn: &Arc<ChatTurn>) -> Result<ExitStatus, String> {
     loop {
-        let result = turn
+        let terminal_grace_elapsed = provider_terminal_event(turn)
+            .is_some_and(|event| event.observed_at.elapsed() >= PROVIDER_EXIT_GRACE);
+        let mut child_guard = turn
             .child
             .lock()
-            .map_err(|_| "Processus du tour verrouillé".to_string())?
+            .map_err(|_| "Processus du tour verrouillé".to_string())?;
+        let child = child_guard
             .as_mut()
-            .ok_or_else(|| "Processus du tour introuvable".to_string())?
-            .try_wait()
-            .map_err(|error| error.to_string())?;
+            .ok_or_else(|| "Processus du tour introuvable".to_string())?;
+        let result = child.try_wait().map_err(|error| error.to_string())?;
         if let Some(status) = result {
             return Ok(status);
         }
+        if terminal_grace_elapsed {
+            // `turn.completed` / `result` est plus fiable que la survie d'un
+            // wrapper CLI. Après un court délai de flush, termine le wrapper
+            // resté vivant afin de libérer le tour et son workspace.
+            let _ = child.kill();
+            return child.wait().map_err(|error| error.to_string());
+        }
+        drop(child_guard);
         thread::sleep(Duration::from_millis(120));
     }
 }
 
 fn finish_turn(turn: &Arc<ChatTurn>, exit: Result<ExitStatus, String>, stderr: &str) {
+    let provider_terminal = provider_terminal_event(turn);
     let Ok(mut snapshot) = turn.snapshot.lock() else {
         return;
     };
     if snapshot.status == ChatTurnStatus::Cancelled {
         return;
     }
-    snapshot.finished_at = Some(metrics::now_ts());
+    if snapshot.status == ChatTurnStatus::Finalizing {
+        match provider_terminal.map(|event| event.outcome) {
+            Some(ProviderTerminalOutcome::Failed(error)) => {
+                snapshot.status = ChatTurnStatus::Failed;
+                snapshot.error = Some(first_non_empty(
+                    &Some(error),
+                    stderr,
+                    "Le provider a signalé un échec",
+                ));
+                complete_running_activities(&mut snapshot, "error");
+                complete_running_thoughts(&mut snapshot, "error");
+                complete_running_parts(&mut snapshot, "error");
+            }
+            _ => {
+                snapshot.status = ChatTurnStatus::Completed;
+                snapshot.error = None;
+                complete_running_activities(&mut snapshot, "complete");
+                complete_running_thoughts(&mut snapshot, "complete");
+                complete_running_parts(&mut snapshot, "complete");
+                remove_final_commentary(&mut snapshot);
+            }
+        }
+        return;
+    }
+    snapshot.finished_at.get_or_insert_with(metrics::now_ts);
     match exit {
         Ok(status) if status.success() => {
             snapshot.status = ChatTurnStatus::Completed;
@@ -933,6 +993,48 @@ fn remove_final_commentary(snapshot: &mut ChatTurnSnapshot) {
     }
 }
 
+fn provider_terminal_event(turn: &Arc<ChatTurn>) -> Option<ProviderTerminalEvent> {
+    turn.provider_terminal
+        .lock()
+        .ok()
+        .and_then(|event| event.clone())
+}
+
+fn mark_provider_terminal(
+    turn: &Arc<ChatTurn>,
+    snapshot: &mut ChatTurnSnapshot,
+    outcome: ProviderTerminalOutcome,
+) {
+    if snapshot.status != ChatTurnStatus::Running {
+        return;
+    }
+
+    snapshot.status = ChatTurnStatus::Finalizing;
+    snapshot.finished_at = Some(metrics::now_ts());
+    match &outcome {
+        ProviderTerminalOutcome::Completed => {
+            snapshot.error = None;
+            complete_running_activities(snapshot, "complete");
+            complete_running_thoughts(snapshot, "complete");
+            complete_running_parts(snapshot, "complete");
+            remove_final_commentary(snapshot);
+        }
+        ProviderTerminalOutcome::Failed(error) => {
+            snapshot.error = Some(error.clone());
+            complete_running_activities(snapshot, "error");
+            complete_running_thoughts(snapshot, "error");
+            complete_running_parts(snapshot, "error");
+        }
+    }
+
+    if let Ok(mut terminal) = turn.provider_terminal.lock() {
+        terminal.get_or_insert(ProviderTerminalEvent {
+            outcome,
+            observed_at: Instant::now(),
+        });
+    }
+}
+
 fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return;
@@ -966,7 +1068,42 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
         }
         return;
     }
-    if event_type == "turn.failed" || event_type == "error" {
+    if event_type == "turn.completed" {
+        mark_provider_terminal(turn, &mut snapshot, ProviderTerminalOutcome::Completed);
+        return;
+    }
+    if event_type == "turn.failed" {
+        let error = event_error(&value)
+            .unwrap_or_else(|| "Le provider a signalé l'échec du tour".to_string());
+        mark_provider_terminal(turn, &mut snapshot, ProviderTerminalOutcome::Failed(error));
+        return;
+    }
+    if provider == Provider::Claude && event_type == "result" {
+        if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
+            snapshot.session_id = Some(session_id.to_string());
+        }
+        let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
+        let failed = value.get("is_error").and_then(Value::as_bool) == Some(true)
+            || subtype.starts_with("error");
+        let outcome = if failed {
+            ProviderTerminalOutcome::Failed(
+                event_error(&value)
+                    .or_else(|| {
+                        value
+                            .get("result")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.trim().is_empty())
+                            .map(ToString::to_string)
+                    })
+                    .unwrap_or_else(|| "Claude a signalé l'échec du tour".to_string()),
+            )
+        } else {
+            ProviderTerminalOutcome::Completed
+        };
+        mark_provider_terminal(turn, &mut snapshot, outcome);
+        return;
+    }
+    if event_type == "error" {
         snapshot.error = event_error(&value);
         return;
     }
@@ -1470,6 +1607,7 @@ mod tests {
             }),
             child: Mutex::new(None),
             workspace: Mutex::new(None),
+            provider_terminal: Mutex::new(None),
         })
     }
 
@@ -1521,6 +1659,76 @@ mod tests {
         assert_eq!(snapshot.parts[0].status, "complete");
         assert_eq!(snapshot.parts[1].kind, "reasoning");
         assert_eq!(snapshot.parts[2].kind, "text");
+    }
+
+    #[test]
+    fn codex_terminal_event_stops_visible_work_before_process_exit() {
+        let turn = test_turn();
+        apply_provider_event(
+            &turn,
+            Provider::Codex,
+            r#"{"type":"item.completed","item":{"id":"message_1","type":"agent_message","text":"La réponse est terminée."}}"#,
+        );
+        apply_provider_event(
+            &turn,
+            Provider::Codex,
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}"#,
+        );
+
+        let snapshot = turn.snapshot.lock().unwrap();
+        assert_eq!(snapshot.status, ChatTurnStatus::Finalizing);
+        assert!(snapshot.finished_at.is_some());
+        assert!(snapshot
+            .parts
+            .iter()
+            .all(|part| part.status != "running" && part.status != "queued"));
+        drop(snapshot);
+        assert!(matches!(
+            provider_terminal_event(&turn).map(|event| event.outcome),
+            Some(ProviderTerminalOutcome::Completed)
+        ));
+        finish_turn(&turn, Err("wrapper resté vivant".to_string()), "");
+        assert_eq!(
+            turn.snapshot.lock().unwrap().status,
+            ChatTurnStatus::Completed
+        );
+    }
+
+    #[test]
+    fn claude_result_event_stops_visible_work_and_preserves_failure() {
+        let successful = test_turn();
+        apply_provider_event(
+            &successful,
+            Provider::Claude,
+            r#"{"type":"result","subtype":"success","is_error":false,"session_id":"claude-session"}"#,
+        );
+        let snapshot = successful.snapshot.lock().unwrap();
+        assert_eq!(snapshot.status, ChatTurnStatus::Finalizing);
+        assert_eq!(snapshot.session_id.as_deref(), Some("claude-session"));
+        drop(snapshot);
+        assert!(matches!(
+            provider_terminal_event(&successful).map(|event| event.outcome),
+            Some(ProviderTerminalOutcome::Completed)
+        ));
+
+        let failed = test_turn();
+        apply_provider_event(
+            &failed,
+            Provider::Claude,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"quota dépassé"}"#,
+        );
+        let snapshot = failed.snapshot.lock().unwrap();
+        assert_eq!(snapshot.status, ChatTurnStatus::Finalizing);
+        assert_eq!(snapshot.error.as_deref(), Some("quota dépassé"));
+        drop(snapshot);
+        assert!(matches!(
+            provider_terminal_event(&failed).map(|event| event.outcome),
+            Some(ProviderTerminalOutcome::Failed(error)) if error == "quota dépassé"
+        ));
+        finish_turn(&failed, Err("wrapper resté vivant".to_string()), "");
+        let snapshot = failed.snapshot.lock().unwrap();
+        assert_eq!(snapshot.status, ChatTurnStatus::Failed);
+        assert_eq!(snapshot.error.as_deref(), Some("quota dépassé"));
     }
 
     #[test]

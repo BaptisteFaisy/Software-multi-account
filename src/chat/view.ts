@@ -6,6 +6,7 @@
 
 import { escapeHtml, renderMarkdown } from "./markdown";
 import {
+  chatTurnIsBusy,
   formatChatDuration,
   formatChatResetCountdown,
   groupConsecutiveCommandParts,
@@ -15,7 +16,13 @@ import {
 
 export type ChatRole = "user" | "assistant";
 export type ChatMode = "build" | "plan" | "ask";
-export type ChatTurnStatus = "running" | "completed" | "failed" | "cancelled" | "idle";
+export type ChatTurnStatus =
+  | "running"
+  | "finalizing"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "idle";
 
 export type ChatMessage = RuntimeChatMessage;
 export type ChatPart = RuntimeChatPart;
@@ -511,6 +518,10 @@ const renderLegacyChatRuntimeStatus = (model: ChatPanelModel): string => {
     title = `${model.providerLabel || "L'agent"} travaille`;
     detail = runningActivity?.label || latestActivity?.label || "Analyse et préparation de la réponse";
     icon = "loader-circle";
+  } else if (model.turnStatus === "finalizing") {
+    title = "Réponse terminée";
+    detail = "Synchronisation de la conversation…";
+    icon = "circle-check";
   } else if (model.turnStatus === "completed") {
     title = "Réponse terminée";
     detail = latestActivity?.label || "Le dernier tour est terminé.";
@@ -584,7 +595,8 @@ export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
   if (waitingForUser) stateLabel = "Reponse attendue";
   else if (model.turnStatus === "running") {
     stateLabel = latestPart?.title || runningActivity?.label || "Thinking";
-  } else if (model.turnStatus === "failed") stateLabel = "Echec";
+  } else if (model.turnStatus === "finalizing") stateLabel = "Termine";
+  else if (model.turnStatus === "failed") stateLabel = "Echec";
   else if (model.turnStatus === "cancelled") stateLabel = "Arrete";
   else if (model.turnStatus === "completed") stateLabel = "Termine";
 
@@ -606,11 +618,15 @@ export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
 
 export const renderChatTurnStatus = (model: ChatPanelModel): string => {
   const running = model.turnStatus === "running";
-  const label = running ? "En cours" : "Disponible";
+  const finalizing = model.turnStatus === "finalizing";
+  const state = running ? "running" : finalizing ? "finalizing" : "idle";
+  const label = running ? "En cours" : finalizing ? "Terminé" : "Disponible";
   const title = running
     ? "Le chat est en cours d'execution"
+    : finalizing
+      ? "Réponse terminée, synchronisation en cours"
     : "Le chat ne tourne pas";
-  return `<button type="button" data-chat-control="turn-status" class="chat-turn-status chat-turn-status--${running ? "running" : "idle"}" title="${title}" aria-label="${title}" disabled>
+  return `<button type="button" data-chat-control="turn-status" class="chat-turn-status chat-turn-status--${state}" title="${title}" aria-label="${title}" disabled>
     <span class="chat-turn-status-dot" aria-hidden="true"></span>
     <span class="chat-turn-status-label">${label}</span>
   </button>`;
@@ -819,6 +835,7 @@ export const renderChatPanel = (
   options: ChatPanelRenderOptions = {},
 ): string => {
   const running = model.turnStatus === "running";
+  const busy = chatTurnIsBusy(model.turnStatus);
   const userMessageCount = model.messages.filter((message) => message.role === "user").length;
   const instanceId = (options.instanceId ?? "").replace(/[^a-zA-Z0-9_-]/g, "-");
   const id = (base: string) => instanceId ? `${base}-${instanceId}` : base;
@@ -871,14 +888,14 @@ export const renderChatPanel = (
       ${renderChatHistory(model, instanceId)}
     </div>
     ${renderChatQuestionDock(model, instanceId)}
-    <form id="${id("chatComposer")}" data-chat-control="composer" class="chat-composer ${running ? "is-running" : ""} ${model.pendingQuestion ? "is-question-pending" : ""}">
+    <form id="${id("chatComposer")}" data-chat-control="composer" class="chat-composer ${busy ? "is-running" : ""} ${model.pendingQuestion ? "is-question-pending" : ""}">
       <div class="chat-composer-box">
-        <textarea id="${id("chatPrompt")}" data-chat-control="prompt" rows="1" placeholder="Demandez a ${escapeHtml(model.providerLabel || "l'agent")} de construire quelque chose…" ${running ? "disabled" : ""}>${escapeHtml(model.draft)}</textarea>
+        <textarea id="${id("chatPrompt")}" data-chat-control="prompt" rows="1" placeholder="Demandez a ${escapeHtml(model.providerLabel || "l'agent")} de construire quelque chose…" ${busy ? "disabled" : ""}>${escapeHtml(model.draft)}</textarea>
         <div class="chat-composer-toolbar">
           <div class="chat-composer-context">
             <label class="chat-mode-select" title="Mode de travail">
               <i data-lucide="sparkles"></i>
-              <select id="${id("chatMode")}" data-chat-control="mode" ${running ? "disabled" : ""} aria-label="Mode de travail">
+              <select id="${id("chatMode")}" data-chat-control="mode" ${busy ? "disabled" : ""} aria-label="Mode de travail">
                 <option value="build" ${model.mode === "build" ? "selected" : ""}>Construire</option>
                 <option value="plan" ${model.mode === "plan" ? "selected" : ""}>Planifier</option>
                 <option value="ask" ${model.mode === "ask" ? "selected" : ""}>Question</option>
@@ -886,12 +903,12 @@ export const renderChatPanel = (
             </label>
             <label class="chat-model-select" title="Modele utilise pour les prochains messages">
               <i data-lucide="cpu"></i>
-              <input id="${id("chatModel")}" data-chat-control="model" list="${id("chatModelSuggestions")}" value="${escapeHtml(model.selectedModel)}" ${running || !model.selectedAccountId ? "disabled" : ""} aria-label="Modele" autocomplete="off" spellcheck="false" maxlength="160" />
+              <input id="${id("chatModel")}" data-chat-control="model" list="${id("chatModelSuggestions")}" value="${escapeHtml(model.selectedModel)}" ${busy || !model.selectedAccountId ? "disabled" : ""} aria-label="Modele" autocomplete="off" spellcheck="false" maxlength="160" />
               <datalist id="${id("chatModelSuggestions")}">${modelSuggestions(model)}</datalist>
             </label>
             <label class="chat-effort-select" title="${model.supportsReasoningEffort ? "Intensite de raisonnement Codex" : "Ce fournisseur ne gere pas l'intensite de raisonnement"}">
               <i data-lucide="gauge"></i>
-              <select id="${id("chatReasoningEffort")}" data-chat-control="reasoning-effort" ${running || !model.selectedAccountId || !model.supportsReasoningEffort ? "disabled" : ""} aria-label="Intensite de raisonnement">
+              <select id="${id("chatReasoningEffort")}" data-chat-control="reasoning-effort" ${busy || !model.selectedAccountId || !model.supportsReasoningEffort ? "disabled" : ""} aria-label="Intensite de raisonnement">
                 ${reasoningEffortOptions(model)}
               </select>
             </label>
@@ -905,12 +922,14 @@ export const renderChatPanel = (
             class="chat-goal"
             title="${model.supportsGoals ? "Créer un goal à partir du texte saisi" : "Les goals sont disponibles avec Codex"}"
             aria-label="Créer un goal"
-            ${running || !model.selectedAccountId || !model.supportsGoals ? "disabled" : ""}
+            ${busy || !model.selectedAccountId || !model.supportsGoals ? "disabled" : ""}
           >
             <i data-lucide="target"></i><span>Goal</span>
           </button>
           ${running
             ? `<button id="${id("chatStop")}" data-chat-action="stop" type="button" class="chat-send chat-stop" title="Arreter la reponse" aria-label="Arreter la reponse"><i data-lucide="square"></i></button>`
+            : model.turnStatus === "finalizing"
+              ? `<button id="${id("chatSend")}" type="button" class="chat-send" title="Réponse terminée, synchronisation en cours" aria-label="Synchronisation en cours" disabled><i data-lucide="badge-check"></i></button>`
             : `<button id="${id("chatSend")}" data-chat-action="send" type="submit" class="chat-send" title="Envoyer" aria-label="Envoyer" ${model.accounts.length ? "" : "disabled"}><i data-lucide="arrow-up"></i></button>`}
         </div>
       </div>

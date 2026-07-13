@@ -44,6 +44,7 @@ import {
 } from "./chat/quota";
 import {
   chatMessagesEqual,
+  chatTurnIsBusy,
   conversationWaitsForUser,
   createGoalPrompt,
   formatChatDuration,
@@ -3518,10 +3519,10 @@ const continueDiscussionWith = async (discussion: DiscussionSummary, targetAccou
 };
 
 const discussionHasRunningTurn = (discussion: DiscussionSummary): boolean =>
-  (chatDiscussion?.sessionId === discussion.sessionId && chatTurn?.status === "running") ||
+  (chatDiscussion?.sessionId === discussion.sessionId && chatTurnIsBusy(chatTurn?.status)) ||
   expertChatPanes.some(
     (pane) =>
-      pane.discussion?.sessionId === discussion.sessionId && pane.turn?.status === "running",
+      pane.discussion?.sessionId === discussion.sessionId && chatTurnIsBusy(pane.turn?.status),
   );
 
 // Deplacement persistant utilise par le drag-and-drop de la barre laterale.
@@ -4261,11 +4262,12 @@ const attachCreatedChat = async (sessionId: string): Promise<boolean> => {
 const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   const pane = expertChatPanes.find(
     (candidate) =>
-      candidate.turn?.status === "running" &&
+      !!candidate.turn &&
+      chatTurnIsBusy(candidate.turn?.status) &&
       (candidate.turn.id === 0 || candidate.turn.id === snapshot.id) &&
       candidate.turn.accountId === snapshot.accountId,
   ) ?? activeExpertChatPane();
-  if (pane?.turn?.status === "running") {
+  if (pane?.turn && chatTurnIsBusy(pane.turn.status)) {
     await applyExpertChatTurnSnapshot(pane, snapshot);
     return;
   }
@@ -4288,12 +4290,12 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     isQuotaExhaustionError(snapshot.error);
   const attached = snapshot.sessionId ? await attachCreatedChat(snapshot.sessionId) : !!chatDiscussion;
 
-  if (snapshot.status === "completed") {
+  if (snapshot.status === "finalizing") {
+    statusText = "Reponse terminee, synchronisation…";
+  } else if (snapshot.status === "completed") {
     statusText = "Reponse terminee";
-    if (attached) {
-      await loadChatTranscript();
-      stopChatTurnPoll();
-    }
+    if (attached) await loadChatTranscript();
+    stopChatTurnPoll();
   } else if (snapshot.status === "failed") {
     chatMessages = markLatestPendingMessageFailed(chatMessages);
     statusText = snapshot.error || "La reponse a echoue";
@@ -4305,7 +4307,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     statusText = `${chatPanelModel().providerLabel} travaille…`;
   }
 
-  if (previousStatus === "running" && snapshot.status !== "running") {
+  if (chatTurnIsBusy(previousStatus) && !chatTurnIsBusy(snapshot.status)) {
     void refreshLimitStatus(true);
   }
   if (activeView === "chat") {
@@ -4354,7 +4356,7 @@ const chatSubmissionPrompt = (
 };
 
 const sendChatMessage = async (intent: ChatSubmitIntent = "message") => {
-  if (chatTurn?.status === "running") return;
+  if (chatTurnIsBusy(chatTurn?.status)) return;
   const input = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
   const prompt = chatSubmissionPrompt(input, chatDraft, intent);
   const account = chatSelectedAccount();
@@ -5166,7 +5168,9 @@ const applyExpertChatTurnSnapshot = async (
     ? await attachCreatedExpertChat(pane, snapshot.sessionId)
     : !!pane.discussion;
 
-  if (snapshot.status === "completed") {
+  if (snapshot.status === "finalizing") {
+    statusText = "Reponse terminee, synchronisation…";
+  } else if (snapshot.status === "completed") {
     statusText = "Reponse terminee";
     if (attached) await loadExpertChatTranscript(pane);
     stopExpertChatTurnPoll(pane);
@@ -5181,7 +5185,7 @@ const applyExpertChatTurnSnapshot = async (
     statusText = `${expertChatPanelModel(pane).providerLabel} travaille…`;
   }
 
-  if (previousStatus === "running" && snapshot.status !== "running") {
+  if (chatTurnIsBusy(previousStatus) && !chatTurnIsBusy(snapshot.status)) {
     void refreshLimitStatus(true);
   }
   if (activeView === "chat") {
@@ -5215,7 +5219,7 @@ const sendExpertChatMessage = async (
   promptOverride?: string,
   intent: ChatSubmitIntent = "message",
 ): Promise<boolean> => {
-  if (pane.turn?.status === "running") return false;
+  if (chatTurnIsBusy(pane.turn?.status)) return false;
   const input = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
   const prompt = chatSubmissionPrompt(
     promptOverride === undefined ? input : null,
@@ -5347,7 +5351,9 @@ const startAllExpertChatWork = () => {
       startExpertChatSync(pane);
       void loadExpertChatTranscript(pane);
     }
-    if (pane.turn?.status === "running" && pane.turn.id !== 0) startExpertChatTurnPoll(pane);
+    if (pane.turn && chatTurnIsBusy(pane.turn.status) && pane.turn.id !== 0) {
+      startExpertChatTurnPoll(pane);
+    }
   });
 };
 
@@ -5479,8 +5485,10 @@ const toggleExpertChatFullscreen = (pane: ExpertChatPane) => {
 };
 
 const closeExpertChatPane = (pane: ExpertChatPane) => {
-  if (pane.turn?.status === "running") {
-    statusText = "Arretez la reponse avant de fermer ce chat";
+  if (chatTurnIsBusy(pane.turn?.status)) {
+    statusText = pane.turn?.status === "finalizing"
+      ? "La conversation termine sa synchronisation"
+      : "Arretez la reponse avant de fermer ce chat";
     return;
   }
   const index = expertChatPanes.indexOf(pane);
@@ -6570,8 +6578,10 @@ const openFolderTerminals = async (value: string): Promise<void> => {
 
 const closeExpertChatAndDiscussion = async (pane: ExpertChatPane) => {
   if (!expertChatPanes.includes(pane)) return;
-  if (pane.turn?.status === "running") {
-    statusText = "Arretez la reponse avant de fermer ce chat";
+  if (chatTurnIsBusy(pane.turn?.status)) {
+    statusText = pane.turn?.status === "finalizing"
+      ? "La conversation termine sa synchronisation"
+      : "Arretez la reponse avant de fermer ce chat";
     render();
     return;
   }

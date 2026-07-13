@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   chatMessagesEqual,
+  chatTurnIsBusy,
   conversationWaitsForUser,
   formatChatDuration,
   formatChatResetCountdown,
@@ -69,6 +70,18 @@ test("une question finale place clairement le chat en attente de l'utilisateur",
   );
 });
 
+test("la reponse finale sort du mode anime pendant la synchronisation", () => {
+  assert.equal(chatTurnIsBusy("running"), true);
+  assert.equal(chatTurnIsBusy("finalizing"), true);
+  assert.equal(chatTurnIsBusy("completed"), false);
+  assert.match(view, /model\.turnStatus === "finalizing"/);
+  assert.match(view, /Réponse terminée, synchronisation en cours/);
+  assert.match(main, /snapshot\.status === "finalizing"/);
+  assert.match(chatBackend, /event_type == "turn\.completed"/);
+  assert.match(chatBackend, /provider == Provider::Claude && event_type == "result"/);
+  assert.match(chatBackend, /PROVIDER_EXIT_GRACE/);
+});
+
 test("les durees et resets sont lisibles pendant un long tour", () => {
   assert.equal(formatChatDuration(9), "9 s");
   assert.equal(formatChatDuration(65), "1 min 05 s");
@@ -96,10 +109,10 @@ test("le chat expose le chronometre, le quota et le dock de question", () => {
 
 test("le bandeau du chat indique en couleur si le tour est en cours", () => {
   assert.match(view, /data-chat-control="turn-status"/);
-  assert.match(view, /const label = running \? "En cours" : "Disponible"/);
-  assert.match(view, /chat-turn-status--\$\{running \? "running" : "idle"\}/);
+  assert.match(view, /finalizing \? "Terminé" : "Disponible"/);
+  assert.match(view, /chat-turn-status--\$\{state\}/);
   assert.match(style, /\.chat-turn-status--running \{[\s\S]*?background: #f59e0b;/);
-  assert.match(style, /\.chat-turn-status--idle \{[\s\S]*?background: #22c55e;/);
+  assert.match(style, /\.chat-turn-status--finalizing \{[\s\S]*?background: #22c55e;/);
   assert.match(main, /\[data-chat-control='turn-status'\]/);
 });
 

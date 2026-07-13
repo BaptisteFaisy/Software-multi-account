@@ -20,6 +20,10 @@ export type RuntimeChatMessage = {
   parts?: RuntimeChatPart[];
 };
 
+/** Un tour reste verrouillé pendant la synchronisation qui suit la réponse finale. */
+export const chatTurnIsBusy = (status: string | null | undefined): boolean =>
+  status === "running" || status === "finalizing";
+
 /**
  * Transforme l'objectif saisi via le bouton Goal en demande utilisateur
  * explicite. Codex n'active un goal que lorsque l'utilisateur le demande : le
