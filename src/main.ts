@@ -93,6 +93,13 @@ import {
   workspacePathBreadcrumbs,
   type WorkspaceProfile,
 } from "./workspace";
+import {
+  STATS_RANGE_OPTIONS,
+  buildAccountTokenSeries,
+  sumTokenUsage,
+  type DailyTokenUsage,
+  type StatsRangeDays,
+} from "./stats";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import {
@@ -800,10 +807,10 @@ let limitStatusLoaded = false;
 let limitPoll: number | null = null;
 let limitStatusInFlight = false;
 let usageDashboard: UsageDashboard | null = null;
-let usageLoaded = false;
 let usagePoll: number | null = null;
 let accountUsage: AccountUsageDashboard | null = null;
 let accountUsageLoaded = false;
+let statsRangeDays: StatsRangeDays = 30;
 let kombaiStatus: KombaiStatus | null = null;
 let kombaiLoaded = false;
 let kombaiPoll: number | null = null;
@@ -3151,10 +3158,8 @@ const stopLimitPoll = () => {
 const refreshUsageDashboard = async () => {
   try {
     usageDashboard = await invoke<UsageDashboard>("usage_dashboard");
-    usageLoaded = true;
   } catch (error) {
     statusText = String(error);
-    usageLoaded = true;
   }
 
   if (activeView === "dashboard") {
@@ -8971,109 +8976,76 @@ const formatRemaining = (seconds?: number | null) => {
   return `${minutes}min`;
 };
 
-// Tokens/coût agrégés par date à partir des logs Codex par-compte
-// (account_usage.rs). Source complète : couvre aussi les comptes utilisés
-// interactivement via `codex login`, contrairement au trafic pool.
-type DayTokenTotals = {
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  costUsd: number;
-};
-
-const aggregateAccountDaysByDate = (
-  data: AccountUsageDashboard,
-): Map<string, DayTokenTotals> => {
-  const byDate = new Map<string, DayTokenTotals>();
-  for (const account of data.accounts) {
-    for (const day of account.days) {
-      const entry =
-        byDate.get(day.date) ??
-        { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 };
-      entry.inputTokens += day.inputTokens;
-      entry.cachedInputTokens += day.cachedInputTokens;
-      entry.outputTokens += day.outputTokens;
-      entry.totalTokens += day.totalTokens;
-      entry.costUsd += day.costUsd;
-      byDate.set(day.date, entry);
-    }
-  }
-  return byDate;
-};
-
-// Remplace (jamais additionne, pour éviter tout double comptage) les
-// tokens/coût d'une journée par la valeur issue des comptes. Les compteurs
-// propres au pool (temps agents, requêtes API…) sont conservés tels quels.
-const mergeDayTokens = (day: UsageDayView, tokens: DayTokenTotals | undefined): UsageDayView => ({
-  ...day,
-  inputTokens: tokens?.inputTokens ?? 0,
-  cachedInputTokens: tokens?.cachedInputTokens ?? 0,
-  outputTokens: tokens?.outputTokens ?? 0,
-  totalTokens: tokens?.totalTokens ?? 0,
-  costUsd: tokens?.costUsd ?? 0,
-});
-
-// « Général » = somme de tous les comptes. On garde la structure mois-à-date du
-// pool (temps agents / requêtes API) et on y superpose les tokens/coût réels
-// relus des logs Codex. Repli sur les données pool tant que le scan par-compte
-// n'est pas chargé, ou s'il n'y a aucun compte.
-const buildMergedUsageDashboard = (
-  pool: UsageDashboard,
-  accounts: AccountUsageDashboard | null,
-): UsageDashboard => {
-  if (!accounts || accounts.accounts.length === 0) {
-    return pool;
-  }
-  const byDate = aggregateAccountDaysByDate(accounts);
-  const days = pool.days.map((day) => mergeDayTokens(day, byDate.get(day.date)));
-  const today = mergeDayTokens(pool.today, byDate.get(pool.today.date));
-  return {
-    ...pool,
-    totalTokens: days.reduce((sum, day) => sum + day.totalTokens, 0),
-    totalCostUsd: days.reduce((sum, day) => sum + day.costUsd, 0),
-    today,
-    days,
-  };
+const localDateKey = (timestamp: number): string => {
+  const date = new Date(timestamp * 1000);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 };
 
 const renderDashboardPanel = () => {
-  if (!usageLoaded || !usageDashboard) {
-    return `<section class="dashboard-panel"><div class="pool-empty">Chargement dashboard</div></section>`;
+  if (!accountUsageLoaded) {
+    return `<section class="dashboard-panel"><div class="pool-empty">Calcul des tokens de tous les comptes…</div></section>`;
   }
 
-  const dash = buildMergedUsageDashboard(usageDashboard, accountUsageLoaded ? accountUsage : null);
+  if (!accountUsage) {
+    return `
+      <section class="dashboard-panel">
+        <div class="pool-empty">Impossible de lire les statistiques des comptes.</div>
+        <div class="dashboard-table-actions dashboard-empty-action">
+          <button id="dashboardRefresh"><i data-lucide="refresh-ccw"></i><span>Réessayer</span></button>
+        </div>
+      </section>
+    `;
+  }
 
-  const days = dash.days.length > 0 ? dash.days : [dash.today];
-  const chartDays = days.slice(-30);
-  const monthLabel = formatMonthLabel(days[0]?.date ?? dash.today.date);
-  const errorRate =
-    dash.totalApiRequests > 0
-      ? Math.round((dash.totalApiErrors / dash.totalApiRequests) * 100)
-      : 0;
+  // La série est indépendante des jours disponibles dans le pool : elle couvre
+  // toujours 30 jours calendaires et additionne chaque compte pour chaque date.
+  const endDate = usageDashboard?.today.date ?? localDateKey(accountUsage.generatedAt);
+  const last30Days = buildAccountTokenSeries(accountUsage, endDate, 30);
+  const todayUsage = sumTokenUsage(last30Days.slice(-1));
+  const last7DaysUsage = sumTokenUsage(last30Days.slice(-7));
+  const last30DaysUsage = sumTokenUsage(last30Days);
+  const selectedDays = last30Days.slice(-statsRangeDays);
+  const selectedUsage = sumTokenUsage(selectedDays);
+  const selectedRange =
+    STATS_RANGE_OPTIONS.find((range) => range.days === statsRangeDays) ?? STATS_RANGE_OPTIONS[2];
+  const readableAccounts = accountUsage.accounts.filter((account) => !account.error).length;
+  const accountValue =
+    readableAccounts === accountUsage.accounts.length
+      ? String(readableAccounts)
+      : `${readableAccounts}/${accountUsage.accounts.length}`;
 
   return `
     <section class="dashboard-panel">
       <div class="metric-grid">
-        ${renderMetricCard("Temps agents", formatDuration(dash.totalAgentSeconds), `${dash.totalAgentRuns} sessions ce mois`, `${dash.activeAgentCount} actives`, "clock-3")}
-        ${renderMetricCard("Tokens du jour", formatTokens(dash.today.totalTokens), `${formatTokens(dash.today.inputTokens)} entree | ${formatTokens(dash.today.outputTokens)} sortie`, `${dash.today.apiRequests} API`, "bar-chart-3")}
-        ${renderMetricCard("Cout du jour", formatUsd(dash.today.costUsd), `${dash.today.estimatedRequests} estimation(s)`, "aujourd'hui", "circle-dollar-sign")}
-        ${renderMetricCard("Cout du mois", formatUsd(dash.totalCostUsd), `${formatTokens(dash.totalTokens)} tokens`, `${errorRate}% err`, "server")}
+        ${renderMetricCard("Aujourd'hui", formatTokens(todayUsage.totalTokens), `${formatTokens(todayUsage.inputTokens)} entrée · ${formatTokens(todayUsage.outputTokens)} sortie`, "tous comptes", "calendar-clock")}
+        ${renderMetricCard("7 derniers jours", formatTokens(last7DaysUsage.totalTokens), `${formatTokens(last7DaysUsage.totalTokens / 7)} tokens / jour`, "cumul", "bar-chart-3")}
+        ${renderMetricCard("30 derniers jours", formatTokens(last30DaysUsage.totalTokens), formatUsd(last30DaysUsage.costUsd), "cumul", "bar-chart-3")}
+        ${renderMetricCard("Comptes additionnés", accountValue, `${accountUsage.totalSessions} sessions analysées`, "source Codex", "users")}
       </div>
 
       <section class="usage-chart-card">
         <div class="dashboard-card-head">
           <div>
-            <strong>Total tokens</strong>
-            <span>${escapeHtml(monthLabel)} | ${formatTokens(dash.totalTokens)} consommes</span>
+            <strong>Total des tokens utilisés</strong>
+            <span>${escapeHtml(selectedRange.label)} · ${formatTokens(selectedUsage.totalTokens)} tokens · tous les comptes additionnés</span>
           </div>
-          <div class="dashboard-segment">
-            <button class="active">30 jours</button>
-            <button>14 jours</button>
-            <button>7 jours</button>
+          <div class="dashboard-segment" role="group" aria-label="Période du graphique">
+            ${STATS_RANGE_OPTIONS.map(
+              (range) => `
+                <button
+                  class="${range.days === statsRangeDays ? "active" : ""}"
+                  data-stats-range="${range.days}"
+                  aria-pressed="${range.days === statsRangeDays ? "true" : "false"}"
+                >${escapeHtml(range.label)}</button>
+              `,
+            ).join("")}
           </div>
         </div>
-        ${renderUsageAreaChart(chartDays)}
+        ${renderUsageAreaChart(selectedDays)}
+        <p class="usage-chart-note">Chaque point correspond au total journalier de tous les comptes configurés.</p>
       </section>
 
       <div class="dashboard-table-toolbar">
@@ -9087,17 +9059,15 @@ const renderDashboardPanel = () => {
           <thead>
             <tr>
               <th>Jour</th>
-              <th>Temps agent</th>
-              <th>API</th>
               <th>Tokens</th>
-              <th>Entree</th>
+              <th>Entrée</th>
               <th>Cache</th>
               <th>Sortie</th>
-              <th>Cout</th>
+              <th>Coût estimé</th>
             </tr>
           </thead>
           <tbody>
-            ${days.map(renderUsageDayRow).join("")}
+            ${[...selectedDays].reverse().map(renderTokenUsageDayRow).join("")}
           </tbody>
         </table>
       </div>
@@ -9209,30 +9179,47 @@ const renderMetricCard = (label: string, value: string, detail: string, badge: s
   </div>
 `;
 
-const renderUsageAreaChart = (days: UsageDayView[]) => {
+const renderUsageAreaChart = (days: DailyTokenUsage[]) => {
   const chartDays = days.length > 0 ? days : [];
   if (chartDays.length === 0) {
     return `<div class="usage-area-chart empty">Aucune donnee</div>`;
   }
 
   const width = 960;
-  const height = 246;
-  const padX = 28;
-  const padTop = 26;
-  const padBottom = 38;
+  const height = 270;
+  const padLeft = 78;
+  const padRight = 24;
+  const padTop = 34;
+  const padBottom = 42;
   const bottom = height - padBottom;
-  const innerWidth = width - padX * 2;
-  const maxTokens = Math.max(1, ...chartDays.map((day) => day.totalTokens));
+  const right = width - padRight;
+  const innerWidth = right - padLeft;
+  const actualMaxTokens = Math.max(0, ...chartDays.map((day) => day.totalTokens));
+  const scaleMaxTokens = Math.max(1, actualMaxTokens);
   const points = chartDays.map((day, index) => {
-    const x = padX + (chartDays.length === 1 ? innerWidth / 2 : (index / (chartDays.length - 1)) * innerWidth);
-    const y = bottom - (day.totalTokens / maxTokens) * (bottom - padTop);
+    const x =
+      padLeft +
+      (chartDays.length === 1 ? innerWidth / 2 : (index / (chartDays.length - 1)) * innerWidth);
+    const y = bottom - (day.totalTokens / scaleMaxTokens) * (bottom - padTop);
     return { day, x, y };
   });
-  const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
-  const areaPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${bottom} L ${points[0].x.toFixed(2)} ${bottom} Z`;
+  const linePath =
+    points.length === 1
+      ? `M ${padLeft} ${points[0].y.toFixed(2)} L ${right} ${points[0].y.toFixed(2)}`
+      : points
+          .map(
+            (point, index) =>
+              `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`,
+          )
+          .join(" ");
+  const areaPath = `${linePath} L ${right} ${bottom} L ${padLeft} ${bottom} Z`;
   const gridLines = [0, 1, 2, 3].map((step) => {
     const y = padTop + ((bottom - padTop) / 3) * step;
-    return `<line x1="${padX}" y1="${y.toFixed(2)}" x2="${width - padX}" y2="${y.toFixed(2)}" />`;
+    const tokenValue = actualMaxTokens === 0 ? 0 : actualMaxTokens * (1 - step / 3);
+    return `
+      <line x1="${padLeft}" y1="${y.toFixed(2)}" x2="${right}" y2="${y.toFixed(2)}" />
+      <text x="${padLeft - 12}" y="${(y + 4).toFixed(2)}" text-anchor="end">${escapeHtml(formatCompactTokens(tokenValue))}</text>
+    `;
   });
   const labelStep = Math.max(1, Math.ceil(chartDays.length / 7));
   const labels = points
@@ -9241,26 +9228,41 @@ const renderUsageAreaChart = (days: UsageDayView[]) => {
       (point) =>
         `<text x="${point.x.toFixed(2)}" y="${height - 11}" text-anchor="middle">${escapeHtml(formatDayLabel(point.day.date))}</text>`,
     );
+  const valueLabels =
+    points.length <= 7
+      ? points.map(
+          (point) =>
+            `<text x="${point.x.toFixed(2)}" y="${Math.max(padTop + 14, point.y - 11).toFixed(2)}" text-anchor="middle">${escapeHtml(formatCompactTokens(point.day.totalTokens))}</text>`,
+        )
+      : [];
 
   return `
     <div class="usage-area-chart">
-      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Usage tokens">
-        <g class="chart-grid">${gridLines.join("")}</g>
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Total des tokens utilisés par tous les comptes">
+        <title>Total journalier des tokens utilisés par tous les comptes</title>
+        <g class="chart-grid chart-y-labels">${gridLines.join("")}</g>
         <path class="chart-area" d="${areaPath}"></path>
         <path class="chart-line" d="${linePath}"></path>
-        <g class="chart-points">${points.map((point) => `<circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="2.3" />`).join("")}</g>
+        <g class="chart-points">${points
+          .map(
+            (point) => `
+              <circle cx="${point.x.toFixed(2)}" cy="${point.y.toFixed(2)}" r="3.5">
+                <title>${escapeHtml(formatDayLabel(point.day.date))} : ${escapeHtml(formatTokens(point.day.totalTokens))} tokens</title>
+              </circle>
+            `,
+          )
+          .join("")}</g>
+        <g class="chart-value-labels">${valueLabels.join("")}</g>
         <g class="chart-labels">${labels.join("")}</g>
       </svg>
     </div>
   `;
 };
 
-const renderUsageDayRow = (day: UsageDayView) => `
+const renderTokenUsageDayRow = (day: DailyTokenUsage) => `
   <tr>
     <td>${escapeHtml(formatDayLabel(day.date))}</td>
-    <td>${escapeHtml(formatDuration(day.agentRunSeconds))}<small>${day.agentRuns} run</small></td>
-    <td>${day.apiRequests}<small>${day.apiErrors ? `${day.apiErrors} err` : ""}</small></td>
-    <td>${escapeHtml(formatTokens(day.totalTokens))}${day.estimatedRequests ? `<small>${day.estimatedRequests} est.</small>` : ""}</td>
+    <td>${escapeHtml(formatTokens(day.totalTokens))}</td>
     <td>${escapeHtml(formatTokens(day.inputTokens))}</td>
     <td>${escapeHtml(formatTokens(day.cachedInputTokens))}</td>
     <td>${escapeHtml(formatTokens(day.outputTokens))}</td>
@@ -9284,6 +9286,12 @@ const formatDuration = (seconds: number) => {
 const formatTokens = (value: number) =>
   new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 }).format(Math.max(0, Math.round(value)));
 
+const formatCompactTokens = (value: number) =>
+  new Intl.NumberFormat("fr-FR", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(Math.max(0, Math.round(value)));
+
 const formatUsd = (value: number) =>
   new Intl.NumberFormat("fr-FR", {
     style: "currency",
@@ -9298,15 +9306,6 @@ const formatDayLabel = (date: string) => {
   return new Intl.DateTimeFormat("fr-FR", {
     day: "2-digit",
     month: "short",
-  }).format(parsed);
-};
-
-const formatMonthLabel = (date: string) => {
-  const parsed = new Date(`${date}T12:00:00`);
-  if (Number.isNaN(parsed.getTime())) return "Mois courant";
-  return new Intl.DateTimeFormat("fr-FR", {
-    month: "long",
-    year: "numeric",
   }).format(parsed);
 };
 
@@ -10324,6 +10323,15 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#dashboardToggle")?.addEventListener("click", () => {
     setActiveView("dashboard");
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-stats-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const range = Number(button.dataset.statsRange);
+      if (range !== 1 && range !== 7 && range !== 30) return;
+      statsRangeDays = range;
+      render();
+    });
   });
 
   document.querySelector<HTMLButtonElement>("#dashboardRefresh")?.addEventListener("click", () => {

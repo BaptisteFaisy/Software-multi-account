@@ -2772,6 +2772,24 @@ body {
   font-size: 11px;
 }
 
+.chart-y-labels text,
+.chart-value-labels text {
+  fill: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-value-labels text {
+  fill: var(--text);
+  font-weight: 700;
+}
+
+.usage-chart-note {
+  margin: -12px 20px 16px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .dashboard-table-toolbar {
   display: flex;
   align-items: center;
@@ -2796,6 +2814,11 @@ body {
 
 .dashboard-table-actions {
   margin-left: auto;
+}
+
+.dashboard-empty-action {
+  justify-content: center;
+  margin: 12px auto 0;
 }
 
 .dashboard-table-actions button {
