@@ -695,6 +695,22 @@ mod tests {
         env::temp_dir().join(format!("cst-{prefix}-{unique}"))
     }
 
+    fn account_for_home(home: &Path) -> AccountProfile {
+        AccountProfile {
+            id: "test-account".to_string(),
+            label: "Test".to_string(),
+            provider: Provider::Codex,
+            codex_home: home.to_string_lossy().to_string(),
+            project_dir: None,
+            proxy_id: None,
+            startup_command: None,
+            limits: AccountLimitTracking::default(),
+            bypass: true,
+            model: None,
+            reasoning_effort: None,
+        }
+    }
+
     #[test]
     fn account_home_is_provisioned_with_all_account_defaults() {
         let home = fresh_account_home("account-config");
@@ -1202,6 +1218,34 @@ mod tests {
         assert_eq!(snapshot.buckets[0].used_percent, Some(54.0));
         assert_eq!(snapshot.buckets[0].plan_type.as_deref(), Some("plus"));
         assert!(snapshot.observed_at > 0);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn fallback_snapshot_must_be_newer_than_current_credentials() {
+        let home = fresh_account_home("rate-limit-credentials");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("auth.json"), "{}").unwrap();
+        let account = account_for_home(&home);
+        let stale = LocalRateLimitSnapshot {
+            buckets: Vec::new(),
+            observed_at: 1,
+        };
+        let current = LocalRateLimitSnapshot {
+            buckets: Vec::new(),
+            observed_at: now_unix() + 1,
+        };
+
+        assert!(!local_snapshot_matches_current_credentials(
+            &account, &stale
+        ));
+        assert!(local_snapshot_matches_current_credentials(
+            &account, &current
+        ));
+
+        fs::remove_file(home.join("auth.json")).unwrap();
+        assert!(local_snapshot_matches_current_credentials(&account, &stale));
 
         let _ = fs::remove_dir_all(home);
     }
@@ -1896,7 +1940,9 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
                 }
             }
             Err(message) => {
-                if let Some(snapshot) = local_snapshot {
+                if let Some(snapshot) = local_snapshot.filter(|snapshot| {
+                    local_snapshot_matches_current_credentials(account, snapshot)
+                }) {
                     buckets = valid_local_rate_limit_buckets(&snapshot.buckets, now);
                     if buckets.is_empty() {
                         error = Some(message);
@@ -2189,6 +2235,38 @@ fn parse_account_model_catalog(value: &Value) -> Vec<AccountModelView> {
 struct LocalRateLimitSnapshot {
     buckets: Vec<AccountRateLimitBucketView>,
     observed_at: i64,
+}
+
+/// Un home peut etre reconnecte a un autre compte sans supprimer ses anciens
+/// rollouts. En cas d'echec reseau, ces mesures ne sont un fallback fiable que
+/// si elles ont ete observees apres la derniere ecriture des credentials.
+///
+/// Cette verification reste volontairement limitee au chemin d'erreur : quand
+/// le serveur repond, la fusion par fenetre + reset ci-dessous sait conserver
+/// une vraie consommation locale tout en rejetant les anciennes fenetres.
+fn local_snapshot_matches_current_credentials(
+    account: &AccountProfile,
+    snapshot: &LocalRateLimitSnapshot,
+) -> bool {
+    let Ok(home) = expand_home(&account.codex_home) else {
+        return false;
+    };
+    let credentials = match account.provider {
+        Provider::Codex => home.join("auth.json"),
+        Provider::Claude => home.join(".credentials.json"),
+    };
+    let Some(modified_at) = fs::metadata(credentials)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+    else {
+        // Sans horodatage exploitable, on conserve le comportement historique
+        // plutot que de supprimer un fallback potentiellement valide.
+        return true;
+    };
+
+    snapshot.observed_at >= modified_at
 }
 
 /// Codex ecrit la mesure de quota effectivement appliquee a chaque tour dans
