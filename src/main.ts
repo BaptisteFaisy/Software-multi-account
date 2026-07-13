@@ -3875,6 +3875,7 @@ const chatPanelModel = (): ChatPanelModel => {
   return {
     title: discussion?.title?.trim() || "Nouvelle conversation",
     subtitle: metaParts.join(" \u00b7 "),
+    accountLabel: account?.label ?? discussion?.accountLabel ?? "Aucun compte",
     providerLabel: providerLabel(accountProvider(account)),
     loading: chatLoading,
     error: chatError,
@@ -4822,6 +4823,7 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
   return {
     title: discussion?.title?.trim() || "Nouvelle conversation",
     subtitle: metaParts.join(" \u00b7 "),
+    accountLabel: account?.label ?? discussion?.accountLabel ?? "Aucun compte",
     providerLabel: providerLabel(provider),
     loading: pane.loading,
     error: pane.error,

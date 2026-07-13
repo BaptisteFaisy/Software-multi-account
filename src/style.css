@@ -4975,6 +4975,32 @@ body:has(.boot) .m-chrome {
   gap: 8px;
 }
 
+.chat-account-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 180px;
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: 10px;
+}
+
+.chat-account-name svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+
+.chat-account-name > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .chat-sync {
   display: inline-flex;
   align-items: center;
@@ -6243,6 +6269,13 @@ body.chat-dragging .chat-side-drag-handle {
   font-size: 9px;
 }
 .chat-provider { color: var(--chat-text); }
+.chat-app-layout .chat-account-name {
+  min-height: 25px;
+  padding: 0 8px;
+  border-color: var(--chat-border);
+  color: var(--chat-text);
+  font-size: 9px;
+}
 .chat-sync-dot { width: 5px; height: 5px; border-radius: 50%; background: #777777; }
 .chat-sync--live .chat-sync-dot { background: var(--chat-accent); box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.1); }
 .chat-sync--error .chat-sync-dot { background: #cfcfcf; }
@@ -8502,6 +8535,13 @@ div.chat-tool-part {
 }
 
 .chat-app-layout .expert-chat-wall .chat-panel--compact .chat-head-actions { gap: 4px; }
+
+.chat-app-layout .expert-chat-wall .chat-panel--compact .chat-account-name {
+  max-width: 42%;
+  min-height: 22px;
+  padding-inline: 6px;
+  font-size: 8px;
+}
 
 .chat-app-layout .expert-chat-wall .chat-panel--compact .chat-history-button {
   height: 24px;

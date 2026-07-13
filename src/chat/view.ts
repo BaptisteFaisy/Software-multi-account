@@ -89,6 +89,7 @@ export type ChatSyncState =
 export type ChatPanelModel = {
   title: string;
   subtitle: string;
+  accountLabel: string;
   providerLabel: string;
   loading: boolean;
   error: string | null;
@@ -806,6 +807,10 @@ export const renderChatPanel = (
           <i data-lucide="plus"></i><span>Nouveau chat</span>
         </button>`}
       </div>
+      <span class="chat-account-name" title="Compte : ${escapeHtml(model.accountLabel)}" aria-label="Compte : ${escapeHtml(model.accountLabel)}">
+        <i data-lucide="user-round" aria-hidden="true"></i>
+        <span>${escapeHtml(model.accountLabel)}</span>
+      </span>
     </header>
     <div class="chat-conversation-body">
       <div id="${id("chatFeed")}" data-chat-control="feed" class="chat-feed">${renderChatFeedInner(model, instanceId)}</div>
