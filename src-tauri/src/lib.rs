@@ -24,6 +24,7 @@ use agent_room::RoomState;
 use pool::PoolManager;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "desktop")]
 use tauri::Manager;
 
 struct PoolRuntime {
@@ -79,6 +80,7 @@ async fn serve_room(
     Ok(tx)
 }
 
+#[cfg(feature = "desktop")]
 pub fn run() {
     let worktrees = settings::runtime_data_dir()
         .and_then(|root| worktree::WorktreeManager::from_env(root.join("agents")))

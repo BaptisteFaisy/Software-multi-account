@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "identifier": "dev.jeanp.codex-switch-terminal",
   "build": {
+    "features": ["desktop"],
     "beforeDevCommand": "npm run dev:frontend",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:frontend",

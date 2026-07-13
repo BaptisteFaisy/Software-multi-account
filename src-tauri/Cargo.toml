@@ -6,6 +6,12 @@ authors = ["jeanp"]
 edition = "2021"
 default-run = "codex-switch-terminal"
 
+[features]
+# Le serveur web est la cible par defaut et ne doit pas embarquer le contexte
+# graphique Tauri (qui exige les ressources d'icone propres a chaque OS).
+default = []
+desktop = []
+
 [lib]
 name = "codex_switch_terminal_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -13,6 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [[bin]]
 name = "codex-switch-terminal"
 path = "src/main.rs"
+required-features = ["desktop"]
 
 [[bin]]
 name = "cst-server"
