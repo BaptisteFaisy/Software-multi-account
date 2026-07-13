@@ -340,6 +340,10 @@ pub struct PoolConfig {
 
 const SESSION_LIMIT_MINS: i64 = 5 * 60;
 const WEEKLY_LIMIT_MINS: i64 = 7 * 24 * 60;
+// Un meme quota peut passer de `secondary` a `primary` entre deux versions du
+// backend Codex. Son reset, lui, reste stable (a quelques secondes pres) tant
+// que l'on parle bien de la meme fenetre et du meme compte.
+const RATE_LIMIT_RESET_MATCH_TOLERANCE_SECS: u64 = 60;
 const RATE_LIMIT_READ_TIMEOUT_SECS: u64 = 18;
 const MODEL_CATALOG_TIMEOUT_SECS: u64 = 12;
 
@@ -1252,9 +1256,11 @@ mod tests {
         let local = vec![AccountRateLimitBucketView {
             limit_id: "codex".to_string(),
             limit_name: None,
-            bucket: "primary".to_string(),
+            // Le backend utilisait auparavant `secondary` pour cette meme
+            // fenetre hebdomadaire.
+            bucket: "secondary".to_string(),
             window_duration_mins: 10080,
-            resets_at: 4000,
+            resets_at: 5001,
             used_percent: Some(54.0),
             rate_limit_reached_type: None,
             plan_type: Some("plus".to_string()),
@@ -1264,8 +1270,72 @@ mod tests {
 
         assert!(used_local);
         assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].bucket, "primary");
         assert_eq!(merged[0].used_percent, Some(54.0));
-        assert_eq!(merged[0].resets_at, 4000);
+        assert_eq!(merged[0].resets_at, 5000);
+    }
+
+    #[test]
+    fn stale_secondary_weekly_bucket_does_not_duplicate_current_primary() {
+        let server = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 1_784_573_804,
+            used_percent: Some(100.0),
+            rate_limit_reached_type: Some("rate_limit_reached".to_string()),
+            plan_type: Some("plus".to_string()),
+        }];
+        let local = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "secondary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 1_784_462_078,
+            used_percent: Some(31.0),
+            rate_limit_reached_type: None,
+            plan_type: Some("plus".to_string()),
+        }];
+
+        let (merged, used_local) = merge_rate_limit_buckets(server, Some(&local), 1_783_976_468);
+
+        assert!(!used_local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].bucket, "primary");
+        assert_eq!(merged[0].used_percent, Some(100.0));
+        assert_eq!(merged[0].resets_at, 1_784_573_804);
+    }
+
+    #[test]
+    fn stale_higher_snapshot_from_another_window_does_not_override_server() {
+        let server = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 700_000,
+            used_percent: Some(12.0),
+            rate_limit_reached_type: None,
+            plan_type: Some("plus".to_string()),
+        }];
+        let local = vec![AccountRateLimitBucketView {
+            limit_id: "codex".to_string(),
+            limit_name: None,
+            bucket: "primary".to_string(),
+            window_duration_mins: 10080,
+            resets_at: 600_000,
+            used_percent: Some(94.0),
+            rate_limit_reached_type: None,
+            plan_type: Some("plus".to_string()),
+        }];
+
+        let (merged, used_local) = merge_rate_limit_buckets(server, Some(&local), 500_000);
+
+        assert!(!used_local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].used_percent, Some(12.0));
+        assert_eq!(merged[0].resets_at, 700_000);
     }
 
     #[test]
@@ -2303,10 +2373,17 @@ fn valid_local_rate_limit_buckets(
     valid
 }
 
-/// Fusion monotone : tant que la fenetre locale n'est pas expiree, une lecture
-/// reseau a 0 % ne doit jamais effacer une consommation positive observee par
-/// une vraie session Codex. Les nouvelles fenetres absentes de la reponse
-/// serveur (notamment la fenetre courte) sont egalement conservees.
+/// Fusion monotone : tant que la fenetre locale est la meme que celle du
+/// serveur, une lecture reseau a 0 % ne doit jamais effacer une consommation
+/// positive observee par une vraie session Codex.
+///
+/// `primary`/`secondary` ne sont pas des identifiants stables : Codex a deja
+/// deplace l'hebdomadaire de l'un vers l'autre. On rapproche donc les buckets
+/// par limite + duree + reset. Un snapshot dont le reset differe appartient a
+/// une ancienne session (souvent un compte reconnecte dans le meme home) et ne
+/// doit ni remplacer ni doubler la valeur serveur. Les fenetres totalement
+/// absentes de la reponse serveur, notamment la fenetre courte, restent en
+/// revanche utilisables en fallback.
 fn merge_rate_limit_buckets(
     mut server_buckets: Vec<AccountRateLimitBucketView>,
     local_buckets: Option<&[AccountRateLimitBucketView]>,
@@ -2321,15 +2398,30 @@ fn merge_rate_limit_buckets(
     {
         let matching = server_buckets.iter().position(|server| {
             server.limit_id == local.limit_id
-                && server.bucket == local.bucket
                 && server.window_duration_mins == local.window_duration_mins
         });
         match matching {
             Some(index) => {
-                let server_used = server_buckets[index].used_percent.unwrap_or(-1.0);
+                let server = &mut server_buckets[index];
+                let same_window = server.resets_at.abs_diff(local.resets_at)
+                    <= RATE_LIMIT_RESET_MATCH_TOLERANCE_SECS;
+                let server_used = server.used_percent.unwrap_or(-1.0);
                 let local_used = local.used_percent.unwrap_or(-1.0);
-                if local_used > server_used {
-                    server_buckets[index] = local.clone();
+                if same_window && local_used > server_used {
+                    // La valeur serveur garde son slot et son reset canoniques;
+                    // seul le compteur monotone vient du snapshot local.
+                    server.used_percent = local.used_percent;
+                    if server.limit_name.is_none() {
+                        server.limit_name.clone_from(&local.limit_name);
+                    }
+                    if server.rate_limit_reached_type.is_none() {
+                        server
+                            .rate_limit_reached_type
+                            .clone_from(&local.rate_limit_reached_type);
+                    }
+                    if server.plan_type.is_none() {
+                        server.plan_type.clone_from(&local.plan_type);
+                    }
                     used_local_snapshot = true;
                 }
             }
