@@ -604,6 +604,18 @@ export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
   </div>`;
 };
 
+export const renderChatTurnStatus = (model: ChatPanelModel): string => {
+  const running = model.turnStatus === "running";
+  const label = running ? "En cours" : "Disponible";
+  const title = running
+    ? "Le chat est en cours d'execution"
+    : "Le chat ne tourne pas";
+  return `<button type="button" data-chat-control="turn-status" class="chat-turn-status chat-turn-status--${running ? "running" : "idle"}" title="${title}" aria-label="${title}" disabled>
+    <span class="chat-turn-status-dot" aria-hidden="true"></span>
+    <span class="chat-turn-status-label">${label}</span>
+  </button>`;
+};
+
 const renderChatQuestionDock = (model: ChatPanelModel, instanceId: string): string => {
   const pending = model.pendingQuestion;
   if (!pending?.questions.length) return "";
@@ -826,6 +838,7 @@ export const renderChatPanel = (
         <strong class="chat-title" title="${escapeHtml(model.title)}">${escapeHtml(model.title)}</strong>
         ${compact ? "" : `<span id="${id("chatSubtitle")}" data-chat-control="subtitle" class="chat-sub">${escapeHtml(model.subtitle)}</span>`}
       </div>
+      ${renderChatTurnStatus(model)}
       <div class="chat-head-actions">
         ${compact ? "" : `<span id="${id("chatSync")}" data-chat-control="sync" class="chat-sync chat-sync--${model.syncState}" aria-live="polite">
           <span class="chat-sync-dot" aria-hidden="true"></span>

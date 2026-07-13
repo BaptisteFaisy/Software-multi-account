@@ -94,6 +94,15 @@ test("le chat expose le chronometre, le quota et le dock de question", () => {
   assert.match(main, /reconcileChatMessages\(/);
 });
 
+test("le bandeau du chat indique en couleur si le tour est en cours", () => {
+  assert.match(view, /data-chat-control="turn-status"/);
+  assert.match(view, /const label = running \? "En cours" : "Disponible"/);
+  assert.match(view, /chat-turn-status--\$\{running \? "running" : "idle"\}/);
+  assert.match(style, /\.chat-turn-status--running \{[\s\S]*?background: #f59e0b;/);
+  assert.match(style, /\.chat-turn-status--idle \{[\s\S]*?background: #22c55e;/);
+  assert.match(main, /\[data-chat-control='turn-status'\]/);
+});
+
 test("une question structuree suspend le tour et propose choix plus reponse libre", () => {
   assert.match(view, /data-chat-control="question"/);
   assert.match(view, /Le même tour reprendra/);

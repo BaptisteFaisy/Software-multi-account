@@ -24,6 +24,7 @@ import {
   renderChatFeedInner,
   renderChatPanel,
   renderChatRuntimeStatus,
+  renderChatTurnStatus,
   type ChatActivity,
   type ChatPart,
   type ChatThought,
@@ -3931,6 +3932,8 @@ const chatPanelModel = (): ChatPanelModel => {
 const patchChatRuntimeStatus = (root: ParentNode, model: ChatPanelModel) => {
   const current = root.querySelector<HTMLElement>("[data-chat-control='runtime']");
   if (current) current.outerHTML = renderChatRuntimeStatus(model);
+  const turnStatus = root.querySelector<HTMLButtonElement>("[data-chat-control='turn-status']");
+  if (turnStatus) turnStatus.outerHTML = renderChatTurnStatus(model);
 };
 
 const refreshAllChatRuntimeStatus = () => {
