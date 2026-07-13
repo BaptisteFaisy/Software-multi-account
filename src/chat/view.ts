@@ -884,7 +884,7 @@ export const renderChatPanel = (
       </span>
     </header>
     <div class="chat-conversation-body">
-      <div id="${id("chatFeed")}" data-chat-control="feed" class="chat-feed">${renderChatFeedInner(model, instanceId)}</div>
+      <div id="${id("chatFeed")}" data-chat-control="feed" class="chat-feed" tabindex="0" aria-label="Messages de la conversation">${renderChatFeedInner(model, instanceId)}</div>
       ${renderChatHistory(model, instanceId)}
     </div>
     ${renderChatQuestionDock(model, instanceId)}

@@ -53,6 +53,12 @@ import {
   reconcileChatMessages,
 } from "./chat/runtime";
 import {
+  pauseChatScrollFollow,
+  restoreChatScrollTop,
+  updateChatScrollState,
+  type ChatScrollState,
+} from "./chat/scroll";
+import {
   CHAT_SIDEBAR_DEFAULT_WIDTH,
   CHAT_SIDEBAR_MAX_WIDTH,
   CHAT_SIDEBAR_MIN_WIDTH,
@@ -856,9 +862,10 @@ let chatHistoryOpen = false;
 // Le fil est mis a jour plusieurs fois par seconde pendant une reponse. Garder
 // l'intention de suivi en memoire evite de ramener de force au bas un utilisateur
 // qui vient juste de commencer a remonter avec la molette ou au tactile.
-const CHAT_SCROLL_BOTTOM_EPSILON = 12;
-let chatFollowLatest = true;
-let chatScrollTop = 0;
+const chatScrollState: ChatScrollState = {
+  followLatest: true,
+  scrollTop: 0,
+};
 let skipNextChatScrollCapture = false;
 let chatPreferencesSave: Promise<void> = Promise.resolve();
 const chatModelCatalogs = new Map<string, AccountModelView[]>();
@@ -4119,16 +4126,11 @@ const refreshChatSyncIndicator = () => {
   if (label) label.textContent = chatSyncLabel(chatSyncState);
 };
 
-const chatFeedMaxScrollTop = (feed: HTMLElement) =>
-  Math.max(0, feed.scrollHeight - feed.clientHeight);
-
-const chatFeedIsAtBottom = (feed: HTMLElement) =>
-  chatFeedMaxScrollTop(feed) - feed.scrollTop <= CHAT_SCROLL_BOTTOM_EPSILON;
-
-const rememberChatFeedScroll = (feed: HTMLElement) => {
-  chatScrollTop = feed.scrollTop;
-  chatFollowLatest = chatFeedIsAtBottom(feed);
-};
+const rememberChatFeedScroll = (
+  feed: HTMLElement,
+  state: ChatScrollState,
+  userMovedAway = false,
+) => updateChatScrollState(state, feed, userMovedAway);
 
 const captureChatFeedScroll = () => {
   if (skipNextChatScrollCapture) {
@@ -4136,30 +4138,45 @@ const captureChatFeedScroll = () => {
     return;
   }
   const feed = document.querySelector<HTMLDivElement>("#chatFeed");
-  if (feed) rememberChatFeedScroll(feed);
+  if (feed) rememberChatFeedScroll(feed, chatScrollState);
 };
 
-const restoreChatFeedScroll = (feed: HTMLElement | null) => {
+const restoreChatFeedScroll = (
+  feed: HTMLElement | null,
+  state: ChatScrollState = chatScrollState,
+) => {
   if (!feed) return;
-  const maxScrollTop = chatFeedMaxScrollTop(feed);
-  const target = chatFollowLatest
-    ? maxScrollTop
-    : Math.min(Math.max(0, chatScrollTop), maxScrollTop);
-  feed.scrollTop = target;
-  chatScrollTop = target;
-  if (maxScrollTop <= CHAT_SCROLL_BOTTOM_EPSILON) chatFollowLatest = true;
+  const applyPosition = () => {
+    feed.scrollTop = restoreChatScrollTop(state, feed);
+    state.scrollTop = feed.scrollTop;
+  };
+  applyPosition();
+
+  // Le premier calcul peut preceder la mise en page finale (police, icones,
+  // changement de hauteur du composer). Un second passage garde le dernier
+  // message visible sans contrer une remontee effectuee entre-temps.
+  window.requestAnimationFrame(() => {
+    if (feed.isConnected && state.followLatest) applyPosition();
+  });
 };
 
 const resetChatFeedScroll = () => {
-  chatFollowLatest = true;
-  chatScrollTop = 0;
+  chatScrollState.followLatest = true;
+  chatScrollState.scrollTop = 0;
   // Le DOM contient encore l'ancien chat jusqu'au prochain render : ne pas
   // capturer sa position apres avoir demande la remise a zero.
   skipNextChatScrollCapture = true;
 };
 
-const bindChatFeedScroll = (feed: HTMLDivElement) => {
-  feed.addEventListener("scroll", () => rememberChatFeedScroll(feed), { passive: true });
+const bindChatFeedScroll = (
+  feed: HTMLDivElement,
+  state: ChatScrollState = chatScrollState,
+) => {
+  let pointerDown = false;
+  feed.addEventListener("scroll", () => {
+    const userMovedAway = feed.scrollTop < state.scrollTop - 0.5;
+    rememberChatFeedScroll(feed, state, userMovedAway);
+  }, { passive: true });
 
   // Le listener scroll arrive apres le geste. On desactive donc le suivi des le
   // debut d'une remontee afin qu'un tick de streaming concurrent ne l'annule pas.
@@ -4167,12 +4184,43 @@ const bindChatFeedScroll = (feed: HTMLDivElement) => {
     "wheel",
     (event) => {
       if (event.deltaY < 0 && feed.scrollTop > 0) {
-        chatFollowLatest = false;
-        chatScrollTop = feed.scrollTop;
+        pauseChatScrollFollow(state, feed);
       }
     },
     { passive: true },
   );
+
+  feed.addEventListener("pointerdown", (event) => {
+    pointerDown = true;
+    const bounds = feed.getBoundingClientRect();
+    const usesScrollbar =
+      event.pointerType === "mouse" &&
+      feed.scrollHeight > feed.clientHeight &&
+      event.clientX >= bounds.left + feed.clientWidth;
+    if (usesScrollbar && feed.scrollTop > 0) pauseChatScrollFollow(state, feed);
+  }, { passive: true });
+  feed.addEventListener("pointerup", () => {
+    pointerDown = false;
+  }, { passive: true });
+  feed.addEventListener("pointercancel", () => {
+    pointerDown = false;
+  }, { passive: true });
+  feed.addEventListener("pointerleave", (event) => {
+    if (pointerDown && event.buttons > 0 && feed.scrollTop > 0) {
+      pauseChatScrollFollow(state, feed);
+    }
+    pointerDown = false;
+  }, { passive: true });
+
+  feed.addEventListener("keydown", (event) => {
+    if (event.target !== feed || feed.scrollTop <= 0) return;
+    const movesUp =
+      event.key === "ArrowUp" ||
+      event.key === "PageUp" ||
+      event.key === "Home" ||
+      (event.key === " " && event.shiftKey);
+    if (movesUp) pauseChatScrollFollow(state, feed);
+  });
 
   let lastTouchY: number | null = null;
   feed.addEventListener(
@@ -4187,8 +4235,7 @@ const bindChatFeedScroll = (feed: HTMLDivElement) => {
     (event) => {
       const touchY = event.touches[0]?.clientY ?? null;
       if (touchY !== null && lastTouchY !== null && touchY > lastTouchY && feed.scrollTop > 0) {
-        chatFollowLatest = false;
-        chatScrollTop = feed.scrollTop;
+        pauseChatScrollFollow(state, feed);
       }
       lastTouchY = touchY;
     },
@@ -4211,7 +4258,7 @@ const refreshChatFeed = () => {
     render();
     return;
   }
-  chatScrollTop = feed.scrollTop;
+  chatScrollState.scrollTop = feed.scrollTop;
   const model = chatPanelModel();
   feed.innerHTML = renderChatFeedInner(model);
   const panel = document.querySelector<HTMLElement>("#chatPanel");
@@ -4930,20 +4977,13 @@ const restoreExpertChats = () => {
 const captureExpertChatScroll = (pane: ExpertChatPane, root = expertChatPaneRoot(pane)) => {
   const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
   if (!feed) return;
-  pane.scrollTop = feed.scrollTop;
-  pane.followLatest = chatFeedIsAtBottom(feed);
+  rememberChatFeedScroll(feed, pane);
 };
 
 const restoreExpertChatScroll = (pane: ExpertChatPane, root = expertChatPaneRoot(pane)) => {
   const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
   if (!feed) return;
-  const maxScrollTop = chatFeedMaxScrollTop(feed);
-  const target = pane.followLatest
-    ? maxScrollTop
-    : Math.min(Math.max(0, pane.scrollTop), maxScrollTop);
-  feed.scrollTop = target;
-  pane.scrollTop = target;
-  if (maxScrollTop <= CHAT_SCROLL_BOTTOM_EPSILON) pane.followLatest = true;
+  restoreChatFeedScroll(feed, pane);
 };
 
 const captureAllExpertChatScroll = () => expertChatPanes.forEach((pane) => captureExpertChatScroll(pane));
@@ -5643,13 +5683,7 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   });
 
   const feed = root.querySelector<HTMLDivElement>("[data-chat-control='feed']");
-  feed?.addEventListener("scroll", () => captureExpertChatScroll(pane, root), { passive: true });
-  feed?.addEventListener("wheel", (event) => {
-    if (event.deltaY < 0 && feed.scrollTop > 0) {
-      pane.followLatest = false;
-      pane.scrollTop = feed.scrollTop;
-    }
-  }, { passive: true });
+  if (feed) bindChatFeedScroll(feed, pane);
   feed?.addEventListener("click", (event) => {
     const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>(".chat-code-copy, [data-chat-copy]");
     if (!button) return;
@@ -7689,6 +7723,8 @@ const render = () => {
     app.innerHTML = `<main class="boot">Chargement</main>`;
     return;
   }
+
+  captureChatFeedScroll();
 
   // Plusieurs raccourcis ouvrent directement un chat sans passer par
   // setActiveView. Le polling suit donc aussi la vue réellement rendue.
@@ -10541,7 +10577,12 @@ const bindUi = () => {
   });
   // Delegation sur le conteneur : les boutons copier sont recrees a chaque
   // patch du fil, le listener sur #chatFeed (stable) les couvre tous.
-  document.querySelector<HTMLDivElement>("#chatFeed")?.addEventListener("click", (event) => {
+  const mainChatFeed = document.querySelector<HTMLDivElement>("#chatFeed");
+  if (mainChatFeed) {
+    bindChatFeedScroll(mainChatFeed);
+    restoreChatFeedScroll(mainChatFeed);
+  }
+  mainChatFeed?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
     const button = target?.closest<HTMLButtonElement>(".chat-code-copy, [data-chat-copy]");
     if (!button) return;
