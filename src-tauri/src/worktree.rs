@@ -1377,8 +1377,9 @@ pub fn room_id_for_local_path(path: &Path) -> String {
         identity.make_ascii_lowercase();
     } else if let Some(windows_identity) = wsl_path_identity(&identity) {
         // Le meme dossier doit conserver le meme salon avant et apres une
-        // bascule Windows -> WSL. Windows normalise deja cette identite en
-        // minuscules, donc on reproduit exactement cette forme.
+        // bascule Windows -> WSL. `canonicalize` ajoute historiquement le
+        // prefixe `\\?\` sous Windows ; on reproduit exactement cette identite
+        // existante pour retrouver les salons deja persistants.
         identity = windows_identity;
     }
     hashed_room_id("local", &identity)
@@ -1391,7 +1392,7 @@ fn wsl_path_identity(value: &str) -> Option<String> {
         return None;
     }
     let drive = (bytes[0] as char).to_ascii_lowercase();
-    Some(format!("{drive}:/{}", &rest[2..]).to_ascii_lowercase())
+    Some(format!("//?/{drive}:/{}", &rest[2..]).to_ascii_lowercase())
 }
 
 fn room_id_for_remote(repo_key: &str, target_ref: &str) -> String {
@@ -1877,14 +1878,14 @@ mod tests {
     fn wsl_mount_identity_matches_windows_normalization() {
         assert_eq!(
             wsl_path_identity("/mnt/c/Users/JeanP/Project"),
-            Some("c:/users/jeanp/project".to_string())
+            Some("//?/c:/users/jeanp/project".to_string())
         );
         assert_eq!(wsl_path_identity("/srv/cst/project"), None);
 
         #[cfg(not(windows))]
         assert_eq!(
             room_id_for_local_path(Path::new("/mnt/c/Users/JeanP/Project")),
-            hashed_room_id("local", "c:/users/jeanp/project")
+            hashed_room_id("local", "//?/c:/users/jeanp/project")
         );
     }
 
