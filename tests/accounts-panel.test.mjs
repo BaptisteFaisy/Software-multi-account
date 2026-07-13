@@ -80,6 +80,32 @@ test("la reconnexion utilise un terminal strictement reserve au login", () => {
   assert.match(main, /!loginOnly &&\s*\n\s*\(session\.resumeSessionId/);
 });
 
+test("une reconnexion ne peut ouvrir qu'un terminal ephemere a la fois", () => {
+  // Le login ne restaure pas implicitement les terminaux de travail et ne sera
+  // lui-meme jamais sauvegarde pour une restauration ulterieure.
+  assert.match(
+    main,
+    /if \(!loginOnly \|\| terminalRestoreAttempted\) \{\s*await ensureTerminalsRestored\(\);/,
+  );
+  assert.match(main, /session\.loginOnly = loginOnly;/);
+  assert.match(
+    main,
+    /\.filter\(\(session\) => session\.status !== "Ferme" && !session\.loginOnly\)/,
+  );
+  assert.match(main, /if \(!terminalRestoreAttempted\) return;/);
+
+  // Deux declenchements concurrents pour le meme compte reutilisent la meme
+  // promesse au lieu de reserver puis demarrer deux PTY.
+  assert.match(
+    main,
+    /const loginTerminalCreations = new Map<string, Promise<TerminalSession \| null>>\(\);/,
+  );
+  assert.match(main, /const inFlightLogin = loginTerminalCreations\.get\(accountId\);/);
+  assert.match(main, /if \(inFlightLogin\) \{[\s\S]*?return inFlightLogin;/);
+  assert.match(main, /loginTerminalCreations\.set\(accountId, creation\);/);
+  assert.match(main, /loginTerminalCreations\.delete\(accountId\);/);
+});
+
 test("le login depuis Nouveau terminal persiste aussi dans le home du compte", () => {
   const handlerStart = main.indexOf(
     'querySelector<HTMLButtonElement>("#loginNewTerminal")?.addEventListener',

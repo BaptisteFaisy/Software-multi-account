@@ -530,6 +530,9 @@ type TerminalSession = {
   accountId: string;
   agentId: string;
   title: string;
+  // Un terminal d'authentification est temporaire : il ne doit jamais etre
+  // restaure comme un terminal de travail au prochain login / rechargement.
+  loginOnly: boolean;
   // Dossier logique choisi par l'utilisateur. Plusieurs agents/terminaux
   // partagent ce dossier tout en travaillant dans des workspaces physiques
   // differents, crees par le gestionnaire de worktrees.
@@ -755,6 +758,9 @@ let terminalFolderFilter: string | null = null;
 // permet de faire respecter la limite EXPERT_MAX_TERMINALS malgre les await
 // (deux creations concurrentes ne peuvent plus reserver le meme dernier slot).
 let pendingTerminalCreations = 0;
+// Un double clic (ou deux handlers rapproches) partage la meme creation de
+// terminal de connexion pour un compte donne.
+const loginTerminalCreations = new Map<string, Promise<TerminalSession | null>>();
 // Terminal qui detenait le focus juste avant le dernier render() (capture avant
 // la destruction du DOM) : restaure de facon synchrone au remontage pour ne pas
 // perdre les frappes lors d'un re-render incident (ex: sortie d'un PTY voisin).
@@ -1411,13 +1417,14 @@ const saveOpenTerminalRecords = (state: PersistedTerminalState) => {
 
 const persistTerminalSessions = () => {
   // Les PTY sont charges paresseusement. Ne jamais ecraser leur etat persiste
-  // par une liste vide tant que le mur de terminaux n'a pas ete ouvert.
-  if (!terminalRestoreAttempted && terminalSessions.length === 0) return;
+  // tant que le mur de terminaux n'a pas ete ouvert. Un terminal de login peut
+  // exister avant cette restauration, mais il est volontairement ephemere.
+  if (!terminalRestoreAttempted) return;
   saveOpenTerminalRecords({
     v: 4,
     activeKey: activeTerminalKey,
     terminals: terminalSessions
-      .filter((session) => session.status !== "Ferme")
+      .filter((session) => session.status !== "Ferme" && !session.loginOnly)
       .map((session) => ({
         key: session.key,
         accountId: session.accountId,
@@ -6232,9 +6239,16 @@ const restoreTerminals = async () => {
       settings!.accounts.some((account) => account.id === record.accountId) &&
       !!userEnvironmentPath(record.folderPath),
   );
-  const records = eligibleRecords.slice(0, EXPERT_MAX_TERMINALS);
+  // Un login ephemere peut deja etre affiche sans avoir declenche la
+  // restauration. Ne jamais depasser la limite en ajoutant les sessions
+  // sauvegardees a celles qui sont deja en memoire / en cours de creation.
+  const availableSlots = Math.max(
+    0,
+    EXPERT_MAX_TERMINALS - terminalSessions.length - pendingTerminalCreations,
+  );
+  const records = eligibleRecords.slice(0, availableSlots);
   if (records.length === 0) {
-    if (state.terminals.length > 0) persistTerminalSessions();
+    if (eligibleRecords.length === 0 && state.terminals.length > 0) persistTerminalSessions();
     return;
   }
 
@@ -6281,8 +6295,8 @@ const restoreTerminals = async () => {
     await startTerminalSession(session, command);
   }
 
-  if (eligibleRecords.length > EXPERT_MAX_TERMINALS) {
-    statusText = `${EXPERT_MAX_TERMINALS} terminaux restaures; la limite de la fenetre est atteinte`;
+  if (eligibleRecords.length > records.length) {
+    statusText = `${records.length} terminaux restaures; la limite de la fenetre est atteinte`;
   }
   persistTerminalSessions();
 };
@@ -10848,6 +10862,7 @@ const createTerminalSession = (
     accountId: account.id,
     agentId,
     title: account.label,
+    loginOnly: false,
     folderPath: capturedEnvironment,
     workspaceId: null,
     workspacePath: null,
@@ -10899,7 +10914,7 @@ const mountExpertTerminals = () => {
   requestAnimationFrame(() => fitAndResizeExpertTerminals());
 };
 
-const createNewTerminal = async (
+const createNewTerminalOnce = async (
   accountId = selectedAccountId,
   settingsAlreadyRead = false,
   commandOverride: string | null = null,
@@ -10917,7 +10932,12 @@ const createNewTerminal = async (
   }
 
   activeView = "terminal";
-  await ensureTerminalsRestored();
+  // Ouvrir un login ne doit pas faire apparaitre en meme temps tous les
+  // terminaux de travail sauvegardes. Si une restauration a deja commence, on
+  // l'attend toutefois pour conserver un comptage de slots coherent.
+  if (!loginOnly || terminalRestoreAttempted) {
+    await ensureTerminalsRestored();
+  }
   if (terminalSessions.length + pendingTerminalCreations >= EXPERT_MAX_TERMINALS) {
     statusText = `Limite atteinte: ${EXPERT_MAX_TERMINALS} terminaux maximum dans une fenetre`;
     render();
@@ -10982,6 +11002,7 @@ const createNewTerminal = async (
     chosenAgentId,
     environmentPath,
   );
+  session.loginOnly = loginOnly;
   session.resumeSessionId = resumeSessionId;
   if (resumeSessionId) {
     session.codexSessionId = resumeSessionId;
@@ -11004,6 +11025,46 @@ const createNewTerminal = async (
   await startTerminalSession(session, commandOverride, loginOnly);
   persistTerminalSessions();
   return session;
+};
+
+const createNewTerminal = async (
+  accountId = selectedAccountId,
+  settingsAlreadyRead = false,
+  commandOverride: string | null = null,
+  agentId: string | null = null,
+  resumeSessionId: string | null = null,
+  folderPath: string | null | undefined = undefined,
+  loginOnly = false,
+): Promise<TerminalSession | null> => {
+  const create = () =>
+    createNewTerminalOnce(
+      accountId,
+      settingsAlreadyRead,
+      commandOverride,
+      agentId,
+      resumeSessionId,
+      folderPath,
+      loginOnly,
+    );
+
+  if (!loginOnly || !accountId) return create();
+
+  const inFlightLogin = loginTerminalCreations.get(accountId);
+  if (inFlightLogin) {
+    statusText = "Connexion deja en cours dans le terminal ouvert";
+    render();
+    return inFlightLogin;
+  }
+
+  const creation = create();
+  loginTerminalCreations.set(accountId, creation);
+  try {
+    return await creation;
+  } finally {
+    if (loginTerminalCreations.get(accountId) === creation) {
+      loginTerminalCreations.delete(accountId);
+    }
+  }
 };
 
 const startTerminalSession = async (
