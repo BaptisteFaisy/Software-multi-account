@@ -44,6 +44,7 @@ import {
 import {
   chatMessagesEqual,
   conversationWaitsForUser,
+  createGoalPrompt,
   formatChatDuration,
   formatChatResetCountdown,
   markLatestPendingMessageFailed,
@@ -116,6 +117,7 @@ import {
   Shuffle,
   SquareTerminal,
   Stethoscope,
+  Target,
   Trash2,
   Upload,
   Users,
@@ -940,6 +942,7 @@ const lucideIcons = {
   Shuffle,
   SquareTerminal,
   Stethoscope,
+  Target,
   Trash2,
   Upload,
   Users,
@@ -3902,6 +3905,7 @@ const chatPanelModel = (): ChatPanelModel => {
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: provider === "codex",
+    supportsGoals: provider === "codex",
     mode: chatMode,
     draft: chatDraft,
     newConversation: !discussion,
@@ -4312,13 +4316,39 @@ const startChatTurnPoll = () => {
   chatTurnPoll = window.setInterval(() => void pollChatTurn(), 550);
 };
 
-const sendChatMessage = async () => {
+type ChatSubmitIntent = "message" | "goal";
+
+const chatSubmissionPrompt = (
+  input: HTMLTextAreaElement | null,
+  fallback: string,
+  intent: ChatSubmitIntent,
+): string => {
+  const value = (input?.value ?? fallback).trim();
+  if (!value) {
+    if (intent === "goal" && input) {
+      input.setCustomValidity("Décrivez l'objectif du goal avant de le créer.");
+      input.reportValidity();
+      input.focus();
+    }
+    return "";
+  }
+  input?.setCustomValidity("");
+  return intent === "goal" ? createGoalPrompt(value) : value;
+};
+
+const sendChatMessage = async (intent: ChatSubmitIntent = "message") => {
   if (chatTurn?.status === "running") return;
   const input = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
-  const prompt = (input?.value ?? chatDraft).trim();
+  const prompt = chatSubmissionPrompt(input, chatDraft, intent);
   const account = chatSelectedAccount();
   if (!prompt || !account) {
-    statusText = account ? "Ecrivez un message" : "Ajoutez d'abord un compte agent";
+    statusText = account
+      ? intent === "goal" ? "Décrivez le goal" : "Ecrivez un message"
+      : "Ajoutez d'abord un compte agent";
+    return;
+  }
+  if (intent === "goal" && accountProvider(account) !== "codex") {
+    statusText = "Les goals sont disponibles avec Codex";
     return;
   }
   const preferences = readChatPreferences(account);
@@ -4822,6 +4852,7 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: provider === "codex",
+    supportsGoals: provider === "codex",
     mode: pane.mode,
     draft: pane.draft,
     newConversation: !discussion,
@@ -5164,13 +5195,24 @@ const sendExpertChatMessage = async (
   pane: ExpertChatPane,
   root: HTMLElement,
   promptOverride?: string,
+  intent: ChatSubmitIntent = "message",
 ): Promise<boolean> => {
   if (pane.turn?.status === "running") return false;
   const input = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
-  const prompt = (promptOverride ?? input?.value ?? pane.draft).trim();
+  const prompt = chatSubmissionPrompt(
+    promptOverride === undefined ? input : null,
+    promptOverride ?? pane.draft,
+    intent,
+  );
   const account = expertChatSelectedAccount(pane);
   if (!prompt || !account) {
-    statusText = account ? "Ecrivez un message" : "Ajoutez d'abord un compte agent";
+    statusText = account
+      ? intent === "goal" ? "Décrivez le goal" : "Ecrivez un message"
+      : "Ajoutez d'abord un compte agent";
+    return false;
+  }
+  if (intent === "goal" && accountProvider(account) !== "codex") {
+    statusText = "Les goals sont disponibles avec Codex";
     return false;
   }
   const preferences = readChatPreferences(account, root);
@@ -5498,6 +5540,9 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   root.querySelector<HTMLButtonElement>("[data-chat-action='stop']")?.addEventListener("click", () => {
     void stopExpertChatTurn(pane);
   });
+  root.querySelector<HTMLButtonElement>("[data-chat-action='goal']")?.addEventListener("click", () => {
+    void sendExpertChatMessage(pane, root, undefined, "goal");
+  });
   root
     .querySelector<HTMLButtonElement>("[data-chat-action='quota-switch'][data-quota-account]")
     ?.addEventListener("click", (event) => {
@@ -5516,6 +5561,7 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   };
   prompt?.addEventListener("input", () => {
     pane.draft = prompt.value;
+    prompt.setCustomValidity("");
     resizePrompt();
   });
   prompt?.addEventListener("keydown", (event) => {
@@ -10366,6 +10412,9 @@ const bindUi = () => {
   document.querySelector<HTMLButtonElement>("#chatStop")?.addEventListener("click", () => {
     void stopCurrentChatTurn();
   });
+  document.querySelector<HTMLButtonElement>("#chatGoal")?.addEventListener("click", () => {
+    void sendChatMessage("goal");
+  });
   const mainChatPanel = document.querySelector<HTMLElement>("#chatPanel");
   if (mainChatPanel) {
     bindChatQuestionUi(mainChatPanel, () => chatTurn, applyChatTurnSnapshot);
@@ -10399,6 +10448,7 @@ const bindUi = () => {
   };
   chatPrompt?.addEventListener("input", () => {
     chatDraft = chatPrompt.value;
+    chatPrompt.setCustomValidity("");
     resizeChatPrompt();
   });
   chatPrompt?.addEventListener("keydown", (event) => {

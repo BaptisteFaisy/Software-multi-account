@@ -113,6 +113,7 @@ export type ChatPanelModel = {
   selectedReasoningEffort: string;
   reasoningEffortOptions: ChatSelectOption[];
   supportsReasoningEffort: boolean;
+  supportsGoals: boolean;
   mode: ChatMode;
   draft: string;
   newConversation: boolean;
@@ -838,6 +839,17 @@ export const renderChatPanel = (
             <span class="chat-workspace-chip" title="${escapeHtml(model.workspaceLabel)}"><i data-lucide="folder-open"></i>${escapeHtml(model.workspaceLabel)}</span>
           </div>
           ${renderChatRuntimeStatus(model)}
+          <button
+            id="${id("chatGoal")}"
+            data-chat-action="goal"
+            type="button"
+            class="chat-goal"
+            title="${model.supportsGoals ? "Créer un goal à partir du texte saisi" : "Les goals sont disponibles avec Codex"}"
+            aria-label="Créer un goal"
+            ${running || !model.selectedAccountId || !model.supportsGoals ? "disabled" : ""}
+          >
+            <i data-lucide="target"></i><span>Goal</span>
+          </button>
           ${running
             ? `<button id="${id("chatStop")}" data-chat-action="stop" type="button" class="chat-send chat-stop" title="Arreter la reponse" aria-label="Arreter la reponse"><i data-lucide="square"></i></button>`
             : `<button id="${id("chatSend")}" data-chat-action="send" type="submit" class="chat-send" title="Envoyer" aria-label="Envoyer" ${model.accounts.length ? "" : "disabled"}><i data-lucide="arrow-up"></i></button>`}

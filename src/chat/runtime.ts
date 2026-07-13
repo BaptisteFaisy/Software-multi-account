@@ -20,6 +20,18 @@ export type RuntimeChatMessage = {
   parts?: RuntimeChatPart[];
 };
 
+/**
+ * Transforme l'objectif saisi via le bouton Goal en demande utilisateur
+ * explicite. Codex n'active un goal que lorsque l'utilisateur le demande : le
+ * bouton doit donc conserver cette intention dans le transcript, quel que soit
+ * le transport utilise (Tauri local ou API web).
+ */
+export const createGoalPrompt = (objective: string): string => {
+  const normalized = objective.trim();
+  if (!normalized) return "";
+  return `Crée un goal avec l'outil create_goal pour l'objectif suivant, puis commence à le poursuivre :\n\n${normalized}`;
+};
+
 const sameMessageContent = (left: RuntimeChatMessage, right: RuntimeChatMessage): boolean =>
   left.role === right.role && left.text === right.text;
 

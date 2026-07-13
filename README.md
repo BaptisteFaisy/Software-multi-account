@@ -41,6 +41,7 @@ Depuis PowerShell, une action peut etre lancee directement :
 - Chaque chat conserve independamment sa discussion, son brouillon, son compte, son mode de travail, son suivi temps reel, son tour en cours et sa position de lecture. Tous les chats restent visibles dans la grille, mais seule la conversation selectionnee affiche sa bulle de saisie.
 - `Ctrl+N`, le bouton de la barre laterale et le bouton `Nouveau chat` ajoutent une conversation a la fin de la grille sans fermer les autres. La grille affiche au choix 6, 9, 12 ou 16 chats de taille uniforme par page et ouvre automatiquement la page du nouveau chat.
 - Le composer de chaque chat permet de choisir le modele et, pour Codex, l'intensite de raisonnement. Les intensites viennent du catalogue du modele (`model/list`) : GPT-5.6 Sol/Terra proposent donc aussi `max` et `ultra`, tandis que Luna propose `max` sans `ultra`. Ces choix sont enregistres comme valeurs du compte et transmis explicitement a chaque nouveau tour, en desktop comme en mode SaaS.
+- Le bouton `Goal` du composer transforme le texte saisi en demande explicite de creation de goal Codex. Il utilise le meme tour de chat dans l'app desktop et dans la version web, et reste compact dans la grille multi-chat comme sur mobile.
 - Les comptes Codex sont des dossiers utilises comme `CODEX_HOME`.
 - L'app detecte automatiquement les dossiers `~\.codex*` qui contiennent `auth.json` ou `config.toml`.
 - Les profils proxy sont detectes depuis les fichiers `proxy.txt` presents dans `~\.codex*`.
