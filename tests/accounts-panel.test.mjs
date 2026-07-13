@@ -80,6 +80,23 @@ test("la reconnexion utilise un terminal strictement reserve au login", () => {
   assert.match(main, /!loginOnly &&\s*\n\s*\(session\.resumeSessionId/);
 });
 
+test("le login depuis Nouveau terminal persiste aussi dans le home du compte", () => {
+  const handlerStart = main.indexOf(
+    'querySelector<HTMLButtonElement>("#loginNewTerminal")?.addEventListener',
+  );
+  const handlerEnd = main.indexOf(
+    'querySelector<HTMLButtonElement>("#poolTerminal")?.addEventListener',
+    handlerStart,
+  );
+  assert.ok(handlerStart >= 0 && handlerEnd > handlerStart, "gestionnaire login introuvable");
+  const handler = main.slice(handlerStart, handlerEnd);
+
+  // Le meme logout + login est utilise, et loginOnly=true force le backend a
+  // exposer le CODEX_HOME permanent plutot que la copie jetable du workspace.
+  assert.match(handler, /reconnectCommandForAccount\(account, agent\)/);
+  assert.match(handler, /newTerminalWorkspacePath,\s*\n\s*true,\s*\n\s*\);/);
+});
+
 test("une erreur d'auth reste prioritaire sur les limites locales en cache", () => {
   assert.match(main, /account\.error && AUTH_LIMIT_ERROR\.test\(account\.error\)/);
   assert.match(main, /return "session expiree"/);

@@ -1758,6 +1758,19 @@ const shellCommandSeparator = () => {
   return executable === "cmd" || executable === "cmd.exe" ? " & " : "; ";
 };
 
+const reconnectCommandForAccount = (
+  account: AccountProfile,
+  agent: AgentProfile | null | undefined,
+) => {
+  const loginSub = agent?.loginCommand?.trim() || "login";
+  // Connexion classique : on ouvre le flux OAuth standard (callback navigateur),
+  // sans passer par les codes du device flow, y compris en mode remote/Tailscale.
+  const loginCommand = agentSubcommand(agent, loginSub);
+  return accountProvider(account) === "codex"
+    ? `${agentSubcommand(agent, "logout")}${shellCommandSeparator()}${loginCommand}`
+    : loginCommand;
+};
+
 const setActiveAgent = (id: string | null) => {
   if (!settings) return;
   if (!settings.agents.some((agent) => agent.id === id)) return;
@@ -3086,14 +3099,7 @@ const reloginAccount = async (accountId: string) => {
   const provider = accountProvider(account);
   const agentId = providerAgentId(provider);
   const agent = agentById(agentId);
-  const loginSub = agent?.loginCommand?.trim() || "login";
-  // Connexion classique : on ouvre le flux OAuth standard (callback navigateur),
-  // sans passer par les codes du device flow, y compris en mode remote/Tailscale.
-  const loginCommand = agentSubcommand(agent, loginSub);
-  const reconnectCommand =
-    provider === "codex"
-      ? `${agentSubcommand(agent, "logout")}${shellCommandSeparator()}${loginCommand}`
-      : loginCommand;
+  const reconnectCommand = reconnectCommandForAccount(account, agent);
   const environmentPath =
     userEnvironmentPath(currentWorkspace()) ?? loadWorkspacePaths()[0] ?? null;
   if (!environmentPath) {
@@ -10200,10 +10206,11 @@ const bindUi = () => {
     void createNewTerminal(
       account.id,
       true,
-      agentSubcommand(agent, agent.loginCommand),
+      reconnectCommandForAccount(account, agent),
       agent.id,
       null,
       newTerminalWorkspacePath,
+      true,
     );
   });
 
