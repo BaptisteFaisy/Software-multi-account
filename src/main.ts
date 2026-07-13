@@ -9133,7 +9133,7 @@ const renderAccountUsagePanel = () => {
           </tbody>
         </table>
       </div>
-      <p class="account-usage-hint">Reconstruit depuis les logs de session Codex (CODEX_HOME/sessions). Le cout est une estimation.</p>
+      <p class="account-usage-hint">Reconstruit depuis les sessions Codex actives et archivées. Le coût est une estimation.</p>
     </section>
   `;
 };

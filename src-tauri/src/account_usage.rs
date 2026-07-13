@@ -1,6 +1,7 @@
 //! Suivi de la consommation de tokens **par compte**, reconstruite à partir des
 //! logs de session que le CLI Codex écrit dans `CODEX_HOME/sessions/AAAA/MM/JJ/
-//! rollout-*.jsonl`.
+//! rollout-*.jsonl`, y compris les conversations ensuite déplacées dans
+//! `sessions-archive/` ou dans l'ancien dossier `archived_sessions/`.
 //!
 //! Contrairement au dashboard global (`metrics.rs`) qui ne voit que le trafic
 //! transitant par le pool, cette source fonctionne pour **tous** les comptes,
@@ -26,7 +27,7 @@ use chrono::{Local, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -81,6 +82,7 @@ pub struct AccountUsageDay {
 }
 
 const MAX_DAYS_RETURNED: usize = 60;
+const SESSION_STORAGE_DIRS: &[&str] = &["sessions", "sessions-archive", "archived_sessions"];
 
 #[tauri::command]
 pub async fn account_token_usage() -> Result<AccountUsageDashboard, String> {
@@ -167,15 +169,12 @@ struct SessionUsage {
 fn account_usage_view(account: &AccountProfile, default_model: &str) -> AccountUsageView {
     let has_tokens = settings::account_has_auth_tokens(account);
 
-    let sessions_dir = match expand_home(&account.codex_home) {
-        Ok(home) => home.join("sessions"),
+    let home = match expand_home(&account.codex_home) {
+        Ok(home) => home,
         Err(error) => return error_view(account, has_tokens, error),
     };
 
-    let mut files = Vec::new();
-    if sessions_dir.is_dir() {
-        collect_rollouts(&sessions_dir, &mut files);
-    }
+    let files = collect_account_rollouts(&home);
 
     let mut all_time = TokenTotals::default();
     let mut total_cost = 0.0_f64;
@@ -261,6 +260,38 @@ fn account_usage_view(account: &AccountProfile, default_model: &str) -> AccountU
         days,
         error: None,
     }
+}
+
+/// Retourne toutes les sessions connues d'un compte, actives ou archivées.
+///
+/// L'archivage peut être interrompu après une copie mais avant la suppression
+/// de la source. Le nom d'un rollout contient son UUID : le dédupliquer évite
+/// alors de compter deux fois la même conversation. `sessions/` est parcouru
+/// en premier et reste prioritaire sur ses éventuelles copies archivées.
+fn collect_account_rollouts(home: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+
+    for directory in SESSION_STORAGE_DIRS {
+        let root = home.join(directory);
+        if !root.is_dir() {
+            continue;
+        }
+
+        let mut candidates = Vec::new();
+        collect_rollouts(&root, &mut candidates);
+        candidates.sort();
+        for path in candidates {
+            let Some(name) = path.file_name().map(|name| name.to_os_string()) else {
+                continue;
+            };
+            if seen.insert(name) {
+                files.push(path);
+            }
+        }
+    }
+
+    files
 }
 
 fn error_view(account: &AccountProfile, has_tokens: bool, error: String) -> AccountUsageView {
@@ -478,6 +509,47 @@ mod tests {
         assert_eq!(totals.input, 100);
         assert_eq!(totals.output, 10);
         assert_eq!(totals.total, 110);
+    }
+
+    #[test]
+    fn account_rollouts_include_archives_without_duplicates() {
+        let home = fresh_dir();
+        let current = home.join("sessions/2026/07/13");
+        let archive = home.join("sessions-archive/2026/07/12");
+        let legacy_archive = home.join("archived_sessions");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&archive).unwrap();
+        fs::create_dir_all(&legacy_archive).unwrap();
+
+        let duplicate = "rollout-2026-07-13T10-00-00-duplicate.jsonl";
+        fs::write(current.join(duplicate), "current").unwrap();
+        fs::write(archive.join(duplicate), "archived copy").unwrap();
+        fs::write(
+            archive.join("rollout-2026-07-12T09-00-00-archive.jsonl"),
+            "archive",
+        )
+        .unwrap();
+        fs::write(
+            legacy_archive.join("rollout-2026-07-11T08-00-00-legacy.jsonl"),
+            "legacy",
+        )
+        .unwrap();
+
+        let files = collect_account_rollouts(&home);
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().any(|path| path.starts_with(&current)));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name == std::ffi::OsStr::new(duplicate))
+                })
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
