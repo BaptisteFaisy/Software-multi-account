@@ -9,6 +9,8 @@ export default defineConfig({
   },
   build: {
     emptyOutDir: true,
+    target: "es2022",
+    modulePreload: { polyfill: false },
   },
   server: {
     strictPort: true,

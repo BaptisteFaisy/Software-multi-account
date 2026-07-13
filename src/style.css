@@ -1,5 +1,3 @@
-@import url("https://fonts.googleapis.com/css2?family=League+Spartan:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap");
-
 :root {
   color: #e8e1d2;
   background: #151513;
@@ -9830,6 +9828,22 @@ div.chat-tool-part {
   width: 15px;
   height: 15px;
   color: #8a8474;
+}
+
+/* Les historiques peuvent contenir des centaines de cartes. Le navigateur ne
+   calcule le layout et la peinture des lignes hors ecran qu'au moment utile. */
+@supports (content-visibility: auto) {
+  .chat-turn:not(.is-latest) {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 180px;
+  }
+
+  .discussion-row,
+  .prompt-row,
+  .chat-side-item {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 76px;
+  }
 }
 
 @media (max-width: 620px) {

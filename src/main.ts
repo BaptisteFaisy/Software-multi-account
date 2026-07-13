@@ -13,7 +13,6 @@ import {
   type RealtimeConnectionState,
   type UnlistenFn,
 } from "./platform";
-import { initDesktopUpdater } from "./updater";
 import { initPwaSupport } from "./pwa";
 import {
   chatHoverShortcutAction,
@@ -100,8 +99,8 @@ import {
   type DailyTokenUsage,
   type StatsRangeDays,
 } from "./stats";
-import { FitAddon } from "@xterm/addon-fit";
-import { Terminal } from "@xterm/xterm";
+import type { FitAddon } from "@xterm/addon-fit";
+import type { Terminal } from "@xterm/xterm";
 import {
   AppWindow,
   ArrowLeft,
@@ -161,9 +160,9 @@ import {
   ChevronsUpDown,
   PanelLeftClose,
   PanelLeftOpen,
-  createIcons,
+  createElement as createLucideElement,
+  type IconNode,
 } from "lucide";
-import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 
 type CodexReasoningEffort = string;
@@ -765,6 +764,7 @@ let expertTerminalFullscreenKey: string | null = null;
 let statusText = "Pret";
 let ptyIdSeed = Date.now();
 let terminalSessions: TerminalSession[] = [];
+const terminalSessionsByPtyId = new Map<number, TerminalSession>();
 // Dossier dont la session est actuellement ouverte. `null` signifie qu'aucun
 // environnement n'a encore ete choisi : on affiche alors le sas de selection,
 // jamais les terminaux de plusieurs projets dans un meme mur.
@@ -795,6 +795,8 @@ let terminalRestoreAttempted = false;
 let terminalRestorePromise: Promise<void> | null = null;
 let poolStatus: PoolStatus | null = null;
 let poolPoll: number | null = null;
+let poolStatusInFlight = false;
+let poolRowsSignature = "";
 let poolImportPaths = "";
 let poolNewAccountLabel = "";
 let poolNewAccountProxyId = "";
@@ -806,8 +808,11 @@ let limitStatus: AccountLimitView[] = [];
 let limitStatusLoaded = false;
 let limitPoll: number | null = null;
 let limitStatusInFlight = false;
+let limitStatusSignature = "";
 let usageDashboard: UsageDashboard | null = null;
 let usagePoll: number | null = null;
+let usageDashboardInFlight = false;
+let usageDashboardSignature = "";
 let accountUsage: AccountUsageDashboard | null = null;
 let accountUsageLoaded = false;
 let statsRangeDays: StatsRangeDays = 30;
@@ -815,6 +820,7 @@ let kombaiStatus: KombaiStatus | null = null;
 let kombaiLoaded = false;
 let kombaiPoll: number | null = null;
 let kombaiStatusError = false;
+let kombaiStatusInFlight = false;
 let isFullscreen = false;
 let newTerminalModalOpen = false;
 let newTerminalAccountId: string | null = null;
@@ -838,6 +844,8 @@ let discussionsLoaded = false;
 let discussionsPoll: number | null = null;
 let discussionsLiveUnlisten: UnlistenFn | null = null;
 let discussionsSyncState: RealtimeConnectionState = "closed";
+let discussionsRenderSignature = "";
+let discussionsRefreshPromise: Promise<void> | null = null;
 let discussionSearch = "";
 let chatSidebarSearch = "";
 let chatSidebarWidth = CHAT_SIDEBAR_DEFAULT_WIDTH;
@@ -887,6 +895,10 @@ let promptSearch = "";
 let roomStatus: RoomStatus | null = null;
 let roomMessages: RoomMessage[] = [];
 let roomPoll: number | null = null;
+let roomRefreshInFlight = false;
+let roomRenderSignature = "";
+let roomMessageCursor = 0;
+let roomMessageWorkspace = "";
 let workspaceLiveGraphOpen = false;
 // Destinataire choisi dans le composer : "" = diffusion workspace, sinon ident d'un
 // agent (DM). Conserve entre les rendus complets.
@@ -995,6 +1007,70 @@ const lucideIcons = {
   PanelLeftOpen,
 };
 
+// `lucide.createIcons()` reparcourt puis remplace toutes les icones du document
+// a chaque patch de DOM. Pendant un tour actif cela pouvait recreer des dizaines
+// de SVG deux fois par seconde. On ne transforme ici que les nouveaux <i> du
+// sous-arbre modifie ; les SVG deja montes restent intacts.
+const lucideComponentName = (name: string) =>
+  name.replace(/(\w)(\w*)(_|-|\s*)/g, (_match, first: string, rest: string) =>
+    first.toUpperCase() + rest.toLowerCase());
+
+const renderIcons = (root: ParentNode = document) => {
+  const placeholders = Array.from(root.querySelectorAll<HTMLElement>("i[data-lucide]"));
+  if (root instanceof HTMLElement && root.matches("i[data-lucide]")) {
+    placeholders.unshift(root);
+  }
+  placeholders.forEach((placeholder) => {
+    const name = placeholder.dataset.lucide;
+    if (!name) return;
+    const componentName = lucideComponentName(name) as keyof typeof lucideIcons;
+    const icon = lucideIcons[componentName] as IconNode | undefined;
+    if (!icon) return;
+    const svg = createLucideElement(icon);
+    Array.from(placeholder.attributes).forEach((attribute) => {
+      if (attribute.name !== "class") svg.setAttribute(attribute.name, attribute.value);
+    });
+    svg.setAttribute(
+      "class",
+      ["lucide", `lucide-${name}`, placeholder.className].filter(Boolean).join(" "),
+    );
+    placeholder.replaceWith(svg);
+  });
+};
+
+const chatFeedSignatures = new WeakMap<HTMLElement, string>();
+const chatRuntimeSignatures = new WeakMap<object, string>();
+
+const chatFeedRenderSignature = (model: ChatPanelModel) => JSON.stringify([
+  model.providerLabel,
+  model.loading,
+  model.error,
+  model.truncated,
+  model.messages,
+  model.activities,
+  model.thoughts,
+  model.parts,
+  model.turnStatus,
+  model.turnStartedAt,
+  model.turnFinishedAt,
+  model.turnError,
+  model.waitingForUser,
+  model.pendingQuestion,
+  model.quotaSuggestion,
+]);
+
+const chatRuntimeRenderSignature = (model: ChatPanelModel) => JSON.stringify([
+  model.turnStatus,
+  model.turnStartedAt,
+  model.turnFinishedAt,
+  model.waitingForUser,
+  model.pendingQuestion,
+  model.activities.at(-1),
+  model.parts.at(-1),
+  model.turnError,
+  model.quotaStatus,
+]);
+
 const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v4";
 const LEGACY_OPEN_TERMINALS_STORAGE_KEYS = [
   "codex-switch-terminal.open-terminals.v3",
@@ -1003,10 +1079,20 @@ const LEGACY_OPEN_TERMINALS_STORAGE_KEYS = [
 const EXPERT_GRID_LAYOUT_STORAGE_KEY = "codex-switch-terminal.expert-grid-layout.v1";
 const EXPERT_CHATS_PER_PAGE_STORAGE_KEY = "codex-switch-terminal.expert-chats-per-page.v1";
 const EXPERT_MAX_TERMINALS = 16;
+const TERMINAL_RESTORE_CONCURRENCY = 4;
 const EXPERT_OPEN_CHATS_STORAGE_KEY = "codex-switch-terminal.expert-open-chats.v1";
 const CHAT_SIDEBAR_WIDTH_STORAGE_KEY = "codex-switch-terminal.chat-sidebar-width.v1";
 const CHAT_SIDEBAR_SNAP_CLOSED_WIDTH = 48;
 const LIMIT_POLL_INTERVAL_MS = 30_000;
+const LOCAL_TRANSCRIPT_POLL_INTERVAL_MS = 2_000;
+let terminalRuntimePromise: Promise<typeof import("./terminal-runtime")> | null = null;
+
+const loadTerminalRuntime = () =>
+  (terminalRuntimePromise ??= import("./terminal-runtime"));
+
+const runWhenPageVisible = (task: () => void) => {
+  if (document.visibilityState === "visible") task();
+};
 
 const loadExpertGridLayout = (): ExpertGridLayout => {
   const value = localStorage.getItem(EXPERT_GRID_LAYOUT_STORAGE_KEY);
@@ -2161,25 +2247,37 @@ const stopPool = async () => {
 };
 
 const refreshPoolStatus = async () => {
+  if (poolStatusInFlight) return;
+  poolStatusInFlight = true;
   try {
-    poolStatus = await invoke<PoolStatus>("pool_status");
-  } catch {
-    return;
-  }
-  if (activeView === "pool" && poolStatus?.running) {
-    const rows = document.querySelector<HTMLTableSectionElement>("#poolRows");
-    if (rows) {
-      rows.innerHTML = poolStatus.accounts?.map(renderPoolRow).join("") ?? "";
-      createIcons({ icons: lucideIcons });
-    } else {
-      render();
+    try {
+      poolStatus = await invoke<PoolStatus>("pool_status");
+    } catch {
+      return;
     }
+    const nextRowsSignature = JSON.stringify(poolStatus.accounts ?? []);
+    const rowsChanged = nextRowsSignature !== poolRowsSignature;
+    poolRowsSignature = nextRowsSignature;
+    if (activeView === "pool" && poolStatus?.running && rowsChanged) {
+      const rows = document.querySelector<HTMLTableSectionElement>("#poolRows");
+      if (rows) {
+        rows.innerHTML = poolStatus.accounts?.map(renderPoolRow).join("") ?? "";
+        renderIcons(rows);
+      } else {
+        render();
+      }
+    }
+  } finally {
+    poolStatusInFlight = false;
   }
 };
 
 const startPoolPoll = () => {
   stopPoolPoll();
-  poolPoll = window.setInterval(() => void refreshPoolStatus(), 3000);
+  poolPoll = window.setInterval(
+    () => runWhenPageVisible(() => void refreshPoolStatus()),
+    3000,
+  );
 };
 
 const stopPoolPoll = () => {
@@ -2894,47 +2992,84 @@ const syncRoomTargetOptions = () => {
 };
 
 const refreshRoom = async () => {
+  if (roomRefreshInFlight) return;
+  roomRefreshInFlight = true;
   try {
-    roomStatus = await invoke<RoomStatus>("room_status", {
-      workspacePath: currentWorkspace(),
-    });
-  } catch {
-    return;
-  }
-  try {
-    const result = await invoke<{ messages: RoomMessage[]; cursor: number }>("room_messages", {
-      since: 0,
-      workspacePath: currentWorkspace(),
-    });
-    roomMessages = result.messages ?? [];
-  } catch {
-    // le fil reste tel quel
-  }
-  const liveGraph = document.querySelector<HTMLElement>("#workspaceLiveGraphContent");
-  if (liveGraph) {
-    liveGraph.innerHTML = renderWorkspaceLiveGraphContent();
-    createIcons({ icons: lucideIcons });
-  }
-  if (activeView !== "room") return;
-  const agentsEl = document.querySelector<HTMLDivElement>("#roomAgents");
-  const feedEl = document.querySelector<HTMLDivElement>("#roomFeed");
-  const coordinationEl = document.querySelector<HTMLElement>("#roomCoordination");
-  if (agentsEl && feedEl) {
-    const atBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 40;
-    agentsEl.innerHTML = renderRoomAgentsInner();
-    feedEl.innerHTML = renderRoomFeedInner();
-    if (coordinationEl) coordinationEl.innerHTML = renderRoomCoordinationInner();
-    syncRoomTargetOptions();
-    createIcons({ icons: lucideIcons });
-    if (atBottom) feedEl.scrollTop = feedEl.scrollHeight;
-  } else {
-    render();
+    const workspacePath = currentWorkspace();
+    const workspaceKey = workspacePath ?? "";
+    if (roomMessageWorkspace !== workspaceKey) {
+      roomMessageWorkspace = workspaceKey;
+      roomMessageCursor = 0;
+      roomMessages = [];
+      roomRenderSignature = "";
+    }
+    try {
+      roomStatus = await invoke<RoomStatus>("room_status", {
+        workspacePath,
+      });
+    } catch {
+      return;
+    }
+    if (
+      roomMessageCursor > 0
+      && roomStatus.snapshot.oldestCursor > 0
+      && roomMessageCursor < roomStatus.snapshot.oldestCursor - 1
+    ) {
+      roomMessageCursor = 0;
+      roomMessages = [];
+    }
+    try {
+      const result = await invoke<{ messages: RoomMessage[]; cursor: number }>("room_messages", {
+        since: roomMessageCursor,
+        workspacePath,
+      });
+      const incoming = result.messages ?? [];
+      if (roomMessageCursor === 0) {
+        roomMessages = incoming.slice(-500);
+      } else if (incoming.length) {
+        const known = new Set(roomMessages.map((message) => message.id));
+        roomMessages = [...roomMessages, ...incoming.filter((message) => !known.has(message.id))]
+          .slice(-500);
+      }
+      roomMessageCursor = Math.max(roomMessageCursor, result.cursor ?? 0);
+    } catch {
+      // le fil reste tel quel
+    }
+    if ((currentWorkspace() ?? "") !== workspaceKey) return;
+    const nextRenderSignature = JSON.stringify([roomStatus, roomMessages]);
+    if (nextRenderSignature === roomRenderSignature) return;
+    roomRenderSignature = nextRenderSignature;
+    const liveGraph = document.querySelector<HTMLElement>("#workspaceLiveGraphContent");
+    if (liveGraph) {
+      liveGraph.innerHTML = renderWorkspaceLiveGraphContent();
+      renderIcons(liveGraph);
+    }
+    if (activeView !== "room") return;
+    const agentsEl = document.querySelector<HTMLDivElement>("#roomAgents");
+    const feedEl = document.querySelector<HTMLDivElement>("#roomFeed");
+    const coordinationEl = document.querySelector<HTMLElement>("#roomCoordination");
+    if (agentsEl && feedEl) {
+      const atBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 40;
+      agentsEl.innerHTML = renderRoomAgentsInner();
+      feedEl.innerHTML = renderRoomFeedInner();
+      if (coordinationEl) coordinationEl.innerHTML = renderRoomCoordinationInner();
+      syncRoomTargetOptions();
+      renderIcons(agentsEl.parentElement ?? agentsEl);
+      if (atBottom) feedEl.scrollTop = feedEl.scrollHeight;
+    } else {
+      render();
+    }
+  } finally {
+    roomRefreshInFlight = false;
   }
 };
 
 const startRoomPoll = () => {
   stopRoomPoll();
-  roomPoll = window.setInterval(() => void refreshRoom(), 1000);
+  roomPoll = window.setInterval(
+    () => runWhenPageVisible(() => void refreshRoom()),
+    1000,
+  );
 };
 
 const stopRoomPoll = () => {
@@ -3065,6 +3200,7 @@ const setActiveView = (view: AppView) => {
   }
 
   if (activeView === "chat") startAllExpertChatWork();
+  else stopAllExpertChatWork();
 
   render();
 
@@ -3089,8 +3225,12 @@ const refreshLimitStatus = async (silent = false) => {
   if (announceInLimitsView) {
     statusText = "Lecture des limites serveur";
   }
+  let statusChanged = false;
   try {
     limitStatus = await invoke<AccountLimitView[]>("account_limit_status");
+    const nextSignature = JSON.stringify(limitStatus);
+    statusChanged = nextSignature !== limitStatusSignature;
+    limitStatusSignature = nextSignature;
     limitStatusLoaded = true;
     if (announceInLimitsView) statusText = "Limites serveur actualisees";
   } catch (error) {
@@ -3100,9 +3240,9 @@ const refreshLimitStatus = async (silent = false) => {
     limitStatusInFlight = false;
   }
 
-  if (activeView === "limits") {
+  if (activeView === "limits" && (statusChanged || announceInLimitsView)) {
     render();
-  } else if (activeView === "chat") {
+  } else if (activeView === "chat" && statusChanged) {
     refreshAllChatRuntimeStatus();
   }
 };
@@ -3145,7 +3285,10 @@ const reloginAccount = async (accountId: string) => {
 
 const startLimitPoll = () => {
   if (limitPoll !== null) return;
-  limitPoll = window.setInterval(() => void refreshLimitStatus(), LIMIT_POLL_INTERVAL_MS);
+  limitPoll = window.setInterval(
+    () => runWhenPageVisible(() => void refreshLimitStatus()),
+    LIMIT_POLL_INTERVAL_MS,
+  );
 };
 
 const stopLimitPoll = () => {
@@ -3156,14 +3299,25 @@ const stopLimitPoll = () => {
 };
 
 const refreshUsageDashboard = async () => {
+  if (usageDashboardInFlight) return;
+  usageDashboardInFlight = true;
+  let dashboardChanged = false;
   try {
-    usageDashboard = await invoke<UsageDashboard>("usage_dashboard");
-  } catch (error) {
-    statusText = String(error);
-  }
+    try {
+      usageDashboard = await invoke<UsageDashboard>("usage_dashboard");
+      const nextSignature = JSON.stringify(usageDashboard);
+      dashboardChanged = nextSignature !== usageDashboardSignature;
+      usageDashboardSignature = nextSignature;
+    } catch (error) {
+      statusText = String(error);
+      dashboardChanged = true;
+    }
 
-  if (activeView === "dashboard") {
-    render();
+    if (activeView === "dashboard" && dashboardChanged) {
+      render();
+    }
+  } finally {
+    usageDashboardInFlight = false;
   }
 };
 
@@ -3186,7 +3340,10 @@ const refreshAccountUsage = async () => {
 
 const startUsagePoll = () => {
   stopUsagePoll();
-  usagePoll = window.setInterval(() => void refreshUsageDashboard(), 5000);
+  usagePoll = window.setInterval(
+    () => runWhenPageVisible(() => void refreshUsageDashboard()),
+    5000,
+  );
 };
 
 const stopUsagePoll = () => {
@@ -3200,34 +3357,43 @@ const kombaiStatusSummary = (status: KombaiStatus) =>
   status.running ? "Kombai actif" : status.started ? "Kombai en cours de demarrage" : "Kombai arrete";
 
 const refreshKombaiStatus = async () => {
+  if (kombaiStatusInFlight) return;
+  kombaiStatusInFlight = true;
   try {
-    const wasRunning = kombaiStatus?.running ?? false;
-    kombaiStatus = await invoke<KombaiStatus>("kombai_status");
-    kombaiLoaded = true;
-    const recoveredFromError = kombaiStatusError;
-    const runningChanged = kombaiStatus.running !== wasRunning;
-    kombaiStatusError = false;
-    if (activeView === "kombai") {
-      if (recoveredFromError || runningChanged) {
-        statusText = kombaiStatusSummary(kombaiStatus);
+    try {
+      const wasRunning = kombaiStatus?.running ?? false;
+      kombaiStatus = await invoke<KombaiStatus>("kombai_status");
+      kombaiLoaded = true;
+      const recoveredFromError = kombaiStatusError;
+      const runningChanged = kombaiStatus.running !== wasRunning;
+      kombaiStatusError = false;
+      if (activeView === "kombai") {
+        if (recoveredFromError || runningChanged) {
+          statusText = kombaiStatusSummary(kombaiStatus);
+        }
+        // Evite de recharger l'iframe a chaque tick : on ne re-render que si
+        // l'etat "running" change (ou tant qu'on n'est pas encore lance).
+        if (recoveredFromError || !kombaiStatus.running || runningChanged || !document.querySelector("#kombaiFrame")) {
+          render();
+        }
       }
-      // Evite de recharger l'iframe a chaque tick : on ne re-render que si
-      // l'etat "running" change (ou tant qu'on n'est pas encore lance).
-      if (recoveredFromError || !kombaiStatus.running || runningChanged || !document.querySelector("#kombaiFrame")) {
-        render();
-      }
+    } catch (error) {
+      kombaiStatusError = true;
+      statusText = String(error);
+      kombaiLoaded = true;
+      if (activeView === "kombai") render();
     }
-  } catch (error) {
-    kombaiStatusError = true;
-    statusText = String(error);
-    kombaiLoaded = true;
-    if (activeView === "kombai") render();
+  } finally {
+    kombaiStatusInFlight = false;
   }
 };
 
 const startKombaiPoll = () => {
   stopKombaiPoll();
-  kombaiPoll = window.setInterval(() => void refreshKombaiStatus(), 2000);
+  kombaiPoll = window.setInterval(
+    () => runWhenPageVisible(() => void refreshKombaiStatus()),
+    2000,
+  );
 };
 
 const stopKombaiPoll = () => {
@@ -3240,6 +3406,9 @@ const stopKombaiPoll = () => {
 const applyDiscussionsSnapshot = (snapshot: DiscussionsView) => {
   discussions = snapshot;
   discussionsLoaded = true;
+  const nextRenderSignature = JSON.stringify([snapshot.totalDiscussions, snapshot.accounts]);
+  if (nextRenderSignature === discussionsRenderSignature) return;
+  discussionsRenderSignature = nextRenderSignature;
   const latestBySession = new Map(
     snapshot.accounts.flatMap((group) => group.discussions).map((discussion) => [discussion.sessionId, discussion]),
   );
@@ -3261,7 +3430,7 @@ const applyDiscussionsSnapshot = (snapshot: DiscussionsView) => {
     // le navigateur annule le geste avant que le drop atteigne son workspace.
     if (host && !draggedChatSessionId) {
       host.innerHTML = renderChatSidebarConversations();
-      createIcons({ icons: lucideIcons });
+      renderIcons(host);
       bindDiscussionRowUi();
       bindWorkspaceSwitcherUi(host);
     }
@@ -3270,13 +3439,22 @@ const applyDiscussionsSnapshot = (snapshot: DiscussionsView) => {
   }
 };
 
-const refreshDiscussions = async () => {
-  try {
-    applyDiscussionsSnapshot(await invoke<DiscussionsView>("list_discussions"));
-  } catch (error) {
-    statusText = String(error);
-    discussionsLoaded = true;
-  }
+const refreshDiscussions = (): Promise<void> => {
+  if (discussionsRefreshPromise) return discussionsRefreshPromise;
+  const pending = (async () => {
+    try {
+      applyDiscussionsSnapshot(await invoke<DiscussionsView>("list_discussions"));
+    } catch (error) {
+      statusText = String(error);
+      discussionsLoaded = true;
+    }
+  })();
+  discussionsRefreshPromise = pending;
+  const clear = () => {
+    if (discussionsRefreshPromise === pending) discussionsRefreshPromise = null;
+  };
+  void pending.then(clear, clear);
+  return pending;
 };
 
 const startDiscussionsPoll = () => {
@@ -3298,12 +3476,17 @@ const startDiscussionsPoll = () => {
     );
     // Filet de securite si un proxy intermediaire coupe durablement les WS.
     discussionsPoll = window.setInterval(() => {
-      if (discussionsSyncState !== "live") void refreshDiscussions();
+      runWhenPageVisible(() => {
+        if (discussionsSyncState !== "live") void refreshDiscussions();
+      });
     }, 2000);
   } else {
     // Le bureau local n'a pas de serveur WebSocket : le scan ne tourne que tant
     // que la vue est ouverte, avec une cadence assez courte pour suivre un chat.
-    discussionsPoll = window.setInterval(() => void refreshDiscussions(), 2000);
+    discussionsPoll = window.setInterval(
+      () => runWhenPageVisible(() => void refreshDiscussions()),
+      2000,
+    );
   }
 };
 
@@ -3942,22 +4125,26 @@ const chatPanelModel = (): ChatPanelModel => {
   };
 };
 
-const patchChatRuntimeStatus = (root: ParentNode, model: ChatPanelModel) => {
+const patchChatRuntimeStatus = (root: ParentNode, model: ChatPanelModel): boolean => {
   const current = root.querySelector<HTMLElement>("[data-chat-control='runtime']");
-  if (current) current.outerHTML = renderChatRuntimeStatus(model);
   const turnStatus = root.querySelector<HTMLButtonElement>("[data-chat-control='turn-status']");
+  if (!current && !turnStatus) return false;
+  const signature = chatRuntimeRenderSignature(model);
+  if (chatRuntimeSignatures.get(root) === signature) return false;
+  if (current) current.outerHTML = renderChatRuntimeStatus(model);
   if (turnStatus) turnStatus.outerHTML = renderChatTurnStatus(model);
+  chatRuntimeSignatures.set(root, signature);
+  return true;
 };
 
 const refreshAllChatRuntimeStatus = () => {
   if (activeView !== "chat") return;
   const mainPanel = document.querySelector<HTMLElement>("#chatPanel");
-  if (mainPanel) patchChatRuntimeStatus(mainPanel, chatPanelModel());
+  if (mainPanel && patchChatRuntimeStatus(mainPanel, chatPanelModel())) renderIcons(mainPanel);
   expertChatPanes.forEach((pane) => {
     const root = expertChatPaneRoot(pane);
-    if (root) patchChatRuntimeStatus(root, expertChatPanelModel(pane));
+    if (root && patchChatRuntimeStatus(root, expertChatPanelModel(pane))) renderIcons(root);
   });
-  createIcons({ icons: lucideIcons });
   refreshChatRuntimeClocks();
 };
 
@@ -3983,7 +4170,10 @@ const refreshChatRuntimeClocks = () => {
 const startChatRuntimeClock = () => {
   if (chatRuntimeClock !== null) return;
   refreshChatRuntimeClocks();
-  chatRuntimeClock = window.setInterval(refreshChatRuntimeClocks, 1000);
+  chatRuntimeClock = window.setInterval(
+    () => runWhenPageVisible(refreshChatRuntimeClocks),
+    1000,
+  );
 };
 
 const stopChatRuntimeClock = () => {
@@ -4265,9 +4455,14 @@ const refreshChatFeed = () => {
   }
   chatScrollState.scrollTop = feed.scrollTop;
   const model = chatPanelModel();
-  feed.innerHTML = renderChatFeedInner(model);
+  const feedSignature = chatFeedRenderSignature(model);
+  const feedChanged = chatFeedSignatures.get(feed) !== feedSignature;
+  if (feedChanged) {
+    feed.innerHTML = renderChatFeedInner(model);
+    chatFeedSignatures.set(feed, feedSignature);
+  }
   const panel = document.querySelector<HTMLElement>("#chatPanel");
-  if (panel) patchChatRuntimeStatus(panel, model);
+  const runtimeChanged = panel ? patchChatRuntimeStatus(panel, model) : false;
   const subtitle = document.querySelector<HTMLSpanElement>("#chatSubtitle");
   if (subtitle) subtitle.textContent = model.subtitle;
   const historyCount = document.querySelector<HTMLElement>("#chatHistoryToggle small");
@@ -4275,8 +4470,8 @@ const refreshChatFeed = () => {
     historyCount.textContent = String(chatMessages.filter((message) => message.role === "user").length);
   }
   refreshChatSyncIndicator();
-  createIcons({ icons: lucideIcons });
-  restoreChatFeedScroll(feed);
+  if (feedChanged || runtimeChanged) renderIcons(panel ?? feed);
+  if (feedChanged) restoreChatFeedScroll(feed);
 };
 
 const stopChatTurnPoll = () => {
@@ -4384,7 +4579,10 @@ const pollChatTurn = async () => {
 
 const startChatTurnPoll = () => {
   stopChatTurnPoll();
-  chatTurnPoll = window.setInterval(() => void pollChatTurn(), 550);
+  chatTurnPoll = window.setInterval(
+    () => runWhenPageVisible(() => void pollChatTurn()),
+    550,
+  );
 };
 
 type ChatSubmitIntent = "message" | "goal";
@@ -4706,7 +4904,10 @@ const startChatSync = () => {
 
   if (!isRemoteMode()) {
     chatSyncState = "polling";
-    chatFallbackPoll = window.setInterval(() => void loadChatTranscript(), 1000);
+    chatFallbackPoll = window.setInterval(
+      () => runWhenPageVisible(() => void loadChatTranscript()),
+      LOCAL_TRANSCRIPT_POLL_INTERVAL_MS,
+    );
     return;
   }
 
@@ -4742,7 +4943,9 @@ const startChatSync = () => {
   // Si un reverse-proxy refuse les WebSockets, le REST garde la conversation
   // vivante pendant les tentatives de reconnexion.
   chatFallbackPoll = window.setInterval(() => {
-    if (chatSyncState !== "live") void loadChatTranscript();
+    runWhenPageVisible(() => {
+      if (chatSyncState !== "live") void loadChatTranscript();
+    });
   }, 2000);
 };
 
@@ -5014,10 +5217,15 @@ const refreshExpertChatFeed = (pane: ExpertChatPane) => {
   const root = expertChatPaneRoot(pane);
   const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
   if (!root || !feed) return;
-  pane.scrollTop = feed.scrollTop;
   const model = expertChatPanelModel(pane);
-  feed.innerHTML = renderChatFeedInner(model, pane.key);
-  patchChatRuntimeStatus(root, model);
+  const feedSignature = chatFeedRenderSignature(model);
+  const feedChanged = chatFeedSignatures.get(feed) !== feedSignature;
+  if (feedChanged) {
+    pane.scrollTop = feed.scrollTop;
+    feed.innerHTML = renderChatFeedInner(model, pane.key);
+    chatFeedSignatures.set(feed, feedSignature);
+  }
+  const runtimeChanged = patchChatRuntimeStatus(root, model);
   const subtitle = root.querySelector<HTMLElement>("[data-chat-control='subtitle']");
   if (subtitle) subtitle.textContent = model.subtitle;
   const historyCount = root.querySelector<HTMLElement>("[data-chat-action='history-toggle'] small");
@@ -5025,8 +5233,8 @@ const refreshExpertChatFeed = (pane: ExpertChatPane) => {
     historyCount.textContent = String(pane.messages.filter((message) => message.role === "user").length);
   }
   refreshExpertChatSyncIndicator(pane);
-  createIcons({ icons: lucideIcons });
-  restoreExpertChatScroll(pane, root);
+  if (feedChanged || runtimeChanged) renderIcons(root);
+  if (feedChanged) restoreExpertChatScroll(pane, root);
 };
 
 const refreshExpertChatPane = (pane: ExpertChatPane) => {
@@ -5034,8 +5242,8 @@ const refreshExpertChatPane = (pane: ExpertChatPane) => {
   if (!root) return;
   captureExpertChatScroll(pane, root);
   root.outerHTML = renderExpertChatPane(pane);
-  createIcons({ icons: lucideIcons });
   const nextRoot = expertChatPaneRoot(pane);
+  if (nextRoot) renderIcons(nextRoot);
   if (nextRoot) bindExpertChatPaneUi(pane, nextRoot);
   restoreExpertChatScroll(pane, nextRoot);
 };
@@ -5123,7 +5331,10 @@ const startExpertChatSync = (pane: ExpertChatPane) => {
 
   if (!isRemoteMode()) {
     pane.syncState = "polling";
-    pane.fallbackPoll = window.setInterval(() => void loadExpertChatTranscript(pane), 1000);
+    pane.fallbackPoll = window.setInterval(
+      () => runWhenPageVisible(() => void loadExpertChatTranscript(pane)),
+      LOCAL_TRANSCRIPT_POLL_INTERVAL_MS,
+    );
     return;
   }
 
@@ -5153,7 +5364,9 @@ const startExpertChatSync = (pane: ExpertChatPane) => {
     },
   );
   pane.fallbackPoll = window.setInterval(() => {
-    if (pane.syncState !== "live") void loadExpertChatTranscript(pane);
+    runWhenPageVisible(() => {
+      if (pane.syncState !== "live") void loadExpertChatTranscript(pane);
+    });
   }, 2000);
 };
 
@@ -5255,7 +5468,10 @@ const pollExpertChatTurn = async (pane: ExpertChatPane) => {
 
 const startExpertChatTurnPoll = (pane: ExpertChatPane) => {
   stopExpertChatTurnPoll(pane);
-  pane.turnPoll = window.setInterval(() => void pollExpertChatTurn(pane), 550);
+  pane.turnPoll = window.setInterval(
+    () => runWhenPageVisible(() => void pollExpertChatTurn(pane)),
+    550,
+  );
 };
 
 const sendExpertChatMessage = async (
@@ -5391,13 +5607,23 @@ const stopExpertChatTurn = async (pane: ExpertChatPane) => {
 };
 
 const startAllExpertChatWork = () => {
+  const visiblePanes = new Set(visibleExpertChatPanes());
   expertChatPanes.forEach((pane) => {
-    if (pane.discussion) {
+    if (visiblePanes.has(pane) && pane.discussion) {
       startExpertChatSync(pane);
       void loadExpertChatTranscript(pane);
+    } else {
+      stopExpertChatSync(pane);
     }
-    if (pane.turn && chatTurnIsBusy(pane.turn.status) && pane.turn.id !== 0) {
+    if (
+      visiblePanes.has(pane)
+      && pane.turn
+      && chatTurnIsBusy(pane.turn.status)
+      && pane.turn.id !== 0
+    ) {
       startExpertChatTurnPoll(pane);
+    } else {
+      stopExpertChatTurnPoll(pane);
     }
   });
 };
@@ -5432,6 +5658,7 @@ const setExpertChatPage = (requestedPage: number) => {
   statusText = expertChatStatusText();
   persistExpertChats();
   render();
+  startAllExpertChatWork();
 };
 
 const addExpertChatPane = (
@@ -5455,6 +5682,7 @@ const addExpertChatPane = (
   statusText = expertChatStatusText();
   persistExpertChats();
   render();
+  startAllExpertChatWork();
   window.setTimeout(() => activateExpertChatPane(pane, true), 0);
   return pane;
 };
@@ -5468,6 +5696,7 @@ const openDiscussionInExpert = (discussion: DiscussionSummary): ExpertChatPane =
     activateExpertChatPane(existing);
     statusText = expertChatStatusText();
     render();
+    startAllExpertChatWork();
     return existing;
   }
   const pane = createExpertChatPane(discussion);
@@ -5479,8 +5708,7 @@ const openDiscussionInExpert = (discussion: DiscussionSummary): ExpertChatPane =
   void loadChatModelCatalog(pane.accountId);
   persistExpertChats();
   render();
-  startExpertChatSync(pane);
-  void loadExpertChatTranscript(pane);
+  startAllExpertChatWork();
   return pane;
 };
 
@@ -5550,6 +5778,7 @@ const closeExpertChatPane = (pane: ExpertChatPane) => {
   statusText = expertChatStatusText();
   persistExpertChats();
   render();
+  startAllExpertChatWork();
 };
 
 const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
@@ -5843,7 +6072,7 @@ const refreshDiscussionList = () => {
     return;
   }
   host.innerHTML = renderDiscussionGroups();
-  createIcons({ icons: lucideIcons });
+  renderIcons(host);
   bindDiscussionRowUi();
 };
 
@@ -5992,7 +6221,7 @@ const refreshWorkspaceSwitcher = () => {
   const next = wrapper.firstElementChild;
   if (!next) return;
   current.replaceWith(next);
-  createIcons({ icons: lucideIcons });
+  renderIcons(next);
   bindWorkspaceSwitcherUi(next);
 };
 
@@ -6251,7 +6480,7 @@ const refreshPromptList = () => {
     return;
   }
   host.innerHTML = renderPromptRows();
-  createIcons({ icons: lucideIcons });
+  renderIcons(host);
   bindPromptRowUi();
 };
 
@@ -6312,7 +6541,7 @@ const restoreTerminals = async () => {
         : codexAgentId();
     const restoredFolder = userEnvironmentPath(record.folderPath);
     if (!restoredFolder) continue;
-    const session = createTerminalSession(
+    const session = await createTerminalSession(
       account,
       proxyForAccount(account),
       agentId,
@@ -6338,11 +6567,15 @@ const restoreTerminals = async () => {
   if (restoredActive && activeView === "terminal") activateTerminalSession(restoredActive);
   if (activeView === "terminal") render();
 
-  for (const session of restored) {
-    const command = isPlausibleSessionId(session.codexSessionId)
-      ? buildResumeCommand(session.codexSessionId, accountById(session.accountId))
-      : null;
-    await startTerminalSession(session, command);
+  for (let index = 0; index < restored.length; index += TERMINAL_RESTORE_CONCURRENCY) {
+    const batch = restored.slice(index, index + TERMINAL_RESTORE_CONCURRENCY);
+    await Promise.all(batch.map((session) => {
+      const command = isPlausibleSessionId(session.codexSessionId)
+        ? buildResumeCommand(session.codexSessionId, accountById(session.accountId))
+        : null;
+      return startTerminalSession(session, command, false, false);
+    }));
+    if (activeView === "terminal") render();
   }
 
   if (eligibleRecords.length > records.length) {
@@ -6978,7 +7211,7 @@ function ensureMobileChrome(): void {
 
   bindGlobalMobileListeners();
 
-  createIcons({ icons: lucideIcons });
+  renderIcons(chrome);
   syncMobileChrome();
 }
 
@@ -7716,7 +7949,7 @@ const renderChatFirstShell = () => {
     ${renderCodexModelSuggestions()}
   `;
 
-  createIcons({ icons: lucideIcons });
+  renderIcons(app);
   bindUi();
   bindExpertChatGridUi();
   if (activeView === "terminal") mountExpertTerminals();
@@ -8024,7 +8257,7 @@ const renderLegacyTerminalShell = () => {
     ${renderCodexModelSuggestions()}
   `;
 
-  createIcons({ icons: lucideIcons });
+  renderIcons(app);
   bindUi();
   if (activeView === "terminal") mountExpertTerminals();
   ensureMobileChrome();
@@ -9819,6 +10052,7 @@ const bindUi = () => {
     statusText = `${expertChatsPerPage} chats par page · ${expertChatStatusText()}`;
     persistExpertChats();
     render();
+    startAllExpertChatWork();
   });
 
   document.querySelector<HTMLButtonElement>("#expertChatPrevPage")?.addEventListener("click", () => {
@@ -10439,7 +10673,7 @@ const bindUi = () => {
     const host = document.querySelector<HTMLElement>("#chatSideConversations");
     if (host) {
       host.innerHTML = renderChatSidebarConversations();
-      createIcons({ icons: lucideIcons });
+      renderIcons(host);
       bindDiscussionRowUi();
       bindWorkspaceSwitcherUi(host);
     }
@@ -10873,50 +11107,18 @@ const readSettingsForm = () => {
   if (autoDiscover) settings.autoDiscoverAccounts = autoDiscover.checked;
 };
 
-const createTerminalSession = (
+const createTerminalSession = async (
   account: AccountProfile,
   proxy: ProxyProfile | null,
   agentId: string,
   folderPath: string,
-): TerminalSession => {
+): Promise<TerminalSession> => {
   const capturedEnvironment = userEnvironmentPath(folderPath);
   if (!capturedEnvironment) {
     throw new Error("Environnement terminal obligatoire");
   }
-  const terminal = new Terminal({
-    cursorBlink: true,
-    cursorStyle: "bar",
-    fontFamily: "Cascadia Mono, Consolas, monospace",
-    fontSize: 13,
-    lineHeight: 1.15,
-    theme: {
-      // Noir & blanc profond : chrome du terminal en niveaux de gris (fond
-      // noir absolu, texte/curseur blancs). Les couleurs ANSI (red/green/...)
-      // restent fonctionnelles pour la lisibilite des sorties (git diff, ls...).
-      background: "#000000",
-      foreground: "#f4f4f4",
-      cursor: "#ffffff",
-      selectionBackground: "#3a3a3a",
-      black: "#1a1a1a",
-      red: "#f06f6c",
-      green: "#8fd694",
-      yellow: "#ffd166",
-      blue: "#78a6d9",
-      magenta: "#d29bd9",
-      cyan: "#6ec6bd",
-      white: "#f4f4f4",
-      brightBlack: "#6a6a6a",
-      brightRed: "#ff8a82",
-      brightGreen: "#a7e9aa",
-      brightYellow: "#ffe08a",
-      brightBlue: "#94c1f0",
-      brightMagenta: "#e7b3ef",
-      brightCyan: "#8de1d7",
-      brightWhite: "#ffffff",
-    },
-  });
-  const fitAddon = new FitAddon();
-  terminal.loadAddon(fitAddon);
+  const { createTerminalRuntime } = await loadTerminalRuntime();
+  const { terminal, fitAddon } = createTerminalRuntime();
 
   const session: TerminalSession = {
     key: uid("terminal"),
@@ -11058,7 +11260,7 @@ const createNewTerminalOnce = async (
     return null;
   }
 
-  const session = createTerminalSession(
+  const session = await createTerminalSession(
     savedAccount,
     proxyForAccount(savedAccount),
     chosenAgentId,
@@ -11133,6 +11335,7 @@ const startTerminalSession = async (
   session: TerminalSession,
   commandOverride: string | null = null,
   loginOnly = false,
+  renderProgress = true,
 ) => {
   if (!settings) return;
   const folder = userEnvironmentPath(session.folderPath);
@@ -11149,11 +11352,12 @@ const startTerminalSession = async (
 
   const requestedId = reservePtyId();
   session.ptyId = requestedId;
+  terminalSessionsByPtyId.set(requestedId, session);
   session.running = true;
   session.status = "Demarrage";
   session.startedAtUnix = Math.floor(Date.now() / 1000);
   statusText = "Demarrage terminal";
-  render();
+  if (renderProgress) render();
 
   const sessionAgent = agentById(session.agentId);
   const isIde = agentIsIde(sessionAgent);
@@ -11182,7 +11386,9 @@ const startTerminalSession = async (
       loginOnly,
     });
     const ptyId = typeof started === "number" ? started : started.id;
+    if (ptyId !== requestedId) terminalSessionsByPtyId.delete(requestedId);
     session.ptyId = ptyId;
+    terminalSessionsByPtyId.set(ptyId, session);
     session.workspaceId = typeof started === "number" ? null : started.workspaceId;
     session.workspacePath = typeof started === "number" ? null : started.workspacePath;
     session.running = true;
@@ -11203,6 +11409,8 @@ const startTerminalSession = async (
       void captureCodexSessionId(session);
     }
   } catch (error) {
+    terminalSessionsByPtyId.delete(requestedId);
+    if (session.ptyId !== null) terminalSessionsByPtyId.delete(session.ptyId);
     session.ptyId = null;
     session.running = false;
     session.status = "Erreur";
@@ -11210,7 +11418,7 @@ const startTerminalSession = async (
     session.terminal.writeln(`\r\n${String(error)}`);
   }
 
-  render();
+  if (renderProgress) render();
 };
 
 const closeTerminalSession = async (key: string) => {
@@ -11221,6 +11429,7 @@ const closeTerminalSession = async (key: string) => {
   if (expertTerminalFullscreenKey === key) expertTerminalFullscreenKey = null;
   const closedWorkspaceKey = terminalWorkspaceDescriptor(session).key;
   const ptyId = session.ptyId;
+  if (ptyId !== null) terminalSessionsByPtyId.delete(ptyId);
   session.ptyId = null;
   session.running = false;
   session.terminal.dispose();
@@ -11352,6 +11561,22 @@ const handleHoveredExpertTerminalArrows = (event: KeyboardEvent): boolean => {
 };
 
 const setupEvents = async () => {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    refreshChatRuntimeClocks();
+    if (activeView === "chat" || activeView === "discussions") void refreshDiscussions();
+    if (activeView === "limits" || activeView === "chat") void refreshLimitStatus(true);
+    if (activeView === "pool") void refreshPoolStatus();
+    if (activeView === "dashboard") void refreshUsageDashboard();
+    if (activeView === "kombai") void refreshKombaiStatus();
+    if (activeView === "room") void refreshRoom();
+    if (activeView === "chat") {
+      if (chatTurn?.status === "running") void pollChatTurn();
+      visibleExpertChatPanes().forEach((pane) => {
+        if (pane.turn?.status === "running") void pollExpertChatTurn(pane);
+      });
+    }
+  });
   document.addEventListener("fullscreenchange", scheduleFullscreenSync);
   document.addEventListener("webkitfullscreenchange", scheduleFullscreenSync);
   window.addEventListener("resize", scheduleFullscreenSync);
@@ -11373,13 +11598,14 @@ const setupEvents = async () => {
   });
 
   unlistenData = await listen<PtyDataEvent>("pty-data", (event) => {
-    const session = terminalSessions.find((candidate) => candidate.ptyId === event.payload.id);
+    const session = terminalSessionsByPtyId.get(event.payload.id);
     session?.terminal.write(event.payload.data);
   });
 
   unlistenExit = await listen<PtyExitEvent>("pty-exit", (event) => {
-    const session = terminalSessions.find((candidate) => candidate.ptyId === event.payload.id);
+    const session = terminalSessionsByPtyId.get(event.payload.id);
     if (!session) return;
+    terminalSessionsByPtyId.delete(event.payload.id);
 
     session.ptyId = null;
     session.running = false;
@@ -11552,7 +11778,7 @@ const renderRemoteLogin = (error: string | null = null) => {
       </section>
     </main>
   `;
-  createIcons({ icons: lucideIcons });
+  renderIcons(app);
   document.querySelector<HTMLFormElement>("#remoteLoginForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const baseUrl = document.querySelector<HTMLInputElement>("#remoteBaseUrl")?.value.trim() || remoteBaseUrl();
@@ -11567,9 +11793,25 @@ const renderRemoteLogin = (error: string | null = null) => {
   });
 };
 
+type IdleCapableWindow = Window & {
+  requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+};
+
+const scheduleIdleTask = (task: () => void) => {
+  const requestIdle = (window as IdleCapableWindow).requestIdleCallback;
+  if (requestIdle) requestIdle.call(window, task, { timeout: 4_000 });
+  else window.setTimeout(task, 1_000);
+};
+
+const initDesktopUpdaterDeferred = () => {
+  if (!("__TAURI_INTERNALS__" in window)) return;
+  scheduleIdleTask(() => {
+    void import("./updater").then(({ initDesktopUpdater }) => initDesktopUpdater());
+  });
+};
+
 const boot = async () => {
   await initializePlatform();
-  void initDesktopUpdater();
 
   if (isRemoteMode() && !hasRemoteAuth()) {
     renderRemoteLogin();
@@ -11590,22 +11832,30 @@ const boot = async () => {
   poolNewAccountBypass = settings.codexBypass ?? true;
   // Migre le registre de workspaces (localStorage -> settings) et fixe le
   // filtre par defaut, avant le premier rendu de la barre laterale.
-  await syncWorkspaceRegistry();
   expertGridLayout = loadExpertGridLayout();
   expertChatsPerPage = loadExpertChatsPerPage();
   chatSidebarWidth = loadChatSidebarWidth();
-  isFullscreen = await appWindow.isFullscreen().catch(() => false);
-  await setupEvents();
+  const [fullscreen] = await Promise.all([
+    appWindow.isFullscreen().catch(() => false),
+    setupEvents(),
+    syncWorkspaceRegistry(),
+  ]);
+  isFullscreen = fullscreen;
   activeView = "chat";
-  await refreshDiscussions();
-  restoreExpertChats();
   render();
+  initDesktopUpdaterDeferred();
   startChatRuntimeClock();
   startLimitPoll();
   void refreshLimitStatus(true);
   startDiscussionsPoll();
-  startAllExpertChatWork();
-  expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
+  void refreshDiscussions().then(() => {
+    restoreExpertChats();
+    if (activeView === "chat") {
+      render();
+      startAllExpertChatWork();
+    }
+    expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
+  });
 };
 
 window.addEventListener("beforeunload", () => {

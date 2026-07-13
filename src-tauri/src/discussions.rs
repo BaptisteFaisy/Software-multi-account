@@ -43,17 +43,56 @@ use crate::settings::{self, expand_home, AccountProfile, AppSettings};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::{hash_map::DefaultHasher, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     thread,
     time::UNIX_EPOCH,
 };
 
 const TITLE_MAX_CHARS: usize = 80;
 const PREVIEW_MAX_CHARS: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SummaryCacheKey {
+    path: PathBuf,
+    account_id: String,
+    account_label: String,
+    codex_home: String,
+    provider: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSummary {
+    fingerprint: FileFingerprint,
+    summary: Option<DiscussionSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDashboard {
+    revision: u64,
+    dashboard: DiscussionsDashboard,
+}
+
+static SUMMARY_CACHE: OnceLock<Mutex<HashMap<SummaryCacheKey, CachedSummary>>> = OnceLock::new();
+static DASHBOARD_CACHE: OnceLock<Mutex<Option<CachedDashboard>>> = OnceLock::new();
+
+fn summary_cache() -> &'static Mutex<HashMap<SummaryCacheKey, CachedSummary>> {
+    SUMMARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dashboard_cache() -> &'static Mutex<Option<CachedDashboard>> {
+    DASHBOARD_CACHE.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,7 +173,36 @@ pub async fn list_discussions() -> Result<DiscussionsDashboard, String> {
 /// cote serveur) puis construit le tableau de bord des discussions.
 pub fn list_discussions_dashboard() -> Result<DiscussionsDashboard, String> {
     let settings = settings::load_settings_for_terminal()?;
-    Ok(build(&settings))
+    let revision = discussions_revision_for_settings(&settings);
+    Ok(dashboard_for_revision(&settings, revision))
+}
+
+/// Variante utilisee par le WebSocket, qui vient deja de calculer l'empreinte.
+/// Elle evite une seconde enumeration de tous les fichiers au meme tick.
+pub fn list_discussions_dashboard_at_revision(
+    revision: u64,
+) -> Result<DiscussionsDashboard, String> {
+    let settings = settings::load_settings_for_terminal()?;
+    Ok(dashboard_for_revision(&settings, revision))
+}
+
+fn dashboard_for_revision(settings: &AppSettings, revision: u64) -> DiscussionsDashboard {
+    if let Ok(mut cache) = dashboard_cache().lock() {
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.revision == revision) {
+            let mut dashboard = cached.dashboard.clone();
+            dashboard.generated_at = metrics::now_ts();
+            return dashboard;
+        }
+
+        let dashboard = build(settings);
+        *cache = Some(CachedDashboard {
+            revision,
+            dashboard: dashboard.clone(),
+        });
+        return dashboard;
+    }
+
+    build(settings)
 }
 
 /// Empreinte legere de l'index des discussions.
@@ -145,6 +213,10 @@ pub fn list_discussions_dashboard() -> Result<DiscussionsDashboard, String> {
 /// l'empreinte et declenche alors seulement un nouveau scan complet.
 pub fn discussions_revision() -> Result<u64, String> {
     let settings = settings::load_settings_for_terminal()?;
+    Ok(discussions_revision_for_settings(&settings))
+}
+
+fn discussions_revision_for_settings(settings: &AppSettings) -> u64 {
     let mut hasher = DefaultHasher::new();
 
     for account in &settings.accounts {
@@ -169,7 +241,7 @@ pub fn discussions_revision() -> Result<u64, String> {
         }
     }
 
-    Ok(hasher.finish())
+    hasher.finish()
 }
 
 /// Empreinte du fichier qui porte un transcript precis. Elle permet au flux
@@ -227,7 +299,78 @@ fn hash_file_revision(path: &Path, hasher: &mut DefaultHasher) {
     }
 }
 
+fn summary_cache_key(path: &Path, account: &AccountProfile) -> SummaryCacheKey {
+    SummaryCacheKey {
+        path: path.to_path_buf(),
+        account_id: account.id.clone(),
+        account_label: account.label.clone(),
+        codex_home: account.codex_home.clone(),
+        provider: account.provider.as_str().to_string(),
+    }
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Some(FileFingerprint {
+        len: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn cached_file_summary(
+    path: &Path,
+    account: &AccountProfile,
+    parser: fn(&Path, &AccountProfile) -> Option<DiscussionSummary>,
+) -> Option<DiscussionSummary> {
+    let fingerprint = file_fingerprint(path)?;
+    let key = summary_cache_key(path, account);
+    if let Ok(cache) = summary_cache().lock() {
+        if let Some(cached) = cache
+            .get(&key)
+            .filter(|cached| cached.fingerprint == fingerprint)
+        {
+            return cached.summary.clone();
+        }
+    }
+
+    let summary = parser(path, account);
+    if let Ok(mut cache) = summary_cache().lock() {
+        cache.insert(
+            key,
+            CachedSummary {
+                fingerprint,
+                summary: summary.clone(),
+            },
+        );
+    }
+    summary
+}
+
+fn prune_summary_cache(settings: &AppSettings) {
+    let Ok(mut cache) = summary_cache().lock() else {
+        return;
+    };
+    cache.retain(|key, _| {
+        key.path.is_file()
+            && settings.accounts.iter().any(|account| {
+                key.account_id == account.id
+                    && key.account_label == account.label
+                    && key.codex_home == account.codex_home
+                    && key.provider == account.provider.as_str()
+            })
+    });
+}
+
 fn build(settings: &AppSettings) -> DiscussionsDashboard {
+    // Une conversation active modifie un seul JSONL a la fois. Les resumes des
+    // milliers d'autres fichiers restent reutilisables entre deux revisions.
+    prune_summary_cache(settings);
     // Un thread par compte (scan disque independant), comme
     // `account_usage::build_dashboard`. On JOINT dans l'ordre des handles, ce
     // qui preserve l'ordre des comptes tel que declare dans les settings.
@@ -307,7 +450,7 @@ fn scan_codex_discussions(home: &Path, account: &AccountProfile) -> Vec<Discussi
         let mut files = Vec::new();
         collect_rollouts(&dir, &mut files);
         for file in &files {
-            if let Some(summary) = scan_discussion_file(file, account) {
+            if let Some(summary) = cached_file_summary(file, account, scan_discussion_file) {
                 discussions.push(summary);
             }
         }
@@ -337,7 +480,8 @@ fn scan_claude_discussions(home: &Path, account: &AccountProfile) -> Vec<Discuss
             let path = file.path();
             let is_jsonl = path.extension().and_then(|ext| ext.to_str()) == Some("jsonl");
             if is_jsonl && path.is_file() {
-                if let Some(summary) = scan_claude_session_file(&path, account) {
+                if let Some(summary) = cached_file_summary(&path, account, scan_claude_session_file)
+                {
                     discussions.push(summary);
                 }
             }

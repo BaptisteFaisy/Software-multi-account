@@ -787,9 +787,20 @@ fn frontend_cache_control(path: &str) -> Option<&'static str> {
         return Some("public, max-age=31536000, immutable");
     }
 
-    // index.html, le service worker et les icones a nom stable doivent etre
-    // revalides pour que le navigateur decouvre immediatement un nouveau build.
-    Some("no-store, no-cache, must-revalidate")
+    if path.starts_with("/icons/") || path == "/apple-touch-icon.png" {
+        return Some("public, max-age=604800, stale-while-revalidate=2592000");
+    }
+
+    if path == "/manifest.webmanifest"
+        || path.starts_with("/skills/")
+        || path.starts_with("/impeccable/")
+    {
+        return Some("public, max-age=3600, stale-while-revalidate=86400");
+    }
+
+    // `no-cache` autorise un 304 conditionnel, contrairement a l'ancien
+    // `no-store` qui retransmettait index.html et le service worker en entier.
+    Some("no-cache, must-revalidate")
 }
 
 async fn set_frontend_cache_control(request: Request, next: Next) -> Response {
@@ -905,7 +916,9 @@ pub async fn run_from_env() -> Result<(), String> {
         .fallback_service(static_service)
         .layer(middleware::from_fn(set_frontend_cache_control))
         .layer(CompressionLayer::new())
-        .layer(CorsLayer::very_permissive());
+        // Les clients mobiles peuvent joindre un noeud sur une autre origine.
+        // Mettre en cache le preflight evite un OPTIONS avant chaque poll API.
+        .layer(CorsLayer::very_permissive().max_age(Duration::from_secs(24 * 60 * 60)));
 
     let addr: SocketAddr = config
         .bind
@@ -1988,9 +2001,11 @@ async fn discussion_ws_update(
     if last_revision == Some(revision) {
         return Ok(None);
     }
-    let dashboard = tokio::task::spawn_blocking(discussions::list_discussions_dashboard)
-        .await
-        .map_err(|error| error.to_string())??;
+    let dashboard = tokio::task::spawn_blocking(move || {
+        discussions::list_discussions_dashboard_at_revision(revision)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     let payload = json!({ "type": "dashboard", "dashboard": dashboard });
     // generatedAt est volontairement exclu de la signature fonctionnelle : sa
     // variation seule ne constitue pas une mise a jour visible.
@@ -2389,11 +2404,11 @@ mod tests {
         );
         assert_eq!(
             frontend_cache_control("/"),
-            Some("no-store, no-cache, must-revalidate")
+            Some("no-cache, must-revalidate")
         );
         assert_eq!(
             frontend_cache_control("/service-worker.js"),
-            Some("no-store, no-cache, must-revalidate")
+            Some("no-cache, must-revalidate")
         );
         assert_eq!(frontend_cache_control("/api/settings"), None);
         assert_eq!(frontend_cache_control("/ws/discussions"), None);

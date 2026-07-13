@@ -56,5 +56,8 @@ test("choisit le compte compatible ayant le plus de quota", () => {
 
 test("les limites visibles sont reactivees toutes les 30 secondes", () => {
   assert.match(main, /const LIMIT_POLL_INTERVAL_MS = 30_000/);
-  assert.match(main, /refreshLimitStatus\(\), LIMIT_POLL_INTERVAL_MS/);
+  assert.match(
+    main,
+    /runWhenPageVisible\(\(\) => void refreshLimitStatus\(\)\)[\s\S]*?LIMIT_POLL_INTERVAL_MS/,
+  );
 });

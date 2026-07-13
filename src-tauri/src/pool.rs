@@ -760,7 +760,7 @@ pub fn router(mgr: Arc<PoolManager>, break_glass: Option<String>) -> Router {
         // (`api_healthz`, avec version/commit/readiness). Enregistrer un second
         // `/healthz` faisait paniquer axum au demarrage ("Overlapping method
         // route. Handler for `GET /healthz` already exists").
-        .layer(CorsLayer::very_permissive())
+        .layer(CorsLayer::very_permissive().max_age(Duration::from_secs(24 * 60 * 60)))
         .with_state(state)
 }
 

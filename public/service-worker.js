@@ -2,6 +2,7 @@ const CACHE_PREFIX = "codex-terminal-static-";
 const BUILD_ID = new URL(self.location.href).searchParams.get("build") || "legacy";
 const CACHE_NAME = `${CACHE_PREFIX}${BUILD_ID}`;
 const PRECACHE_URLS = [
+  "/",
   "/offline.html",
   "/manifest.webmanifest",
   "/apple-touch-icon.png",
@@ -44,6 +45,21 @@ const cachedStaticAsset = async (request) => {
   return response;
 };
 
+const cachedNavigation = async (request, event) => {
+  const cache = await caches.open(CACHE_NAME);
+  const cached = await cache.match("/");
+  const refresh = fetch(request).then(async (response) => {
+    if (response.ok) await cache.put("/", response.clone());
+    return response;
+  });
+
+  if (cached) {
+    event.waitUntil(refresh.catch(() => undefined));
+    return cached;
+  }
+  return refresh.catch(() => caches.match("/offline.html"));
+};
+
 self.addEventListener("fetch", (event) => {
   const { request } = event;
   if (request.method !== "GET") return;
@@ -52,7 +68,7 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin || isPrivateApplicationRequest(url)) return;
 
   if (request.mode === "navigate") {
-    event.respondWith(fetch(request).catch(() => caches.match("/offline.html")));
+    event.respondWith(cachedNavigation(request, event));
     return;
   }
 

@@ -17,6 +17,47 @@ export const escapeHtml = (value: string): string =>
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 
+type MarkdownCacheEntry = {
+  html: string;
+  weight: number;
+};
+
+// Un nouveau fragment arrive a chaque token pendant le streaming, tandis que
+// les anciens messages sont rendus a nouveau. Ce petit LRU borne evite de
+// reparcourir tout l'historique sans laisser les longues conversations gonfler
+// la memoire indefiniment.
+const MARKDOWN_CACHE_MAX_ENTRIES = 128;
+const MARKDOWN_CACHE_MAX_WEIGHT = 1_000_000;
+const markdownHtmlCache = new Map<string, MarkdownCacheEntry>();
+let markdownHtmlCacheWeight = 0;
+
+const cachedMarkdown = (source: string): string | null => {
+  const entry = markdownHtmlCache.get(source);
+  if (!entry) return null;
+  markdownHtmlCache.delete(source);
+  markdownHtmlCache.set(source, entry);
+  return entry.html;
+};
+
+const cacheMarkdown = (source: string, html: string): void => {
+  const weight = source.length + html.length;
+  if (weight > MARKDOWN_CACHE_MAX_WEIGHT / 4) return;
+
+  markdownHtmlCache.set(source, { html, weight });
+  markdownHtmlCacheWeight += weight;
+  while (
+    markdownHtmlCache.size > MARKDOWN_CACHE_MAX_ENTRIES
+    || markdownHtmlCacheWeight > MARKDOWN_CACHE_MAX_WEIGHT
+  ) {
+    const oldest = markdownHtmlCache.entries().next().value as
+      | [string, MarkdownCacheEntry]
+      | undefined;
+    if (!oldest) break;
+    markdownHtmlCache.delete(oldest[0]);
+    markdownHtmlCacheWeight -= oldest[1].weight;
+  }
+};
+
 // --- Inline ----------------------------------------------------------------
 
 // Transforme une tranche de texte BRUT (hors code inline) : echappe d'abord,
@@ -80,6 +121,9 @@ const renderCodeBlock = (code: string, lang: string): string => {
  * hostile : le texte source ne peut injecter aucune balise.
  */
 export const renderMarkdown = (source: string): string => {
+  const cached = cachedMarkdown(source);
+  if (cached !== null) return cached;
+
   const lines = source.replace(/\r\n?/g, "\n").split("\n");
   const html: string[] = [];
   let index = 0;
@@ -154,5 +198,7 @@ export const renderMarkdown = (source: string): string => {
     html.push(`<p>${buffer.map(renderInline).join("<br />")}</p>`);
   }
 
-  return html.join("");
+  const rendered = html.join("");
+  cacheMarkdown(source, rendered);
+  return rendered;
 };

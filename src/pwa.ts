@@ -83,17 +83,27 @@ const registerServiceWorker = () => {
     scope: "/",
     updateViaCache: "none",
   })
-    .then((registration) => registration.update())
     .catch(() => {
       // Le serveur reste utilisable si Safari refuse le service worker.
     });
 };
 
+const scheduleServiceWorkerRegistration = () => {
+  const idleWindow = window as Window & {
+    requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+  };
+  if (idleWindow.requestIdleCallback) {
+    idleWindow.requestIdleCallback(registerServiceWorker, { timeout: 4_000 });
+  } else {
+    window.setTimeout(registerServiceWorker, 1_000);
+  }
+};
+
 export const initPwaSupport = () => {
   showIosInstallHint();
   if (document.readyState === "complete") {
-    registerServiceWorker();
+    scheduleServiceWorkerRegistration();
   } else {
-    window.addEventListener("load", registerServiceWorker, { once: true });
+    window.addEventListener("load", scheduleServiceWorkerRegistration, { once: true });
   }
 };
