@@ -2258,6 +2258,14 @@ const refreshPoolStatus = async () => {
     const nextRowsSignature = JSON.stringify(poolStatus.accounts ?? []);
     const rowsChanged = nextRowsSignature !== poolRowsSignature;
     poolRowsSignature = nextRowsSignature;
+    if (activeView === "pool") {
+      const runtimeStatus = document.querySelector<HTMLElement>("#poolRuntimeStatus");
+      const startButton = document.querySelector<HTMLButtonElement>("#poolStart");
+      const stopButton = document.querySelector<HTMLButtonElement>("#poolStop");
+      if (runtimeStatus) runtimeStatus.textContent = poolRuntimeSummary();
+      if (startButton) startButton.disabled = poolStatus.running;
+      if (stopButton) stopButton.disabled = !poolStatus.running;
+    }
     if (activeView === "pool" && poolStatus?.running && rowsChanged) {
       const rows = document.querySelector<HTMLTableSectionElement>("#poolRows");
       if (rows) {
@@ -2806,17 +2814,21 @@ const renderSkillsPanel = (): string => {
     </div>`;
 };
 
-const renderRoomPanel = (): string => {
+const roomStatusSummary = (): string => {
   const running = roomStatus?.running ?? false;
   const present = roomStatus?.snapshot.present ?? 0;
   const workspace = currentWorkspace();
-  const sub = `${running ? "Active automatiquement" : "Service indisponible"} · ${present} agent(s) présent(s) · ${workspace ? escapeHtml(workspaceBaseName(workspace)) : "aucun environnement actif"}${roomStatus?.snapshot.storeOwner === false ? " · store passif" : ""}`;
+  return `${running ? "Active automatiquement" : "Service indisponible"} · ${present} agent(s) présent(s) · ${workspace ? workspaceBaseName(workspace) : "aucun environnement actif"}${roomStatus?.snapshot.storeOwner === false ? " · store passif" : ""}`;
+};
+
+const renderRoomPanel = (): string => {
+  const sub = roomStatusSummary();
   return `
     <div class="panel room-panel">
       <div class="panel-head">
         <div>
           <h2>Collaboration de l'environnement</h2>
-          <p class="panel-sub">${sub}</p>
+          <p id="roomStatusSummary" class="panel-sub">${escapeHtml(sub)}</p>
         </div>
         <div class="panel-actions">
           <button id="roomRefresh" class="icon-button wide" title="Rafraîchir"><i data-lucide="refresh-ccw"></i></button>
@@ -3039,6 +3051,8 @@ const refreshRoom = async () => {
     const nextRenderSignature = JSON.stringify([roomStatus, roomMessages]);
     if (nextRenderSignature === roomRenderSignature) return;
     roomRenderSignature = nextRenderSignature;
+    const summaryEl = document.querySelector<HTMLElement>("#roomStatusSummary");
+    if (summaryEl) summaryEl.textContent = roomStatusSummary();
     const liveGraph = document.querySelector<HTMLElement>("#workspaceLiveGraphContent");
     if (liveGraph) {
       liveGraph.innerHTML = renderWorkspaceLiveGraphContent();
@@ -7953,6 +7967,7 @@ const renderChatFirstShell = () => {
   bindUi();
   bindExpertChatGridUi();
   if (activeView === "terminal") mountExpertTerminals();
+  ensureMobileChrome();
 };
 
 const render = () => {
@@ -8370,8 +8385,14 @@ const renderAccountsPanel = (proxyOptions: string, proxiesEnabled: boolean) => {
         <section class="account-editor proxy-section ${proxiesEnabled ? "" : "disabled-section"}">
           <div class="section-row">
             <span>Proxy</span>
-            <button class="icon-button" id="addProxy" title="${proxiesEnabled ? "Ajouter un proxy" : "Proxies desactives"}" ${proxiesEnabled ? "" : "disabled"}>
-              <i data-lucide="plug-zap"></i>
+          </div>
+          <div class="proxy-add-row">
+            <label>
+              <span>URL du proxy</span>
+              <input id="proxyUrlInput" type="url" placeholder="http://user:pass@host:port" autocomplete="off" spellcheck="false" ${proxiesEnabled ? "" : "disabled"} />
+            </label>
+            <button type="button" class="tool-button" id="addProxy" title="${proxiesEnabled ? "Ajouter un proxy" : "Proxies desactives"}" ${proxiesEnabled ? "" : "disabled"}>
+              <i data-lucide="plug-zap"></i><span>Ajouter</span>
             </button>
           </div>
           <div class="proxy-list">${proxies || `<div class="empty">Aucun proxy</div>`}</div>
@@ -8951,6 +8972,11 @@ const renderKombaiPanel = () => {
   `;
 };
 
+const poolRuntimeSummary = (): string =>
+  poolStatus?.running
+    ? `Actif${poolStatus.baseUrl ? ` · ${poolStatus.baseUrl}` : ""}`
+    : "Arrêté";
+
 const renderPoolPanel = () => {
   const accounts = poolStatus?.accounts ?? [];
   const proxiesEnabled = proxyControlsEnabled();
@@ -8963,6 +8989,20 @@ const renderPoolPanel = () => {
       .join("") ?? "";
   return `
     <section class="pool-panel">
+      <div class="pool-runtime-toolbar">
+        <div>
+          <strong>Pool de service</strong>
+          <span id="poolRuntimeStatus">${escapeHtml(poolRuntimeSummary())}</span>
+        </div>
+        <div class="pool-actions">
+          <button id="poolStart" type="button" class="tool-button primary" ${poolStatus?.running ? "disabled" : ""}>
+            <i data-lucide="play"></i><span>Démarrer le pool</span>
+          </button>
+          <button id="poolStop" type="button" class="tool-button danger" ${poolStatus?.running ? "" : "disabled"}>
+            <i data-lucide="square"></i><span>Arrêter le pool</span>
+          </button>
+        </div>
+      </div>
       <form id="poolAddAccount" class="pool-add">
         <div class="pool-add-grid">
           <label>
@@ -10234,8 +10274,13 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#addProxy")?.addEventListener("click", () => {
     if (!settings || !proxyControlsEnabled()) return;
-    const proxyUrl = window.prompt("URL proxy", "http://user:pass@host:port");
-    if (!proxyUrl) return;
+    const input = document.querySelector<HTMLInputElement>("#proxyUrlInput");
+    const proxyUrl = input?.value.trim() ?? "";
+    if (!proxyUrl) {
+      statusText = "Saisis une URL de proxy";
+      input?.focus();
+      return;
+    }
     const id = uid("proxy");
     settings.proxies.push({
       id,
@@ -10245,7 +10290,7 @@ const bindUi = () => {
     });
     const account = selectedAccount();
     if (account) account.proxyId = id;
-    statusText = "Proxy ajoute";
+    statusText = "Proxy ajouté";
     render();
   });
 

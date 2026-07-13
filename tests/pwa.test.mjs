@@ -36,6 +36,7 @@ test("le service worker ne met jamais les API privees en cache", async () => {
   assert.match(worker, /url\.origin !== self\.location\.origin/);
   assert.match(worker, /url\.pathname\.startsWith\("\/api\/"\)/);
   assert.match(worker, /url\.pathname\.startsWith\("\/ws\/"\)/);
+  assert.match(worker, /url\.pathname === "\/reset-update\.html"/);
   assert.match(worker, /request\.mode === "navigate"/);
   assert.match(worker, /caches\.match\("\/offline\.html"\)/);
 });

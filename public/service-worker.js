@@ -66,6 +66,10 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin || isPrivateApplicationRequest(url)) return;
+  // Cette page est la porte de sortie d'un cache PWA obsolète. Si le service
+  // worker la remplace par la navigation mise en cache, elle ne peut jamais
+  // désinscrire l'ancien worker ni purger les caches.
+  if (url.pathname === "/reset-update.html") return;
 
   if (request.mode === "navigate") {
     event.respondWith(cachedNavigation(request, event));
