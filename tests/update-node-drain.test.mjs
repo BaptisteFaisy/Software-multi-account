@@ -8,6 +8,10 @@ const frontendPublisher = readFileSync(
   new URL("../scripts/publish-local-frontend.ps1", import.meta.url),
   "utf8",
 );
+const localServerStarter = readFileSync(
+  new URL("../scripts/start-local-server.ps1", import.meta.url),
+  "utf8",
+);
 
 test("l'updater Windows annule le drain si le redemarrage n'a pas eu lieu", () => {
   const drainOn = windowsUpdater.indexOf("Set-DrainState -Draining $true");
@@ -67,4 +71,17 @@ test("la publication frontend ne bloque jamais le serveur 8080", () => {
   assert.ok(copy > lock && replace > copy, "les assets doivent preceder l'index atomique");
   assert.ok(unlock > replace && verify > unlock, "la verification HTTP doit etre hors mutex");
   assert.doesNotMatch(frontendPublisher, /Set-DrainState|Stop-ScheduledTask|Stop-Process/);
+});
+
+test("le serveur local refuse de republier un checkout connu comme obsolete", () => {
+  const guard = localServerStarter.indexOf("Assert-CheckoutIsNotStale");
+  const guardCall = localServerStarter.indexOf("Assert-CheckoutIsNotStale", guard + 1);
+  const firstMutation = localServerStarter.indexOf("New-Item", guardCall);
+  const launch = localServerStarter.indexOf("& $ServerExe", firstMutation);
+
+  assert.ok(guard >= 0 && guardCall > guard, "le garde doit etre defini puis appele");
+  assert.ok(firstMutation > guardCall, "le garde doit preceder toute preparation locale");
+  assert.ok(launch > firstMutation, "le lancement doit rester apres le garde");
+  assert.match(localServerStarter, /merge-base --is-ancestor \$head \$originMain/);
+  assert.match(localServerStarter, /git pull --ff-only origin main/);
 });

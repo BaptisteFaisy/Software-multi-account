@@ -374,6 +374,12 @@ accepter les autres agents. Le drain n'est active qu'apres cette attente, sous
 forme de lease courte de 20 secondes, juste le temps de la bascule. Une
 interruption ou un crash ne peut ainsi plus laisser `8080` verrouille.
 
+Au demarrage, `npm run server:local` compare aussi le commit du checkout avec le
+`origin/main` deja connu localement. Si le checkout est un ancetre strict, le
+script refuse de republier cette ancienne version avant toute construction ou
+modification du serveur. Il faut d'abord preserver les changements non commites,
+puis synchroniser avec `git pull --ff-only origin main`.
+
 Le binaire serveur est produit dans :
 
 ```text

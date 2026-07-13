@@ -11,6 +11,35 @@ $EnvFile = Join-Path $DataDir "server.local.env.ps1"
 $StaticDir = Join-Path $Root "dist"
 $ServerExe = Join-Path $Root "src-tauri\target\release\cst-server.exe"
 
+function Assert-CheckoutIsNotStale {
+  # Tous les worktrees partagent refs/remotes/origin/main. Les pushes des agents
+  # mettent donc cette ref a jour meme si le checkout principal n'a pas suivi.
+  # Refuser un ancetre connu evite qu'un simple restart republie une vieille UI.
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    return
+  }
+
+  $head = [string](& git -C $Root rev-parse --verify HEAD 2>$null)
+  $originMain = [string](& git -C $Root rev-parse --verify refs/remotes/origin/main 2>$null)
+  $head = $head.Trim()
+  $originMain = $originMain.Trim()
+  if (-not $head -or -not $originMain -or $head -eq $originMain) {
+    return
+  }
+
+  & git -C $Root merge-base --is-ancestor $head $originMain 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    $shortHead = $head.Substring(0, [Math]::Min(8, $head.Length))
+    $shortOrigin = $originMain.Substring(0, [Math]::Min(8, $originMain.Length))
+    throw @"
+Demarrage refuse : le checkout local $shortHead est en retard sur origin/main $shortOrigin.
+Ce script n'a ni arrete ni modifie le serveur existant.
+Preserve d'abord tes changements locaux, puis synchronise avec :
+  git pull --ff-only origin main
+"@
+  }
+}
+
 function Test-TreeNewerThan {
   param(
     [string[]]$Paths,
@@ -54,6 +83,8 @@ function Test-NeedsBuild {
   $outputTime = (Get-Item $Output).LastWriteTimeUtc
   return Test-TreeNewerThan -Paths $Inputs -Timestamp $outputTime
 }
+
+Assert-CheckoutIsNotStale
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $DataDir "codex-homes") | Out-Null
