@@ -8704,6 +8704,52 @@ div.chat-tool-part {
 
 .chat-app-layout .expert-chat-wall .chat-panel--compact .chat-head-actions { gap: 4px; }
 
+.chat-app-layout .expert-chat-wall .expert-chat-pane-controls {
+  display: flex;
+  align-self: stretch;
+  flex: none;
+  margin-right: -8px;
+}
+
+.chat-app-layout .expert-chat-wall .expert-chat-pane-controls button {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--chat-border-strong, var(--chat-border));
+  background: transparent;
+  color: var(--chat-muted);
+  cursor: pointer;
+}
+
+.chat-app-layout .expert-chat-wall .expert-chat-pane-controls button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--chat-text);
+}
+
+.chat-app-layout .expert-chat-wall .expert-chat-pane-controls button:focus-visible {
+  outline: 2px solid var(--chat-accent);
+  outline-offset: -3px;
+}
+
+.chat-app-layout .expert-chat-wall .expert-chat-pane-fullscreen[aria-pressed="true"] {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--chat-text);
+}
+
+.chat-app-layout .expert-chat-wall .expert-chat-pane-controls svg {
+  width: 13px;
+  height: 13px;
+}
+
+.chat-app-layout .expert-chat-wall .expert-chat-pane-close svg {
+  width: 12px;
+  height: 12px;
+}
+
 .chat-app-layout .expert-chat-wall .chat-panel--compact .chat-account-name {
   max-width: 42%;
   min-height: 22px;

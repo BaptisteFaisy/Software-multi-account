@@ -882,6 +882,14 @@ export const renderChatPanel = (
         <i data-lucide="user-round" aria-hidden="true"></i>
         <span>${escapeHtml(model.accountLabel)}</span>
       </span>
+      ${instanceId ? `<div class="expert-chat-pane-controls" aria-label="Actions de ce chat">
+        <button id="${id("chatFullscreen")}" type="button" class="expert-chat-pane-fullscreen" data-chat-action="fullscreen" title="${fullscreen ? "Quitter le plein écran" : "Afficher ce chat en plein écran"}" aria-label="${fullscreen ? "Quitter le plein écran" : "Afficher ce chat en plein écran"}" aria-pressed="${fullscreen}">
+          <i data-lucide="${fullscreen ? "minimize-2" : "maximize-2"}"></i>
+        </button>
+        <button id="${id("chatClose")}" type="button" class="expert-chat-pane-close" data-chat-action="close" title="Fermer ce chat" aria-label="Fermer ce chat">
+          <i data-lucide="x"></i>
+        </button>
+      </div>` : ""}
     </header>
     <div class="chat-conversation-body">
       <div id="${id("chatFeed")}" data-chat-control="feed" class="chat-feed" tabindex="0" aria-label="Messages de la conversation">${renderChatFeedInner(model, instanceId)}</div>
