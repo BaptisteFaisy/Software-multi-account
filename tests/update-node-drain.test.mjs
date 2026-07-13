@@ -4,6 +4,10 @@ import test from "node:test";
 
 const windowsUpdater = readFileSync(new URL("../scripts/update-node.ps1", import.meta.url), "utf8");
 const linuxUpdater = readFileSync(new URL("../deploy/update-node.sh", import.meta.url), "utf8");
+const frontendPublisher = readFileSync(
+  new URL("../scripts/publish-local-frontend.ps1", import.meta.url),
+  "utf8",
+);
 
 test("l'updater Windows annule le drain si le redemarrage n'a pas eu lieu", () => {
   const drainOn = windowsUpdater.indexOf("Set-DrainState -Draining $true");
@@ -28,4 +32,39 @@ test("l'updater Linux annule le drain sur erreur, timeout ou interruption", () =
   assert.ok(restart > armed && disarmed > restart, "le cleanup reste arme jusqu'au redemarrage");
   assert.match(linuxUpdater, /if set_drain false/);
   assert.doesNotMatch(linuxUpdater, /LAISSE EN DRAIN/i);
+});
+
+test("les updaters attendent sans drain puis utilisent une lease bornee", () => {
+  const windowsWait = windowsUpdater.indexOf("Attente NON BLOQUANTE");
+  const windowsDrain = windowsUpdater.indexOf("Set-DrainState -Draining $true", windowsWait);
+  const linuxWait = linuxUpdater.indexOf("Attente NON BLOQUANTE");
+  const linuxDrain = linuxUpdater.indexOf("set_drain true", linuxWait);
+
+  assert.ok(windowsWait >= 0 && windowsDrain > windowsWait);
+  assert.ok(linuxWait >= 0 && linuxDrain > linuxWait);
+  assert.match(windowsUpdater, /ttlSeconds\s*=\s*if \(\$Draining\)/);
+  assert.match(linuxUpdater, /ttlSeconds[^\r\n]*DRAIN_LEASE/);
+  assert.match(windowsUpdater, /sans avoir draine ni bloque le noeud/);
+  assert.match(linuxUpdater, /sans avoir draine ni bloque le noeud/);
+});
+
+test("les releases de developpement sont immuables et verifiees par commit", () => {
+  assert.match(windowsUpdater, /\$releaseId = "\$version-\$safeCommit"/);
+  assert.match(windowsUpdater, /-WantCommit \$commit/);
+  assert.match(linuxUpdater, /RELEASE_ID="\$VERSION-\$SAFE_COMMIT"/);
+  assert.match(linuxUpdater, /verify "\$VERSION" "\$COMMIT"/);
+});
+
+test("la publication frontend ne bloque jamais le serveur 8080", () => {
+  const build = frontendPublisher.indexOf("npm run build:frontend");
+  const lock = frontendPublisher.indexOf("$mutex.WaitOne", build);
+  const copy = frontendPublisher.indexOf("Copy-TreeEntry -Source", lock);
+  const replace = frontendPublisher.indexOf("[IO.File]::Replace", copy);
+  const unlock = frontendPublisher.indexOf("$mutex.ReleaseMutex()", replace);
+  const verify = frontendPublisher.indexOf("Invoke-WebRequest", unlock);
+
+  assert.ok(build >= 0 && lock > build, "le build doit rester hors mutex");
+  assert.ok(copy > lock && replace > copy, "les assets doivent preceder l'index atomique");
+  assert.ok(unlock > replace && verify > unlock, "la verification HTTP doit etre hors mutex");
+  assert.doesNotMatch(frontendPublisher, /Set-DrainState|Stop-ScheduledTask|Stop-Process/);
 });

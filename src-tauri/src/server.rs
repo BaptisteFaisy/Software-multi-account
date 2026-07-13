@@ -31,7 +31,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -41,6 +41,8 @@ use tokio::sync::broadcast;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, services::ServeDir};
 
 const WORKSPACE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_DRAIN_LEASE_SECS: u64 = 20;
+const MAX_DRAIN_LEASE_SECS: u64 = 60;
 // Le receiver conserve les sorties produites entre le demarrage du PTY et
 // l'ouverture du WebSocket par le navigateur. Une capacite genereuse evite de
 // perdre l'ecran ANSI initial d'une TUI telle que Codex.
@@ -83,11 +85,10 @@ struct ServerState {
     room: RoomState,
     worktrees: WorktreeManager,
     started_at: i64,
-    /// Quand true, le noeud refuse les NOUVEAUX terminaux (503) et se signale
-    /// `draining`/non `ready` ; les sessions deja ouvertes continuent. En
-    /// memoire uniquement : un redemarrage repart non draine (voulu par
-    /// l'updater qui redemarre apres la bascule).
-    draining: Arc<AtomicBool>,
+    /// Echeance Unix de la courte lease de drain. Une lease bornee evite qu'un
+    /// updater interrompu laisse le noeud ferme aux autres agents. Les sessions
+    /// deja ouvertes continuent et un redemarrage repart toujours non draine.
+    drain_until: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,8 +155,13 @@ struct LivenessResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DrainRequest {
     draining: bool,
+    /// Lease courte, renouvelee par l'appelant si necessaire. Bornee cote
+    /// serveur pour qu'un agent mort ne puisse pas verrouiller le noeud.
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -817,7 +823,7 @@ pub async fn run_from_env() -> Result<(), String> {
         room: room.clone(),
         worktrees,
         started_at: metrics::now_ts(),
-        draining: Arc::new(AtomicBool::new(false)),
+        drain_until: Arc::new(AtomicI64::new(0)),
     });
 
     spawn_workspace_cleanup(config.data_dir.clone(), state.worktrees.clone());
@@ -1132,7 +1138,7 @@ fn workspace_id_for_dir(dir: &Path) -> String {
 }
 
 async fn api_healthz(State(state): State<Arc<ServerState>>) -> Response {
-    let draining = state.draining.load(Ordering::Relaxed);
+    let draining = is_draining(&state);
     json_response(LivenessResponse {
         ok: true,
         node_id: state.config.node_id.clone(),
@@ -1148,9 +1154,31 @@ async fn api_healthz(State(state): State<Arc<ServerState>>) -> Response {
     })
 }
 
+fn is_draining(state: &ServerState) -> bool {
+    drain_lease_active(&state.drain_until, metrics::now_ts())
+}
+
+fn drain_lease_active(drain_until: &AtomicI64, now: i64) -> bool {
+    loop {
+        let deadline = drain_until.load(Ordering::Acquire);
+        if deadline == 0 {
+            return false;
+        }
+        if deadline > now {
+            return true;
+        }
+        if drain_until
+            .compare_exchange(deadline, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return false;
+        }
+    }
+}
+
 async fn api_health(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
     auth_or(&state, &headers, || {
-        let draining = state.draining.load(Ordering::Relaxed);
+        let draining = is_draining(&state);
         Ok(json_response(HealthResponse {
             ok: true,
             node_id: state.config.node_id.clone(),
@@ -1173,9 +1201,19 @@ async fn api_admin_drain(
     Json(request): Json<DrainRequest>,
 ) -> Response {
     auth_or(&state, &headers, || {
-        state.draining.store(request.draining, Ordering::Relaxed);
+        let drain_until = if request.draining {
+            let ttl = request
+                .ttl_seconds
+                .unwrap_or(DEFAULT_DRAIN_LEASE_SECS)
+                .clamp(1, MAX_DRAIN_LEASE_SECS);
+            metrics::now_ts().saturating_add(ttl as i64)
+        } else {
+            0
+        };
+        state.drain_until.store(drain_until, Ordering::Release);
         Ok(json_response(json!({
             "draining": request.draining,
+            "drainUntil": (drain_until > 0).then_some(drain_until),
             "activeTerminals": state.worktrees.active_count(),
         })))
     })
@@ -1405,7 +1443,7 @@ async fn api_start_terminal(
     if let Err(response) = check_admin_header(&state, &headers) {
         return response;
     }
-    if state.draining.load(Ordering::Relaxed) {
+    if is_draining(&state) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "noeud en drain: nouveaux terminaux refuses",
@@ -1441,7 +1479,7 @@ async fn api_start_chat_turn(
     if let Err(response) = check_admin_header(&state, &headers) {
         return response;
     }
-    if state.draining.load(Ordering::Relaxed) {
+    if is_draining(&state) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "noeud en drain: nouveaux messages refusés",
@@ -2326,6 +2364,22 @@ fn system_time_to_unix(value: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_drain_lease_reopens_the_node() {
+        let drain_until = AtomicI64::new(120);
+        assert!(drain_lease_active(&drain_until, 119));
+        assert!(!drain_lease_active(&drain_until, 120));
+        assert_eq!(drain_until.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn drain_request_accepts_a_camel_case_ttl() {
+        let request: DrainRequest =
+            serde_json::from_str(r#"{"draining":true,"ttlSeconds":12}"#).unwrap();
+        assert!(request.draining);
+        assert_eq!(request.ttl_seconds, Some(12));
+    }
 
     #[test]
     fn hashed_frontend_assets_are_cached_but_entrypoints_are_revalidated() {

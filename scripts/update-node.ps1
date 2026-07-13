@@ -1,7 +1,13 @@
 param(
   [int]$Port = 8080,
   [string]$TaskName = "Codex Switch Terminal Node",
+  # Delai TOTAL pour trouver un instant sans terminal. Le noeud reste ouvert
+  # aux agents pendant cette attente ; le drain n'est active qu'a la bascule.
   [int]$DrainTimeoutSec = 300,
+  [ValidateRange(5, 60)]
+  [int]$DrainLeaseSec = 20,
+  [ValidateRange(1, 60)]
+  [int]$StopTimeoutSec = 10,
   [int]$VerifyTimeoutSec = 60,
   [switch]$Force,
   [switch]$SkipBuild,
@@ -23,8 +29,8 @@ param(
 #                              puis l'installe.
 #
 # Sequence commune ensuite : self-check `--version` -> installe dans
-# releases\<version> -> drain -> attente activeTerminals==0 (borne) -> stop
-# tache (l'exe est verrouille tant qu'il tourne) -> bascule de la jonction
+# releases\<version-commit> -> attente NON BLOQUANTE activeTerminals==0 ->
+# courte lease de drain -> stop tache -> bascule de la jonction
 # 'current' -> (re)demarrage tache -> verification "vraiment revenu" -> rollback
 # de la jonction si echec.
 #
@@ -57,7 +63,10 @@ function Get-Healthz {
 
 function Set-DrainState {
   param([bool]$Draining)
-  $body = @{ draining = $Draining } | ConvertTo-Json -Compress
+  $body = @{
+    draining = $Draining
+    ttlSeconds = if ($Draining) { $DrainLeaseSec } else { 0 }
+  } | ConvertTo-Json -Compress
   Invoke-RestMethod -Uri "$base/api/admin/drain" -Method Post -Headers $authHeaders `
     -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
 }
@@ -89,11 +98,12 @@ function Register-NodeTask {
 }
 
 function Test-NodeBack {
-  param([string]$Want)
+  param([string]$WantVersion, [string]$WantCommit)
   $deadline = (Get-Date).AddSeconds($VerifyTimeoutSec)
   while ($true) {
     $h = Get-Healthz
-    if ($h -and $h.version -eq $Want -and $h.ready -eq $true -and $h.draining -eq $false) {
+    if ($h -and $h.version -eq $WantVersion -and $h.commit -eq $WantCommit `
+        -and $h.ready -eq $true -and $h.draining -eq $false) {
       # Sonde d'acceptation : compte bidon -> 400/500 sur un noeud sain, 503 si
       # draine, 401 si token invalide. On accepte tout sauf 503/401/echec.
       $code = 0
@@ -172,105 +182,177 @@ if ($IsReleaseMode) {
 }
 
 # --- 2. Self-check version ---
-$verLine = & $builtExe --version
-$version = ($verLine -split '\s+')[1]
-if (-not $version) { throw "Version illisible via 'cst-server --version'." }
+$verLine = [string](& $builtExe --version)
+if ($verLine -notmatch '^cst-server\s+(\S+)\s+\(([^)]+)\)$') {
+  throw "Version/commit illisibles via 'cst-server --version': $verLine"
+}
+$version = $Matches[1]
+$commit = $Matches[2]
 if ($IsReleaseMode -and ($ReleaseTag.TrimStart('v') -ne $version)) {
   throw "Incoherence: tag $ReleaseTag mais binaire en version $version."
 }
 Write-Host "Nouvelle release : $verLine" -ForegroundColor Cyan
 
-# Release active actuelle (cible du rollback).
-$prevTarget = $null
-if (Test-Path $CurrentLink) {
-  $item = Get-Item $CurrentLink -Force
-  if ($item.Target) { $prevTarget = [string](@($item.Target)[0]) }
-}
-
 # --- 3. Installer la release ---
-$releaseDir = Join-Path $ReleasesDir $version
+# La version Cargo reste souvent stable pendant le developpement. Le commit fait
+# donc partie du dossier afin de ne jamais reecrire l'executable actuellement
+# charge/verrouille par Windows. Une seconde publication du meme commit recoit
+# un suffixe unique au lieu de modifier la release active.
+$safeCommit = $commit -replace '[^A-Za-z0-9._-]', '-'
+$releaseId = "$version-$safeCommit"
+$releaseDir = Join-Path $ReleasesDir $releaseId
+if (Test-Path $releaseDir) {
+  $releaseId = "$releaseId-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())-$PID"
+  $releaseDir = Join-Path $ReleasesDir $releaseId
+}
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 Copy-Item $builtExe (Join-Path $releaseDir "cst-server.exe") -Force
 $releaseDist = Join-Path $releaseDir "dist"
 if (Test-Path $releaseDist) { Remove-Item $releaseDist -Recurse -Force }
 Copy-Item $distSrc $releaseDist -Recurse -Force
 
-# Le drain est arme uniquement jusqu'au redemarrage. Toute erreur/annulation
-# avant celui-ci remet l'ancien noeud en service pour ne jamais le bloquer
-# indefiniment apres une mise a jour abandonnee.
+# Le mutex ne couvre ni le build ni l'attente d'inactivite. Il serialise
+# seulement la bascule de quelques secondes entre deux agents deployeurs.
+$updateMutex = [Threading.Mutex]::new($false, "Local\CST-Deploy-$Port")
+$updateLockHeld = $false
 $drainArmed = $false
+$deadline = (Get-Date).AddSeconds($DrainTimeoutSec)
+$prevTarget = $null
+$previousHealth = $null
+
 try {
-  # --- 4. Drain (si un noeud tourne deja) ---
-  $running = $null -ne (Get-Healthz)
+  # --- 4. Attente NON BLOQUANTE puis acquisition de la courte fenetre ---
+  while (-not $updateLockHeld) {
+    $h = Get-Healthz
+    $running = $null -ne $h
+    $active = if ($h) { [int]$h.activeTerminals } else { 0 }
+    $available = -not $h -or ($h.draining -eq $false -and $active -eq 0)
+
+    if ($available -or ((Get-Date) -ge $deadline -and $Force)) {
+      try {
+        $updateLockHeld = $updateMutex.WaitOne(0)
+      }
+      catch [Threading.AbandonedMutexException] {
+        # Le processus precedent est mort : Windows nous transfere le mutex.
+        $updateLockHeld = $true
+      }
+      if (-not $updateLockHeld) {
+        throw "Une autre mise a jour effectue deja la bascule de 8080 ; reessaie apres sa verification."
+      }
+
+      # Ferme la course entre la sonde precedente et la prise du mutex. Si un
+      # terminal vient de demarrer, on rend immediatement le mutex et on attend
+      # sans drainer le noeud.
+      $h = Get-Healthz
+      $running = $null -ne $h
+      $active = if ($h) { [int]$h.activeTerminals } else { 0 }
+      if ($h -and ($h.draining -eq $true -or ($active -gt 0 -and -not $Force))) {
+        $updateMutex.ReleaseMutex()
+        $updateLockHeld = $false
+      }
+      else {
+        break
+      }
+    }
+
+    if ((Get-Date) -ge $deadline) {
+      throw "Timeout: $active session(s) actives. MAJ abandonnee sans avoir draine ni bloque le noeud."
+    }
+    Write-Host "Noeud occupe ($active session(s)) : attente sans drain..." -ForegroundColor DarkGray
+    Start-Sleep -Seconds 1
+  }
+
+  # Capture la vraie release precedente sous le mutex, apres l'attente : un
+  # autre agent a pu deployer pendant notre build ou pendant la phase idle.
+  $previousHealth = Get-Healthz
+  if (Test-Path $CurrentLink) {
+    $item = Get-Item $CurrentLink -Force
+    if ($item.Target) { $prevTarget = [string](@($item.Target)[0]) }
+  }
+
+  # --- 5. Lease de drain courte, uniquement pendant la bascule ---
   if ($running) {
-    Write-Host "Passage du noeud en drain..." -ForegroundColor Yellow
+    Write-Host "Fenetre de bascule : drain borne a ${DrainLeaseSec}s..." -ForegroundColor Yellow
     Set-DrainState -Draining $true
     $drainArmed = $true
 
-    # --- 5. Attente activeTerminals==0 ---
-    $deadline = (Get-Date).AddSeconds($DrainTimeoutSec)
-    while ($true) {
-      $h = Get-Healthz
-      $active = if ($h) { [int]$h.activeTerminals } else { 0 }
-      if ($active -eq 0) { break }
-      if ((Get-Date) -ge $deadline) {
-        if ($Force) { Write-Warning "Timeout, -Force : on poursuit malgre $active session(s)."; break }
-        throw "Timeout: $active session(s) actives. MAJ abandonnee ; remise en service automatique du noeud."
-      }
-      Start-Sleep -Seconds 3
+    # Une creation deja acceptee juste avant le drain peut apparaitre ici. Sans
+    # -Force, on annule aussitot la fenetre plutot que bloquer les autres agents.
+    Start-Sleep -Milliseconds 250
+    $h = Get-Healthz
+    $active = if ($h) { [int]$h.activeTerminals } else { 0 }
+    if ($active -gt 0 -and -not $Force) {
+      Set-DrainState -Draining $false
+      $drainArmed = $false
+      throw "Course de bascule: $active session(s) viennent de demarrer. Noeud rouvert immediatement ; retente."
     }
   }
 
-  # --- 6. Stop tache (l'exe est verrouille tant qu'il tourne) ---
+  # --- 6. Stop bref de la tache ---
   $taskExists = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
   if ($taskExists) {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    $stopDeadline = (Get-Date).AddSeconds($StopTimeoutSec)
+    while ((Get-Healthz) -and (Get-Date) -lt $stopDeadline) {
+      Start-Sleep -Milliseconds 100
+    }
+    if (Get-Healthz) {
+      throw "Le serveur ne s'est pas arrete en ${StopTimeoutSec}s ; bascule annulee."
+    }
   }
 
   # --- 7. Bascule de la jonction 'current' ---
-  Write-Host "Bascule current -> releases\$version" -ForegroundColor Cyan
+  Write-Host "Bascule current -> releases\$releaseId" -ForegroundColor Cyan
   Set-Junction -Link $CurrentLink -Target $releaseDir
 
   # --- 8. (Re)creer + demarrer la tache ---
   Register-NodeTask
   Start-ScheduledTask -TaskName $TaskName
-  # Le nouvel executable repart non draine (etat uniquement en memoire).
+  # Le nouveau processus repart non draine (etat uniquement en memoire).
   $drainArmed = $false
+
+  # --- 9. Verification exacte version + commit ---
+  if (Test-NodeBack -WantVersion $version -WantCommit $commit) {
+    Write-Host "OK : noeud en $version ($commit), pret et non draine." -ForegroundColor Green
+    exit 0
+  }
+
+  # --- 10. Rollback ---
+  Write-Warning "ECHEC de la verification en $version ($commit)."
+  if ($prevTarget -and (Test-Path $prevTarget) -and ($prevTarget -ne $releaseDir)) {
+    Write-Host "Rollback -> $prevTarget" -ForegroundColor Yellow
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $stopDeadline = (Get-Date).AddSeconds($StopTimeoutSec)
+    while ((Get-Healthz) -and (Get-Date) -lt $stopDeadline) {
+      Start-Sleep -Milliseconds 100
+    }
+    Set-Junction -Link $CurrentLink -Target $prevTarget
+    Start-ScheduledTask -TaskName $TaskName
+    $prevVersion = if ($previousHealth) { [string]$previousHealth.version } else { "" }
+    $prevCommit = if ($previousHealth) { [string]$previousHealth.commit } else { "" }
+    if ($prevVersion -and $prevCommit -and
+        (Test-NodeBack -WantVersion $prevVersion -WantCommit $prevCommit)) {
+      Write-Host "Rollback OK : noeud restaure en $prevVersion ($prevCommit)." -ForegroundColor Green
+    } else {
+      Write-Error "ALERTE : le rollback n'a pas restaure un etat sain, intervention manuelle requise."
+    }
+  } else {
+    Write-Error "ALERTE : pas de release precedente valide pour le rollback."
+  }
+  exit 1
 }
 finally {
   if ($drainArmed) {
     try {
       Set-DrainState -Draining $false
-      Write-Warning "Mise a jour interrompue avant le redemarrage : noeud remis hors drain."
+      Write-Warning "Mise a jour interrompue : noeud remis hors drain."
     }
     catch {
-      Write-Warning "ALERTE : impossible de sortir automatiquement le noeud du drain : $($_.Exception.Message)"
+      Write-Warning "La lease de drain expirera seule sous ${DrainLeaseSec}s : $($_.Exception.Message)"
     }
   }
-}
-
-# --- 9. Verification ---
-if (Test-NodeBack -Want $version) {
-  Write-Host "OK : noeud en version $version, pret et non draine." -ForegroundColor Green
-  exit 0
-}
-
-# --- 10. Rollback ---
-Write-Warning "ECHEC de la verification en $version."
-if ($prevTarget -and (Test-Path $prevTarget) -and ($prevTarget -ne $releaseDir)) {
-  $prevVersion = Split-Path $prevTarget -Leaf
-  Write-Host "Rollback -> $prevTarget" -ForegroundColor Yellow
-  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  Start-Sleep -Seconds 2
-  Set-Junction -Link $CurrentLink -Target $prevTarget
-  Start-ScheduledTask -TaskName $TaskName
-  if (Test-NodeBack -Want $prevVersion) {
-    Write-Host "Rollback OK : noeud restaure en $prevVersion." -ForegroundColor Green
-  } else {
-    Write-Error "ALERTE : le rollback n'a pas restaure un etat sain, intervention manuelle requise."
+  if ($updateLockHeld) {
+    $updateMutex.ReleaseMutex()
   }
-} else {
-  Write-Error "ALERTE : pas de release precedente valide pour le rollback."
+  $updateMutex.Dispose()
 }
-exit 1

@@ -308,7 +308,8 @@ ne les change qu'aux deux endroits à la fois (`.github/workflows/release.yml`,
   brouillon ; ne coche pas *prerelease* pour une vraie diffusion.
 - **Cohérence tag ↔ version** : les updaters serveur refusent si
   `tag (sans v) != cst-server --version` (garde-fou contre un mauvais artefact).
-- **Le drain n'est pas persistant** (AtomicBool en mémoire) : un crash-loop
-  rouvre le nœud ; c'est voulu (l'updater le repasse en service via restart).
+- **Le drain est une lease courte en mémoire** (20 s par défaut, 60 s maximum) :
+  un updater interrompu ne peut pas laisser le nœud verrouillé. Le restart
+  rouvre également le nœud immédiatement.
 - **CST_GIT_COMMIT** : injecté depuis `${{ github.sha }}` en CI (le `.git` n'est
   pas présent au runtime des nœuds).

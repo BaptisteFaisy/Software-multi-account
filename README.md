@@ -353,6 +353,27 @@ npm run build:frontend
 npm run build:server
 ```
 
+#### Verification web avec plusieurs agents
+
+Pour publier un changement **uniquement frontend** sur le noeud de test
+`http://127.0.0.1:8080`, utilise :
+
+```powershell
+npm run deploy:web:local
+```
+
+Le build est effectue dans le worktree isole de l'agent, sans verrou. Le script
+prend ensuite un mutex de publication tres court, copie d'abord les assets Vite
+hashes et remplace `index.html` atomiquement en dernier. Il ne draine pas le
+noeud, ne coupe aucun terminal et ne redemarre pas le serveur. Les agents ne
+doivent donc pas arreter le PID de `8080` pour verifier une modification web.
+
+Pour une modification **backend**, `scripts/update-node.ps1` reste le point
+d'entree. Il attend desormais un instant sans terminal tout en laissant le noeud
+accepter les autres agents. Le drain n'est active qu'apres cette attente, sous
+forme de lease courte de 20 secondes, juste le temps de la bascule. Une
+interruption ou un crash ne peut ainsi plus laisser `8080` verrouille.
+
 Le binaire serveur est produit dans :
 
 ```text

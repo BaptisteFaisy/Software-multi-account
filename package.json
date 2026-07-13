@@ -9,6 +9,7 @@
     "dev:server": "cargo run --manifest-path src-tauri/Cargo.toml --bin cst-server",
     "server:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-local-server.ps1",
     "server:local:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-local-server.ps1 -Build",
+    "deploy:web:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-local-frontend.ps1",
     "web:local": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/open-web-interface.ps1",
     "web:local:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop-local-server.ps1",
     "build": "tauri build",
