@@ -371,7 +371,7 @@ impl WorktreeManager {
         let workspace_root = self.inner.data_dir.join("workspaces").join(&workspace_id);
         let isolated_home = self.inner.data_dir.join("agent-homes").join(&workspace_id);
         fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
-        copy_tree(canonical_home, &isolated_home, Some(&self.inner.data_dir))?;
+        copy_home_snapshot(canonical_home, &isolated_home, &self.inner.data_dir)?;
         inject_agent_conventions(&isolated_home)?;
         let transcript_baseline = collect_transcript_baseline(&isolated_home)?;
 
@@ -877,6 +877,23 @@ fn git_status(command: &mut Command) -> bool {
 /// sont stables et copies normalement ; l'authentification a de toute facon deja
 /// ete validee avant d'arriver ici.
 fn copy_tree(source: &Path, target: &Path, excluded: Option<&Path>) -> Result<(), String> {
+    copy_tree_with_mode(source, target, excluded, false)
+}
+
+/// Variante destinee aux runtimes immuables : cree des liens physiques quand
+/// la source et la cible partagent le meme volume, puis retombe sur une copie
+/// classique partout ailleurs. Supprimer le home isole ne supprime que ses
+/// liens, jamais les fichiers canoniques.
+fn link_or_copy_tree(source: &Path, target: &Path, excluded: Option<&Path>) -> Result<(), String> {
+    copy_tree_with_mode(source, target, excluded, true)
+}
+
+fn copy_tree_with_mode(
+    source: &Path,
+    target: &Path,
+    excluded: Option<&Path>,
+    prefer_hard_links: bool,
+) -> Result<(), String> {
     fs::create_dir_all(target).map_err(|error| error.to_string())?;
     let entries = match fs::read_dir(source) {
         Ok(entries) => entries,
@@ -910,10 +927,15 @@ fn copy_tree(source: &Path, target: &Path, excluded: Option<&Path>) -> Result<()
             continue;
         }
         if metadata.is_dir() {
-            copy_tree(&from, &to, excluded)?;
+            copy_tree_with_mode(&from, &to, excluded, prefer_hard_links)?;
         } else if metadata.is_file() {
-            match fs::copy(&from, &to) {
-                Ok(_) => {}
+            let copied = if prefer_hard_links {
+                fs::hard_link(&from, &to).or_else(|_| fs::copy(&from, &to).map(|_| ()))
+            } else {
+                fs::copy(&from, &to).map(|_| ())
+            };
+            match copied {
+                Ok(()) => {}
                 // Fichier ephemere disparu/verrouille par un ecrivain concurrent.
                 Err(error) if is_transient_copy_race(&error) => continue,
                 Err(error) => return Err(error.to_string()),
@@ -953,12 +975,28 @@ const EPHEMERAL_HOME_DIRS: &[&str] = &[
     "tmp",
     ".tmp",
     "archived_sessions",
+    "sessions-archive",
 ];
 
-/// Snapshot d'un home provider vers un home isole, en omettant les gros dossiers
-/// ephemeres de premier niveau (`EPHEMERAL_HOME_DIRS`). Les credentials, la
-/// config et `sessions/`/`projects/` (refusionnes ensuite) sont preserves. Comme
-/// `copy_tree`, la copie est best-effort et resiliente aux ecrivains concurrents.
+/// Binaires generes par Codex, volumineux mais immuables pendant une session.
+/// Les recopier (plus de 300 Mo sur Windows) ne fournit aucune isolation utile.
+const SHARED_IMMUTABLE_HOME_DIRS: &[&str] = &[".sandbox-bin"];
+
+/// Bases de journalisation et journaux texte regenerables. Les bases d'etat,
+/// credentials et fichiers de memoire ne correspondent volontairement pas a
+/// ce filtre et restent copies dans le home isole.
+fn is_ephemeral_home_file(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    normalized.ends_with(".log")
+        || (normalized.starts_with("logs_")
+            && (normalized.ends_with(".sqlite") || normalized.contains(".sqlite-")))
+}
+
+/// Snapshot d'un home provider vers un home isole, en omettant les gros caches
+/// et journaux de premier niveau. Les credentials, la config et
+/// `sessions/`/`projects/` (refusionnes ensuite) sont preserves. Les binaires
+/// sandbox immuables sont partages par lien physique avec repli en copie. Comme
+/// `copy_tree`, l'operation est best-effort face aux ecrivains concurrents.
 fn copy_home_snapshot(source: &Path, target: &Path, excluded: &Path) -> Result<(), String> {
     fs::create_dir_all(target).map_err(|error| error.to_string())?;
     let entries = match fs::read_dir(source) {
@@ -998,8 +1036,18 @@ fn copy_home_snapshot(source: &Path, target: &Path, excluded: &Path) -> Result<(
                 // Gros dossier ephemere/regenerable : omis du home isole.
                 continue;
             }
-            copy_tree(&from, &to, Some(excluded))?;
+            if SHARED_IMMUTABLE_HOME_DIRS
+                .iter()
+                .any(|candidate| lossy.eq_ignore_ascii_case(candidate))
+            {
+                link_or_copy_tree(&from, &to, Some(excluded))?;
+            } else {
+                copy_tree(&from, &to, Some(excluded))?;
+            }
         } else if metadata.is_file() {
+            if is_ephemeral_home_file(&lossy) {
+                continue;
+            }
             match fs::copy(&from, &to) {
                 Ok(_) => {}
                 Err(error) if is_transient_copy_race(&error) => continue,
@@ -1434,6 +1482,64 @@ mod tests {
             fs::read_to_string(home.join("sessions").join("turn.jsonl")).unwrap(),
             "turn"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn isolated_home_skips_heavy_runtime_data_but_keeps_session_inputs() {
+        let root = temp("lean-home-snapshot");
+        let home = root.join("home");
+        for directory in [
+            "sessions",
+            "plugins",
+            ".tmp",
+            "sessions-archive",
+            ".sandbox-bin",
+        ] {
+            fs::create_dir_all(home.join(directory)).unwrap();
+        }
+        fs::write(home.join("auth.json"), "credentials").unwrap();
+        fs::write(home.join("config.toml"), "model = 'test'").unwrap();
+        fs::write(home.join("state_5.sqlite"), "state").unwrap();
+        fs::write(home.join("sessions").join("turn.jsonl"), "turn").unwrap();
+        fs::write(home.join("plugins").join("cache.bin"), vec![0_u8; 1024]).unwrap();
+        fs::write(home.join(".tmp").join("scratch.bin"), vec![0_u8; 1024]).unwrap();
+        fs::write(home.join("sessions-archive").join("old.jsonl"), "archived").unwrap();
+        fs::write(home.join("logs_2.sqlite"), vec![0_u8; 1024]).unwrap();
+        fs::write(home.join("sandbox.2026-07-13.log"), "log").unwrap();
+        fs::write(home.join(".sandbox-bin").join("codex.exe"), "binary").unwrap();
+
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, None).unwrap();
+        let isolated = agent.home();
+
+        for retained in [
+            "auth.json",
+            "config.toml",
+            "state_5.sqlite",
+            "sessions/turn.jsonl",
+            ".sandbox-bin/codex.exe",
+        ] {
+            assert!(
+                isolated.join(retained).is_file(),
+                "fichier conserve: {retained}"
+            );
+        }
+        for skipped in [
+            "plugins",
+            ".tmp",
+            "sessions-archive",
+            "logs_2.sqlite",
+            "sandbox.2026-07-13.log",
+        ] {
+            assert!(
+                !isolated.join(skipped).exists(),
+                "donnee ephemere omise: {skipped}"
+            );
+        }
+
+        drop(agent);
+        drop(manager);
         let _ = fs::remove_dir_all(root);
     }
 
