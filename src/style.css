@@ -6431,7 +6431,7 @@ body.chat-dragging .chat-side-drag-handle {
 }
 .chat-msg-delivery--pending { border-style: dashed; }
 .chat-msg-delivery--failed { border-color: rgba(226, 105, 105, 0.42); color: #e99a9a; }
-.chat-app-layout .chat-msg--pending {
+.chat-app-layout .chat-msg.chat-msg--pending {
   border-style: dashed;
 }
 .chat-app-layout .chat-msg--failed {

@@ -55,6 +55,14 @@ test("le badge optimiste disparait quand le serveur a persiste le message", () =
   assert.equal(merged[0].deliveryState, undefined);
 });
 
+test("un message utilisateur en attente ne recoit pas de cadre pointille", () => {
+  // `chat-user-message` partage la classe d'etat `chat-msg--pending` sans avoir
+  // de bordure. Un selecteur generique sur cette classe faisait donc apparaitre
+  // la bordure `medium` blanche par defaut du navigateur autour de tout le tour.
+  assert.doesNotMatch(style, /\.chat-app-layout \.chat-msg--pending\s*\{/);
+  assert.match(style, /\.chat-app-layout \.chat-msg\.chat-msg--pending\s*\{/);
+});
+
 test("une question finale place clairement le chat en attente de l'utilisateur", () => {
   assert.equal(
     conversationWaitsForUser([
