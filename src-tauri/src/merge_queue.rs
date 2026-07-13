@@ -6,15 +6,15 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Mutex, Weak,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const JOURNAL_FILE: &str = "merge-queue.jsonl";
@@ -23,6 +23,8 @@ const JOURNAL_COMPACT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MERGE_WORKERS: usize = 4;
 const MAX_MERGE_WORKERS: usize = 32;
 const MAX_CAS_ATTEMPTS: u32 = 32;
+const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 15 * 60;
+const DEFAULT_NETWORK_TIMEOUT_SECS: u64 = 2 * 60;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +67,11 @@ struct MergeJob {
     workspace_id: String,
     context: MergeContext,
     commit_sha: String,
+    /// Dernier commit d'integration durablement prepare avant le CAS/push.
+    /// Permet de reconnaitre un land deja effectue si le processus s'arrete
+    /// entre la publication et l'ecriture du statut terminal.
+    #[serde(default)]
+    attempt_sha: Option<String>,
     landed_sha: Option<String>,
     #[serde(default)]
     conflicts: Vec<String>,
@@ -146,7 +153,26 @@ struct QueueInner {
     integration_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     owner_lock: Option<crate::fs_util::ProcessFileLock>,
     verify_command: Option<String>,
+    command_timeouts: CommandTimeouts,
     ephemeral: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CommandTimeouts {
+    verify: Duration,
+    network: Duration,
+}
+
+impl CommandTimeouts {
+    fn from_env() -> Self {
+        Self {
+            verify: timeout_from_env("CST_MERGE_VERIFY_TIMEOUT_SECS", DEFAULT_VERIFY_TIMEOUT_SECS),
+            network: timeout_from_env(
+                "CST_MERGE_NETWORK_TIMEOUT_SECS",
+                DEFAULT_NETWORK_TIMEOUT_SECS,
+            ),
+        }
+    }
 }
 
 impl MergeQueue {
@@ -180,10 +206,33 @@ impl MergeQueue {
         ephemeral: bool,
         worker_count: usize,
     ) -> Self {
+        Self::build_with_timeouts(
+            data_dir,
+            verify_command,
+            ephemeral,
+            worker_count,
+            CommandTimeouts::from_env(),
+        )
+    }
+
+    fn build_with_timeouts(
+        data_dir: PathBuf,
+        verify_command: Option<String>,
+        ephemeral: bool,
+        worker_count: usize,
+        command_timeouts: CommandTimeouts,
+    ) -> Self {
         let _ = fs::create_dir_all(data_dir.join("integration"));
         let _ = fs::create_dir_all(data_dir.join("hooks-empty"));
         let owner_lock = crate::fs_util::try_process_lock(&data_dir.join(".owner.lock")).ok();
         let is_owner = owner_lock.is_some();
+        if is_owner {
+            for journal in [JOURNAL_FILE, TASK_JOURNAL_FILE] {
+                if let Err(error) = repair_jsonl_tail(&data_dir.join(journal)) {
+                    eprintln!("[merge_queue] reparation de {journal} impossible: {error}");
+                }
+            }
+        }
         let (sender, receiver) = mpsc::channel();
         let (jobs, next_id) = load_jobs(&data_dir);
         let tasks = load_tasks(&data_dir);
@@ -206,6 +255,7 @@ impl MergeQueue {
             integration_locks: Mutex::new(HashMap::new()),
             owner_lock,
             verify_command,
+            command_timeouts,
             ephemeral,
         });
         if is_owner {
@@ -231,6 +281,26 @@ impl MergeQueue {
         worker_count: usize,
     ) -> Self {
         Self::build_with_mode(data_dir, verify_command, false, worker_count)
+    }
+
+    #[cfg(test)]
+    fn build_with_test_timeouts(
+        data_dir: PathBuf,
+        verify_command: Option<String>,
+        worker_count: usize,
+        verify_timeout: Duration,
+        network_timeout: Duration,
+    ) -> Self {
+        Self::build_with_timeouts(
+            data_dir,
+            verify_command,
+            false,
+            worker_count,
+            CommandTimeouts {
+                verify: verify_timeout,
+                network: network_timeout,
+            },
+        )
     }
 
     pub fn set_notifier(&self, notifier: Notifier) {
@@ -326,6 +396,7 @@ impl MergeQueue {
             workspace_id: workspace_id.to_string(),
             context,
             commit_sha,
+            attempt_sha: None,
             landed_sha: None,
             conflicts: Vec::new(),
             error: None,
@@ -339,7 +410,19 @@ impl MergeQueue {
             .lock()
             .map_err(|_| "merge queue verrouillee".to_string())?
             .insert(id, job.clone());
-        persist_job(&self.inner, &job);
+        if let Err(error) = persist_job(&self.inner, &job) {
+            if let Ok(mut jobs) = self.inner.jobs.lock() {
+                jobs.remove(&id);
+            }
+            let mut control = control_command(&job.context.control);
+            let _ = git_run(
+                control.args(["update-ref", "-d", &queue_ref, &job.commit_sha]),
+                "annulation de la ref queue",
+            );
+            return Err(format!(
+                "soumission non journalisee; aucune publication effectuee: {error}"
+            ));
+        }
         self.inner
             .sender
             .send(id)
@@ -464,9 +547,11 @@ impl MergeQueue {
             claimed_by: agent_ident.to_string(),
             updated_at: now_ts(),
         };
-        tasks.insert(key, task.clone());
-        drop(tasks);
-        persist_task(&self.inner, &task);
+        tasks.insert(key.clone(), task.clone());
+        if let Err(error) = persist_task(&self.inner, &task) {
+            tasks.remove(&key);
+            return Err(format!("claim non journalise: {error}"));
+        }
         Ok(task)
     }
 
@@ -480,23 +565,26 @@ impl MergeQueue {
         let room_id = normalized_room_id(room_id);
         let id = validate_task_id(task_id)?;
         let key = scoped_task_key(&room_id, &id);
-        let task = {
-            let mut tasks = self
-                .inner
-                .tasks
-                .lock()
-                .map_err(|_| "task board verrouille".to_string())?;
-            let task = tasks
-                .get_mut(&key)
-                .ok_or_else(|| format!("tache introuvable: {id}"))?;
-            if task.claimed_by != agent_ident {
-                return Err(format!("tache prise par {}", task.claimed_by));
-            }
-            task.status = TaskStatus::Completed;
-            task.updated_at = now_ts();
-            task.clone()
-        };
-        persist_task(&self.inner, &task);
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .map_err(|_| "task board verrouille".to_string())?;
+        let task = tasks
+            .get_mut(&key)
+            .ok_or_else(|| format!("tache introuvable: {id}"))?;
+        if task.claimed_by != agent_ident {
+            return Err(format!("tache prise par {}", task.claimed_by));
+        }
+        let previous = task.clone();
+        task.status = TaskStatus::Completed;
+        task.updated_at = now_ts();
+        let completed = task.clone();
+        if let Err(error) = persist_task(&self.inner, &completed) {
+            *task = previous;
+            return Err(format!("completion non journalisee: {error}"));
+        }
+        let task = completed;
         Ok(task)
     }
 
@@ -621,6 +709,11 @@ fn process_job(inner: &Arc<QueueInner>, id: u64, worker_slot: usize) {
             control.args(["update-ref", "-d", &queue_ref(job.id), &job.commit_sha]),
             "retrait de la ref queue",
         );
+        let mut control = control_command(&job.context.control);
+        let _ = git_run(
+            control.args(["update-ref", "-d", &attempt_ref(job.id)]),
+            "retrait de la ref de tentative",
+        );
     }
     if let Ok(notifier) = inner.notifier.lock() {
         if let Some(notifier) = notifier.as_ref() {
@@ -641,7 +734,19 @@ fn update_job(
         job.updated_at = now_ts();
         job.clone()
     };
-    persist_job(inner, &job);
+    if let Err(error) = persist_job(inner, &job) {
+        eprintln!(
+            "[merge_queue] statut {} non journalise pour le job {id}: {error}",
+            match job.status {
+                MergeStatus::Queued => "queued",
+                MergeStatus::Running => "running",
+                MergeStatus::Landed => "landed",
+                MergeStatus::Conflict => "conflict",
+                MergeStatus::VerifyFailed => "verifyFailed",
+                MergeStatus::Failed => "failed",
+            }
+        );
+    }
     Some(job)
 }
 
@@ -651,11 +756,39 @@ enum LandError {
     Failed(String),
 }
 
-fn land_job(inner: &QueueInner, job: &MergeJob, worker_slot: usize) -> Result<String, LandError> {
+fn land_job(
+    inner: &Arc<QueueInner>,
+    job: &MergeJob,
+    worker_slot: usize,
+) -> Result<String, LandError> {
     let integration = integration_path(&inner.data_dir, &job.context.control, worker_slot);
+    let mut recorded_attempt = job.attempt_sha.clone();
     for _attempt in 0..MAX_CAS_ATTEMPTS {
-        let expected_old = resolve_control_ref(&job.context.control, &job.context.target_ref)
+        let mut expected_old = resolve_control_ref(&job.context.control, &job.context.target_ref)
             .map_err(LandError::Failed)?;
+
+        // Reprise apres crash : la tentative est journalisee AVANT le CAS. Si
+        // la cible la contient deja, le land a reussi et ne doit pas etre
+        // rejoue. Pour une cible distante, un fetch borne couvre le cas ou le
+        // push a ete accepte mais sa reponse n'est jamais revenue au worker.
+        if let Some(attempt_sha) = recorded_attempt.as_deref() {
+            if !is_control_ancestor(&job.context.control, attempt_sha, &expected_old) {
+                if let Some(publish) = job.context.publish.as_ref() {
+                    refresh_publish_target(
+                        &job.context.control,
+                        publish,
+                        inner.command_timeouts.network,
+                    )
+                    .map_err(LandError::Failed)?;
+                    expected_old =
+                        resolve_control_ref(&job.context.control, &job.context.target_ref)
+                            .map_err(LandError::Failed)?;
+                }
+            }
+            if is_control_ancestor(&job.context.control, attempt_sha, &expected_old) {
+                return Ok(attempt_sha.to_string());
+            }
+        }
 
         // L'arbitre n'integre que sur une histoire comparable. Si main a ete
         // force-push/reset sur une branche divergente, aucun patch ancien ne
@@ -759,11 +892,17 @@ fn land_job(inner: &QueueInner, job: &MergeJob, worker_slot: usize) -> Result<St
         }
 
         if job.verify {
-            if let Err(error) = run_verify(&integration, inner.verify_command.as_deref()) {
+            if let Err(error) = run_verify(
+                &integration,
+                inner.verify_command.as_deref(),
+                inner.command_timeouts.verify,
+            ) {
                 let _ = reset_integration(&integration, &integration_base);
                 return Err(LandError::Verify(error));
             }
         }
+        record_attempt(inner, job.id, &job.context.control, &new_sha).map_err(LandError::Failed)?;
+        recorded_attempt = Some(new_sha.clone());
         let target_lock = target_lock(inner, &job.context).map_err(LandError::Failed)?;
         let landed = {
             let _publish = target_lock
@@ -780,6 +919,7 @@ fn land_job(inner: &QueueInner, job: &MergeJob, worker_slot: usize) -> Result<St
                     job.context.publish.as_ref(),
                     &new_sha,
                     &expected_old,
+                    inner.command_timeouts.network,
                 )
             }
         };
@@ -806,12 +946,13 @@ fn cas_land(
     publish: Option<&GitPublishTarget>,
     new_sha: &str,
     expected_old: &str,
+    network_timeout: Duration,
 ) -> Result<bool, String> {
     if let Some(publish) = publish {
         if target_ref != publish.tracking_ref {
             return Err("cible de publication incoherente avec sa ref de suivi".to_string());
         }
-        return publish_fast_forward(control, publish, new_sha, expected_old);
+        return publish_fast_forward(control, publish, new_sha, expected_old, network_timeout);
     }
     if let GitControl::WorkTree { repo_root } = control {
         let checked_out = git_output(
@@ -865,6 +1006,7 @@ fn publish_fast_forward(
     publish: &GitPublishTarget,
     new_sha: &str,
     expected_old: &str,
+    timeout: Duration,
 ) -> Result<bool, String> {
     let refspec = format!("{new_sha}:{}", publish.remote_ref);
     let mut push = control_command(control);
@@ -874,8 +1016,9 @@ fn publish_fast_forward(
         "--no-verify",
         &publish.remote,
         &refspec,
-    ]);
-    match git_run(&mut push, "publication fast-forward par l'arbitre") {
+    ])
+    .env("GIT_TERMINAL_PROMPT", "0");
+    match git_run_with_timeout(&mut push, "publication fast-forward par l'arbitre", timeout) {
         Ok(()) => {
             // Git met normalement la remote-tracking ref a jour apres un push.
             // Le CAS best-effort couvre aussi les remotes/configurations qui ne
@@ -893,11 +1036,13 @@ fn publish_fast_forward(
             // Un push concurrent a pu gagner. On rafraichit uniquement la ref
             // de suivi (jamais le checkout utilisateur), puis le worker rebase
             // et revalide son patch sur cette nouvelle tete.
-            if let Err(fetch_error) = refresh_publish_target(control, publish) {
+            if let Err(fetch_error) = refresh_publish_target(control, publish, timeout) {
                 return Err(format!("{push_error}; {fetch_error}"));
             }
             let current = resolve_control_ref(control, &publish.tracking_ref)?;
-            if current != expected_old {
+            if current == new_sha || is_control_ancestor(control, new_sha, &current) {
+                Ok(true)
+            } else if current != expected_old {
                 Ok(false)
             } else {
                 Err(push_error)
@@ -906,13 +1051,50 @@ fn publish_fast_forward(
     }
 }
 
-fn refresh_publish_target(control: &GitControl, publish: &GitPublishTarget) -> Result<(), String> {
+fn refresh_publish_target(
+    control: &GitControl,
+    publish: &GitPublishTarget,
+    timeout: Duration,
+) -> Result<(), String> {
     let refspec = format!("+{}:{}", publish.remote_ref, publish.tracking_ref);
     let mut fetch = control_command(control);
-    git_run(
-        fetch.args(["fetch", "--quiet", "--no-tags", &publish.remote, &refspec]),
+    git_run_with_timeout(
+        fetch
+            .args(["fetch", "--quiet", "--no-tags", &publish.remote, &refspec])
+            .env("GIT_TERMINAL_PROMPT", "0"),
         "actualisation de la tete publiee",
+        timeout,
     )
+}
+
+/// Rend une tentative recuperable avant toute mutation de la cible. La ref Git
+/// protege le commit candidat du GC et le journal permet de determiner, apres
+/// redemarrage, si le CAS/push avait deja abouti.
+fn record_attempt(
+    inner: &Arc<QueueInner>,
+    id: u64,
+    control: &GitControl,
+    new_sha: &str,
+) -> Result<(), String> {
+    let mut command = control_command(control);
+    git_run(
+        command.args(["update-ref", &attempt_ref(id), new_sha]),
+        "ancrage de la tentative de merge",
+    )?;
+    let snapshot = {
+        let mut jobs = inner
+            .jobs
+            .lock()
+            .map_err(|_| "merge queue verrouillee".to_string())?;
+        let job = jobs
+            .get_mut(&id)
+            .ok_or_else(|| format!("soumission de merge introuvable: {id}"))?;
+        job.attempt_sha = Some(new_sha.to_string());
+        job.updated_at = now_ts();
+        job.clone()
+    };
+    persist_job(inner, &snapshot)
+        .map_err(|error| format!("tentative non journalisee; publication annulee: {error}"))
 }
 
 fn target_lock(inner: &QueueInner, context: &MergeContext) -> Result<Arc<Mutex<()>>, String> {
@@ -927,6 +1109,10 @@ fn target_lock(inner: &QueueInner, context: &MergeContext) -> Result<Arc<Mutex<(
         .target_locks
         .lock()
         .map_err(|_| "registre des arbitres de branche verrouille".to_string())?;
+    // Le nombre de dossiers peut croitre sans limite. Les entrees sans worker
+    // actif sont donc elaguees au fil de l'eau au lieu de vivre jusqu'au
+    // redemarrage du serveur.
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
     Ok(Arc::clone(
         locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))),
     ))
@@ -941,6 +1127,7 @@ fn integration_setup_lock(
         .integration_locks
         .lock()
         .map_err(|_| "registre de preparation des worktrees verrouille".to_string())?;
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
     Ok(Arc::clone(
         locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))),
     ))
@@ -1024,7 +1211,7 @@ fn reset_integration(integration: &Path, expected: &str) -> Result<(), String> {
     )
 }
 
-fn run_verify(integration: &Path, script: Option<&str>) -> Result<(), String> {
+fn run_verify(integration: &Path, script: Option<&str>, timeout: Duration) -> Result<(), String> {
     let Some(script) = script else {
         return Ok(());
     };
@@ -1038,9 +1225,7 @@ fn run_verify(integration: &Path, script: Option<&str>) -> Result<(), String> {
         command
     };
     command.current_dir(integration).stdin(Stdio::null());
-    let output = command
-        .output()
-        .map_err(|error| format!("verify impossible: {error}"))?;
+    let output = command_output_with_timeout(&mut command, "verify", timeout)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1072,6 +1257,44 @@ fn load_jobs(data_dir: &Path) -> (BTreeMap<u64, MergeJob>, u64) {
     (jobs, max_id + 1)
 }
 
+/// Une extinction brutale peut laisser le dernier JSON incomplet. Sans
+/// reparation, le prochain append serait colle a ce fragment et deux mises a
+/// jour seraient perdues au rechargement. Une derniere valeur complete sans
+/// saut de ligne est conservee ; seul un fragment invalide est tronque.
+fn repair_jsonl_tail(path: &Path) -> Result<(), String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let line_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|position| position + 1)
+        .unwrap_or(0);
+    let keep_len = if serde_json::from_slice::<serde_json::Value>(&bytes[line_start..]).is_ok() {
+        bytes.len()
+    } else {
+        line_start
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.set_len(keep_len as u64)
+        .map_err(|error| error.to_string())?;
+    if keep_len == bytes.len() {
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| error.to_string())?;
+        writeln!(file).map_err(|error| error.to_string())?;
+    }
+    file.flush().map_err(|error| error.to_string())?;
+    file.sync_data().map_err(|error| error.to_string())
+}
+
 fn load_tasks(data_dir: &Path) -> HashMap<String, TaskView> {
     let mut tasks = HashMap::new();
     if let Ok(file) = fs::File::open(data_dir.join(TASK_JOURNAL_FILE)) {
@@ -1084,19 +1307,22 @@ fn load_tasks(data_dir: &Path) -> HashMap<String, TaskView> {
     tasks
 }
 
-fn persist_job(inner: &QueueInner, job: &MergeJob) {
-    let Ok(line) = serde_json::to_string(job) else {
-        return;
-    };
-    let Ok(_io) = inner.io_lock.lock() else {
-        return;
-    };
+fn persist_job(inner: &QueueInner, job: &MergeJob) -> Result<(), String> {
+    let line = serde_json::to_string(job).map_err(|error| error.to_string())?;
+    let _io = inner
+        .io_lock
+        .lock()
+        .map_err(|_| "journal de merge verrouille".to_string())?;
     let path = inner.data_dir.join(JOURNAL_FILE);
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
-        let _ = file.sync_data();
-    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("ouverture de {} impossible: {error}", path.display()))?;
+    writeln!(file, "{line}").map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())?;
+    file.sync_data().map_err(|error| error.to_string())?;
+    drop(file);
     if path.metadata().map(|meta| meta.len()).unwrap_or(0) > JOURNAL_COMPACT_BYTES {
         if let Ok(jobs) = inner.jobs.lock() {
             let compact = jobs
@@ -1104,24 +1330,30 @@ fn persist_job(inner: &QueueInner, job: &MergeJob) {
                 .filter_map(|job| serde_json::to_string(job).ok())
                 .collect::<Vec<_>>()
                 .join("\n");
-            let _ = crate::fs_util::atomic_write(&path, format!("{compact}\n"));
+            if let Err(error) = crate::fs_util::atomic_write(&path, format!("{compact}\n")) {
+                eprintln!("[merge_queue] compaction du journal ignoree: {error}");
+            }
         }
     }
+    Ok(())
 }
 
-fn persist_task(inner: &QueueInner, task: &TaskView) {
-    let Ok(line) = serde_json::to_string(task) else {
-        return;
-    };
-    let Ok(_io) = inner.task_io_lock.lock() else {
-        return;
-    };
+fn persist_task(inner: &QueueInner, task: &TaskView) -> Result<(), String> {
+    let line = serde_json::to_string(task).map_err(|error| error.to_string())?;
+    let _io = inner
+        .task_io_lock
+        .lock()
+        .map_err(|_| "journal des taches verrouille".to_string())?;
     let path = inner.data_dir.join(TASK_JOURNAL_FILE);
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
-        let _ = file.sync_data();
-    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("ouverture de {} impossible: {error}", path.display()))?;
+    writeln!(file, "{line}").map_err(|error| error.to_string())?;
+    file.flush().map_err(|error| error.to_string())?;
+    file.sync_data().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn integration_path(data_dir: &Path, control: &GitControl, worker_slot: usize) -> PathBuf {
@@ -1192,8 +1424,153 @@ fn git_output(command: &mut Command, operation: &str) -> Result<String, String> 
     }
 }
 
+fn git_output_with_timeout(
+    command: &mut Command,
+    operation: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let output = command_output_with_timeout(command, operation, timeout)?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "{operation} a echoue ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 fn git_run(command: &mut Command, operation: &str) -> Result<(), String> {
     git_output(command, operation).map(|_| ())
+}
+
+fn git_run_with_timeout(
+    command: &mut Command,
+    operation: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    git_output_with_timeout(command, operation, timeout).map(|_| ())
+}
+
+/// Execute une commande avec capture non bloquante et tue tout son arbre au
+/// depassement du delai. Des fichiers temporaires evitent qu'un gros stdout
+/// remplisse un pipe et soit confondu avec une commande figee.
+fn command_output_with_timeout(
+    command: &mut Command,
+    operation: &str,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let capture_id = uuid::Uuid::new_v4().simple().to_string();
+    let stdout_path = std::env::temp_dir().join(format!("cst-command-{capture_id}.stdout"));
+    let stderr_path = std::env::temp_dir().join(format!("cst-command-{capture_id}.stderr"));
+    let stdout_file = open_private_capture_file(&stdout_path)
+        .map_err(|error| format!("capture stdout impossible: {error}"))?;
+    let stderr_file = match open_private_capture_file(&stderr_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&stdout_path);
+            return Err(format!("capture stderr impossible: {error}"));
+        }
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    configure_process_group(command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&stdout_path);
+            let _ = fs::remove_file(&stderr_path);
+            return Err(format!("{operation} impossible: {error}"));
+        }
+    };
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                terminate_process_tree(&mut child);
+                let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                return Err(format!(
+                    "{operation} a depasse le delai de {} ms et a ete arretee",
+                    timeout.as_millis()
+                ));
+            }
+            Err(error) => {
+                terminate_process_tree(&mut child);
+                let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                return Err(format!("attente de {operation} impossible: {error}"));
+            }
+        }
+    };
+    let stdout = fs::read(&stdout_path).unwrap_or_default();
+    let stderr = fs::read(&stderr_path).unwrap_or_default();
+    let _ = fs::remove_file(&stdout_path);
+    let _ = fs::remove_file(&stderr_path);
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn open_private_capture_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut Child) {
+    // Le process est leader du groupe cree dans `configure_process_group`.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(child: &mut Child) {
+    // `Child::kill` ne termine pas les helpers ssh/git ni les hooks. taskkill /T
+    // borne aussi ces descendants, puis `kill` couvre une course de sortie.
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_process_tree(child: &mut Child) {
+    let _ = child.kill();
 }
 
 fn git_success(command: &mut Command) -> bool {
@@ -1208,6 +1585,10 @@ fn git_success(command: &mut Command) -> bool {
 
 fn queue_ref(id: u64) -> String {
     format!("refs/cst/queue/{id}")
+}
+
+fn attempt_ref(id: u64) -> String {
+    format!("refs/cst/attempt/{id}")
 }
 
 fn validate_task_id(value: &str) -> Result<String, String> {
@@ -1272,6 +1653,15 @@ fn merge_workers_from_env() -> usize {
         .clamp(1, MAX_MERGE_WORKERS)
 }
 
+fn timeout_from_env(name: &str, default_secs: u64) -> Duration {
+    let seconds = std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,6 +1703,91 @@ mod tests {
             ],
         );
         repo
+    }
+
+    fn commit_file(repo: &Path, path: &str, contents: &str, message: &str) -> String {
+        fs::write(repo.join(path), contents).unwrap();
+        git(repo, &["add", path]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        );
+        resolve_commit(repo, "HEAD").unwrap()
+    }
+
+    fn init_upstream_repo(root: &Path) -> (PathBuf, PathBuf) {
+        let repo = init_test_repo(root, "repo");
+        let origin = root.join("origin.git");
+        fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "--bare"]);
+        let origin_url = origin.to_string_lossy().to_string();
+        git(&repo, &["remote", "add", "origin", &origin_url]);
+        git(&repo, &["push", "-u", "origin", "main"]);
+        (repo, origin)
+    }
+
+    fn install_sleep_hook(origin: &Path, name: &str) -> PathBuf {
+        let hook = origin.join("hooks").join(name);
+        fs::write(&hook, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        hook
+    }
+
+    fn install_verify_barrier(root: &Path) -> (String, PathBuf, PathBuf) {
+        let ready = root.join("verify-ready");
+        let release = root.join("verify-release");
+        if cfg!(windows) {
+            let script = root.join("verify-barrier.cmd");
+            fs::write(
+                &script,
+                format!(
+                    "@echo off\r\ntype nul > \"{}\"\r\n:wait\r\nif exist \"{}\" exit /b 0\r\nping -n 2 127.0.0.1 > nul\r\ngoto wait\r\n",
+                    ready.display(),
+                    release.display()
+                ),
+            )
+            .unwrap();
+            (script.display().to_string(), ready, release)
+        } else {
+            let script = root.join("verify-barrier.sh");
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n",
+                    ready.display(),
+                    release.display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            (script.display().to_string(), ready, release)
+        }
+    }
+
+    fn wait_for_path(path: &Path) {
+        for _ in 0..400 {
+            if path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("fichier attendu absent: {}", path.display());
     }
 
     fn wait_terminal(queue: &MergeQueue, id: u64) -> MergeStatusView {
@@ -1475,6 +1950,360 @@ mod tests {
         assert_eq!(wait_terminal(&queue, second.id).status, MergeStatus::Landed);
         drop(agent_a);
         drop(agent_b);
+        drop(queue);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hung_verify_is_bounded_and_the_only_worker_continues_with_next_folder() {
+        let root = temp("verify-timeout");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let blocked_repo = init_test_repo(&root, "blocked-repo");
+        let healthy_repo = init_test_repo(&root, "healthy-repo");
+        let manager = WorktreeManager::new(root.join("runtime"), 2).unwrap();
+        let blocked = manager
+            .prepare_local("blocked", &home, Some(&blocked_repo))
+            .unwrap();
+        let healthy = manager
+            .prepare_local("healthy", &home, Some(&healthy_repo))
+            .unwrap();
+        commit_file(blocked.cwd(), "hang.flag", "hang", "blocked verify");
+        commit_file(healthy.cwd(), "healthy.txt", "ok", "healthy change");
+        let verify = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        };
+        let queue = MergeQueue::build_with_test_timeouts(
+            root.join("queue"),
+            Some(verify.to_string()),
+            1,
+            Duration::from_millis(350),
+            Duration::from_secs(2),
+        );
+        let first = queue
+            .submit(
+                ROOM,
+                "blocked",
+                blocked.workspace_id(),
+                blocked.merge_context().unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+        let second = queue
+            .submit(
+                ROOM,
+                "healthy",
+                healthy.workspace_id(),
+                healthy.merge_context().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+
+        let timed_out = wait_terminal(&queue, first.id);
+        assert_eq!(timed_out.status, MergeStatus::VerifyFailed, "{timed_out:?}");
+        assert!(
+            timed_out
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delai"),
+            "{timed_out:?}"
+        );
+        let landed = wait_terminal(&queue, second.id);
+        assert_eq!(landed.status, MergeStatus::Landed, "{landed:?}");
+        assert!(!blocked_repo.join("hang.flag").exists());
+        assert_eq!(
+            fs::read_to_string(healthy_repo.join("healthy.txt")).unwrap(),
+            "ok"
+        );
+        drop(blocked);
+        drop(healthy);
+        drop(queue);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocked_push_times_out_without_moving_main_then_queue_recovers() {
+        let root = temp("push-timeout");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (repo, origin) = init_upstream_repo(&root);
+        let base = resolve_commit(&repo, "refs/remotes/origin/main").unwrap();
+        let hook = install_sleep_hook(&origin, "pre-receive");
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, Some(&repo)).unwrap();
+        commit_file(agent.cwd(), "agent.txt", "agent", "agent change");
+        let queue = MergeQueue::build_with_test_timeouts(
+            root.join("queue"),
+            None,
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        let blocked = queue
+            .submit(
+                ROOM,
+                "agent",
+                agent.workspace_id(),
+                agent.merge_context().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        let failed = wait_terminal(&queue, blocked.id);
+        assert_eq!(failed.status, MergeStatus::Failed, "{failed:?}");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("delai"),
+            "{failed:?}"
+        );
+        assert_eq!(
+            resolve_commit(&origin, "refs/heads/main").unwrap(),
+            base,
+            "un push bloque avant le CAS ne doit pas deplacer main"
+        );
+
+        fs::remove_file(hook).unwrap();
+        let retry = queue
+            .submit(
+                ROOM,
+                "agent",
+                agent.workspace_id(),
+                agent.merge_context().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        let landed = wait_terminal(&queue, retry.id);
+        assert_eq!(landed.status, MergeStatus::Landed, "{landed:?}");
+        assert_eq!(
+            git_output(
+                Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&origin)
+                    .args(["show", "refs/heads/main:agent.txt"]),
+                "lecture du retry publie",
+            )
+            .unwrap(),
+            "agent"
+        );
+        drop(agent);
+        drop(queue);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lost_push_response_is_recognized_as_landed() {
+        let root = temp("push-response-lost");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (repo, origin) = init_upstream_repo(&root);
+        let _hook = install_sleep_hook(&origin, "post-receive");
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, Some(&repo)).unwrap();
+        commit_file(
+            agent.cwd(),
+            "landed.txt",
+            "landed",
+            "land despite lost response",
+        );
+        let queue = MergeQueue::build_with_test_timeouts(
+            root.join("queue"),
+            None,
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        let submitted = queue
+            .submit(
+                ROOM,
+                "agent",
+                agent.workspace_id(),
+                agent.merge_context().unwrap(),
+                None,
+                false,
+            )
+            .unwrap();
+        let landed = wait_terminal(&queue, submitted.id);
+        assert_eq!(landed.status, MergeStatus::Landed, "{landed:?}");
+        assert_eq!(
+            git_output(
+                Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&origin)
+                    .args(["show", "refs/heads/main:landed.txt"]),
+                "lecture apres reponse perdue",
+            )
+            .unwrap(),
+            "landed"
+        );
+        drop(agent);
+        drop(queue);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_external_push_is_preserved_and_agent_patch_is_rebased() {
+        let root = temp("concurrent-external-push");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let (repo, origin) = init_upstream_repo(&root);
+        let external = root.join("external");
+        let origin_url = origin.to_string_lossy().to_string();
+        let external_path = external.to_string_lossy().to_string();
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--branch",
+                "main",
+                &origin_url,
+                &external_path,
+            ],
+        );
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, Some(&repo)).unwrap();
+        commit_file(agent.cwd(), "agent.txt", "agent", "agent concurrent change");
+        let (verify, ready, release) = install_verify_barrier(&root);
+        let queue = MergeQueue::build_with_test_timeouts(
+            root.join("queue"),
+            Some(verify),
+            1,
+            Duration::from_secs(15),
+            Duration::from_secs(5),
+        );
+        let submitted = queue
+            .submit(
+                ROOM,
+                "agent",
+                agent.workspace_id(),
+                agent.merge_context().unwrap(),
+                None,
+                true,
+            )
+            .unwrap();
+        wait_for_path(&ready);
+        commit_file(
+            &external,
+            "external.txt",
+            "external",
+            "external concurrent push",
+        );
+        git(&external, &["push", "origin", "main"]);
+        fs::write(&release, "release").unwrap();
+
+        let landed = wait_terminal(&queue, submitted.id);
+        assert_eq!(landed.status, MergeStatus::Landed, "{landed:?}");
+        for (path, expected) in [("agent.txt", "agent"), ("external.txt", "external")] {
+            assert_eq!(
+                git_output(
+                    Command::new("git")
+                        .arg("--git-dir")
+                        .arg(&origin)
+                        .args(["show", &format!("refs/heads/main:{path}"),]),
+                    "lecture apres push concurrent",
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        drop(agent);
+        drop(queue);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_after_cas_does_not_replay_an_already_landed_attempt() {
+        let root = temp("restart-after-cas");
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let repo = init_test_repo(&root, "repo");
+        let manager = WorktreeManager::new(root.join("runtime"), 1).unwrap();
+        let agent = manager.prepare_local("agent", &home, Some(&repo)).unwrap();
+        let context = agent.merge_context().unwrap();
+        let commit_sha = commit_file(agent.cwd(), "once.txt", "once", "land once");
+        git(&repo, &["merge", "--ff-only", &commit_sha]);
+        git(&repo, &["update-ref", &queue_ref(41), &commit_sha]);
+        git(&repo, &["update-ref", &attempt_ref(41), &commit_sha]);
+
+        let now = now_ts();
+        let job = MergeJob {
+            id: 41,
+            room_id: ROOM.to_string(),
+            status: MergeStatus::Running,
+            agent_ident: "agent".to_string(),
+            workspace_id: agent.workspace_id().to_string(),
+            context,
+            commit_sha: commit_sha.clone(),
+            attempt_sha: Some(commit_sha.clone()),
+            landed_sha: None,
+            conflicts: Vec::new(),
+            error: None,
+            verify: false,
+            submitted_at: now,
+            updated_at: now,
+        };
+        let queue_dir = root.join("queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join(JOURNAL_FILE),
+            format!("{}\n", serde_json::to_string(&job).unwrap()),
+        )
+        .unwrap();
+
+        let queue = MergeQueue::build_with_test_timeouts(
+            queue_dir,
+            None,
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        let recovered = wait_terminal(&queue, 41);
+        assert_eq!(recovered.status, MergeStatus::Landed, "{recovered:?}");
+        assert_eq!(recovered.landed_sha.as_deref(), Some(commit_sha.as_str()));
+        assert_eq!(
+            git_output(
+                Command::new("git").arg("-C").arg(&repo).args([
+                    "rev-list",
+                    "--count",
+                    &format!("{}..main", job.context.base_sha)
+                ]),
+                "comptage apres reprise",
+            )
+            .unwrap(),
+            "1",
+            "la reprise ne doit pas dupliquer le patch"
+        );
+        assert!(!git_success(
+            Command::new("git").arg("-C").arg(&repo).args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &queue_ref(41)
+            ])
+        ));
+        assert!(!git_success(
+            Command::new("git").arg("-C").arg(&repo).args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &attempt_ref(41)
+            ])
+        ));
+        drop(agent);
         drop(queue);
         drop(manager);
         let _ = fs::remove_dir_all(root);
@@ -1677,6 +2506,33 @@ mod tests {
         assert_eq!(reloaded.list_tasks(ROOM).len(), 1);
         assert_eq!(reloaded.list_tasks("other-room").len(), 1);
         drop(reloaded);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn truncated_journal_tail_is_repaired_before_future_appends() {
+        let root = temp("journal-tail");
+        fs::create_dir_all(&root).unwrap();
+        let truncated = root.join("truncated.jsonl");
+        fs::write(&truncated, b"{\"id\":1}\n{\"id\":").unwrap();
+        repair_jsonl_tail(&truncated).unwrap();
+        assert_eq!(fs::read(&truncated).unwrap(), b"{\"id\":1}\n");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&truncated)
+            .unwrap()
+            .write_all(b"{\"id\":2}\n")
+            .unwrap();
+        let values = BufReader::new(fs::File::open(&truncated).unwrap())
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(&line.unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+
+        let complete = root.join("complete.jsonl");
+        fs::write(&complete, b"{\"id\":3}").unwrap();
+        repair_jsonl_tail(&complete).unwrap();
+        assert_eq!(fs::read(&complete).unwrap(), b"{\"id\":3}\n");
         let _ = fs::remove_dir_all(root);
     }
 

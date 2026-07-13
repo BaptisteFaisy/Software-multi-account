@@ -499,7 +499,12 @@ Variables utiles :
 - `CST_MERGE_WORKERS` : nombre de preparations de merge concurrentes (4 par
   defaut, borne entre 1 et 32) ;
 - `CST_MERGE_VERIFY_COMMAND` : commande executee dans le worktree d'integration
-  lorsque la soumission demande `verify: true`.
+  lorsque la soumission demande `verify: true` ;
+- `CST_MERGE_VERIFY_TIMEOUT_SECS` : delai maximal d'une verification avant
+  arret de tout son arbre de processus (900 secondes par defaut) ;
+- `CST_MERGE_NETWORK_TIMEOUT_SECS` : delai maximal d'un `push` ou `fetch` de
+  l'arbitre (120 secondes par defaut). Un depassement libere le worker et le
+  verrou de branche sans deplacer la cible.
 
 Des verrous d'ownership OS garantissent qu'un seul processus ecrit un store
 `agent-room`/merge donne et qu'un seul processus admet/nettoie les worktrees
