@@ -4,6 +4,10 @@ import test from "node:test";
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+const keyboardShortcuts = readFileSync(
+  new URL("../src/keyboard-shortcuts.ts", import.meta.url),
+  "utf8",
+);
 const desktop = readFileSync(
   new URL("../src-tauri/src/terminal.rs", import.meta.url),
   "utf8",
@@ -28,8 +32,12 @@ test("un menu separe est l'unique selecteur d'environnement", () => {
 });
 
 test("la touche accent grave ouvre le menu des environnements", () => {
-  assert.match(main, /event\.key === "`" \|\| event\.code === "Backquote"/);
-  assert.match(main, /event\.code === "Digit7"/);
+  assert.match(main, /keyboardShortcutMatchesAction\("toggle-environments", event\)/);
+  assert.match(
+    keyboardShortcuts,
+    /id: "toggle-environments"[\s\S]*?defaultBinding: "Backquote"/,
+  );
+  assert.match(keyboardShortcuts, /event\.code === "Digit7"/);
   assert.match(main, /renderTerminalEnvironmentMenu/);
   assert.match(main, /terminalEnvironmentMenuOpen/);
   assert.match(main, /data-environment-menu-id/);

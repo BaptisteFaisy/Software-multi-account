@@ -130,7 +130,7 @@ test("les limites utilisent des cartes responsives sans tableau horizontal", () 
 test("le menu mobile gere son etat et le focus au clavier", () => {
   assert.match(main, /data-m="menu" aria-haspopup="menu" aria-expanded="false"/);
   assert.match(main, /id="mobileActionSheet" aria-hidden="true" inert/);
-  assert.equal([...main.matchAll(/role="menuitem"/g)].length, 13);
+  assert.equal([...main.matchAll(/role="menuitem"/g)].length, 14);
   assert.match(main, /role="menuitem" data-view="tasks"/);
   assert.match(main, /role="menuitem" data-view="prompts"/);
   assert.doesNotMatch(main, /role="menuitem" data-view="doctolib-lab"/);

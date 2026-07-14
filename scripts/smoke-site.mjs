@@ -1389,7 +1389,7 @@ try {
     if (viewport.mustScroll && sheetDiagnostics.scrollHeight <= sheetDiagnostics.clientHeight) {
       failures.push(`mobile-${viewport.name}: la faible hauteur ne declenche pas le defilement`);
     }
-    if (sheetDiagnostics.itemCount !== 13 || sheetDiagnostics.unreachable.length) {
+    if (sheetDiagnostics.itemCount !== 14 || sheetDiagnostics.unreachable.length) {
       failures.push(`mobile-${viewport.name}: actions inaccessibles ${JSON.stringify(sheetDiagnostics)}`);
     }
     await auditAccessibilityAndOverflow(`mobile-more-${viewport.name}`);
