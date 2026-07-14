@@ -5567,38 +5567,6 @@ body.chat-sidebar-resizing {
 
 .chat-sidebar-close { display: none; }
 
-.chat-side-new {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  width: 100%;
-  min-height: 38px;
-  padding: 0 11px;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 9px;
-  background: var(--chat-accent-soft);
-  color: var(--chat-text);
-  font: 600 12px var(--font-body);
-  cursor: pointer;
-  transition: background 140ms ease, border-color 140ms ease;
-}
-
-.chat-side-new:hover {
-  border-color: rgba(255, 255, 255, 0.4);
-  background: rgba(255, 255, 255, 0.17);
-}
-
-.chat-side-new svg { width: 15px; height: 15px; color: var(--chat-accent); }
-.chat-side-new span { flex: 1; text-align: left; }
-.chat-side-new kbd {
-  padding: 2px 5px;
-  border: 1px solid var(--chat-border);
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.18);
-  color: var(--chat-muted);
-  font: 9px var(--font-mono);
-}
-
 .chat-side-search {
   display: flex;
   align-items: center;
@@ -8329,7 +8297,6 @@ div.chat-tool-part {
 .expert-chat-wall .chat-composer > small { display: none; }
 .expert-chat-wall .chat-history { flex-basis: min(300px, 55%); min-width: 220px; }
 
-.chat-side-new:disabled,
 .expert-chat-toolbar button:disabled {
   opacity: 0.38;
   cursor: not-allowed;

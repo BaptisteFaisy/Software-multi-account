@@ -10,6 +10,11 @@ test("l'interface charge directement la grille de chats", () => {
   assert.match(style, /\.chat-app-layout/);
 });
 
+test("la colonne gauche ne propose plus de bouton nouveau chat", () => {
+  assert.doesNotMatch(main, /newChatSide|chat-side-new/);
+  assert.doesNotMatch(style, /\.chat-side-new/);
+});
+
 test("la navigation mobile reste disponible dans la coque multi-chat", () => {
   const start = main.indexOf("const renderChatFirstShell = () =>");
   const end = main.indexOf("\nconst render = () =>", start);

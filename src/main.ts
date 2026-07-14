@@ -7203,13 +7203,8 @@ const renderExpertChatGrid = () => {
 
 const renderChatFirstShell = () => {
   const isChat = activeView === "chat";
-  const environmentChatCount = expertChatPanesForCurrentEnvironment().length;
   const visibleSidebarWidth = displayedChatSidebarWidth();
   const sidebarMaxWidth = chatSidebarMaxWidth(window.innerWidth);
-  const activeWorkspacePath = currentWorkspace();
-  const newChatTitle = activeWorkspacePath
-    ? `Nouvelle conversation dans ${workspaceBaseName(activeWorkspacePath)}`
-    : "Nouvelle conversation dans un environnement a choisir";
   captureAllExpertChatScroll();
   document.querySelector(".m-chrome")?.remove();
   document.body.classList.remove("m-drawer-open", "m-sheet-open", "chat-sidebar-resizing");
@@ -7227,9 +7222,6 @@ const renderChatFirstShell = () => {
 
         ${renderWorkspaceSwitcher()}
 
-        <button type="button" id="newChatSide" class="chat-side-new" title="${escapeAttr(newChatTitle)}">
-          <i data-lucide="plus"></i><span>Nouveau chat</span><kbd>${environmentChatCount}</kbd>
-        </button>
         <label class="chat-side-search">
           <i data-lucide="search"></i>
           <input id="chatSidebarSearch" type="search" value="${escapeAttr(chatSidebarSearch)}" placeholder="Rechercher dans cet environnement" aria-label="Rechercher dans l'environnement actif" />
@@ -10059,7 +10051,6 @@ const bindUi = () => {
   };
   document.querySelector<HTMLButtonElement>("#chatHome")?.addEventListener("click", returnToChat);
   document.querySelector<HTMLButtonElement>("#adminBackChat")?.addEventListener("click", returnToChat);
-  document.querySelector<HTMLButtonElement>("#newChatSide")?.addEventListener("click", openNewChat);
   document.querySelector<HTMLButtonElement>("#chatSidebarClose")?.addEventListener("click", () => {
     document.body.classList.remove("chat-sidebar-open");
   });
