@@ -2754,6 +2754,8 @@ const refreshLimitStatus = async (silent = false) => {
     limitStatusInFlight = false;
   }
 
+  if (newChatModalOpen) syncNewChatAccountUsageUi();
+
   if (activeView === "limits" && (statusChanged || announceInLimitsView)) {
     render();
   } else if (activeView === "chat" && statusChanged) {
@@ -7782,18 +7784,29 @@ const renderNewChatModal = () => {
   const accountOptions = accounts
     .map((item) => {
       const selected = item.id === account?.id;
+      const usage = newChatAccountUsageFor(item);
       return `<button
         type="button"
         class="new-chat-account-option ${selected ? "selected" : ""}"
         data-new-chat-account="${escapeAttr(item.id)}"
         role="radio"
         aria-checked="${selected}"
-        title="${escapeAttr(item.label)}"
+        aria-label="${escapeAttr(`${item.label}, ${providerLabel(accountProvider(item))}, ${usage.announcement}`)}"
+        title="${escapeAttr(`${item.label} · ${usage.detail}`)}"
       >
         <span class="new-chat-account-dot" aria-hidden="true"></span>
         <span class="new-chat-account-copy">
           <strong>${escapeHtml(item.label)}</strong>
           <small>${escapeHtml(providerLabel(accountProvider(item)))} · ${escapeHtml(accountModel(item))}</small>
+        </span>
+        <span
+          class="new-chat-account-usage ${usage.state}"
+          data-new-chat-account-usage="${escapeAttr(item.id)}"
+          title="${escapeAttr(usage.detail)}"
+          aria-hidden="true"
+        >
+          <strong>${escapeHtml(usage.value)}</strong>
+          <small>${escapeHtml(usage.caption)}</small>
         </span>
         <i data-lucide="${accountProvider(item) === "claude" ? "sparkles" : "cpu"}"></i>
       </button>`;
@@ -7846,6 +7859,59 @@ const renderNewChatModal = () => {
       </section>
     </div>
   `;
+};
+
+const newChatAccountUsageFor = (account: AccountProfile) => {
+  const status = chatQuotaStatusFor(account);
+  if (status.remainingPercent !== null) {
+    const usedPercent = Math.round(100 - status.remainingPercent);
+    return {
+      state: status.state,
+      value: `${usedPercent} %`,
+      caption: "utilisé",
+      announcement: `${usedPercent} % utilisé`,
+      detail: `${usedPercent} % utilisé · ${status.detail}`,
+    };
+  }
+
+  if (status.state === "loading") {
+    return {
+      state: status.state,
+      value: "…",
+      caption: "quota",
+      announcement: "utilisation en cours de chargement",
+      detail: status.detail,
+    };
+  }
+
+  const disconnected = status.state === "disconnected";
+  return {
+    state: status.state,
+    value: "—",
+    caption: disconnected ? "connexion" : "indisponible",
+    announcement: disconnected ? "compte non connecté" : "utilisation indisponible",
+    detail: status.detail,
+  };
+};
+
+const syncNewChatAccountUsageUi = () => {
+  document.querySelectorAll<HTMLElement>("[data-new-chat-account-usage]").forEach((element) => {
+    const account = accountById(element.dataset.newChatAccountUsage);
+    if (!account) return;
+    const usage = newChatAccountUsageFor(account);
+    element.className = `new-chat-account-usage ${usage.state}`;
+    element.querySelector<HTMLElement>("strong")!.textContent = usage.value;
+    element.querySelector<HTMLElement>("small")!.textContent = usage.caption;
+    element.title = usage.detail;
+
+    const button = element.closest<HTMLButtonElement>("[data-new-chat-account]");
+    if (!button) return;
+    button.title = `${account.label} · ${usage.detail}`;
+    button.setAttribute(
+      "aria-label",
+      `${account.label}, ${providerLabel(accountProvider(account))}, ${usage.announcement}`,
+    );
+  });
 };
 
 const renderNewTerminalModal = () => {
@@ -9038,6 +9104,7 @@ const openNewChatModal = (options: { workspacePath?: string | null } = {}) => {
   newChatModalOpen = true;
   statusText = "Choisis le compte, le modele et le mode de ce chat";
   render();
+  void refreshLimitStatus(true);
   window.setTimeout(() => {
     document.querySelector<HTMLInputElement>("#newChatModel")?.focus();
   }, 0);

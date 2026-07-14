@@ -65,6 +65,18 @@ test("un nouveau chat s'ouvre via une fenetre de choix du compte", () => {
   assert.match(style, /\.new-chat-account-option/);
 });
 
+test("le choix du compte affiche son pourcentage d'utilisation", () => {
+  assert.match(main, /const newChatAccountUsageFor =/);
+  assert.match(main, /Math\.round\(100 - status\.remainingPercent\)/);
+  assert.match(main, /data-new-chat-account-usage=/);
+  assert.match(main, /syncNewChatAccountUsageUi\(\)/);
+  assert.match(
+    main,
+    /newChatModalOpen = true;[\s\S]*?render\(\);\s*void refreshLimitStatus\(true\);/,
+  );
+  assert.match(style, /\.new-chat-account-usage/);
+});
+
 test("un environnement vide ne recoit jamais de chat de base", () => {
   assert.doesNotMatch(main, /createExpertChatPane\(\s*\)/);
   assert.doesNotMatch(

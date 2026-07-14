@@ -8963,7 +8963,7 @@ div.chat-tool-part {
 
 .new-chat-account-option {
   display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
   min-width: 0;
@@ -9027,10 +9027,69 @@ div.chat-tool-part {
   font-size: 11px;
 }
 
+.new-chat-account-usage {
+  display: grid;
+  min-width: 58px;
+  gap: 1px;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--success) 34%, transparent);
+  border-radius: 7px;
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 9%, transparent);
+  text-align: right;
+}
+
+.new-chat-account-usage strong,
+.new-chat-account-usage small {
+  color: currentColor !important;
+  line-height: 1.05;
+  white-space: nowrap;
+}
+
+.new-chat-account-usage strong {
+  font: 700 11px var(--font-mono);
+}
+
+.new-chat-account-usage small {
+  font-size: 8px;
+  font-weight: 650;
+}
+
+.new-chat-account-usage.low {
+  border-color: color-mix(in srgb, var(--warning) 40%, transparent);
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+
+.new-chat-account-usage.exhausted,
+.new-chat-account-usage.error,
+.new-chat-account-usage.disconnected {
+  border-color: color-mix(in srgb, var(--danger) 38%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+}
+
+.new-chat-account-usage.loading,
+.new-chat-account-usage.unavailable {
+  border-color: #3d392f;
+  color: #8a8474;
+  background: rgba(255, 255, 255, .025);
+}
+
 .new-chat-account-option > svg {
   width: 15px;
   height: 15px;
   color: #8a8474;
+}
+
+@media (max-width: 520px) {
+  .new-chat-account-option {
+    grid-template-columns: 16px minmax(0, 1fr) auto;
+  }
+
+  .new-chat-account-option > svg {
+    display: none;
+  }
 }
 
 /* Les historiques peuvent contenir des centaines de cartes. Le navigateur ne
