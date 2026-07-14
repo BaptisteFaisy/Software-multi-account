@@ -24,6 +24,17 @@ test("l'updater Windows annule le drain si le redemarrage n'a pas eu lieu", () =
   assert.doesNotMatch(windowsUpdater, /laisse EN DRAIN/i);
 });
 
+test("l'updater Windows arrete le serveur enfant sans toucher les copies portables", () => {
+  const stopTask = windowsUpdater.indexOf("Stop-ScheduledTask -TaskName $TaskName");
+  const stopChild = windowsUpdater.indexOf("Stop-NodeProcesses", stopTask);
+  const waitForStop = windowsUpdater.indexOf("$stopDeadline", stopTask);
+
+  assert.ok(stopTask >= 0 && waitForStop > stopTask && stopChild > waitForStop);
+  assert.match(windowsUpdater, /GetFullPath\(\$NodeHome\)/);
+  assert.match(windowsUpdater, /StartsWith\(\$trustedRoot, \[StringComparison\]::OrdinalIgnoreCase\)/);
+  assert.match(windowsUpdater, /Stop-Process -Id \(\[int\]\$process\.ProcessId\) -Force/);
+});
+
 test("l'updater Linux annule le drain sur erreur, timeout ou interruption", () => {
   const trap = linuxUpdater.indexOf("trap cleanup EXIT");
   const drainOn = linuxUpdater.indexOf("set_drain true", trap);

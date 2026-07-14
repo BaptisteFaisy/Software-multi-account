@@ -1,17 +1,25 @@
 mod account_usage;
+mod auth;
+mod autonomous;
 mod chat;
+mod chat_model_tools;
+pub mod chat_tools;
 mod client_startup;
 pub mod devices;
 mod discussions;
+mod doctolib_lab;
 mod fs_util;
 mod kombai;
 mod metrics;
+mod orchestration;
 mod pool;
 mod provider;
 mod security;
 pub mod server;
 mod settings;
 mod terminal;
+mod voice;
+mod work_time;
 
 // `Provider` fait partie des DTOs publics du serveur.
 pub use settings::Provider;
@@ -35,11 +43,28 @@ struct PoolState {
 
 #[cfg(feature = "desktop")]
 pub fn run() {
+    let chat_manager = chat::ChatTurnManager::default();
+    let autonomous_manager = autonomous::AutonomousAgentManager::new(
+        chat_manager.clone(),
+        settings::runtime_data_path("autonomous-agents.json")
+            .expect("repertoire des agents autonomes introuvable"),
+    )
+    .expect("etat des agents autonomes illisible");
+    let orchestration_manager = orchestration::OrchestrationManager::new(
+        chat_manager.clone(),
+        settings::runtime_data_path("orchestrated-runs.json")
+            .expect("repertoire des chats orchestres introuvable"),
+    )
+    .expect("etat des chats orchestres illisible");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(terminal::TerminalManager::default())
-        .manage(chat::ChatTurnManager::default())
+        .manage(chat_manager)
+        .manage(autonomous_manager)
+        .manage(orchestration_manager)
+        .manage(doctolib_lab::DoctolibLabManager::default())
         .manage(PoolState::default())
         .manage(kombai::KombaiManager::default())
         .on_window_event(|window, event| {
@@ -62,6 +87,7 @@ pub fn run() {
             settings::pick_project_dir,
             metrics::usage_dashboard,
             account_usage::account_token_usage,
+            work_time::work_time_dashboard,
             discussions::list_discussions,
             discussions::list_prompt_history,
             discussions::claim_session_for_terminal,
@@ -71,8 +97,31 @@ pub fn run() {
             discussions::get_discussion_transcript,
             discussions::delete_discussion,
             chat::start_chat_turn,
+            chat::list_active_chat_turns,
             chat::chat_turn_status,
             chat::stop_chat_turn,
+            autonomous::list_autonomous_agents,
+            autonomous::create_autonomous_agent,
+            autonomous::update_autonomous_agent,
+            autonomous::control_autonomous_agent,
+            autonomous::schedule_autonomous_agent,
+            autonomous::reassign_autonomous_agent_account,
+            autonomous::add_autonomous_agent_memory,
+            autonomous::delete_autonomous_agent_memory,
+            autonomous::delete_autonomous_agent,
+            orchestration::list_orchestrations,
+            orchestration::create_orchestration,
+            orchestration::promote_autonomous_agent_to_orchestration,
+            orchestration::control_orchestration,
+            orchestration::reassign_orchestration_account,
+            orchestration::delete_orchestration,
+            doctolib_lab::doctolib_lab_status,
+            doctolib_lab::doctolib_lab_connect,
+            doctolib_lab::doctolib_lab_google_calendar_connect,
+            doctolib_lab::doctolib_lab_search,
+            doctolib_lab::doctolib_lab_confirm,
+            voice::process_voice_input,
+            voice::voice_runtime_status,
             terminal::start_terminal,
             terminal::write_terminal,
             terminal::resize_terminal,

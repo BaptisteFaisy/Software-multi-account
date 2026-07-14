@@ -163,13 +163,16 @@ pub fn start_terminal(
     let id_reservation = state.reserve_id(id)?;
     let id = id_reservation.id;
 
-    // Le dossier est une frontiere de session, pas un simple defaut de compte.
-    // Refuser ici les anciens clients qui tenteraient encore un demarrage sans
-    // selection empeche tout cwd implicite ou melange entre deux projets.
-    let project_dir = resolve_terminal_environment(project_dir.as_deref())?;
-
     let account_home = expand_home(&account.codex_home)?;
     std::fs::create_dir_all(&account_home).map_err(|error| error.to_string())?;
+    // L'authentification est independante de tout projet : son terminal
+    // temporaire reste dans le home isole du compte. Les terminaux de travail
+    // continuent d'exiger un environnement explicitement choisi.
+    let project_dir = if login_only {
+        account_home.clone()
+    } else {
+        resolve_terminal_environment(project_dir.as_deref())?
+    };
     let workspace_path = project_dir.to_string_lossy().to_string();
     let workspace_id = workspace_path.clone();
 

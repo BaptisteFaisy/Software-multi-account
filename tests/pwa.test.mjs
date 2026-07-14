@@ -38,6 +38,10 @@ test("le service worker ne met jamais les API privees en cache", async () => {
   assert.match(worker, /url\.pathname\.startsWith\("\/ws\/"\)/);
   assert.match(worker, /url\.pathname === "\/reset-update\.html"/);
   assert.match(worker, /request\.mode === "navigate"/);
+  assert.match(worker, /const networkFirstNavigation = async/);
+  assert.match(worker, /await fetch\(request, \{ signal: controller\.signal \}\)/);
+  assert.match(worker, /return \(await cache\.match\("\/"\)\) \?\?/);
+  assert.doesNotMatch(worker, /if \(cached\)[\s\S]*?event\.waitUntil\(refresh/);
   assert.match(worker, /caches\.match\("\/offline\.html"\)/);
 });
 

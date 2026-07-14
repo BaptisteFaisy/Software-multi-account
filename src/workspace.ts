@@ -5,6 +5,8 @@ export type WorkspaceProfile = {
   id: string;
   label: string;
   path: string;
+  /** Contexte durable partage par tous les chats ouverts dans cet environnement. */
+  memory: string;
 };
 
 /**
@@ -157,15 +159,25 @@ export const mergeWorkspaceProfiles = (
 
     const id = workspaceIdForPath(path);
     const label = profile.label.trim() || workspaceBaseName(path);
-    if (byId.has(id)) {
+    const memory = (profile.memory ?? "").trim();
+    const existing = byId.get(id);
+    if (existing) {
+      // Une ancienne copie sans memoire ne doit pas effacer la copie renseignee
+      // du meme environnement lors de la migration/deduplication.
+      if (!existing.memory && memory) existing.memory = memory;
       changed = true;
       return;
     }
 
-    if (profile.id !== id || profile.label !== label || profile.path !== path) {
+    if (
+      profile.id !== id ||
+      profile.label !== label ||
+      profile.path !== path ||
+      profile.memory !== memory
+    ) {
       changed = true;
     }
-    byId.set(id, { id, label, path });
+    byId.set(id, { id, label, path, memory });
   });
 
   return { workspaces: [...byId.values()], changed };
@@ -202,7 +214,7 @@ export const openWorkspaceRegistry = (
   const wasClosed = normalizedClosed.includes(id);
 
   if (trimmed && !hadProfile) {
-    workspaces.push({ id, label: workspaceBaseName(trimmed), path: trimmed });
+    workspaces.push({ id, label: workspaceBaseName(trimmed), path: trimmed, memory: "" });
   }
 
   return {
@@ -213,6 +225,43 @@ export const openWorkspaceRegistry = (
       (!!trimmed && (!hadProfile || wasClosed)) ||
       normalizedClosed.length !== closedIds.length ||
       normalizedClosed.some((closedId, index) => closedId !== closedIds[index]),
+  };
+};
+
+/** Met a jour le contexte durable d'un environnement sans toucher aux autres. */
+export const setWorkspaceMemory = (
+  profiles: readonly WorkspaceProfile[],
+  path: string,
+  memory: string,
+): MergedWorkspaceProfiles => {
+  const merged = mergeWorkspaceProfiles(profiles);
+  const environmentPath = userEnvironmentPath(path);
+  if (!environmentPath) return merged;
+
+  const id = workspaceIdForPath(environmentPath);
+  const normalizedMemory = memory.trim();
+  const existing = merged.workspaces.find((workspace) => workspace.id === id);
+  if (!existing) {
+    return {
+      workspaces: [
+        ...merged.workspaces,
+        {
+          id,
+          label: workspaceBaseName(environmentPath),
+          path: environmentPath,
+          memory: normalizedMemory,
+        },
+      ],
+      changed: true,
+    };
+  }
+  if (existing.memory === normalizedMemory) return merged;
+
+  return {
+    workspaces: merged.workspaces.map((workspace) =>
+      workspace.id === id ? { ...workspace, memory: normalizedMemory } : workspace,
+    ),
+    changed: true,
   };
 };
 

@@ -10,6 +10,9 @@ export type RuntimeChatPart = {
   subtitle?: string | null;
   detail?: string | null;
   output?: string | null;
+  /** Metadonnees derivees cote client pour une serie de sondages `wait`. */
+  waitCellId?: string | null;
+  waitCount?: number;
 };
 
 export type RuntimeChatMessage = {
@@ -24,6 +27,30 @@ export type RuntimeChatMessage = {
 export const chatTurnIsBusy = (status: string | null | undefined): boolean =>
   status === "running" || status === "finalizing";
 
+type ChatTurnSyncIdentity = {
+  id: number;
+  status: string;
+  startedAt: number;
+};
+
+/**
+ * Evite qu'une reponse tardive du catalogue des tours actifs ne ressuscite un
+ * tour deja termine localement, tout en autorisant la reprise apres reload ou
+ * depuis un autre client.
+ */
+export const shouldAdoptActiveChatTurn = (
+  current: ChatTurnSyncIdentity | null | undefined,
+  candidate: ChatTurnSyncIdentity,
+): boolean => {
+  if (!chatTurnIsBusy(candidate.status)) return false;
+  if (!current) return true;
+  if (current.id === candidate.id) return chatTurnIsBusy(current.status);
+  if (current.id === 0) return true;
+  if (candidate.startedAt > current.startedAt) return true;
+  if (chatTurnIsBusy(current.status)) return false;
+  return candidate.startedAt === current.startedAt && candidate.id > current.id;
+};
+
 /**
  * Transforme l'objectif saisi via le bouton Goal en demande utilisateur
  * explicite. Codex n'active un goal que lorsque l'utilisateur le demande : le
@@ -36,20 +63,105 @@ export const createGoalPrompt = (objective: string): string => {
   return `Crée un goal avec l'outil create_goal pour l'objectif suivant, puis commence à le poursuivre :\n\n${normalized}`;
 };
 
-const isCommandPart = (part: RuntimeChatPart): boolean =>
-  part.kind === "tool" && part.tool === "command";
+const isToolPart = (part: RuntimeChatPart): boolean => part.kind === "tool";
 
-export const groupConsecutiveCommandParts = <T extends RuntimeChatPart>(parts: T[]): T[][] => {
+/**
+ * Regroupe chaque serie d'actions consecutives dans la timeline.
+ *
+ * Le contenu reste ordonne et chaque action garde ses propres details, mais la
+ * vue peut presenter toute la serie dans un seul bloc compact (commandes,
+ * recherches web, modifications de fichiers, outils MCP, etc.).
+ */
+export const groupConsecutiveToolParts = <T extends RuntimeChatPart>(parts: T[]): T[][] => {
   const groups: T[][] = [];
   parts.forEach((part) => {
     const previous = groups[groups.length - 1];
-    if (isCommandPart(part) && previous?.every(isCommandPart)) {
+    if (isToolPart(part) && previous?.every(isToolPart)) {
       previous.push(part);
       return;
     }
     groups.push([part]);
   });
   return groups;
+};
+
+const isWaitToolName = (value: string | null | undefined): boolean => {
+  const normalized = value?.trim().toLocaleLowerCase();
+  if (!normalized) return false;
+  return normalized === "wait" || /(?:^|[.:/])wait$/.test(normalized);
+};
+
+const waitCellIdFromText = (value: string | null | undefined): string | null => {
+  const raw = value?.trim();
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { cell_id?: unknown; cellId?: unknown };
+    const cellId = parsed?.cell_id ?? parsed?.cellId;
+    if (typeof cellId === "string" || typeof cellId === "number") return String(cellId);
+  } catch {
+    // Les anciens rollouts peuvent contenir une representation non JSON.
+  }
+  return raw.match(/["']?cell_id["']?\s*[:=]\s*["']?([^"',}\s]+)/i)?.[1] ?? null;
+};
+
+const waitCellId = (part: RuntimeChatPart): string | null => {
+  if (part.kind !== "tool") return null;
+  if (![part.title, part.subtitle, part.tool].some(isWaitToolName)) return null;
+  return waitCellIdFromText(part.detail) ?? waitCellIdFromText(part.subtitle);
+};
+
+const waitSubtitle = (cellId: string, count: number): string =>
+  `Commande ${cellId} · ${count} vérification${count > 1 ? "s" : ""}`;
+
+/**
+ * Reunit tous les sondages `wait` visant la meme commande dans un tour.
+ *
+ * Les resumes de raisonnement peuvent etre emis entre deux sondages : le
+ * regroupement se fait donc par `cell_id` sur tout le tour, pas seulement sur
+ * des elements strictement adjacents. La premiere position reste stable et la
+ * carte conserve le dernier statut et la derniere sortie connus.
+ */
+export const collapseRepeatedWaitParts = (
+  parts: RuntimeChatPart[],
+): RuntimeChatPart[] => {
+  const collapsed: RuntimeChatPart[] = [];
+  const waitIndexByCellId = new Map<string, number>();
+
+  parts.forEach((part) => {
+    const cellId = waitCellId(part);
+    if (!cellId) {
+      collapsed.push(part);
+      return;
+    }
+
+    const existingIndex = waitIndexByCellId.get(cellId);
+    if (existingIndex === undefined) {
+      waitIndexByCellId.set(cellId, collapsed.length);
+      collapsed.push({
+        ...part,
+        title: "Attente de la commande",
+        subtitle: waitSubtitle(cellId, 1),
+        waitCellId: cellId,
+        waitCount: 1,
+      });
+      return;
+    }
+
+    const existing = collapsed[existingIndex];
+    const count = (existing.waitCount ?? 1) + 1;
+    collapsed[existingIndex] = {
+      ...existing,
+      status: part.status,
+      title: "Attente de la commande",
+      subtitle: waitSubtitle(cellId, count),
+      detail: part.detail ?? existing.detail,
+      output: part.output ?? existing.output,
+      waitCellId: cellId,
+      waitCount: count,
+    };
+  });
+
+  return collapsed;
 };
 
 const sameMessageContent = (left: RuntimeChatMessage, right: RuntimeChatMessage): boolean =>
@@ -125,23 +237,33 @@ export const markLatestPendingMessageFailed = <T extends RuntimeChatMessage>(mes
   );
 };
 
-/** Detecte une vraie demande de reponse dans le dernier paragraphe assistant. */
-export const messageRequestsUserInput = (text: string | null | undefined): boolean => {
-  if (!text?.trim()) return false;
-  const withoutCode = text.replace(/```[\s\S]*?```/g, " ").trim();
-  const paragraphs = withoutCode.split(/\n\s*\n/).filter(Boolean);
-  const lastParagraph = paragraphs[paragraphs.length - 1]?.trim() ?? "";
-  if (!lastParagraph) return false;
-  if (/[?？](?:[\s*_`.)\]]*)$/.test(lastParagraph)) return true;
+const REQUEST_USER_INPUT_NAME = /(?:^|[.:/_])request_user_input$/i;
+const REQUEST_USER_INPUT_CALL = /\btools\.(?:mcp__[a-z0-9_-]+__)?request_user_input\s*\(/i;
 
-  return /\b(?:dites?-moi|dis-moi|choisis(?:sez)?|selectionnez|sélectionnez|preferez-vous|préférez-vous|souhaitez-vous|veux-tu|pouvez-vous|j['’]ai besoin de votre|your (?:choice|answer|input)|please (?:choose|confirm|tell me))\b/i.test(
-    lastParagraph,
-  );
+/**
+ * Detecte l'interface structuree `request_user_input`, et non une simple
+ * question dans le texte de l'assistant. Tant que l'outil n'a pas de sortie,
+ * son formulaire est considere comme ouvert.
+ */
+export const partWaitsForUserInput = (part: RuntimeChatPart): boolean => {
+  if (part.kind !== "tool") return false;
+  if (["error", "failed", "cancelled"].includes(part.status.toLocaleLowerCase())) return false;
+  if (part.output?.trim()) return false;
+
+  const directToolName = [part.tool, part.title, part.subtitle]
+    .some((value) => REQUEST_USER_INPUT_NAME.test(value?.trim() ?? ""));
+  const nestedToolCall = [part.detail, part.subtitle]
+    .some((value) => REQUEST_USER_INPUT_CALL.test(value ?? ""));
+  return directToolName || nestedToolCall;
 };
 
-export const conversationWaitsForUser = (messages: RuntimeChatMessage[]): boolean => {
+export const conversationWaitsForUser = (
+  messages: RuntimeChatMessage[],
+  activeParts?: RuntimeChatPart[],
+): boolean => {
+  if (activeParts !== undefined) return activeParts.some(partWaitsForUserInput);
   const last = messages[messages.length - 1];
-  return !!last && last.role === "assistant" && messageRequestsUserInput(last.text);
+  return !!last && last.role === "assistant" && (last.parts ?? []).some(partWaitsForUserInput);
 };
 
 export const formatChatDuration = (seconds: number): string => {

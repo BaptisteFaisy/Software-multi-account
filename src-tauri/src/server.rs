@@ -1,16 +1,32 @@
 use crate::{
     account_usage,
+    auth::{self, AuthManager},
+    autonomous::{
+        AddAutonomousMemoryRequest, AutonomousAgentManager, ControlAutonomousAgentRequest,
+        CreateAutonomousAgentRequest, ReassignAutonomousAgentAccountRequest,
+        ScheduleAutonomousAgentRequest, UpdateAutonomousAgentRequest,
+    },
     chat::{ChatTurnManager, StartChatTurnRequest},
+    chat_model_tools::{
+        self, AutonomousAgentToolContext, ChatModelToolServerConfig, ChatToolCapabilityRegistry,
+        CreateAutonomousAgentToolArguments, AUTONOMOUS_AGENT_TOOL_NAME,
+    },
     discussions,
+    doctolib_lab::{self, DoctolibLabManager, DoctolibLabSearchRequest},
     kombai::{KombaiManager, KombaiStatus},
     metrics,
+    orchestration::{
+        ControlOrchestrationRequest, CreateOrchestrationRequest, OrchestrationManager,
+        PromoteAutonomousAgentRequest, ReassignOrchestrationAccountRequest,
+    },
     pool::{self, AccountStatus, PoolManager},
     settings::{self, AppSettings},
+    voice, work_time,
 };
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, Query, Request, State,
+        DefaultBodyLimit, Path as AxumPath, Query, Request, State,
     },
     http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
@@ -26,7 +42,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -78,8 +94,13 @@ pub struct ServerConfig {
 #[derive(Clone)]
 struct ServerState {
     config: ServerConfig,
+    auth: AuthManager,
     terminals: RemoteTerminalManager,
     chat: ChatTurnManager,
+    chat_tool_capabilities: ChatToolCapabilityRegistry,
+    autonomous: AutonomousAgentManager,
+    orchestration: OrchestrationManager,
+    doctolib_lab: Arc<DoctolibLabManager>,
     kombai: Arc<KombaiManager>,
     started_at: i64,
     /// Echeance Unix de la courte lease de drain. Une lease bornee evite qu'un
@@ -198,6 +219,14 @@ struct ResizeTerminalRequest {
 #[serde(rename_all = "camelCase")]
 struct KombaiStartRequest {
     project_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctolibLabConfirmRequest {
+    proposal_id: String,
+    #[serde(default)]
+    add_to_google_calendar: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,7 +477,14 @@ impl RemoteTerminalManager {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        let (repo_dir, workspace_id, repo_label) = if let Some(raw) = selected_workspace {
+        let (repo_dir, workspace_id, repo_label) = if request.login_only {
+            // Le login reste hors de tout projet et utilise uniquement le home
+            // isole du compte. La racine des workspaces demeure obligatoire
+            // pour chaque terminal de travail.
+            let label = display_path(&canonical_home);
+            let workspace_id = workspace_id_for_dir(&canonical_home);
+            (canonical_home.clone(), workspace_id, label)
+        } else if let Some(raw) = selected_workspace {
             let dir = resolve_within_root(&config.workspaces_root, raw)?;
             let label = display_path(&dir);
             let workspace_id = workspace_id_for_dir(&dir);
@@ -770,10 +806,21 @@ pub async fn run_from_env() -> Result<(), String> {
 
     let settings = settings::load_settings_for_terminal()?;
     let pool_manager = Arc::new(PoolManager::build(&settings)?);
+    let user_auth = AuthManager::load(config.data_dir.clone(), &config.public_base_url)?;
+    let chat = ChatTurnManager::default();
+    let autonomous =
+        AutonomousAgentManager::new(chat.clone(), config.data_dir.join("autonomous-agents.json"))?;
+    let orchestration =
+        OrchestrationManager::new(chat.clone(), config.data_dir.join("orchestrated-runs.json"))?;
     let state = Arc::new(ServerState {
         config: config.clone(),
+        auth: user_auth.clone(),
         terminals: RemoteTerminalManager::default(),
-        chat: ChatTurnManager::default(),
+        chat,
+        chat_tool_capabilities: ChatToolCapabilityRegistry::default(),
+        autonomous,
+        orchestration,
+        doctolib_lab: Arc::new(DoctolibLabManager::default()),
         kombai: Arc::new(KombaiManager::default()),
         started_at: metrics::now_ts(),
         drain_until: Arc::new(AtomicI64::new(0)),
@@ -792,6 +839,7 @@ pub async fn run_from_env() -> Result<(), String> {
         .route("/limits", get(api_limits))
         .route("/usage", get(api_usage))
         .route("/account-usage", get(api_account_usage))
+        .route("/work-time", get(api_work_time))
         .route("/discussions", get(api_list_discussions))
         .route("/discussions/transcript", get(api_discussion_transcript))
         .route("/discussions/copy", post(api_copy_discussion))
@@ -804,10 +852,69 @@ pub async fn run_from_env() -> Result<(), String> {
         )
         .route("/chat/models", get(api_chat_models))
         .route("/chat/turns", post(api_start_chat_turn))
+        .route("/chat/turns/active", get(api_list_active_chat_turns))
+        .route(
+            "/voice/process",
+            post(api_process_voice).layer(DefaultBodyLimit::max(voice::MAX_REQUEST_BYTES)),
+        )
+        .route("/voice/status", get(api_voice_runtime_status))
         .route(
             "/chat/turns/:id",
             get(api_chat_turn_status).delete(api_stop_chat_turn),
         )
+        .route(
+            "/autonomous-agents",
+            get(api_list_autonomous_agents).post(api_create_autonomous_agent),
+        )
+        .route(
+            "/autonomous-agents/:id/control",
+            post(api_control_autonomous_agent),
+        )
+        .route(
+            "/autonomous-agents/:id/schedule",
+            post(api_schedule_autonomous_agent),
+        )
+        .route(
+            "/autonomous-agents/:id/account",
+            post(api_reassign_autonomous_agent_account),
+        )
+        .route(
+            "/autonomous-agents/:id/memories",
+            post(api_add_autonomous_agent_memory),
+        )
+        .route(
+            "/autonomous-agents/:id/memories/:memory_id",
+            delete(api_delete_autonomous_agent_memory),
+        )
+        .route(
+            "/autonomous-agents/:id/orchestration",
+            post(api_promote_autonomous_agent_to_orchestration),
+        )
+        .route(
+            "/autonomous-agents/:id",
+            post(api_update_autonomous_agent).delete(api_delete_autonomous_agent),
+        )
+        .route(
+            "/orchestrations",
+            get(api_list_orchestrations).post(api_create_orchestration),
+        )
+        .route(
+            "/orchestrations/:id/control",
+            post(api_control_orchestration),
+        )
+        .route(
+            "/orchestrations/:id/account",
+            post(api_reassign_orchestration_account),
+        )
+        .route("/orchestrations/:id", delete(api_delete_orchestration))
+        .route("/doctolib-lab/status", get(api_doctolib_lab_status))
+        .route("/doctolib-lab/connect", post(api_doctolib_lab_connect))
+        .route(
+            "/doctolib-lab/google-calendar/connect",
+            post(api_doctolib_lab_google_calendar_connect),
+        )
+        .route("/doctolib-lab/search", post(api_doctolib_lab_search))
+        .route("/doctolib-lab/confirm", post(api_doctolib_lab_confirm))
         .route("/pool/status", get(api_pool_status))
         .route("/pool/start", post(api_pool_status))
         .route("/pool/stop", post(api_pool_stop))
@@ -839,11 +946,20 @@ pub async fn run_from_env() -> Result<(), String> {
         .route("/healthz", get(api_healthz))
         .with_state(state.clone());
 
+    let mcp = Router::new()
+        .route(
+            "/mcp/chat-tools",
+            post(mcp_chat_tools).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .with_state(state.clone());
+
     let static_service = ServeDir::new(config.static_dir.clone())
         .not_found_service(ServeDir::new(config.static_dir.clone()));
 
     let app = Router::new()
         .merge(health)
+        .merge(mcp)
+        .nest("/api/auth", auth::router(user_auth))
         .nest("/api", api)
         .nest("/ws", ws)
         .merge(pool::router(pool_manager, Some(config.admin_token.clone())))
@@ -950,6 +1066,26 @@ impl ServerConfig {
             node_capacity,
             workspaces_root,
         })
+    }
+
+    fn chat_tools_mcp_url(&self) -> Result<String, String> {
+        let bound: SocketAddr = self
+            .bind
+            .parse()
+            .map_err(|error| format!("CST_BIND invalide pour MCP : {error}"))?;
+        let ip = if bound.ip().is_unspecified() {
+            if bound.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            } else {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            }
+        } else {
+            bound.ip()
+        };
+        Ok(format!(
+            "http://{}/mcp/chat-tools",
+            SocketAddr::new(ip, bound.port())
+        ))
     }
 }
 
@@ -1149,23 +1285,24 @@ async fn api_admin_drain(
     headers: HeaderMap,
     Json(request): Json<DrainRequest>,
 ) -> Response {
-    auth_or(&state, &headers, || {
-        let drain_until = if request.draining {
-            let ttl = request
-                .ttl_seconds
-                .unwrap_or(DEFAULT_DRAIN_LEASE_SECS)
-                .clamp(1, MAX_DRAIN_LEASE_SECS);
-            metrics::now_ts().saturating_add(ttl as i64)
-        } else {
-            0
-        };
-        state.drain_until.store(drain_until, Ordering::Release);
-        Ok(json_response(json!({
-            "draining": request.draining,
-            "drainUntil": (drain_until > 0).then_some(drain_until),
-            "activeTerminals": state.terminals.active_count(),
-        })))
-    })
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    let drain_until = if request.draining {
+        let ttl = request
+            .ttl_seconds
+            .unwrap_or(DEFAULT_DRAIN_LEASE_SECS)
+            .clamp(1, MAX_DRAIN_LEASE_SECS);
+        metrics::now_ts().saturating_add(ttl as i64)
+    } else {
+        0
+    };
+    state.drain_until.store(drain_until, Ordering::Release);
+    json_response(json!({
+        "draining": request.draining,
+        "drainUntil": (drain_until > 0).then_some(drain_until),
+        "activeTerminals": state.terminals.active_count(),
+    }))
 }
 
 async fn api_get_settings(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
@@ -1255,6 +1392,12 @@ async fn api_usage(State(state): State<Arc<ServerState>>, headers: HeaderMap) ->
 async fn api_account_usage(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
     auth_or(&state, &headers, || {
         account_usage::account_token_usage_dashboard().map(json_response)
+    })
+}
+
+async fn api_work_time(State(state): State<Arc<ServerState>>, headers: HeaderMap) -> Response {
+    auth_or(&state, &headers, || {
+        work_time::work_time_dashboard_for_server().map(json_response)
     })
 }
 
@@ -1415,6 +1558,19 @@ async fn api_start_terminal(
     }
 }
 
+fn normalize_source_chat_key(value: Option<String>) -> Result<Option<String>, String> {
+    let value = value
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty());
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.chars().count() > 160 || value.chars().any(char::is_control) {
+        return Err("Identifiant du chat source invalide".to_string());
+    }
+    Ok(Some(value))
+}
+
 async fn api_start_chat_turn(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -1442,15 +1598,277 @@ async fn api_start_chat_turn(
         };
         request.project_dir = Some(resolved.to_string_lossy().to_string());
     }
+    request.source_chat_key = match normalize_source_chat_key(request.source_chat_key.take()) {
+        Ok(value) => value,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+    };
+    let token = match state
+        .chat_tool_capabilities
+        .issue(AutonomousAgentToolContext {
+            account_id: request.account_id.clone(),
+            source_chat_key: request.source_chat_key.clone(),
+            project_dir: request.project_dir.clone(),
+            mode: request.mode,
+            model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+        }) {
+        Ok(value) => value,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config),
+    };
+    let tool_server = match state.config.chat_tools_mcp_url() {
+        Ok(url) => ChatModelToolServerConfig {
+            url,
+            bearer_token: token.clone(),
+        },
+        Err(error) => {
+            state.chat_tool_capabilities.revoke(&token);
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config);
+        }
+    };
     let start_state = state.clone();
-    match tokio::task::spawn_blocking(move || start_state.chat.start(request)).await {
+    let result = tokio::task::spawn_blocking(move || {
+        start_state
+            .chat
+            .start_with_model_tools(request, Some(tool_server))
+    })
+    .await;
+    match result {
         Ok(Ok(value)) => json_response(value),
-        Ok(Err(error)) => api_error(agent_start_status(&error), &error, &state.config),
-        Err(error) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("spawn chat interrompu: {error}"),
-            &state.config,
-        ),
+        Ok(Err(error)) => {
+            state.chat_tool_capabilities.revoke(&token);
+            api_error(agent_start_status(&error), &error, &state.config)
+        }
+        Err(error) => {
+            state.chat_tool_capabilities.revoke(&token);
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("spawn chat interrompu: {error}"),
+                &state.config,
+            )
+        }
+    }
+}
+
+fn mcp_origin_is_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    let normalized = origin.trim().to_ascii_lowercase();
+    normalized.starts_with("http://127.0.0.1:")
+        || normalized.starts_with("http://localhost:")
+        || normalized.starts_with("http://[::1]:")
+}
+
+fn bearer_from_headers(headers: &HeaderMap) -> &str {
+    let value = headers
+        .get("authorization")
+        .and_then(|header| header.to_str().ok())
+        .unwrap_or("");
+    value.strip_prefix("Bearer ").unwrap_or(value).trim()
+}
+
+async fn mcp_chat_tools(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    if !mcp_origin_is_allowed(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let token = bearer_from_headers(&headers);
+    if state.chat_tool_capabilities.authorize(token).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let id = payload
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let method = payload
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if payload.get("id").is_none() {
+        return match method {
+            "notifications/initialized" | "notifications/cancelled" => {
+                StatusCode::ACCEPTED.into_response()
+            }
+            _ => StatusCode::ACCEPTED.into_response(),
+        };
+    }
+
+    match method {
+        "initialize" => {
+            let requested_version = payload
+                .pointer("/params/protocolVersion")
+                .and_then(serde_json::Value::as_str);
+            json_response(chat_model_tools::initialize_response(id, requested_version))
+        }
+        "ping" => json_response(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        })),
+        "tools/list" => json_response(chat_model_tools::tools_list_response(id)),
+        "tools/call" => {
+            let name = payload
+                .pointer("/params/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if name != AUTONOMOUS_AGENT_TOOL_NAME {
+                return json_response(chat_model_tools::protocol_error(
+                    id,
+                    -32602,
+                    "Outil MCP inconnu",
+                ));
+            }
+            let context = match state.chat_tool_capabilities.claim_call(token) {
+                Ok(value) => value,
+                Err(error) => {
+                    return json_response(chat_model_tools::tool_error_response(id, &error))
+                }
+            };
+            if is_draining(&state) {
+                return json_response(chat_model_tools::tool_error_response(
+                    id,
+                    "Le noeud est en drain ; aucun nouvel agent autonome ne peut demarrer.",
+                ));
+            }
+            let arguments = payload
+                .pointer("/params/arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let arguments =
+                match serde_json::from_value::<CreateAutonomousAgentToolArguments>(arguments) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &format!("Arguments invalides pour l'agent autonome : {error}"),
+                        ))
+                    }
+                };
+            let request = match arguments.into_request(context) {
+                Ok(value) => value,
+                Err(error) => {
+                    return json_response(chat_model_tools::tool_error_response(id, &error))
+                }
+            };
+            let manager = state.autonomous.clone();
+            match tokio::task::spawn_blocking(move || manager.create(request)).await {
+                Ok(Ok(agent)) => json_response(chat_model_tools::tool_success_response(id, &agent)),
+                Ok(Err(error)) => json_response(chat_model_tools::tool_error_response(id, &error)),
+                Err(error) => json_response(chat_model_tools::tool_error_response(
+                    id,
+                    &format!("Creation autonome interrompue : {error}"),
+                )),
+            }
+        }
+        _ => json_response(chat_model_tools::protocol_error(
+            id,
+            -32601,
+            "Methode MCP inconnue",
+        )),
+    }
+}
+
+async fn api_process_voice(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<voice::VoiceProcessRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match voice::process_voice_request(request).await {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
+    }
+}
+
+async fn api_voice_runtime_status(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match voice::voice_runtime_status().await {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
+    }
+}
+
+async fn api_doctolib_lab_status(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match doctolib_lab::status().await {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
+    }
+}
+
+async fn api_doctolib_lab_connect(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match doctolib_lab::connect().await {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
+    }
+}
+
+async fn api_doctolib_lab_google_calendar_connect(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match doctolib_lab::connect_google_calendar().await {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
+    }
+}
+
+async fn api_doctolib_lab_search(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<DoctolibLabSearchRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match doctolib_lab::search(state.doctolib_lab.as_ref(), request).await {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
+    }
+}
+
+async fn api_doctolib_lab_confirm(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<DoctolibLabConfirmRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match doctolib_lab::confirm(
+        state.doctolib_lab.as_ref(),
+        request.proposal_id,
+        request.add_to_google_calendar,
+    )
+    .await
+    {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
     }
 }
 
@@ -1488,9 +1906,20 @@ async fn api_chat_turn_status(
     headers: HeaderMap,
     AxumPath(id): AxumPath<u64>,
 ) -> Response {
-    auth_or(&state, &headers, || {
-        state.chat.status(id).map(json_response)
-    })
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match state.chat.status(id) {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(resource_error_status(&error), &error, &state.config),
+    }
+}
+
+async fn api_list_active_chat_turns(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    auth_or(&state, &headers, || state.chat.active().map(json_response))
 }
 
 async fn api_stop_chat_turn(
@@ -1498,7 +1927,367 @@ async fn api_stop_chat_turn(
     headers: HeaderMap,
     AxumPath(id): AxumPath<u64>,
 ) -> Response {
-    auth_or(&state, &headers, || state.chat.stop(id).map(json_response))
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match state.chat.stop(id) {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(resource_error_status(&error), &error, &state.config),
+    }
+}
+
+async fn api_list_autonomous_agents(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    auth_or(&state, &headers, || {
+        state.autonomous.list().map(json_response)
+    })
+}
+
+async fn api_create_autonomous_agent(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(mut request): Json<CreateAutonomousAgentRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    if is_draining(&state) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "noeud en drain: nouveaux agents autonomes refuses",
+            &state.config,
+        );
+    }
+    if let Some(raw) = request
+        .project_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let resolved = match resolve_within_root(&state.config.workspaces_root, raw) {
+            Ok(path) => path,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        };
+        request.project_dir = Some(resolved.to_string_lossy().to_string());
+    }
+
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || manager.create(request)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(agent_start_status(&error), &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("creation de l'agent autonome interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_update_autonomous_agent(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(mut request): Json<UpdateAutonomousAgentRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    if let Some(raw) = request
+        .project_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let resolved = match resolve_within_root(&state.config.workspaces_root, raw) {
+            Ok(path) => path,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        };
+        request.project_dir = Some(resolved.to_string_lossy().to_string());
+    }
+
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || manager.update(&id, request)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("mise a jour de l'agent autonome interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_control_autonomous_agent(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ControlAutonomousAgentRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || manager.control(&id, request.action)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("controle de l'agent autonome interrompu: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_schedule_autonomous_agent(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ScheduleAutonomousAgentRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || {
+        manager.schedule(&id, request.next_run_at, request.interval_seconds)
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("replanification de l'agent autonome interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_reassign_autonomous_agent_account(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ReassignAutonomousAgentAccountRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || manager.reassign_account(&id, request)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("réaffectation du compte autonome interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_add_autonomous_agent_memory(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<AddAutonomousMemoryRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || manager.add_memory(&id, &request.content)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("ajout de memoire autonome interrompu: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_delete_autonomous_agent_memory(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath((id, memory_id)): AxumPath<(String, String)>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || manager.delete_memory(&id, &memory_id)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("suppression de memoire autonome interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_delete_autonomous_agent(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || manager.delete(&id)).await {
+        Ok(Ok(())) => json_response(json!({ "ok": true })),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("suppression de l'agent autonome interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_promote_autonomous_agent_to_orchestration(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(mut request): Json<PromoteAutonomousAgentRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    if is_draining(&state) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "noeud en drain: promotion vers une orchestration refusée",
+            &state.config,
+        );
+    }
+    let resolved =
+        match resolve_within_root(&state.config.workspaces_root, request.project_dir.trim()) {
+            Ok(path) => path,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        };
+    request.project_dir = resolved.to_string_lossy().to_string();
+    let orchestration = state.orchestration.clone();
+    let autonomous = state.autonomous.clone();
+    match tokio::task::spawn_blocking(move || {
+        orchestration.promote_autonomous_agent(&autonomous, &id, request)
+    })
+    .await
+    {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(agent_start_status(&error), &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("promotion de l'agent autonome interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_list_orchestrations(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    auth_or(&state, &headers, || {
+        state.orchestration.list().map(json_response)
+    })
+}
+
+async fn api_create_orchestration(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(mut request): Json<CreateOrchestrationRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    if is_draining(&state) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "noeud en drain: nouveaux chats orchestres refuses",
+            &state.config,
+        );
+    }
+    let resolved =
+        match resolve_within_root(&state.config.workspaces_root, request.project_dir.trim()) {
+            Ok(path) => path,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        };
+    request.project_dir = resolved.to_string_lossy().to_string();
+    let manager = state.orchestration.clone();
+    match tokio::task::spawn_blocking(move || manager.create(request)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(agent_start_status(&error), &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("creation du chat orchestre interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_control_orchestration(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ControlOrchestrationRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.orchestration.clone();
+    match tokio::task::spawn_blocking(move || manager.control(&id, request.action)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("controle du chat orchestre interrompu: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_reassign_orchestration_account(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<ReassignOrchestrationAccountRequest>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.orchestration.clone();
+    match tokio::task::spawn_blocking(move || manager.reassign_account(&id, request)).await {
+        Ok(Ok(value)) => json_response(value),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("reprise du compte orchestre interrompue: {error}"),
+            &state.config,
+        ),
+    }
+}
+
+async fn api_delete_orchestration(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let manager = state.orchestration.clone();
+    match tokio::task::spawn_blocking(move || manager.delete(&id)).await {
+        Ok(Ok(())) => json_response(json!({ "ok": true })),
+        Ok(Err(error)) => api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("suppression du chat orchestre interrompue: {error}"),
+            &state.config,
+        ),
+    }
 }
 
 async fn api_write_terminal(
@@ -1507,10 +2296,13 @@ async fn api_write_terminal(
     AxumPath(id): AxumPath<u64>,
     Json(request): Json<WriteTerminalRequest>,
 ) -> Response {
-    auth_or(&state, &headers, || {
-        state.terminals.write(id, request.data)?;
-        Ok(json_response(json!({ "ok": true })))
-    })
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match state.terminals.write(id, request.data) {
+        Ok(()) => json_response(json!({ "ok": true })),
+        Err(error) => api_error(resource_error_status(&error), &error, &state.config),
+    }
 }
 
 async fn api_resize_terminal(
@@ -1519,10 +2311,13 @@ async fn api_resize_terminal(
     AxumPath(id): AxumPath<u64>,
     Json(request): Json<ResizeTerminalRequest>,
 ) -> Response {
-    auth_or(&state, &headers, || {
-        state.terminals.resize(id, request.cols, request.rows)?;
-        Ok(json_response(json!({ "ok": true })))
-    })
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    match state.terminals.resize(id, request.cols, request.rows) {
+        Ok(()) => json_response(json!({ "ok": true })),
+        Err(error) => api_error(resource_error_status(&error), &error, &state.config),
+    }
 }
 
 async fn api_stop_terminal(
@@ -1612,32 +2407,39 @@ async fn api_fs_list(
     headers: HeaderMap,
     Query(query): Query<FsListQuery>,
 ) -> Response {
-    auth_or(&state, &headers, || {
-        let root = &state.config.workspaces_root;
-        let dir = match query
-            .path
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(path) => resolve_within_root(root, path)?,
-            None => strip_extended_prefix(root),
-        };
-        let root_display = display_path(root);
-        let dir_display = dir.to_string_lossy().to_string();
-        let parent = if dir_display == root_display {
-            None
-        } else {
-            dir.parent()
-                .map(|parent| parent.to_string_lossy().to_string())
-        };
-        let entries = list_subdirs(&dir)?;
-        Ok(json_response(FsListResponse {
-            root: root_display,
-            path: dir_display,
-            parent,
-            entries,
-        }))
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let root = &state.config.workspaces_root;
+    let dir = match query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(path) => match resolve_within_root(root, path) {
+            Ok(dir) => dir,
+            Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
+        },
+        None => strip_extended_prefix(root),
+    };
+    let root_display = display_path(root);
+    let dir_display = dir.to_string_lossy().to_string();
+    let parent = if dir_display == root_display {
+        None
+    } else {
+        dir.parent()
+            .map(|parent| parent.to_string_lossy().to_string())
+    };
+    let entries = match list_subdirs(&dir) {
+        Ok(entries) => entries,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config),
+    };
+    json_response(FsListResponse {
+        root: root_display,
+        path: dir_display,
+        parent,
+        entries,
     })
 }
 
@@ -1952,6 +2754,31 @@ fn check_admin_header(state: &Arc<ServerState>, headers: &HeaderMap) -> Result<(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let provided = bearer.strip_prefix("Bearer ").unwrap_or(bearer).trim();
+    if crate::security::constant_time_eq(provided.as_bytes(), state.config.admin_token.as_bytes())
+        || state.auth.authorize_headers(headers)
+    {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "authentification requise",
+            &state.config,
+        ))
+    }
+}
+
+/// Les operations de maintenance automatisee (drain / mise a jour) restent
+/// reservees au secret administrateur et ne sont jamais ouvertes aux comptes
+/// utilisateurs ordinaires.
+fn check_maintenance_header(
+    state: &Arc<ServerState>,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let bearer = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let provided = bearer.strip_prefix("Bearer ").unwrap_or(bearer).trim();
     if crate::security::constant_time_eq(provided.as_bytes(), state.config.admin_token.as_bytes()) {
         Ok(())
     } else {
@@ -1990,6 +2817,14 @@ fn agent_start_status(error: &str) -> StatusCode {
         StatusCode::TOO_MANY_REQUESTS
     } else if error.contains("deja vivant") || error.contains("déjà en cours") {
         StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn resource_error_status(error: &str) -> StatusCode {
+    if error.to_lowercase().contains("introuvable") {
+        StatusCode::NOT_FOUND
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -2250,6 +3085,22 @@ mod tests {
             serde_json::from_str(r#"{"draining":true,"ttlSeconds":12}"#).unwrap();
         assert!(request.draining);
         assert_eq!(request.ttl_seconds, Some(12));
+    }
+
+    #[test]
+    fn missing_resources_are_not_reported_as_server_failures() {
+        assert_eq!(
+            resource_error_status("Tour de conversation introuvable"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            resource_error_status("Session terminal introuvable"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            resource_error_status("Etat des conversations verrouille"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

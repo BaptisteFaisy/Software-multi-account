@@ -75,6 +75,7 @@ const REMOTE_ENABLED_KEY = "codex-switch-terminal.remote.enabled";
 const REMOTE_BASE_URL_KEY = "codex-switch-terminal.remote.base-url";
 const REMOTE_TOKEN_KEY = "codex-switch-terminal.remote.token";
 const REMOTE_NODES_KEY = "codex-switch-terminal.remote.nodes";
+const REMOTE_BOOTSTRAP_TIMEOUT_MS = 8_000;
 
 const listeners = new Map<string, Set<Listener<any>>>();
 const remoteSockets = new Map<number, WebSocket>();
@@ -414,9 +415,9 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
 async function remoteInvoke<T>(command: string, args: Record<string, any>): Promise<T> {
   switch (command) {
     case "load_settings":
-      return api<T>("GET", "/api/settings");
+      return api<T>("GET", "/api/settings", undefined, REMOTE_BOOTSTRAP_TIMEOUT_MS);
     case "save_settings":
-      return api<T>("PUT", "/api/settings", args.settings);
+      return api<T>("PUT", "/api/settings", args.settings, REMOTE_BOOTSTRAP_TIMEOUT_MS);
     case "ensure_account_home":
       return api<T>("POST", "/api/accounts/home", {
         codexHome: args.codexHome,
@@ -447,6 +448,8 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return api<T>("GET", "/api/usage");
     case "account_token_usage":
       return api<T>("GET", "/api/account-usage");
+    case "work_time_dashboard":
+      return api<T>("GET", "/api/work-time");
     case "pool_status":
       return api<T>("GET", "/api/pool/status");
     case "pool_start":
@@ -483,6 +486,19 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return api<T>("POST", "/api/kombai/install-extension");
     case "launch_ide":
       throw new Error("Le lancement d'IDE local n'est pas disponible en mode SaaS.");
+    case "doctolib_lab_status":
+      return api<T>("GET", "/api/doctolib-lab/status");
+    case "doctolib_lab_connect":
+      return api<T>("POST", "/api/doctolib-lab/connect");
+    case "doctolib_lab_google_calendar_connect":
+      return api<T>("POST", "/api/doctolib-lab/google-calendar/connect");
+    case "doctolib_lab_search":
+      return api<T>("POST", "/api/doctolib-lab/search", args.request);
+    case "doctolib_lab_confirm":
+      return api<T>("POST", "/api/doctolib-lab/confirm", {
+        proposalId: args.proposalId,
+        addToGoogleCalendar: args.addToGoogleCalendar ?? false,
+      });
     case "list_discussions":
       return api<T>("GET", "/api/discussions");
     case "get_discussion_transcript":
@@ -495,7 +511,9 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         "GET",
         `/api/chat/models?accountId=${encodeURIComponent(String(args.accountId))}`,
       );
-    case "start_chat_turn":
+    case "start_chat_turn": {
+      const agentTools = Array.isArray(args.agentTools) ? args.agentTools : [];
+      const agentSkills = Array.isArray(args.agentSkills) ? args.agentSkills : [];
       return api<T>("POST", "/api/chat/turns", {
         accountId: args.accountId,
         sessionId: args.sessionId ?? null,
@@ -504,11 +522,99 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         mode: args.mode ?? "build",
         model: args.model ?? null,
         reasoningEffort: args.reasoningEffort ?? null,
+        sourceChatKey: args.sourceChatKey ?? null,
+        agentTools,
+        agentSkills,
+        // Compatibilite avec un serveur anterieur au registre d'outils.
+        questionTool: agentTools.includes("question"),
+        proofTool: agentTools.includes("proof"),
       });
+    }
+    case "process_voice_input":
+      return api<T>("POST", "/api/voice/process", {
+        audioBase64: args.audioBase64,
+        mimeType: args.mimeType ?? "audio/wav",
+        language: args.language ?? "fr",
+      });
+    case "voice_runtime_status":
+      return api<T>("GET", "/api/voice/status");
+    case "list_active_chat_turns":
+      return api<T>("GET", "/api/chat/turns/active");
     case "chat_turn_status":
       return api<T>("GET", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
     case "stop_chat_turn":
       return api<T>("DELETE", `/api/chat/turns/${encodeURIComponent(String(args.id))}`);
+    case "list_autonomous_agents":
+      return api<T>("GET", "/api/autonomous-agents");
+    case "create_autonomous_agent":
+      return api<T>("POST", "/api/autonomous-agents", args.request);
+    case "update_autonomous_agent":
+      return api<T>(
+        "POST",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}`,
+        args.request,
+      );
+    case "control_autonomous_agent":
+      return api<T>(
+        "POST",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}/control`,
+        { action: args.action },
+      );
+    case "schedule_autonomous_agent":
+      return api<T>(
+        "POST",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}/schedule`,
+        { nextRunAt: args.nextRunAt, intervalSeconds: args.intervalSeconds },
+      );
+    case "reassign_autonomous_agent_account":
+      return api<T>(
+        "POST",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}/account`,
+        args.request,
+      );
+    case "add_autonomous_agent_memory":
+      return api<T>(
+        "POST",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}/memories`,
+        { content: args.content },
+      );
+    case "delete_autonomous_agent_memory":
+      return api<T>(
+        "DELETE",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}/memories/${encodeURIComponent(String(args.memoryId))}`,
+      );
+    case "delete_autonomous_agent":
+      return api<T>(
+        "DELETE",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}`,
+      );
+    case "promote_autonomous_agent_to_orchestration":
+      return api<T>(
+        "POST",
+        `/api/autonomous-agents/${encodeURIComponent(String(args.id))}/orchestration`,
+        args.request,
+      );
+    case "list_orchestrations":
+      return api<T>("GET", "/api/orchestrations");
+    case "create_orchestration":
+      return api<T>("POST", "/api/orchestrations", args.request);
+    case "control_orchestration":
+      return api<T>(
+        "POST",
+        `/api/orchestrations/${encodeURIComponent(String(args.id))}/control`,
+        { action: args.action },
+      );
+    case "reassign_orchestration_account":
+      return api<T>(
+        "POST",
+        `/api/orchestrations/${encodeURIComponent(String(args.id))}/account`,
+        args.request,
+      );
+    case "delete_orchestration":
+      return api<T>(
+        "DELETE",
+        `/api/orchestrations/${encodeURIComponent(String(args.id))}`,
+      );
     case "list_prompt_history":
       return {
         generatedAt: Math.floor(Date.now() / 1000),
@@ -547,8 +653,13 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
   }
 }
 
-async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
-  return apiAt<T>(defaultRemoteRoute(), method, path, body);
+async function api<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  timeoutMs?: number,
+): Promise<T> {
+  return apiAt<T>(defaultRemoteRoute(), method, path, body, timeoutMs);
 }
 
 async function apiAt<T>(
@@ -566,6 +677,7 @@ async function apiAt<T>(
   try {
     const response = await fetch(`${route.baseUrl}${path}`, {
       method,
+      credentials: "include",
       headers: {
         Authorization: `Bearer ${route.token}`,
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
@@ -582,6 +694,13 @@ async function apiAt<T>(
       throw new Error(message);
     }
     return value as T;
+  } catch (error) {
+    if (controller?.signal.aborted) {
+      throw new Error(
+        `Le serveur ${route.baseUrl} ne repond pas apres ${Math.ceil(timeoutMs! / 1_000)} s. Verifie son adresse puis reconnecte-toi.`,
+      );
+    }
+    throw error;
   } finally {
     if (timeout !== null) window.clearTimeout(timeout);
   }

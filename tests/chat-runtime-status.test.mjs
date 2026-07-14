@@ -5,11 +5,13 @@ import test from "node:test";
 import {
   chatMessagesEqual,
   chatTurnIsBusy,
+  collapseRepeatedWaitParts,
   conversationWaitsForUser,
   formatChatDuration,
   formatChatResetCountdown,
-  groupConsecutiveCommandParts,
+  groupConsecutiveToolParts,
   reconcileChatMessages,
+  shouldAdoptActiveChatTurn,
 } from "../src/chat/runtime.ts";
 
 const view = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
@@ -62,17 +64,29 @@ test("un message utilisateur en attente ne recoit pas de cadre pointille", () =>
   assert.match(style, /\.chat-app-layout \.chat-msg\.chat-msg--pending\s*\{/);
 });
 
-test("une question finale place clairement le chat en attente de l'utilisateur", () => {
+test("seule une interface de question structuree place le chat en attente", () => {
   assert.equal(
     conversationWaitsForUser([
       { role: "assistant", text: "Quel environnement voulez-vous utiliser ?", timestamp: 1 },
     ]),
-    true,
+    false,
   );
+  const questionPart = {
+    id: "question-1",
+    kind: "tool",
+    status: "running",
+    tool: "request_user_input",
+    title: "request_user_input",
+  };
   assert.equal(
     conversationWaitsForUser([
-      { role: "assistant", text: "La correction est terminee.", timestamp: 1 },
+      { role: "assistant", text: "", timestamp: 1, parts: [questionPart] },
     ]),
+    true,
+  );
+  assert.equal(conversationWaitsForUser([], [questionPart]), true);
+  assert.equal(
+    conversationWaitsForUser([], [{ ...questionPart, status: "complete", output: "Option A" }]),
     false,
   );
 });
@@ -87,6 +101,30 @@ test("la reponse finale sort du mode anime pendant la synchronisation", () => {
   assert.match(chatBackend, /event_type == "turn\.completed"/);
   assert.match(chatBackend, /provider == Provider::Claude && event_type == "result"/);
   assert.match(chatBackend, /PROVIDER_EXIT_GRACE/);
+});
+
+test("la reconciliation serveur restaure un tour sans ressusciter un snapshot termine", () => {
+  const running = { id: 12, status: "running", startedAt: 200 };
+  assert.equal(shouldAdoptActiveChatTurn(null, running), true);
+  assert.equal(
+    shouldAdoptActiveChatTurn({ id: 12, status: "completed", startedAt: 200 }, running),
+    false,
+  );
+  assert.equal(
+    shouldAdoptActiveChatTurn({ id: 11, status: "completed", startedAt: 100 }, running),
+    true,
+  );
+  assert.equal(
+    shouldAdoptActiveChatTurn({ id: 0, status: "failed", startedAt: 300 }, running),
+    true,
+  );
+  assert.equal(
+    shouldAdoptActiveChatTurn(
+      { id: 13, status: "running", startedAt: 300 },
+      { id: 12, status: "running", startedAt: 200 },
+    ),
+    false,
+  );
 });
 
 test("les durees et resets sont lisibles pendant un long tour", () => {
@@ -114,13 +152,23 @@ test("le chat expose le chronometre, le quota et la reponse classique", () => {
   assert.match(main, /reconcileChatMessages\(/);
 });
 
-test("le bandeau du chat indique en couleur si le tour est en cours", () => {
+test("le bandeau et la colonne de gauche portent les statuts du chat", () => {
   assert.match(view, /data-chat-control="turn-status"/);
-  assert.match(view, /finalizing \? "Terminé" : "Disponible"/);
-  assert.match(view, /chat-turn-status--\$\{state\}/);
+  assert.match(view, /"En cours" : "Disponible"/);
+  assert.match(view, /if \(waitingForUser\) stateLabel = "Question"/);
+  assert.match(main, /turnStatus\.outerHTML = renderChatTurnStatus\(model\)/);
+  assert.match(main, /renderChatSidebarStatus\(openedPane \?\? null, discussion\)/);
+  assert.match(main, /renderChatSidebarStatus\(pane\)/);
+  assert.match(main, /data-chat-status-pane/);
+  assert.match(main, /invoke<ActiveChatTurnSummary\[]>\("list_active_chat_turns"\)/);
+  assert.match(main, /activeChatTurnForDiscussion\(next, pane\.discussion\)/);
+  assert.match(style, /\.chat-turn-status--idle \{[\s\S]*?background: #22c55e;/);
   assert.match(style, /\.chat-turn-status--running \{[\s\S]*?background: #f59e0b;/);
-  assert.match(style, /\.chat-turn-status--finalizing \{[\s\S]*?background: #22c55e;/);
-  assert.match(main, /\[data-chat-control='turn-status'\]/);
+  assert.match(style, /\.chat-turn-status--question \{[\s\S]*?background: #ef4444;/);
+  assert.match(style, /\.chat-side-status--idle \{[\s\S]*?background: #22c55e;/);
+  assert.match(style, /\.chat-side-status--running \{[\s\S]*?background: #f59e0b;/);
+  assert.match(style, /\.chat-side-status--question \{[\s\S]*?background: #ef4444;/);
+  assert.match(style, /\.chat-runtime-inline--waiting \.chat-runtime-dot \{[\s\S]*?background: #ef4444;/);
 });
 
 test("la pensee visible diffuse les resumes sans exposer le raisonnement brut", () => {
@@ -157,7 +205,7 @@ test("le chat suit la timeline OpenCode au lieu de separer pensee et outils", ()
   assert.match(chatBackend, /upsert_part/);
 });
 
-test("les commandes consecutives sont regroupees dans une seule liste depliante", () => {
+test("toutes les actions consecutives sont regroupees dans une seule liste depliante", () => {
   const command = (id) => ({
     id,
     kind: "tool",
@@ -167,23 +215,70 @@ test("les commandes consecutives sont regroupees dans une seule liste depliante"
     detail: `npm run ${id}`,
   });
   const textPart = { id: "text", kind: "text", status: "complete", text: "Etape suivante" };
-  const groups = groupConsecutiveCommandParts([
+  const search = (id) => ({
+    id,
+    kind: "tool",
+    tool: "search",
+    status: "complete",
+    title: "Recherche web",
+    subtitle: id,
+  });
+  const edit = { id: "edit", kind: "tool", tool: "edit", status: "complete", title: "Fichiers modifies" };
+  const groups = groupConsecutiveToolParts([
     command("lint"),
-    command("test"),
+    search("documentation"),
+    edit,
     textPart,
-    command("build"),
-    command("preview"),
+    search("premiere requete"),
+    search("seconde requete"),
   ]);
 
   assert.deepEqual(groups.map((group) => group.map((part) => part.id)), [
-    ["lint", "test"],
+    ["lint", "documentation", "edit"],
     ["text"],
-    ["build", "preview"],
+    ["premiere requete", "seconde requete"],
   ]);
-  assert.match(view, /data-tool-kind="command-group"/);
-  assert.match(view, /Commandes exécutées/);
-  assert.match(view, /<ol class="chat-command-list">/);
-  assert.match(style, /\.chat-command-list/);
+  assert.match(view, /data-tool-kind="activity-group"/);
+  assert.match(view, /Actions effectuées par l’IA/);
+  assert.match(view, /recherche\$\{count > 1 \? "s" : ""\} web/);
+  assert.match(view, /<ul class="chat-action-list">/);
+  assert.match(style, /\.chat-action-list/);
+});
+
+test("les sondages wait du meme cell_id partagent une seule carte", () => {
+  const wait = (id, cellId, status = "complete", output = null) => ({
+    id,
+    kind: "tool",
+    tool: "tool",
+    status,
+    title: "wait",
+    detail: JSON.stringify({ cell_id: cellId, yield_time_ms: 30_000 }),
+    output,
+  });
+  const reasoning = {
+    id: "reasoning",
+    kind: "reasoning",
+    status: "complete",
+    text: "La commande travaille encore.",
+  };
+  const collapsed = collapseRepeatedWaitParts([
+    wait("wait-1", "109", "complete", "Toujours actif"),
+    reasoning,
+    wait("wait-2", "109"),
+    wait("wait-3", "115"),
+    wait("wait-4", "109", "running"),
+  ]);
+
+  assert.equal(collapsed.length, 3, "les resumes intermediaires ne cassent pas le regroupement");
+  assert.equal(collapsed[0].id, "wait-1");
+  assert.equal(collapsed[0].waitCellId, "109");
+  assert.equal(collapsed[0].waitCount, 3);
+  assert.equal(collapsed[0].status, "running");
+  assert.equal(collapsed[0].title, "Attente de la commande");
+  assert.equal(collapsed[0].subtitle, "Commande 109 · 3 vérifications");
+  assert.equal(collapsed[1], reasoning);
+  assert.equal(collapsed[2].waitCellId, "115");
+  assert.match(view, /data-tool-kind="wait-group"/);
 });
 
 test("le bouton d'envoi OpenCode reste sombre et conserve son icone", () => {

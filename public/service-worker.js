@@ -1,6 +1,7 @@
 const CACHE_PREFIX = "codex-terminal-static-";
 const BUILD_ID = new URL(self.location.href).searchParams.get("build") || "legacy";
 const CACHE_NAME = `${CACHE_PREFIX}${BUILD_ID}`;
+const NAVIGATION_NETWORK_TIMEOUT_MS = 5_000;
 const PRECACHE_URLS = [
   "/",
   "/offline.html",
@@ -45,19 +46,20 @@ const cachedStaticAsset = async (request) => {
   return response;
 };
 
-const cachedNavigation = async (request, event) => {
+const networkFirstNavigation = async (request) => {
   const cache = await caches.open(CACHE_NAME);
-  const cached = await cache.match("/");
-  const refresh = fetch(request).then(async (response) => {
-    if (response.ok) await cache.put("/", response.clone());
-    return response;
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), NAVIGATION_NETWORK_TIMEOUT_MS);
 
-  if (cached) {
-    event.waitUntil(refresh.catch(() => undefined));
-    return cached;
+  try {
+    const response = await fetch(request, { signal: controller.signal });
+    if (response.ok) await cache.put("/", response.clone()).catch(() => undefined);
+    return response;
+  } catch {
+    return (await cache.match("/")) ?? (await caches.match("/offline.html"));
+  } finally {
+    clearTimeout(timeout);
   }
-  return refresh.catch(() => caches.match("/offline.html"));
 };
 
 self.addEventListener("fetch", (event) => {
@@ -72,7 +74,7 @@ self.addEventListener("fetch", (event) => {
   if (url.pathname === "/reset-update.html") return;
 
   if (request.mode === "navigate") {
-    event.respondWith(cachedNavigation(request, event));
+    event.respondWith(networkFirstNavigation(request));
     return;
   }
 

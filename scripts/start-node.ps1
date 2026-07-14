@@ -22,6 +22,11 @@ if (-not $env:CST_ADMIN_TOKEN) { throw "CST_ADMIN_TOKEN absent de $EnvFile." }
 $env:CST_DATA_DIR = $DataDir
 $env:CST_STATIC_DIR = $CurrentDist
 if (-not $env:CST_BIND) { $env:CST_BIND = "127.0.0.1:$Port" }
+# Un noeud Tailscale tourne sans operateur devant l'ecran. Le sandbox Codex
+# eleve relance sinon son setup UAC a chaque nouveau workspace/chat.
+if (-not $env:CST_CODEX_WINDOWS_SANDBOX) {
+  $env:CST_CODEX_WINDOWS_SANDBOX = "unelevated"
+}
 
 if (-not (Test-Path $CurrentExe)) {
   throw "Release active introuvable: $CurrentExe (lance d'abord update-node.ps1)."

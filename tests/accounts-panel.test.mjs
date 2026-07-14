@@ -3,15 +3,25 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+const panelStart = main.indexOf("const renderAccountsPanel =");
+const panelEnd = main.indexOf("const renderAccountsAndPool =", panelStart);
+const accountsPanel = main.slice(panelStart, panelEnd);
+const wrapperStart = panelEnd;
+const wrapperEnd = main.indexOf("const renderNewChatModal =", wrapperStart);
+const accountsWrapper = main.slice(wrapperStart, wrapperEnd);
 
-test("la vue « Comptes & pool » affiche l'editeur complet des comptes", () => {
-  // Le panneau editeur (ajout / edition / suppression) doit etre reellement
-  // branche : la vue pool delegue a renderAccountsAndPool, qui appelle
-  // renderAccountsPanel. Regression : renderAccountsPanel etait defini mais
-  // jamais appele, donc invisible.
+test("la vue Comptes affiche uniquement la gestion simple des comptes", () => {
   assert.match(main, /case "pool":\s*\n\s*return renderAccountsAndPool\(\);/);
   assert.match(main, /const renderAccountsAndPool = \(\): string =>/);
-  assert.match(main, /renderAccountsPanel\(proxyOptions, proxiesEnabled\)/);
+  assert.match(accountsWrapper, /renderAccountsPanel\(\)/);
+  assert.doesNotMatch(accountsWrapper, /renderPoolPanel\(\)/);
+  assert.match(accountsPanel, /<strong>Comptes<\/strong>/);
+
+  // Aucun reglage avance ni outil de pool ne doit revenir dans ce panneau.
+  assert.doesNotMatch(
+    accountsPanel,
+    /CODEX_HOME|Repo Git|Proxy compte|Modele Codex|Intensite|Mode bypass|JSON pool|Pool de service|Shell|Commande|Auto-detect/,
+  );
 });
 
 test("renderAccountsPanel n'est plus du code mort", () => {
@@ -23,26 +33,32 @@ test("renderAccountsPanel n'est plus du code mort", () => {
   );
 });
 
-test("l'editeur de comptes propose bien une option pour ajouter un compte", () => {
-  // Le bouton d'ajout et son gestionnaire doivent coexister.
-  assert.match(main, /<strong>Gestion des comptes<\/strong>/);
-  assert.match(main, /id="addAccount"/);
+test("le formulaire minimal ajoute un compte Codex ou Claude", () => {
+  assert.match(accountsPanel, /id="addAccountForm"/);
+  assert.match(accountsPanel, /id="newAccountLabel"/);
+  assert.match(accountsPanel, /name="newAccountProvider" value="codex"/);
+  assert.match(accountsPanel, /name="newAccountProvider" value="claude"/);
+  assert.match(accountsPanel, /Ajouter et se connecter/);
   assert.match(
     main,
-    /querySelector<HTMLButtonElement>\("#addAccount"\)\?\.addEventListener/,
+    /querySelector<HTMLFormElement>\("#addAccountForm"\)\?\.addEventListener\("submit"/,
   );
-  // Le bouton doit reellement creer puis selectionner un nouveau compte.
-  assert.match(main, /const label = "Nouveau compte";/);
-  assert.match(main, /newAccountProfile\(label, uniqueCodexHomeForLabel\(label\)\)/);
+  assert.match(main, /providerValue === "claude" \? "claude" : "codex"/);
+  assert.match(main, /uniqueCodexHomeForLabel\(label, provider\)/);
+  assert.match(main, /\{ provider \}/);
 });
 
-test("l'editeur reste sauvegardable et supprimable", () => {
-  // Save et suppression du compte selectionne restent cables.
-  assert.match(main, /id="saveSettings"/);
-  assert.match(main, /id="removeAccount"/);
+test("chaque compte expose seulement connexion et suppression", () => {
+  assert.match(accountsPanel, /data-login-account=/);
+  assert.match(accountsPanel, /data-delete-account=/);
+  assert.match(accountsPanel, />Se connecter<\/span>/);
   assert.match(
     main,
-    /querySelector<HTMLButtonElement>\("#saveSettings"\)\?\.addEventListener/,
+    /querySelectorAll<HTMLButtonElement>\("\[data-login-account\]"\)/,
+  );
+  assert.match(
+    main,
+    /querySelectorAll<HTMLButtonElement>\("\[data-delete-account\]"\)/,
   );
 });
 
@@ -74,6 +90,7 @@ test("la reconnexion Codex utilise la connexion classique (sans codes/device flo
 });
 
 test("la reconnexion utilise un terminal strictement reserve au login", () => {
+  assert.match(main, /const environmentPath = userEnvironmentPath\(account\.codexHome\);/);
   assert.match(main, /environmentPath,\s*\n\s*true,\s*\n\s*\);/);
   assert.match(main, /loginOnly,\s*\n\s*\}\);/);
   assert.match(main, /!loginOnly && settings\.autoRunCodex/);
@@ -128,14 +145,12 @@ test("une erreur d'auth reste prioritaire sur les limites locales en cache", () 
   assert.match(main, /return "session expiree"/);
 });
 
-test("l'editeur expose un bouton « Se connecter » par compte", () => {
-  assert.match(main, /id="loginAccount"/);
+test("la connexion cible directement le compte de la carte", () => {
+  assert.match(accountsPanel, /data-login-account="\$\{escapeAttr\(item\.id\)\}"/);
   assert.match(
     main,
-    /querySelector<HTMLButtonElement>\("#loginAccount"\)\?\.addEventListener/,
+    /const accountId = button\.dataset\.loginAccount;[\s\S]*?selectedAccountId = accountId;[\s\S]*?void reloginAccount\(accountId\);/,
   );
-  // Le bouton capture les modifs en cours puis ouvre le login du compte choisi.
-  assert.match(main, /void reloginAccount\(selectedAccountId\)/);
 });
 
 test("la suppression persiste vraiment (backend + repli)", () => {
@@ -143,17 +158,18 @@ test("la suppression persiste vraiment (backend + repli)", () => {
   assert.match(main, /const deleteSelectedAccount = async \(\) =>/);
   assert.match(
     main,
-    /querySelector<HTMLButtonElement>\("#removeAccount"\)\?\.addEventListener\(\s*"click",\s*\(\)\s*=>\s*\{\s*\n\s*void deleteSelectedAccount\(\);/,
+    /const accountId = button\.dataset\.deleteAccount;[\s\S]*?selectedAccountId = accountId;[\s\S]*?void deleteSelectedAccount\(\);/,
   );
   // Suppression backend (compte persiste) avec repli save_settings (compte neuf).
   assert.match(main, /invoke<AppSettings>\("remove_account", \{ accountId: id, deleteFiles \}\)/);
 });
 
 test("la suppression tient compte de l'auto-detection (sinon le compte revient)", () => {
-  // Avec l'auto-detection active, on propose d'effacer aussi les fichiers, sinon
-  // le compte est re-decouvert au prochain chargement.
-  assert.match(main, /if \(settings\.autoDiscoverAccounts && target\)/);
-  assert.match(main, /deleteFiles = window\.confirm\(/);
+  // Avec l'auto-detection active, la confirmation unique inclut aussi les
+  // fichiers, sinon le compte serait re-decouvert au prochain chargement.
+  assert.match(main, /const deleteFiles = settings\.autoDiscoverAccounts;/);
+  assert.match(main, /const confirmed = window\.confirm\(/);
+  assert.match(main, /if \(!confirmed\) return;/);
 });
 
 test("le re-rendu preserve le scroll des vues admin (ne fait plus remonter)", () => {

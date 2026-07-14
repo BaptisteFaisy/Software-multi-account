@@ -7,6 +7,7 @@ import {
   mergeWorkspaceProfiles,
   normalizeWorkspacePath,
   openWorkspaceRegistry,
+  setWorkspaceMemory,
   terminalEnvironmentPath,
   terminalsForFolder,
   userEnvironmentPath,
@@ -44,6 +45,7 @@ test("les dossiers identiques fusionnent meme si leurs anciens ids different", (
       id: "c:/projects/codex-switch-terminal",
       label: "Codex Switch Terminal",
       path: "C:\\Projects\\Codex-Switch-Terminal\\",
+      memory: "",
     },
   ]);
 });
@@ -83,8 +85,32 @@ test("rouvrir un dossier retire son tombstone et restaure son profil", () => {
       id: "c:/projects/projet",
       label: "Projet",
       path: "C:\\Projects\\Projet",
+      memory: "",
     },
   ]);
+});
+
+test("la memoire reste isolee dans son environnement", () => {
+  const profiles = [
+    { id: "a", label: "Produit", path: "C:\\Projects\\Produit", memory: "" },
+    { id: "b", label: "Site", path: "C:\\Projects\\Site", memory: "Ne pas utiliser React." },
+  ];
+
+  const updated = setWorkspaceMemory(
+    profiles,
+    "c:/projects/produit/",
+    "  API publique en version 2.\nConserver SQLite.  ",
+  );
+
+  assert.equal(updated.changed, true);
+  assert.equal(
+    updated.workspaces.find((workspace) => workspace.id === "c:/projects/produit")?.memory,
+    "API publique en version 2.\nConserver SQLite.",
+  );
+  assert.equal(
+    updated.workspaces.find((workspace) => workspace.id === "c:/projects/site")?.memory,
+    "Ne pas utiliser React.",
+  );
 });
 
 test("un dossier regroupe plusieurs terminaux dans le meme projet", () => {

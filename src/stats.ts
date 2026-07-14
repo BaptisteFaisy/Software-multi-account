@@ -6,6 +6,29 @@ export const STATS_RANGE_OPTIONS = [
 
 export type StatsRangeDays = (typeof STATS_RANGE_OPTIONS)[number]["days"];
 
+export const WORK_TIME_GRANULARITY_OPTIONS = [
+  { id: "day", label: "Jour", bucketCount: 14 },
+  { id: "week", label: "Semaine", bucketCount: 12 },
+  { id: "month", label: "Mois", bucketCount: 12 },
+] as const;
+
+export type WorkTimeGranularity = (typeof WORK_TIME_GRANULARITY_OPTIONS)[number]["id"];
+
+export type WorkTimeDay = {
+  date: string;
+  activeSeconds: number;
+  turnCount: number;
+};
+
+export type WorkTimeBucket = {
+  key: string;
+  startDate: string;
+  endDate: string;
+  activeSeconds: number;
+  turnCount: number;
+  activeDays: number;
+};
+
 export type DailyTokenUsage = {
   date: string;
   inputTokens: number;
@@ -15,10 +38,28 @@ export type DailyTokenUsage = {
   costUsd: number;
 };
 
-type AccountUsageSource = {
+export type AccountTokenUsageSource = {
   accounts: ReadonlyArray<{
+    id: string;
+    label: string;
+    codexHome?: string;
+    profileLabels?: ReadonlyArray<string>;
+    usageSource?: string;
+    sourceError?: string | null;
+    error?: string | null;
+    totalTokens?: number;
     days: ReadonlyArray<DailyTokenUsage>;
   }>;
+};
+
+export type DailyAccountTokenUsage = {
+  accountId: string;
+  label: string;
+  profileLabels: ReadonlyArray<string>;
+  usageSource: string;
+  totalTokens: number;
+  share: number;
+  error?: string | null;
 };
 
 const emptyDailyTokenUsage = (date: string): DailyTokenUsage => ({
@@ -29,6 +70,44 @@ const emptyDailyTokenUsage = (date: string): DailyTokenUsage => ({
   totalTokens: 0,
   costUsd: 0,
 });
+
+const accountUsageIdentityKey = (
+  account: AccountTokenUsageSource["accounts"][number],
+): string => {
+  const normalizedHome = account.codexHome
+    ?.trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  return normalizedHome ? `home:${normalizedHome}` : `profile:${account.id}`;
+};
+
+const accountUsageCompleteness = (
+  account: AccountTokenUsageSource["accounts"][number],
+): number => {
+  if (Number.isFinite(account.totalTokens)) return Math.max(0, account.totalTokens ?? 0);
+  return account.days.reduce((total, day) => total + day.totalTokens, 0);
+};
+
+/**
+ * Les anciennes versions du serveur renvoyaient une ligne par profil, meme
+ * lorsque plusieurs profils pointaient vers exactement le meme CODEX_HOME.
+ * Ces lignes decrivent la meme source et ne doivent jamais etre additionnees.
+ */
+export const deduplicateAccountTokenAccounts = <
+  T extends AccountTokenUsageSource["accounts"][number],
+>(
+  accounts: ReadonlyArray<T>,
+): T[] => {
+  const unique = new Map<string, T>();
+  for (const account of accounts) {
+    const key = accountUsageIdentityKey(account);
+    const current = unique.get(key);
+    if (!current || accountUsageCompleteness(account) > accountUsageCompleteness(current)) {
+      unique.set(key, account);
+    }
+  }
+  return [...unique.values()];
+};
 
 const shiftDateKey = (dateKey: string, offsetDays: number): string => {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
@@ -43,6 +122,34 @@ const shiftDateKey = (dateKey: string, offsetDays: number): string => {
   return `${year}-${month}-${day}`;
 };
 
+const dateKeyParts = (dateKey: string): [number, number, number] | null => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateKey);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+};
+
+const utcDateKey = (date: Date): string => {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const isoWeekStart = (dateKey: string): string => {
+  const parts = dateKeyParts(dateKey);
+  if (!parts) return dateKey;
+  const date = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+  const weekday = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() - weekday + 1);
+  return utcDateKey(date);
+};
+
+const shiftMonthStart = (dateKey: string, offsetMonths: number): string => {
+  const parts = dateKeyParts(dateKey);
+  if (!parts) return dateKey;
+  return utcDateKey(new Date(Date.UTC(parts[0], parts[1] - 1 + offsetMonths, 1)));
+};
+
 export const recentDateKeys = (endDate: string, dayCount: number): string[] => {
   const safeDayCount = Math.max(1, Math.floor(dayCount));
   return Array.from({ length: safeDayCount }, (_, index) =>
@@ -51,7 +158,7 @@ export const recentDateKeys = (endDate: string, dayCount: number): string[] => {
 };
 
 export const aggregateAccountTokenDays = (
-  data: AccountUsageSource,
+  data: AccountTokenUsageSource,
 ): Map<string, DailyTokenUsage> => {
   const byDate = new Map<string, DailyTokenUsage>();
 
@@ -71,7 +178,7 @@ export const aggregateAccountTokenDays = (
 };
 
 export const buildAccountTokenSeries = (
-  data: AccountUsageSource,
+  data: AccountTokenUsageSource,
   endDate: string,
   dayCount: number,
 ): DailyTokenUsage[] => {
@@ -79,6 +186,90 @@ export const buildAccountTokenSeries = (
   return recentDateKeys(endDate, dayCount).map(
     (date) => byDate.get(date) ?? emptyDailyTokenUsage(date),
   );
+};
+
+const workTimeBucketRanges = (
+  endDate: string,
+  granularity: WorkTimeGranularity,
+): Array<Pick<WorkTimeBucket, "key" | "startDate" | "endDate">> => {
+  const option = WORK_TIME_GRANULARITY_OPTIONS.find((item) => item.id === granularity);
+  const bucketCount = option?.bucketCount ?? 12;
+
+  if (granularity === "day") {
+    return recentDateKeys(endDate, bucketCount).map((date) => ({
+      key: date,
+      startDate: date,
+      endDate: date,
+    }));
+  }
+
+  if (granularity === "week") {
+    const currentWeek = isoWeekStart(endDate);
+    return Array.from({ length: bucketCount }, (_, index) => {
+      const startDate = shiftDateKey(currentWeek, (index - bucketCount + 1) * 7);
+      return {
+        key: startDate,
+        startDate,
+        endDate: shiftDateKey(startDate, 6),
+      };
+    });
+  }
+
+  const currentMonth = shiftMonthStart(endDate, 0);
+  return Array.from({ length: bucketCount }, (_, index) => {
+    const startDate = shiftMonthStart(currentMonth, index - bucketCount + 1);
+    return {
+      key: startDate.slice(0, 7),
+      startDate,
+      endDate: shiftDateKey(shiftMonthStart(startDate, 1), -1),
+    };
+  });
+};
+
+export const buildWorkTimeBuckets = (
+  days: ReadonlyArray<WorkTimeDay>,
+  endDate: string,
+  granularity: WorkTimeGranularity,
+): WorkTimeBucket[] =>
+  workTimeBucketRanges(endDate, granularity).map((range) => {
+    const bucketDays = days.filter(
+      (day) => day.date >= range.startDate && day.date <= range.endDate,
+    );
+    return {
+      ...range,
+      activeSeconds: bucketDays.reduce((total, day) => total + day.activeSeconds, 0),
+      turnCount: bucketDays.reduce((total, day) => total + day.turnCount, 0),
+      activeDays: bucketDays.filter((day) => day.activeSeconds > 0).length,
+    };
+  });
+
+export const accountTokenUsageForDate = (
+  data: AccountTokenUsageSource,
+  date: string,
+): DailyAccountTokenUsage[] => {
+  const rows = data.accounts.map((account) => ({
+    accountId: account.id,
+    label: account.label,
+    profileLabels: account.profileLabels ?? [account.label],
+    usageSource: account.usageSource ?? "local-sessions",
+    totalTokens: account.days
+      .filter((day) => day.date === date)
+      .reduce((total, day) => total + day.totalTokens, 0),
+    share: 0,
+    error: account.error ?? account.sourceError,
+  }));
+  const totalTokens = rows.reduce((total, account) => total + account.totalTokens, 0);
+
+  return rows
+    .map((account) => ({
+      ...account,
+      share: totalTokens > 0 ? account.totalTokens / totalTokens : 0,
+    }))
+    .sort((left, right) =>
+      right.totalTokens !== left.totalTokens
+        ? right.totalTokens - left.totalTokens
+        : left.label.localeCompare(right.label, "fr"),
+    );
 };
 
 export const sumTokenUsage = (days: ReadonlyArray<DailyTokenUsage>): DailyTokenUsage =>

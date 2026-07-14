@@ -1,6 +1,8 @@
 import { defineConfig } from "vite";
 
-const buildId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+const buildId =
+  process.env.CST_BUILD_ID
+  ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
 export default defineConfig({
   clearScreen: false,

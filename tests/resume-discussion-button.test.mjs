@@ -51,6 +51,11 @@ test("deplacer et reprendre continue dans un chat normal sans terminal", () => {
     main,
     /const resumeDiscussionInChat = async[\s\S]*?openDiscussionInExpert\(discussion\)[\s\S]*?sendExpertChatMessage\(pane, root, prompt\)/,
   );
+  assert.match(
+    moveAndResume + main.slice(main.indexOf("const resumeDiscussionInChat = async")),
+    /expertChatFullscreenKey = pane\.key/,
+    "la continuation doit remplacer aussi un chat source en plein ecran",
+  );
 });
 
 test("un chat refuse clairement un compte sans authentification", () => {

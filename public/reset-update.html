@@ -4,11 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="Cache-Control" content="no-store" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#000000" />
+    <script>
+      (() => {
+        let theme = "dark";
+        try {
+          theme = localStorage.getItem("codex-switch-terminal.theme") === "light" ? "light" : "dark";
+        } catch {}
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document.querySelector('meta[name="theme-color"]')?.setAttribute(
+          "content",
+          theme === "light" ? "#f4f6f3" : "#000000",
+        );
+      })();
+    </script>
     <title>Mise à jour de Codex Terminal</title>
     <style>
       body { display: grid; min-height: 100vh; margin: 0; place-items: center; background: #080808; color: #eee; font: 15px system-ui, sans-serif; }
       main { padding: 24px; text-align: center; }
       strong { display: block; margin-bottom: 8px; }
+      :root[data-theme="light"] body { background: #f4f6f3; color: #202420; }
     </style>
   </head>
   <body>

@@ -155,6 +155,30 @@ function Register-NodeTask {
     -Description "Noeud Codex Switch Terminal (release active via 'current')" -Force | Out-Null
 }
 
+function Stop-NodeProcesses {
+  # Stop-ScheduledTask arrete parfois uniquement le PowerShell parent et laisse
+  # cst-server.exe orphelin. Ne cibler que les executables installes sous le
+  # NodeHome evite de toucher un autre serveur portable lance par l'utilisateur.
+  $trustedRoot = [IO.Path]::GetFullPath($NodeHome).TrimEnd(
+    [IO.Path]::DirectorySeparatorChar,
+    [IO.Path]::AltDirectorySeparatorChar
+  ) + [IO.Path]::DirectorySeparatorChar
+  $stopped = 0
+  foreach ($process in Get-CimInstance Win32_Process -Filter "Name = 'cst-server.exe'") {
+    $executable = [string]$process.ExecutablePath
+    if (-not $executable) { continue }
+    $resolved = [IO.Path]::GetFullPath($executable)
+    if (-not $resolved.StartsWith($trustedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+      continue
+    }
+    Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
+    $stopped++
+  }
+  if ($stopped -gt 0) {
+    Write-Host "$stopped processus cst-server orphelin(s) arrete(s)." -ForegroundColor DarkGray
+  }
+}
+
 function Test-NodeBack {
   param([string]$WantVersion, [string]$WantCommit)
   $deadline = (Get-Date).AddSeconds($VerifyTimeoutSec)
@@ -365,6 +389,10 @@ try {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $stopDeadline = (Get-Date).AddSeconds($StopTimeoutSec)
     while ((Get-Healthz) -and (Get-Date) -lt $stopDeadline) {
+      # Une tache configuree avec RestartCount peut laisser apparaitre un
+      # second enfant juste apres le premier Stop-Process. Retenter pendant la
+      # fenetre bornee ferme cette course sans toucher aux serveurs portables.
+      Stop-NodeProcesses
       Start-Sleep -Milliseconds 100
     }
     if (Get-Healthz) {
@@ -398,6 +426,7 @@ try {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $stopDeadline = (Get-Date).AddSeconds($StopTimeoutSec)
     while ((Get-Healthz) -and (Get-Date) -lt $stopDeadline) {
+      Stop-NodeProcesses
       Start-Sleep -Milliseconds 100
     }
     Set-Junction -Link $CurrentLink -Target $prevTarget

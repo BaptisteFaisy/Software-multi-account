@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { chatHoverShortcutAction } from "../src/chat/shortcuts.ts";
+import {
+  chatHoverShortcutAction,
+  chatShortcutTargetConsumesDeletion,
+} from "../src/chat/shortcuts.ts";
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 
@@ -52,6 +55,60 @@ test("Suppr et Retour arriere ne ferment rien pendant la saisie", () => {
   assert.equal(
     chatHoverShortcutAction(deleteEvent({ target: { isContentEditable: true } })),
     null,
+  );
+});
+
+test("un compositeur vide encore focalise laisse agir les raccourcis", () => {
+  const emptyComposer = {
+    tagName: "TEXTAREA",
+    value: "",
+    selectionStart: 0,
+    selectionEnd: 0,
+    closest: () => emptyComposer,
+  };
+  assert.equal(chatHoverShortcutAction(deleteEvent({ target: emptyComposer })), "close-chat-and-discussion");
+  assert.equal(
+    chatHoverShortcutAction(
+      deleteEvent({ key: "Backspace", code: "Backspace", target: emptyComposer }),
+    ),
+    "close-chat",
+  );
+});
+
+test("un brouillon non vide reste toujours prioritaire", () => {
+  const composer = {
+    tagName: "TEXTAREA",
+    value: "bonjour",
+    selectionStart: 3,
+    selectionEnd: 3,
+    closest: () => composer,
+  };
+  assert.equal(chatShortcutTargetConsumesDeletion(composer), true);
+  assert.equal(
+    chatHoverShortcutAction(
+      deleteEvent({ key: "Backspace", code: "Backspace", target: composer }),
+    ),
+    null,
+  );
+  assert.equal(chatHoverShortcutAction(deleteEvent({ target: composer })), null);
+  composer.selectionStart = 0;
+  composer.selectionEnd = 0;
+  assert.equal(
+    chatHoverShortcutAction(
+      deleteEvent({ key: "Backspace", code: "Backspace", target: composer }),
+    ),
+    null,
+  );
+  composer.selectionStart = composer.value.length;
+  composer.selectionEnd = composer.value.length;
+  assert.equal(chatHoverShortcutAction(deleteEvent({ target: composer })), null);
+});
+
+test("les anciens noms de touche restent reconnus", () => {
+  assert.equal(chatHoverShortcutAction(deleteEvent({ key: "Del", code: "" })), "close-chat-and-discussion");
+  assert.equal(
+    chatHoverShortcutAction(deleteEvent({ key: "BackSpace", code: "" })),
+    "close-chat",
   );
 });
 

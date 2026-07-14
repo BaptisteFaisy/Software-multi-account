@@ -1,0 +1,3925 @@
+//! Chats orchestres multi-agents, isoles des conversations ordinaires.
+//!
+//! Chaque execution dispose d'un worktree Git pour l'orchestrateur et d'un
+//! worktree par tache. Un travailleur ne peut etre accepte qu'apres avoir
+//! soumis une preuve structuree, puis apres revue et validation reelle dans le
+//! worktree de l'orchestrateur. Le diff final n'est applique au projet source
+//! que si son HEAD et son etat de travail n'ont pas change depuis le depart.
+
+use crate::{
+    autonomous::AutonomousAgentManager,
+    chat::{ChatTurnManager, ChatTurnMode, ChatTurnSnapshot, ChatTurnStatus, StartChatTurnRequest},
+    discussions, fs_util, metrics, settings,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+use tauri::State;
+use uuid::Uuid;
+
+const STORE_VERSION: u32 = 4;
+const MAX_OBJECTIVE_BYTES: usize = 64 * 1024;
+const MAX_NAME_CHARS: usize = 120;
+const MAX_TEST_COMMAND_CHARS: usize = 8_000;
+const DEFAULT_TEST_TIMEOUT_SECONDS: u64 = 10 * 60;
+const MIN_TEST_TIMEOUT_SECONDS: u64 = 5;
+const MAX_TEST_TIMEOUT_SECONDS: u64 = 30 * 60;
+const DEFAULT_WORKER_COUNT: u32 = 3;
+const MIN_WORKER_COUNT: u32 = 1;
+const MAX_WORKER_COUNT: u32 = 12;
+const MAX_EVENTS: usize = 100;
+const MAX_REVIEWS: usize = 20;
+const MAX_PROTOCOL_FAILURES: u32 = 3;
+const MAX_START_FAILURES: u32 = 3;
+const MAX_TEXT_CHARS: usize = 12_000;
+const MAX_TEST_OUTPUT_BYTES: usize = 96 * 1024;
+const DELETE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationStatus {
+    Active,
+    Paused,
+    Completed,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationPhase {
+    Planning,
+    Working,
+    Reviewing,
+    Validating,
+    FinalReview,
+    FinalValidation,
+    Publishing,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationTaskStatus {
+    Pending,
+    Working,
+    Submitted,
+    Reviewing,
+    Validating,
+    RevisionRequested,
+    Accepted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationTurnKind {
+    Plan,
+    Worker,
+    Review,
+    FinalReview,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationReviewDecision {
+    Accept,
+    Revise,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationValidationKind {
+    Task,
+    Final,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationEvent {
+    pub timestamp: i64,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationProofTest {
+    pub command: String,
+    pub result: String,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationProof {
+    pub summary: String,
+    pub files_changed: Vec<String>,
+    pub tests: Vec<OrchestrationProofTest>,
+    #[serde(default)]
+    pub risks: Vec<String>,
+    pub submitted_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationReview {
+    pub decision: OrchestrationReviewDecision,
+    pub summary: String,
+    pub feedback: String,
+    #[serde(default)]
+    pub tests: Vec<OrchestrationProofTest>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationTask {
+    pub id: String,
+    pub position: u32,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    pub status: OrchestrationTaskStatus,
+    #[serde(default)]
+    pub account_id: String,
+    #[serde(default)]
+    pub handoff_pending: bool,
+    #[serde(default)]
+    pub handoff_count: u32,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub workspace_dir: Option<String>,
+    #[serde(default)]
+    pub base_commit: Option<String>,
+    #[serde(default)]
+    pub workspace_generation: u32,
+    #[serde(default)]
+    pub attempt_count: u32,
+    #[serde(default)]
+    pub protocol_failures: u32,
+    #[serde(default)]
+    pub evidence: Option<OrchestrationProof>,
+    #[serde(default)]
+    pub reviews: Vec<OrchestrationReview>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestrationSnapshot {
+    pub id: String,
+    pub name: String,
+    pub objective: String,
+    #[serde(default)]
+    pub worker_count: u32,
+    pub account_id: String,
+    #[serde(default)]
+    pub orchestrator_account_id: String,
+    #[serde(default)]
+    pub worker_account_ids: Vec<String>,
+    #[serde(default)]
+    pub orchestrator_handoff_pending: bool,
+    #[serde(default)]
+    pub orchestrator_handoff_count: u32,
+    pub project_dir: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    pub test_command: String,
+    pub test_timeout_seconds: u64,
+    pub status: OrchestrationStatus,
+    pub phase: OrchestrationPhase,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub base_commit: String,
+    pub integrated_commit: String,
+    pub sandbox_root: String,
+    pub orchestrator_dir: String,
+    #[serde(default)]
+    pub orchestrator_session_id: Option<String>,
+    #[serde(default)]
+    pub current_turn_id: Option<u64>,
+    #[serde(default)]
+    pub current_turn_kind: Option<OrchestrationTurnKind>,
+    #[serde(default)]
+    pub current_task_id: Option<String>,
+    #[serde(default)]
+    pub current_start_id: Option<String>,
+    #[serde(default)]
+    pub current_validation_id: Option<String>,
+    #[serde(default)]
+    pub current_validation_kind: Option<OrchestrationValidationKind>,
+    #[serde(default)]
+    pub next_action_at: Option<i64>,
+    #[serde(default)]
+    pub plan_summary: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<OrchestrationTask>,
+    #[serde(default)]
+    pub final_summary: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub consecutive_start_failures: u32,
+    #[serde(default)]
+    pub protocol_failures: u32,
+    #[serde(default)]
+    pub publish_applied: bool,
+    #[serde(default)]
+    pub events: Vec<OrchestrationEvent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateOrchestrationRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub objective: String,
+    #[serde(default)]
+    pub worker_count: Option<u32>,
+    /// Session d'un chat normal a reprendre comme orchestrateur. Absente lors
+    /// de la creation depuis la vue dediee.
+    #[serde(default)]
+    pub orchestrator_session_id: Option<String>,
+    #[serde(default)]
+    pub orchestrator_account_id: Option<String>,
+    #[serde(default)]
+    pub worker_account_ids: Vec<String>,
+    #[serde(default)]
+    pub account_id: String,
+    pub project_dir: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    pub test_command: String,
+    #[serde(default)]
+    pub test_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromoteAutonomousAgentRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub objective: String,
+    #[serde(default)]
+    pub worker_count: Option<u32>,
+    #[serde(default)]
+    pub worker_account_ids: Vec<String>,
+    pub project_dir: String,
+    pub test_command: String,
+    #[serde(default)]
+    pub test_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OrchestrationAction {
+    Pause,
+    Resume,
+    Retry,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlOrchestrationRequest {
+    pub action: OrchestrationAction,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationAccountRole {
+    Orchestrator,
+    Worker,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReassignOrchestrationAccountRequest {
+    pub role: OrchestrationAccountRole,
+    #[serde(default)]
+    pub worker_index: Option<u32>,
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OrchestrationStore {
+    version: u32,
+    #[serde(default)]
+    runs: Vec<OrchestrationSnapshot>,
+}
+
+impl Default for OrchestrationStore {
+    fn default() -> Self {
+        Self {
+            version: STORE_VERSION,
+            runs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct OrchestrationManager {
+    inner: Arc<OrchestrationInner>,
+}
+
+struct OrchestrationInner {
+    chat: ChatTurnManager,
+    storage_path: PathBuf,
+    sandboxes_path: PathBuf,
+    store: Mutex<OrchestrationStore>,
+    validation_runs: Mutex<HashMap<String, Arc<ValidationRun>>>,
+    lifecycle: Mutex<()>,
+}
+
+struct ValidationRun {
+    id: String,
+    cancelled: AtomicBool,
+}
+
+struct ValidationResult {
+    passed: bool,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    output: String,
+}
+
+struct PreparedAccountHandoff {
+    session_id: Option<String>,
+    handoff_pending: bool,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanEnvelope {
+    summary: String,
+    tasks: Vec<PlanTask>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanTask {
+    title: String,
+    description: String,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProofEnvelope {
+    summary: String,
+    #[serde(default)]
+    files_changed: Vec<String>,
+    tests: Vec<OrchestrationProofTest>,
+    #[serde(default)]
+    risks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewEnvelope {
+    decision: OrchestrationReviewDecision,
+    summary: String,
+    #[serde(default)]
+    feedback: String,
+    #[serde(default)]
+    tests: Vec<OrchestrationProofTest>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalEnvelope {
+    decision: FinalDecision,
+    summary: String,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    feedback: String,
+    #[serde(default)]
+    tests: Vec<OrchestrationProofTest>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FinalDecision {
+    Complete,
+    Revise,
+}
+
+enum WorkItem {
+    Drive {
+        run_id: String,
+    },
+    Poll {
+        run_id: String,
+        turn_id: u64,
+        kind: OrchestrationTurnKind,
+    },
+}
+
+impl OrchestrationManager {
+    pub fn new(chat: ChatTurnManager, storage_path: PathBuf) -> Result<Self, String> {
+        let sandboxes_path = storage_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("orchestrated-runs");
+        fs::create_dir_all(&sandboxes_path).map_err(|error| error.to_string())?;
+        let mut store = load_store(&storage_path)?;
+        let recovered = normalize_loaded_store(&mut store, metrics::now_ts());
+        if recovered {
+            persist_store(&storage_path, &store)?;
+        }
+        let inner = Arc::new(OrchestrationInner {
+            chat,
+            storage_path,
+            sandboxes_path,
+            store: Mutex::new(store),
+            validation_runs: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+        });
+        spawn_worker(Arc::downgrade(&inner));
+        Ok(Self { inner })
+    }
+
+    pub fn list(&self) -> Result<Vec<OrchestrationSnapshot>, String> {
+        let mut runs = self
+            .inner
+            .store
+            .lock()
+            .map_err(|_| "Etat des orchestrations verrouille".to_string())?
+            .runs
+            .clone();
+        runs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        Ok(runs)
+    }
+
+    pub fn create(
+        &self,
+        request: CreateOrchestrationRequest,
+    ) -> Result<OrchestrationSnapshot, String> {
+        self.create_internal(request, false)
+    }
+
+    fn create_internal(
+        &self,
+        request: CreateOrchestrationRequest,
+        start_paused: bool,
+    ) -> Result<OrchestrationSnapshot, String> {
+        let objective = validate_required_text(
+            &request.objective,
+            MAX_OBJECTIVE_BYTES,
+            "L'objectif orchestre",
+        )?;
+        let name = validate_name(request.name.as_deref(), &objective)?;
+        let worker_count =
+            validate_worker_count(request.worker_count.unwrap_or(DEFAULT_WORKER_COUNT))?;
+        let orchestrator_session_id = normalize_optional(request.orchestrator_session_id);
+        if let Some(session_id) = orchestrator_session_id.as_deref() {
+            Uuid::parse_str(session_id)
+                .map_err(|_| "Identifiant du chat orchestrateur invalide".to_string())?;
+        }
+        let legacy_account_id = request.account_id.trim().to_string();
+        let orchestrator_account_id = normalize_optional(request.orchestrator_account_id)
+            .unwrap_or_else(|| legacy_account_id.clone());
+        if orchestrator_account_id.is_empty() {
+            return Err("Compte obligatoire pour l'orchestration".to_string());
+        }
+        let worker_account_ids = normalize_worker_accounts(
+            request.worker_account_ids,
+            worker_count,
+            &orchestrator_account_id,
+        )?;
+        let app_settings = settings::load_settings_for_terminal()?;
+        require_authenticated_account(&app_settings, &orchestrator_account_id)?;
+        for worker_account_id in &worker_account_ids {
+            require_authenticated_account(&app_settings, worker_account_id)?;
+        }
+        let test_command = validate_required_text(
+            &request.test_command,
+            MAX_TEST_COMMAND_CHARS,
+            "La commande de validation",
+        )?;
+        let test_timeout_seconds = validate_test_timeout(
+            request
+                .test_timeout_seconds
+                .unwrap_or(DEFAULT_TEST_TIMEOUT_SECONDS),
+        )?;
+        let (project_dir, base_commit) = inspect_source_repository(&request.project_dir)?;
+        let id = Uuid::new_v4().to_string();
+        let sandbox_root = self.inner.sandboxes_path.join(&id);
+        let orchestrator_dir = sandbox_root.join("orchestrator");
+        fs::create_dir_all(&sandbox_root).map_err(|error| error.to_string())?;
+        if let Err(error) = add_worktree(&project_dir, &orchestrator_dir, &base_commit) {
+            let _ = fs::remove_dir_all(&sandbox_root);
+            return Err(error);
+        }
+
+        let now = metrics::now_ts();
+        let mut run = OrchestrationSnapshot {
+            id,
+            name,
+            objective,
+            worker_count,
+            account_id: orchestrator_account_id.clone(),
+            orchestrator_account_id,
+            worker_account_ids,
+            orchestrator_handoff_pending: false,
+            orchestrator_handoff_count: 0,
+            project_dir: project_dir.to_string_lossy().to_string(),
+            model: normalize_optional(request.model),
+            reasoning_effort: normalize_optional(request.reasoning_effort),
+            test_command,
+            test_timeout_seconds,
+            status: if start_paused {
+                OrchestrationStatus::Paused
+            } else {
+                OrchestrationStatus::Active
+            },
+            phase: OrchestrationPhase::Planning,
+            created_at: now,
+            updated_at: now,
+            base_commit: base_commit.clone(),
+            integrated_commit: base_commit,
+            sandbox_root: sandbox_root.to_string_lossy().to_string(),
+            orchestrator_dir: orchestrator_dir.to_string_lossy().to_string(),
+            orchestrator_session_id: orchestrator_session_id.clone(),
+            current_turn_id: None,
+            current_turn_kind: None,
+            current_task_id: None,
+            current_start_id: None,
+            current_validation_id: None,
+            current_validation_kind: None,
+            next_action_at: if start_paused { None } else { Some(now) },
+            plan_summary: None,
+            tasks: Vec::new(),
+            final_summary: None,
+            last_error: None,
+            consecutive_start_failures: 0,
+            protocol_failures: 0,
+            publish_applied: false,
+            events: Vec::new(),
+        };
+        push_event(
+            &mut run,
+            now,
+            if orchestrator_session_id.is_some() {
+                "promoted"
+            } else {
+                "created"
+            },
+            if orchestrator_session_id.is_some() {
+                format!(
+                    "Chat existant promu orchestrateur ; {worker_count} worker{} seront ouverts",
+                    if worker_count > 1 { "s" } else { "" }
+                )
+            } else {
+                format!(
+                    "Equipe creee : 1 orchestrateur et {worker_count} worker{}",
+                    if worker_count > 1 { "s" } else { "" }
+                )
+            },
+        );
+        let created = run.clone();
+        if let Err(error) = self.inner.mutate_store(|store| {
+            store.runs.push(run);
+            Ok(())
+        }) {
+            let _ = remove_owned_worktrees(&created, &self.inner.sandboxes_path);
+            return Err(error);
+        }
+        Ok(created)
+    }
+
+    /// Transforme un agent autonome en orchestrateur sans jamais laisser les
+    /// deux planificateurs piloter la même session. L'orchestration est d'abord
+    /// créée en pause, puis l'agent autonome est retiré, et elle est seulement
+    /// ensuite activée.
+    pub fn promote_autonomous_agent(
+        &self,
+        autonomous: &AutonomousAgentManager,
+        id: &str,
+        request: PromoteAutonomousAgentRequest,
+    ) -> Result<OrchestrationSnapshot, String> {
+        let checkpoint = autonomous.prepare_orchestration_promotion(id)?;
+        let agent = &checkpoint.snapshot;
+        let create_request = CreateOrchestrationRequest {
+            name: request.name,
+            objective: request.objective,
+            worker_count: request.worker_count,
+            orchestrator_session_id: agent.session_id.clone(),
+            orchestrator_account_id: Some(agent.account_id.clone()),
+            worker_account_ids: request.worker_account_ids,
+            account_id: agent.account_id.clone(),
+            project_dir: request.project_dir,
+            model: agent.model.clone(),
+            reasoning_effort: agent.reasoning_effort.clone(),
+            test_command: request.test_command,
+            test_timeout_seconds: request.test_timeout_seconds,
+        };
+
+        let created = match self.create_internal(create_request, true) {
+            Ok(created) => created,
+            Err(error) => {
+                return match autonomous.rollback_orchestration_promotion(&checkpoint) {
+                    Ok(_) => Err(error),
+                    Err(rollback_error) => Err(format!(
+                        "{error}. L'agent reste en pause car le retour arrière a échoué : {rollback_error}"
+                    )),
+                };
+            }
+        };
+
+        if let Err(finalize_error) = autonomous.finalize_orchestration_promotion(id) {
+            let orchestration_rollback = self.delete(&created.id);
+            let autonomous_rollback = if orchestration_rollback.is_ok() {
+                autonomous.rollback_orchestration_promotion(&checkpoint)
+            } else {
+                Err("orchestration non supprimée ; agent conservé en pause".to_string())
+            };
+            return match (orchestration_rollback, autonomous_rollback) {
+                (Ok(()), Ok(_)) => Err(format!(
+                    "Promotion annulée avant activation : {finalize_error}"
+                )),
+                (orchestration_result, autonomous_result) => Err(format!(
+                    "Promotion interrompue ({finalize_error}). Nettoyage de l'orchestration : {}. Retour de l'agent : {}",
+                    orchestration_result
+                        .err()
+                        .unwrap_or_else(|| "réussi".to_string()),
+                    autonomous_result
+                        .err()
+                        .unwrap_or_else(|| "réussi".to_string())
+                )),
+            };
+        }
+
+        // L'agent autonome n'existe plus : à partir d'ici, même un échec de
+        // persistance laisse une seule entité, l'orchestration en pause. Elle
+        // reste visible et peut être reprise manuellement sans double exécution.
+        match self.control(&created.id, OrchestrationAction::Resume) {
+            Ok(active) => Ok(active),
+            Err(error) => {
+                eprintln!(
+                    "[orchestration] promotion {} créée mais activation différée : {error}",
+                    created.id
+                );
+                Ok(self
+                    .list()?
+                    .into_iter()
+                    .find(|run| run.id == created.id)
+                    .unwrap_or(created))
+            }
+        }
+    }
+
+    pub fn control(
+        &self,
+        id: &str,
+        action: OrchestrationAction,
+    ) -> Result<OrchestrationSnapshot, String> {
+        let _lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .map_err(|_| "Cycle de vie des orchestrations verrouille".to_string())?;
+        let now = metrics::now_ts();
+        let mut turn_to_stop = None;
+        let mut validation_to_cancel = None;
+        let snapshot = self.inner.mutate_store(|store| {
+            let run = find_run_mut(store, id)?;
+            match action {
+                OrchestrationAction::Pause => {
+                    if run.status == OrchestrationStatus::Completed {
+                        return Err(
+                            "Une orchestration terminee ne peut pas etre mise en pause".to_string()
+                        );
+                    }
+                    turn_to_stop = run.current_turn_id.take();
+                    validation_to_cancel = run.current_validation_id.take();
+                    run.current_turn_kind = None;
+                    run.current_validation_kind = None;
+                    run.current_start_id = None;
+                    run.status = OrchestrationStatus::Paused;
+                    run.next_action_at = None;
+                    push_event(
+                        run,
+                        now,
+                        "paused",
+                        "Orchestration mise en pause".to_string(),
+                    );
+                }
+                OrchestrationAction::Resume | OrchestrationAction::Retry => {
+                    if run.status == OrchestrationStatus::Completed {
+                        return Err("Cette orchestration est deja terminee".to_string());
+                    }
+                    recover_phase_for_resume(run, now);
+                    run.status = OrchestrationStatus::Active;
+                    run.last_error = None;
+                    run.consecutive_start_failures = 0;
+                    run.protocol_failures = 0;
+                    for task in &mut run.tasks {
+                        if task.status != OrchestrationTaskStatus::Accepted {
+                            task.protocol_failures = 0;
+                        }
+                    }
+                    run.next_action_at = Some(now);
+                    push_event(run, now, "resumed", "Orchestration reprise".to_string());
+                }
+            }
+            run.updated_at = now;
+            Ok(run.clone())
+        })?;
+        if let Some(validation_id) = validation_to_cancel {
+            self.inner.cancel_validation(id, &validation_id);
+        }
+        if let Some(turn_id) = turn_to_stop {
+            let _ = self.inner.chat.stop(turn_id);
+        }
+        Ok(snapshot)
+    }
+
+    pub fn reassign_account(
+        &self,
+        id: &str,
+        request: ReassignOrchestrationAccountRequest,
+    ) -> Result<OrchestrationSnapshot, String> {
+        let _lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .map_err(|_| "Cycle de vie des orchestrations verrouille".to_string())?;
+        let target_account_id = request.account_id.trim().to_string();
+        if target_account_id.is_empty() {
+            return Err("Compte cible obligatoire".to_string());
+        }
+        let app_settings = settings::load_settings_for_terminal()?;
+        let target_label = require_authenticated_account(&app_settings, &target_account_id)?
+            .label
+            .clone();
+        let run = snapshot_run(&self.inner, id)?;
+        let worker_index = match request.role {
+            OrchestrationAccountRole::Orchestrator => None,
+            OrchestrationAccountRole::Worker => {
+                let index = request
+                    .worker_index
+                    .ok_or_else(|| "Numero du worker obligatoire".to_string())?;
+                if index == 0 || index > run.worker_count {
+                    return Err(format!(
+                        "Worker invalide : choisis un numero entre 1 et {}",
+                        run.worker_count
+                    ));
+                }
+                Some(index)
+            }
+        };
+        let task = worker_index.and_then(|index| {
+            run.tasks
+                .iter()
+                .find(|task| task.position == index)
+                .cloned()
+        });
+        let (source_account_id, stored_session_id, handoff_pending) = match request.role {
+            OrchestrationAccountRole::Orchestrator => (
+                resolved_orchestrator_account(&run).to_string(),
+                run.orchestrator_session_id.clone(),
+                run.orchestrator_handoff_pending,
+            ),
+            OrchestrationAccountRole::Worker => {
+                let index = worker_index.unwrap_or(1);
+                (
+                    task.as_ref()
+                        .map(|task| resolved_worker_account(&run, task).to_string())
+                        .unwrap_or_else(|| {
+                            run.worker_account_ids
+                                .get((index - 1) as usize)
+                                .filter(|value| !value.trim().is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| run.account_id.clone())
+                        }),
+                    task.as_ref().and_then(|task| task.session_id.clone()),
+                    task.as_ref().is_some_and(|task| task.handoff_pending),
+                )
+            }
+        };
+        if source_account_id == target_account_id {
+            return Ok(run);
+        }
+
+        let targets_current_turn = match (request.role, run.current_turn_kind) {
+            (OrchestrationAccountRole::Orchestrator, Some(kind)) => {
+                kind != OrchestrationTurnKind::Worker
+            }
+            (OrchestrationAccountRole::Worker, Some(OrchestrationTurnKind::Worker)) => task
+                .as_ref()
+                .is_some_and(|task| run.current_task_id.as_deref() == Some(task.id.as_str())),
+            _ => false,
+        };
+        if targets_current_turn && run.current_start_id.is_some() {
+            return Err(
+                "Ce membre initialise son tour. Reessaie dans quelques secondes.".to_string(),
+            );
+        }
+
+        let mut session_id = stored_session_id;
+        if targets_current_turn {
+            if let Some(turn_id) = run.current_turn_id {
+                let now = metrics::now_ts();
+                self.inner.mutate_store(|store| {
+                    let current = find_run_mut(store, id)?;
+                    if current.current_turn_id != Some(turn_id) {
+                        return Err("Le tour a change pendant la reprise ; reessaie".to_string());
+                    }
+                    current.current_turn_id = None;
+                    current.current_turn_kind = None;
+                    current.next_action_at = None;
+                    current.updated_at = now;
+                    push_event(
+                        current,
+                        now,
+                        "account_handoff_stopping",
+                        "Tour actif arrete pour changer de compte sans execution concurrente"
+                            .to_string(),
+                    );
+                    Ok(())
+                })?;
+                match self.inner.chat.stop(turn_id) {
+                    Ok(snapshot) => {
+                        session_id = snapshot.session_id.or(session_id);
+                    }
+                    Err(error) => {
+                        mark_needs_attention(
+                            &self.inner,
+                            id,
+                            format!("Reprise de compte impossible : {error}"),
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        let prepared = match prepare_account_handoff(
+            &run,
+            request.role,
+            worker_index,
+            &source_account_id,
+            &target_account_id,
+            session_id,
+            handoff_pending,
+            &app_settings,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let now = metrics::now_ts();
+                let _ = self.inner.mutate_store(|store| {
+                    let current = find_run_mut(store, id)?;
+                    if current.status == OrchestrationStatus::Active
+                        && current.current_turn_id.is_none()
+                        && current.current_start_id.is_none()
+                        && current.current_validation_id.is_none()
+                    {
+                        current.next_action_at = Some(now);
+                    }
+                    current.updated_at = now;
+                    push_event(
+                        current,
+                        now,
+                        "account_handoff_failed",
+                        format!("Changement de compte annule : {error}"),
+                    );
+                    Ok(())
+                });
+                return Err(error);
+            }
+        };
+
+        let now = metrics::now_ts();
+        let role_label = worker_index
+            .map(|index| format!("Worker {index}"))
+            .unwrap_or_else(|| "Orchestrateur".to_string());
+        let updated = self.inner.mutate_store(|store| {
+            let current = find_run_mut(store, id)?;
+            match request.role {
+                OrchestrationAccountRole::Orchestrator => {
+                    if resolved_orchestrator_account(current) != source_account_id {
+                        return Err(
+                            "Le compte orchestrateur a deja change ; actualise la vue".to_string()
+                        );
+                    }
+                    current.orchestrator_account_id = target_account_id.clone();
+                    current.orchestrator_session_id = prepared.session_id.clone();
+                    current.orchestrator_handoff_pending = prepared.handoff_pending;
+                    current.orchestrator_handoff_count =
+                        current.orchestrator_handoff_count.saturating_add(1);
+                }
+                OrchestrationAccountRole::Worker => {
+                    let index = worker_index.unwrap_or(1);
+                    if current.worker_account_ids.len() < current.worker_count as usize {
+                        current
+                            .worker_account_ids
+                            .resize(current.worker_count as usize, current.account_id.clone());
+                    }
+                    current.worker_account_ids[(index - 1) as usize] = target_account_id.clone();
+                    if let Some(task) = current.tasks.iter_mut().find(|task| task.position == index)
+                    {
+                        task.account_id = target_account_id.clone();
+                        task.session_id = prepared.session_id.clone();
+                        task.handoff_pending = prepared.handoff_pending;
+                        task.handoff_count = task.handoff_count.saturating_add(1);
+                    }
+                }
+            }
+            if current.status == OrchestrationStatus::Active
+                && current.current_turn_id.is_none()
+                && current.current_start_id.is_none()
+                && current.current_validation_id.is_none()
+            {
+                current.next_action_at = Some(now);
+            }
+            current.updated_at = now;
+            push_event(
+                current,
+                now,
+                "account_reassigned",
+                format!(
+                    "{role_label} repris par {target_label} : {}",
+                    prepared.summary
+                ),
+            );
+            Ok(current.clone())
+        });
+        match updated {
+            Ok(updated) => Ok(updated),
+            Err(error) => {
+                mark_needs_attention(&self.inner, id, error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn delete(&self, id: &str) -> Result<(), String> {
+        let _lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .map_err(|_| "Cycle de vie des orchestrations verrouille".to_string())?;
+        let now = metrics::now_ts();
+        let (run, turn_to_stop, validation_to_cancel) = self.inner.mutate_store(|store| {
+            let run = find_run_mut(store, id)?;
+            let turn_to_stop = run.current_turn_id.take();
+            let validation_to_cancel = run.current_validation_id.take();
+            run.current_turn_kind = None;
+            run.current_validation_kind = None;
+            run.status = OrchestrationStatus::Paused;
+            run.next_action_at = None;
+            run.updated_at = now;
+            push_event(
+                run,
+                now,
+                "deleting",
+                "Arret des travaux avant suppression des sandboxes".to_string(),
+            );
+            Ok((run.clone(), turn_to_stop, validation_to_cancel))
+        })?;
+        if let Some(validation_id) = validation_to_cancel.as_deref() {
+            self.inner.cancel_validation(id, validation_id);
+        }
+        if let Some(turn_id) = turn_to_stop {
+            self.inner
+                .chat
+                .stop(turn_id)
+                .map_err(|error| format!("Arret du chat avant suppression impossible : {error}"))?;
+        }
+        self.inner.wait_until_quiescent(
+            id,
+            validation_to_cancel.as_deref(),
+            DELETE_QUIESCE_TIMEOUT,
+        )?;
+        remove_owned_worktrees(&run, &self.inner.sandboxes_path)?;
+        self.inner.mutate_store(|store| {
+            let before = store.runs.len();
+            store.runs.retain(|candidate| candidate.id != id);
+            if store.runs.len() == before {
+                return Err("Orchestration introuvable".to_string());
+            }
+            Ok(())
+        })
+    }
+}
+
+impl OrchestrationInner {
+    fn mutate_store<T>(
+        &self,
+        mutate: impl FnOnce(&mut OrchestrationStore) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "Etat des orchestrations verrouille".to_string())?;
+        let previous = store.clone();
+        let result = match mutate(&mut store) {
+            Ok(result) => result,
+            Err(error) => {
+                *store = previous;
+                return Err(error);
+            }
+        };
+        if *store == previous {
+            return Ok(result);
+        }
+        if let Err(error) = persist_store(&self.storage_path, &store) {
+            *store = previous;
+            return Err(error);
+        }
+        Ok(result)
+    }
+
+    fn work_items(&self, now: i64) -> Vec<WorkItem> {
+        let Ok(store) = self.store.lock() else {
+            return Vec::new();
+        };
+        store
+            .runs
+            .iter()
+            .filter(|run| run.status == OrchestrationStatus::Active)
+            .filter_map(|run| {
+                if let (Some(turn_id), Some(kind)) = (run.current_turn_id, run.current_turn_kind) {
+                    return Some(WorkItem::Poll {
+                        run_id: run.id.clone(),
+                        turn_id,
+                        kind,
+                    });
+                }
+                if run.current_start_id.is_none()
+                    && run.current_validation_id.is_none()
+                    && run.next_action_at.is_some_and(|next| next <= now)
+                {
+                    return Some(WorkItem::Drive {
+                        run_id: run.id.clone(),
+                    });
+                }
+                None
+            })
+            .collect()
+    }
+
+    fn cancel_validation(&self, run_id: &str, validation_id: &str) {
+        if let Ok(runs) = self.validation_runs.lock() {
+            if let Some(run) = runs.get(run_id) {
+                if run.id == validation_id {
+                    run.cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    fn wait_until_quiescent(
+        &self,
+        run_id: &str,
+        validation_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let start_active = self
+                .store
+                .lock()
+                .map_err(|_| "Etat des orchestrations verrouille".to_string())?
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .is_some_and(|run| run.current_start_id.is_some());
+            let validation_active = if let Some(validation_id) = validation_id {
+                self.validation_runs
+                    .lock()
+                    .map_err(|_| "Etat des validations verrouille".to_string())?
+                    .get(run_id)
+                    .is_some_and(|run| run.id == validation_id)
+            } else {
+                false
+            };
+            if !start_active && !validation_active {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "Suppression differee : un processus orchestre ne s'est pas encore arrete"
+                        .to_string(),
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+fn spawn_worker(inner: Weak<OrchestrationInner>) {
+    let _ = thread::Builder::new()
+        .name("cst-orchestrated-chats".to_string())
+        .spawn(move || loop {
+            let Some(inner) = inner.upgrade() else {
+                break;
+            };
+            for item in inner.work_items(metrics::now_ts()) {
+                match item {
+                    WorkItem::Drive { run_id } => drive_run(&inner, &run_id),
+                    WorkItem::Poll {
+                        run_id,
+                        turn_id,
+                        kind,
+                    } => poll_turn(&inner, &run_id, turn_id, kind),
+                }
+            }
+            drop(inner);
+            thread::sleep(Duration::from_secs(1));
+        });
+}
+
+fn drive_run(inner: &Arc<OrchestrationInner>, run_id: &str) {
+    let run = match snapshot_run(inner, run_id) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("[orchestration] execution de {run_id} impossible: {error}");
+            return;
+        }
+    };
+    match run.phase {
+        OrchestrationPhase::Planning => start_plan_turn(inner, &run),
+        OrchestrationPhase::Working => start_worker_turn(inner, &run),
+        OrchestrationPhase::Reviewing => start_review_turn(inner, &run),
+        OrchestrationPhase::FinalReview => start_final_review_turn(inner, &run),
+        OrchestrationPhase::Publishing => publish_run(inner, &run),
+        OrchestrationPhase::Validating
+        | OrchestrationPhase::FinalValidation
+        | OrchestrationPhase::Completed => {}
+    }
+}
+
+fn snapshot_run(inner: &OrchestrationInner, run_id: &str) -> Result<OrchestrationSnapshot, String> {
+    inner
+        .store
+        .lock()
+        .map_err(|_| "Etat des orchestrations verrouille".to_string())?
+        .runs
+        .iter()
+        .find(|run| run.id == run_id)
+        .cloned()
+        .ok_or_else(|| "Orchestration introuvable".to_string())
+}
+
+fn resolved_orchestrator_account(run: &OrchestrationSnapshot) -> &str {
+    if run.orchestrator_account_id.trim().is_empty() {
+        &run.account_id
+    } else {
+        &run.orchestrator_account_id
+    }
+}
+
+fn resolved_worker_account<'a>(
+    run: &'a OrchestrationSnapshot,
+    task: &'a OrchestrationTask,
+) -> &'a str {
+    if !task.account_id.trim().is_empty() {
+        &task.account_id
+    } else {
+        run.worker_account_ids
+            .get(task.position.saturating_sub(1) as usize)
+            .filter(|value| !value.trim().is_empty())
+            .map(String::as_str)
+            .unwrap_or(&run.account_id)
+    }
+}
+
+fn require_authenticated_account<'a>(
+    app_settings: &'a settings::AppSettings,
+    account_id: &str,
+) -> Result<&'a settings::AccountProfile, String> {
+    let account = app_settings
+        .accounts
+        .iter()
+        .find(|candidate| candidate.id == account_id)
+        .ok_or_else(|| format!("Compte introuvable : {account_id}"))?;
+    if !settings::account_has_auth_tokens(account) {
+        return Err(format!(
+            "Compte non authentifie : {}. Connecte ce compte avant de l'affecter a l'orchestration.",
+            account.label
+        ));
+    }
+    Ok(account)
+}
+
+fn normalize_worker_accounts(
+    account_ids: Vec<String>,
+    worker_count: u32,
+    fallback_account_id: &str,
+) -> Result<Vec<String>, String> {
+    if account_ids.is_empty() {
+        return Ok(vec![fallback_account_id.to_string(); worker_count as usize]);
+    }
+    if account_ids.len() != worker_count as usize {
+        return Err(format!(
+            "Il faut affecter exactement {worker_count} compte{} aux workers",
+            if worker_count > 1 { "s" } else { "" }
+        ));
+    }
+    Ok(account_ids
+        .into_iter()
+        .map(|value| {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                fallback_account_id.to_string()
+            } else {
+                value
+            }
+        })
+        .collect())
+}
+
+fn handoff_file(
+    run: &OrchestrationSnapshot,
+    role: OrchestrationAccountRole,
+    worker_index: Option<u32>,
+) -> PathBuf {
+    let name = match role {
+        OrchestrationAccountRole::Orchestrator => "orchestrator.txt".to_string(),
+        OrchestrationAccountRole::Worker => {
+            format!("worker-{:02}.txt", worker_index.unwrap_or(1))
+        }
+    };
+    Path::new(&run.sandbox_root).join("handoffs").join(name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_account_handoff(
+    run: &OrchestrationSnapshot,
+    role: OrchestrationAccountRole,
+    worker_index: Option<u32>,
+    source_account_id: &str,
+    target_account_id: &str,
+    session_id: Option<String>,
+    existing_handoff: bool,
+    app_settings: &settings::AppSettings,
+) -> Result<PreparedAccountHandoff, String> {
+    let path = handoff_file(run, role, worker_index);
+    let Some(session_id) = session_id else {
+        return Ok(PreparedAccountHandoff {
+            session_id: None,
+            handoff_pending: existing_handoff,
+            summary: if existing_handoff {
+                "contexte de reprise conserve pour le prochain tour".to_string()
+            } else {
+                "affectation mise a jour avant le premier tour".to_string()
+            },
+        });
+    };
+    let source = app_settings
+        .accounts
+        .iter()
+        .find(|account| account.id == source_account_id)
+        .ok_or_else(|| format!("Compte source introuvable : {source_account_id}"))?;
+    let target = app_settings
+        .accounts
+        .iter()
+        .find(|account| account.id == target_account_id)
+        .ok_or_else(|| format!("Compte cible introuvable : {target_account_id}"))?;
+    if source.provider == settings::Provider::Codex && target.provider == settings::Provider::Codex
+    {
+        let copied = discussions::copy_discussion_between(
+            session_id,
+            source_account_id.to_string(),
+            target_account_id.to_string(),
+        )?;
+        let _ = fs::remove_file(path);
+        return Ok(PreparedAccountHandoff {
+            session_id: Some(copied.rollout_id),
+            handoff_pending: false,
+            summary: "historique Codex copie et pret a reprendre".to_string(),
+        });
+    }
+
+    let transcript =
+        discussions::export_transcript_for_account(source_account_id.to_string(), session_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs_util::atomic_write(&path, transcript).map_err(|error| error.to_string())?;
+    Ok(PreparedAccountHandoff {
+        session_id: None,
+        handoff_pending: true,
+        summary: "transcript securise ; une nouvelle session sera amorcee au prochain tour"
+            .to_string(),
+    })
+}
+
+fn prompt_with_pending_handoff(
+    run: &OrchestrationSnapshot,
+    kind: OrchestrationTurnKind,
+    task_id: Option<&str>,
+    prompt: String,
+) -> Result<(String, Option<PathBuf>), String> {
+    let (pending, role, worker_index) = if kind == OrchestrationTurnKind::Worker {
+        let task_id = task_id.ok_or_else(|| "Worker absent pour la reprise".to_string())?;
+        let task = run
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| "Worker introuvable pour la reprise".to_string())?;
+        (
+            task.handoff_pending,
+            OrchestrationAccountRole::Worker,
+            Some(task.position),
+        )
+    } else {
+        (
+            run.orchestrator_handoff_pending,
+            OrchestrationAccountRole::Orchestrator,
+            None,
+        )
+    };
+    if !pending {
+        return Ok((prompt, None));
+    }
+    let path = handoff_file(run, role, worker_index);
+    let transcript = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "Contexte de reprise introuvable ({}): {error}",
+            path.display()
+        )
+    })?;
+    Ok((
+        format!(
+            "{transcript}\n\n[Nouvelle instruction du chat orchestre apres changement de compte]\n\n{prompt}"
+        ),
+        Some(path),
+    ))
+}
+
+fn start_plan_turn(inner: &Arc<OrchestrationInner>, run: &OrchestrationSnapshot) {
+    let prompt = plan_prompt(run);
+    start_chat_turn(
+        inner,
+        run,
+        OrchestrationTurnKind::Plan,
+        None,
+        resolved_orchestrator_account(run).to_string(),
+        run.orchestrator_session_id.clone(),
+        run.orchestrator_dir.clone(),
+        ChatTurnMode::Plan,
+        prompt,
+    );
+}
+
+fn start_worker_turn(inner: &Arc<OrchestrationInner>, run: &OrchestrationSnapshot) {
+    let Some(task) = next_open_task(run).cloned() else {
+        let now = metrics::now_ts();
+        let _ = inner.mutate_store(|store| {
+            let current = find_run_mut(store, &run.id)?;
+            current.phase = OrchestrationPhase::FinalReview;
+            current.current_task_id = None;
+            current.next_action_at = Some(now);
+            current.updated_at = now;
+            push_event(
+                current,
+                now,
+                "all_tasks_accepted",
+                "Toutes les taches sont acceptees ; audit final demarre".to_string(),
+            );
+            Ok(())
+        });
+        return;
+    };
+    let task = match ensure_worker_workspace(inner, run, &task) {
+        Ok(task) => task,
+        Err(error) => {
+            mark_needs_attention(inner, &run.id, error);
+            return;
+        }
+    };
+    let prompt = worker_prompt(run, &task);
+    let workspace = task.workspace_dir.clone().unwrap_or_default();
+    let account_id = resolved_worker_account(run, &task).to_string();
+    start_chat_turn(
+        inner,
+        run,
+        OrchestrationTurnKind::Worker,
+        Some(task.id.clone()),
+        account_id,
+        task.session_id.clone(),
+        workspace,
+        ChatTurnMode::Build,
+        prompt,
+    );
+}
+
+fn start_review_turn(inner: &Arc<OrchestrationInner>, run: &OrchestrationSnapshot) {
+    let Some(task_id) = run.current_task_id.as_deref() else {
+        mark_needs_attention(inner, &run.id, "Tache de revue introuvable".to_string());
+        return;
+    };
+    let Some(task) = run.tasks.iter().find(|task| task.id == task_id).cloned() else {
+        mark_needs_attention(inner, &run.id, "Tache de revue introuvable".to_string());
+        return;
+    };
+    if task.status == OrchestrationTaskStatus::Submitted {
+        if let Err(error) = apply_worker_candidate(run, &task) {
+            request_revision(
+                inner,
+                &run.id,
+                &task.id,
+                format!("Le patch du travailleur ne s'applique pas proprement : {error}"),
+            );
+            return;
+        }
+        let now = metrics::now_ts();
+        if let Err(error) = inner.mutate_store(|store| {
+            let current = find_run_mut(store, &run.id)?;
+            let current_task = find_task_mut(current, &task.id)?;
+            current_task.status = OrchestrationTaskStatus::Reviewing;
+            current.updated_at = now;
+            Ok(())
+        }) {
+            mark_needs_attention(inner, &run.id, error);
+            return;
+        }
+    }
+    let refreshed = snapshot_run(inner, &run.id).unwrap_or_else(|_| run.clone());
+    let Some(refreshed_task) = refreshed
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == task.id)
+    else {
+        return;
+    };
+    let prompt = review_prompt(&refreshed, refreshed_task);
+    start_chat_turn(
+        inner,
+        &refreshed,
+        OrchestrationTurnKind::Review,
+        Some(task.id),
+        resolved_orchestrator_account(&refreshed).to_string(),
+        refreshed.orchestrator_session_id.clone(),
+        refreshed.orchestrator_dir.clone(),
+        ChatTurnMode::Build,
+        prompt,
+    );
+}
+
+fn start_final_review_turn(inner: &Arc<OrchestrationInner>, run: &OrchestrationSnapshot) {
+    if let Err(error) =
+        reset_owned_worktree(Path::new(&run.orchestrator_dir), &run.integrated_commit)
+    {
+        mark_needs_attention(inner, &run.id, error);
+        return;
+    }
+    start_chat_turn(
+        inner,
+        run,
+        OrchestrationTurnKind::FinalReview,
+        None,
+        resolved_orchestrator_account(run).to_string(),
+        run.orchestrator_session_id.clone(),
+        run.orchestrator_dir.clone(),
+        ChatTurnMode::Build,
+        final_review_prompt(run),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_chat_turn(
+    inner: &Arc<OrchestrationInner>,
+    run: &OrchestrationSnapshot,
+    kind: OrchestrationTurnKind,
+    task_id: Option<String>,
+    account_id: String,
+    session_id: Option<String>,
+    project_dir: String,
+    mode: ChatTurnMode,
+    prompt: String,
+) {
+    let (prompt, handoff_file_to_clear) =
+        match prompt_with_pending_handoff(run, kind, task_id.as_deref(), prompt) {
+            Ok(value) => value,
+            Err(error) => {
+                mark_needs_attention(inner, &run.id, error);
+                return;
+            }
+        };
+    let now = metrics::now_ts();
+    let start_id = Uuid::new_v4().to_string();
+    let prepared = inner.mutate_store(|store| {
+        let current = find_run_mut(store, &run.id)?;
+        if current.status != OrchestrationStatus::Active
+            || current.current_turn_id.is_some()
+            || current.current_start_id.is_some()
+            || current.current_validation_id.is_some()
+        {
+            return Ok(false);
+        }
+        current.current_start_id = Some(start_id.clone());
+        current.current_turn_kind = Some(kind);
+        current.current_task_id = task_id.clone();
+        current.next_action_at = None;
+        current.updated_at = now;
+        if kind == OrchestrationTurnKind::Worker {
+            if let Some(task_id) = task_id.as_deref() {
+                let task = find_task_mut(current, task_id)?;
+                task.status = OrchestrationTaskStatus::Working;
+                task.attempt_count = task.attempt_count.saturating_add(1);
+            }
+        }
+        Ok(true)
+    });
+    if !matches!(prepared, Ok(true)) {
+        return;
+    }
+
+    let request = StartChatTurnRequest {
+        account_id: account_id.clone(),
+        session_id,
+        prompt,
+        project_dir: Some(project_dir),
+        mode,
+        model: (account_id == run.account_id)
+            .then(|| run.model.clone())
+            .flatten(),
+        reasoning_effort: (account_id == run.account_id)
+            .then(|| run.reasoning_effort.clone())
+            .flatten(),
+        app_connectors: None,
+        app_write_approved: false,
+        agent_tools: Vec::new(),
+        agent_skills: Vec::new(),
+        question_tool: false,
+        proof_tool: kind == OrchestrationTurnKind::Worker,
+        source_chat_key: None,
+    };
+    match inner.chat.start(request) {
+        Ok(snapshot) => {
+            let mut should_stop = false;
+            let mut state_error = None;
+            let mut handoff_consumed = false;
+            let result = inner.mutate_store(|store| {
+                let current = find_run_mut(store, &run.id)?;
+                if current.current_start_id.as_deref() != Some(start_id.as_str()) {
+                    should_stop = true;
+                    return Ok(());
+                }
+                current.current_start_id = None;
+                if current.status != OrchestrationStatus::Active {
+                    should_stop = true;
+                    return Ok(());
+                }
+                current.current_turn_id = Some(snapshot.id);
+                current.consecutive_start_failures = 0;
+                if let Some(found_session) = snapshot.session_id.clone() {
+                    assign_session(current, kind, task_id.as_deref(), found_session)?;
+                }
+                if handoff_file_to_clear.is_some() && snapshot.session_id.is_some() {
+                    if kind == OrchestrationTurnKind::Worker {
+                        let task_id = task_id
+                            .as_deref()
+                            .ok_or_else(|| "Worker absent pour terminer la reprise".to_string())?;
+                        find_task_mut(current, task_id)?.handoff_pending = false;
+                    } else {
+                        current.orchestrator_handoff_pending = false;
+                    }
+                    handoff_consumed = true;
+                }
+                current.updated_at = metrics::now_ts();
+                Ok(())
+            });
+            let state_updated = result.is_ok();
+            if let Err(error) = result {
+                should_stop = true;
+                state_error = Some(error);
+            }
+            if should_stop {
+                let _ = inner.chat.stop(snapshot.id);
+            }
+            if let Some(error) = state_error {
+                record_start_failure(inner, &run.id, &start_id, error);
+            }
+            if state_updated && handoff_consumed && !should_stop {
+                if let Some(path) = handoff_file_to_clear {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        Err(error) => record_start_failure(inner, &run.id, &start_id, error),
+    }
+}
+
+fn poll_turn(
+    inner: &Arc<OrchestrationInner>,
+    run_id: &str,
+    turn_id: u64,
+    kind: OrchestrationTurnKind,
+) {
+    let snapshot = match inner.chat.status(turn_id) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            mark_needs_attention(inner, run_id, error);
+            return;
+        }
+    };
+    if snapshot.session_id.is_some() {
+        let mut consumed_handoff = None;
+        let updated = inner.mutate_store(|store| {
+            let run = find_run_mut(store, run_id)?;
+            if run.current_turn_id != Some(turn_id) {
+                return Ok(());
+            }
+            let task_id = run.current_task_id.clone();
+            assign_session(
+                run,
+                kind,
+                task_id.as_deref(),
+                snapshot.session_id.clone().unwrap_or_default(),
+            )?;
+            let worker_index = if kind == OrchestrationTurnKind::Worker {
+                let task_id = task_id
+                    .as_deref()
+                    .ok_or_else(|| "Worker absent pendant la reprise".to_string())?;
+                let task = find_task_mut(run, task_id)?;
+                if task.handoff_pending {
+                    task.handoff_pending = false;
+                    Some(task.position)
+                } else {
+                    None
+                }
+            } else if run.orchestrator_handoff_pending {
+                run.orchestrator_handoff_pending = false;
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(index) = worker_index {
+                consumed_handoff = Some(handoff_file(
+                    run,
+                    if kind == OrchestrationTurnKind::Worker {
+                        OrchestrationAccountRole::Worker
+                    } else {
+                        OrchestrationAccountRole::Orchestrator
+                    },
+                    (index > 0).then_some(index),
+                ));
+            }
+            Ok(())
+        });
+        if updated.is_ok() {
+            if let Some(path) = consumed_handoff {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    match snapshot.status {
+        ChatTurnStatus::Running | ChatTurnStatus::Finalizing => {}
+        ChatTurnStatus::Completed => complete_turn(inner, run_id, turn_id, kind, &snapshot),
+        ChatTurnStatus::Failed | ChatTurnStatus::Cancelled => {
+            mark_needs_attention(
+                inner,
+                run_id,
+                snapshot.error.unwrap_or_else(|| {
+                    if snapshot.status == ChatTurnStatus::Cancelled {
+                        "Le chat orchestre a ete annule".to_string()
+                    } else {
+                        "Le chat orchestre a echoue".to_string()
+                    }
+                }),
+            );
+        }
+    }
+}
+
+fn complete_turn(
+    inner: &Arc<OrchestrationInner>,
+    run_id: &str,
+    turn_id: u64,
+    kind: OrchestrationTurnKind,
+    snapshot: &ChatTurnSnapshot,
+) {
+    let current = match snapshot_run(inner, run_id) {
+        Ok(run) if run.current_turn_id == Some(turn_id) => run,
+        _ => return,
+    };
+    match kind {
+        OrchestrationTurnKind::Plan => complete_plan(inner, &current, snapshot),
+        OrchestrationTurnKind::Worker => complete_worker(inner, &current, snapshot),
+        OrchestrationTurnKind::Review => complete_review(inner, &current, snapshot),
+        OrchestrationTurnKind::FinalReview => complete_final_review(inner, &current, snapshot),
+    }
+}
+
+fn complete_plan(
+    inner: &Arc<OrchestrationInner>,
+    run: &OrchestrationSnapshot,
+    snapshot: &ChatTurnSnapshot,
+) {
+    let text = snapshot_text(snapshot);
+    let plan = match parse_marked_json::<PlanEnvelope>(&text, "ORCHESTRATION_PLAN:")
+        .and_then(|plan| validate_plan(plan, run.worker_count))
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            protocol_failure(inner, &run.id, None, format!("Plan invalide : {error}"));
+            return;
+        }
+    };
+    let now = metrics::now_ts();
+    let result = inner.mutate_store(|store| {
+        let current = find_run_mut(store, &run.id)?;
+        clear_current_turn(current, snapshot);
+        current.plan_summary = Some(plan.summary.clone());
+        current.protocol_failures = 0;
+        let worker_account_ids = current.worker_account_ids.clone();
+        let fallback_account_id = current.account_id.clone();
+        current.tasks = plan
+            .tasks
+            .into_iter()
+            .enumerate()
+            .map(|(index, task)| OrchestrationTask {
+                id: format!("task-{:02}", index + 1),
+                position: (index + 1) as u32,
+                title: task.title,
+                description: task.description,
+                acceptance_criteria: task.acceptance_criteria,
+                status: OrchestrationTaskStatus::Pending,
+                account_id: worker_account_ids
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| fallback_account_id.clone()),
+                handoff_pending: false,
+                handoff_count: 0,
+                session_id: None,
+                workspace_dir: None,
+                base_commit: None,
+                workspace_generation: 0,
+                attempt_count: 0,
+                protocol_failures: 0,
+                evidence: None,
+                reviews: Vec::new(),
+                last_error: None,
+            })
+            .collect();
+        current.phase = OrchestrationPhase::Working;
+        current.next_action_at = Some(now);
+        current.last_error = None;
+        current.updated_at = now;
+        push_event(
+            current,
+            now,
+            "plan_accepted",
+            format!(
+                "Plan accepte : {} chats travailleurs crees",
+                current.tasks.len()
+            ),
+        );
+        Ok(())
+    });
+    if let Err(error) = result {
+        mark_needs_attention(inner, &run.id, error);
+    }
+}
+
+fn complete_worker(
+    inner: &Arc<OrchestrationInner>,
+    run: &OrchestrationSnapshot,
+    snapshot: &ChatTurnSnapshot,
+) {
+    let Some(task_id) = run.current_task_id.as_deref() else {
+        mark_needs_attention(inner, &run.id, "Tache travailleur absente".to_string());
+        return;
+    };
+    let Some(task) = run.tasks.iter().find(|task| task.id == task_id) else {
+        mark_needs_attention(inner, &run.id, "Tache travailleur absente".to_string());
+        return;
+    };
+    let text = snapshot_text(snapshot);
+    let envelope = match parse_marked_json::<ProofEnvelope>(&text, "ORCHESTRATION_PROOF:")
+        .and_then(validate_proof)
+    {
+        Ok(proof) => proof,
+        Err(error) => {
+            protocol_failure(
+                inner,
+                &run.id,
+                Some(task_id),
+                format!("Preuve travailleur invalide : {error}"),
+            );
+            return;
+        }
+    };
+    let workspace = task.workspace_dir.as_deref().unwrap_or_default();
+    let base_commit = task.base_commit.as_deref().unwrap_or_default();
+    let files_changed = match stage_and_changed_files(Path::new(workspace), base_commit) {
+        Ok(files) if !files.is_empty() => files,
+        Ok(_) => {
+            protocol_failure(
+                inner,
+                &run.id,
+                Some(task_id),
+                "La preuve annonce un travail termine mais aucun fichier n'a change".to_string(),
+            );
+            return;
+        }
+        Err(error) => {
+            mark_needs_attention(inner, &run.id, error);
+            return;
+        }
+    };
+    let now = metrics::now_ts();
+    let result = inner.mutate_store(|store| {
+        let current = find_run_mut(store, &run.id)?;
+        clear_current_turn(current, snapshot);
+        let task_title = {
+            let current_task = find_task_mut(current, task_id)?;
+            current_task.status = OrchestrationTaskStatus::Submitted;
+            current_task.protocol_failures = 0;
+            current_task.last_error = None;
+            current_task.evidence = Some(OrchestrationProof {
+                summary: envelope.summary,
+                files_changed,
+                tests: envelope.tests,
+                risks: envelope.risks,
+                submitted_at: now,
+            });
+            current_task.title.clone()
+        };
+        current.phase = OrchestrationPhase::Reviewing;
+        current.current_task_id = Some(task_id.to_string());
+        current.next_action_at = Some(now);
+        current.last_error = None;
+        current.updated_at = now;
+        push_event(
+            current,
+            now,
+            "proof_submitted",
+            format!("{task_title} a soumis une preuve"),
+        );
+        Ok(())
+    });
+    if let Err(error) = result {
+        mark_needs_attention(inner, &run.id, error);
+    }
+}
+
+fn complete_review(
+    inner: &Arc<OrchestrationInner>,
+    run: &OrchestrationSnapshot,
+    snapshot: &ChatTurnSnapshot,
+) {
+    let Some(task_id) = run.current_task_id.as_deref() else {
+        mark_needs_attention(inner, &run.id, "Tache de revue absente".to_string());
+        return;
+    };
+    let text = snapshot_text(snapshot);
+    let envelope = match parse_marked_json::<ReviewEnvelope>(&text, "ORCHESTRATION_REVIEW:")
+        .and_then(validate_review)
+    {
+        Ok(review) => review,
+        Err(error) => {
+            protocol_failure(
+                inner,
+                &run.id,
+                Some(task_id),
+                format!("Revue orchestrateur invalide : {error}"),
+            );
+            return;
+        }
+    };
+    let now = metrics::now_ts();
+    let decision = envelope.decision;
+    let feedback = envelope.feedback.clone();
+    let result = inner.mutate_store(|store| {
+        let current = find_run_mut(store, &run.id)?;
+        clear_current_turn(current, snapshot);
+        let current_task = find_task_mut(current, task_id)?;
+        current_task.reviews.push(OrchestrationReview {
+            decision,
+            summary: envelope.summary,
+            feedback: feedback.clone(),
+            tests: envelope.tests,
+            created_at: now,
+        });
+        if current_task.reviews.len() > MAX_REVIEWS {
+            current_task
+                .reviews
+                .drain(0..current_task.reviews.len() - MAX_REVIEWS);
+        }
+        current.updated_at = now;
+        Ok(())
+    });
+    if let Err(error) = result {
+        mark_needs_attention(inner, &run.id, error);
+        return;
+    }
+    match decision {
+        OrchestrationReviewDecision::Revise => request_revision(
+            inner,
+            &run.id,
+            task_id,
+            if feedback.trim().is_empty() {
+                "L'orchestrateur demande une revision".to_string()
+            } else {
+                feedback
+            },
+        ),
+        OrchestrationReviewDecision::Accept => {
+            if let Err(error) = begin_validation(
+                inner,
+                &run.id,
+                OrchestrationValidationKind::Task,
+                Some(task_id.to_string()),
+            ) {
+                mark_needs_attention(inner, &run.id, error);
+            }
+        }
+    }
+}
+
+fn complete_final_review(
+    inner: &Arc<OrchestrationInner>,
+    run: &OrchestrationSnapshot,
+    snapshot: &ChatTurnSnapshot,
+) {
+    let text = snapshot_text(snapshot);
+    let envelope = match parse_marked_json::<FinalEnvelope>(&text, "ORCHESTRATION_FINAL:")
+        .and_then(|value| validate_final(value, run))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            protocol_failure(
+                inner,
+                &run.id,
+                None,
+                format!("Audit final invalide : {error}"),
+            );
+            return;
+        }
+    };
+    let now = metrics::now_ts();
+    if let Err(error) = inner.mutate_store(|store| {
+        let current = find_run_mut(store, &run.id)?;
+        clear_current_turn(current, snapshot);
+        current.protocol_failures = 0;
+        current.final_summary = Some(envelope.summary.clone());
+        current.updated_at = now;
+        Ok(())
+    }) {
+        mark_needs_attention(inner, &run.id, error);
+        return;
+    }
+    match envelope.decision {
+        FinalDecision::Complete => {
+            if let Err(error) =
+                begin_validation(inner, &run.id, OrchestrationValidationKind::Final, None)
+            {
+                mark_needs_attention(inner, &run.id, error);
+            }
+        }
+        FinalDecision::Revise => {
+            let task_id = envelope.task_id.unwrap_or_default();
+            reopen_task(
+                inner,
+                &run.id,
+                &task_id,
+                if envelope.feedback.trim().is_empty() {
+                    "L'audit final demande une correction supplementaire".to_string()
+                } else {
+                    envelope.feedback
+                },
+            );
+        }
+    }
+}
+
+fn begin_validation(
+    inner: &Arc<OrchestrationInner>,
+    run_id: &str,
+    kind: OrchestrationValidationKind,
+    task_id: Option<String>,
+) -> Result<(), String> {
+    let _lifecycle = inner
+        .lifecycle
+        .lock()
+        .map_err(|_| "Cycle de vie des orchestrations verrouille".to_string())?;
+    let now = metrics::now_ts();
+    let validation_id = Uuid::new_v4().to_string();
+    let run = inner.mutate_store(|store| {
+        let run = find_run_mut(store, run_id)?;
+        if run.status != OrchestrationStatus::Active || run.current_validation_id.is_some() {
+            return Err("Cette orchestration ne peut pas lancer de validation".to_string());
+        }
+        run.current_validation_id = Some(validation_id.clone());
+        run.current_validation_kind = Some(kind);
+        run.current_task_id = task_id.clone();
+        run.phase = if kind == OrchestrationValidationKind::Task {
+            OrchestrationPhase::Validating
+        } else {
+            OrchestrationPhase::FinalValidation
+        };
+        if let Some(task_id) = task_id.as_deref() {
+            find_task_mut(run, task_id)?.status = OrchestrationTaskStatus::Validating;
+        }
+        run.next_action_at = None;
+        run.updated_at = now;
+        push_event(
+            run,
+            now,
+            "validation_started",
+            if kind == OrchestrationValidationKind::Task {
+                "Validation mecanique de la contribution".to_string()
+            } else {
+                "Validation mecanique finale".to_string()
+            },
+        );
+        Ok(run.clone())
+    })?;
+
+    let validation = Arc::new(ValidationRun {
+        id: validation_id.clone(),
+        cancelled: AtomicBool::new(false),
+    });
+    if let Ok(mut runs) = inner.validation_runs.lock() {
+        if let Some(previous) = runs.insert(run.id.clone(), validation.clone()) {
+            previous.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+    let thread_inner = Arc::clone(inner);
+    let thread_run = run.clone();
+    let thread_validation = validation.clone();
+    let thread_task_id = task_id.clone();
+    let spawned = thread::Builder::new()
+        .name(format!("cst-orchestration-test-{}", short_id(&run.id)))
+        .spawn(move || {
+            let result = run_validation_command(&thread_run, &thread_validation.cancelled);
+            finish_validation(
+                &thread_inner,
+                &thread_run.id,
+                &thread_validation.id,
+                kind,
+                thread_task_id.as_deref(),
+                result,
+            );
+            if let Ok(mut runs) = thread_inner.validation_runs.lock() {
+                if runs
+                    .get(&thread_run.id)
+                    .is_some_and(|known| known.id == thread_validation.id)
+                {
+                    runs.remove(&thread_run.id);
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        finish_validation(
+            inner,
+            &run.id,
+            &validation_id,
+            kind,
+            task_id.as_deref(),
+            ValidationResult {
+                passed: false,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!("Impossible de demarrer la validation : {error}"),
+            },
+        );
+        if let Ok(mut runs) = inner.validation_runs.lock() {
+            if runs
+                .get(&run.id)
+                .is_some_and(|known| known.id == validation_id)
+            {
+                runs.remove(&run.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn finish_validation(
+    inner: &Arc<OrchestrationInner>,
+    run_id: &str,
+    validation_id: &str,
+    kind: OrchestrationValidationKind,
+    task_id: Option<&str>,
+    result: ValidationResult,
+) {
+    let run = match snapshot_run(inner, run_id) {
+        Ok(run) if run.current_validation_id.as_deref() == Some(validation_id) => run,
+        _ => return,
+    };
+    if !result.passed {
+        let message = format!(
+            "Validation echouee{} apres {} ms :\n{}",
+            result
+                .exit_code
+                .map(|code| format!(" (code {code})"))
+                .unwrap_or_default(),
+            result.duration_ms,
+            result.output
+        );
+        if kind == OrchestrationValidationKind::Task {
+            if let Some(task_id) = task_id {
+                request_revision(inner, run_id, task_id, message);
+            }
+        } else {
+            let now = metrics::now_ts();
+            let _ = reset_owned_worktree(Path::new(&run.orchestrator_dir), &run.integrated_commit);
+            let update = inner.mutate_store(|store| {
+                let current = find_run_mut(store, run_id)?;
+                if current.current_validation_id.as_deref() != Some(validation_id) {
+                    return Ok(());
+                }
+                current.current_validation_id = None;
+                current.current_validation_kind = None;
+                current.phase = OrchestrationPhase::FinalReview;
+                current.next_action_at = Some(now);
+                current.last_error = Some(truncate(&message, MAX_TEXT_CHARS));
+                current.updated_at = now;
+                push_event(
+                    current,
+                    now,
+                    "final_validation_failed",
+                    "L'audit final doit attribuer la correction a un travailleur".to_string(),
+                );
+                Ok(())
+            });
+            if let Err(error) = update {
+                mark_needs_attention(inner, run_id, error);
+            }
+        }
+        return;
+    }
+
+    let commit_message = if kind == OrchestrationValidationKind::Task {
+        let title = task_id
+            .and_then(|id| run.tasks.iter().find(|task| task.id == id))
+            .map(|task| task.title.as_str())
+            .unwrap_or("contribution");
+        format!("orchestration: {title}")
+    } else {
+        "orchestration: audit final".to_string()
+    };
+    let integrated_commit = match commit_owned_worktree(&run, &commit_message) {
+        Ok(commit) => commit,
+        Err(error) => {
+            mark_needs_attention(inner, run_id, error);
+            return;
+        }
+    };
+    let now = metrics::now_ts();
+    let update = inner.mutate_store(|store| {
+        let current = find_run_mut(store, run_id)?;
+        if current.current_validation_id.as_deref() != Some(validation_id) {
+            return Ok(());
+        }
+        current.current_validation_id = None;
+        current.current_validation_kind = None;
+        current.integrated_commit = integrated_commit.clone();
+        current.last_error = None;
+        current.updated_at = now;
+        if kind == OrchestrationValidationKind::Task {
+            let task_id = task_id.ok_or_else(|| "Tache validee absente".to_string())?;
+            let task_title = {
+                let task = find_task_mut(current, task_id)?;
+                task.status = OrchestrationTaskStatus::Accepted;
+                task.last_error = None;
+                task.title.clone()
+            };
+            current.phase = OrchestrationPhase::Working;
+            current.current_task_id = None;
+            current.next_action_at = Some(now);
+            push_event(
+                current,
+                now,
+                "task_accepted",
+                format!("{task_title} acceptee et integree"),
+            );
+        } else {
+            current.phase = OrchestrationPhase::Publishing;
+            current.current_task_id = None;
+            current.next_action_at = Some(now);
+            push_event(
+                current,
+                now,
+                "final_validation_passed",
+                "Audit final et commande de validation reussis".to_string(),
+            );
+        }
+        Ok(())
+    });
+    if let Err(error) = update {
+        mark_needs_attention(inner, run_id, error);
+    }
+}
+
+fn request_revision(
+    inner: &Arc<OrchestrationInner>,
+    run_id: &str,
+    task_id: &str,
+    feedback: String,
+) {
+    let run = match snapshot_run(inner, run_id) {
+        Ok(run) => run,
+        Err(_) => return,
+    };
+    if let Err(error) =
+        reset_owned_worktree(Path::new(&run.orchestrator_dir), &run.integrated_commit)
+    {
+        mark_needs_attention(inner, run_id, error);
+        return;
+    }
+    let now = metrics::now_ts();
+    let feedback = truncate(&feedback, MAX_TEXT_CHARS);
+    let update = inner.mutate_store(|store| {
+        let current = find_run_mut(store, run_id)?;
+        current.current_turn_id = None;
+        current.current_turn_kind = None;
+        current.current_start_id = None;
+        current.current_validation_id = None;
+        current.current_validation_kind = None;
+        let task_title = {
+            let task = find_task_mut(current, task_id)?;
+            task.status = OrchestrationTaskStatus::RevisionRequested;
+            task.last_error = Some(feedback.clone());
+            task.title.clone()
+        };
+        current.phase = OrchestrationPhase::Working;
+        current.current_task_id = Some(task_id.to_string());
+        current.next_action_at = Some(now);
+        current.last_error = Some(feedback.clone());
+        current.updated_at = now;
+        push_event(
+            current,
+            now,
+            "revision_requested",
+            format!("Revision renvoyee a {task_title}"),
+        );
+        Ok(())
+    });
+    if let Err(error) = update {
+        mark_needs_attention(inner, run_id, error);
+    }
+}
+
+fn reopen_task(inner: &Arc<OrchestrationInner>, run_id: &str, task_id: &str, feedback: String) {
+    let run = match snapshot_run(inner, run_id) {
+        Ok(run) => run,
+        Err(_) => return,
+    };
+    if let Err(error) =
+        reset_owned_worktree(Path::new(&run.orchestrator_dir), &run.integrated_commit)
+    {
+        mark_needs_attention(inner, run_id, error);
+        return;
+    }
+    let now = metrics::now_ts();
+    let update = inner.mutate_store(|store| {
+        let current = find_run_mut(store, run_id)?;
+        let task_title = {
+            let task = find_task_mut(current, task_id)?;
+            task.status = OrchestrationTaskStatus::RevisionRequested;
+            task.workspace_dir = None;
+            task.base_commit = None;
+            task.evidence = None;
+            task.last_error = Some(truncate(&feedback, MAX_TEXT_CHARS));
+            task.title.clone()
+        };
+        current.phase = OrchestrationPhase::Working;
+        current.current_task_id = Some(task_id.to_string());
+        current.next_action_at = Some(now);
+        current.last_error = Some(truncate(&feedback, MAX_TEXT_CHARS));
+        current.updated_at = now;
+        push_event(
+            current,
+            now,
+            "task_reopened",
+            format!("{task_title} rouverte apres l'audit final"),
+        );
+        Ok(())
+    });
+    if let Err(error) = update {
+        mark_needs_attention(inner, run_id, error);
+    }
+}
+
+fn protocol_failure(
+    inner: &Arc<OrchestrationInner>,
+    run_id: &str,
+    task_id: Option<&str>,
+    error: String,
+) {
+    let now = metrics::now_ts();
+    let error = truncate(&error, MAX_TEXT_CHARS);
+    let update = inner.mutate_store(|store| {
+        let run = find_run_mut(store, run_id)?;
+        run.current_turn_id = None;
+        run.current_turn_kind = None;
+        run.current_start_id = None;
+        let failures = if let Some(task_id) = task_id {
+            let task = find_task_mut(run, task_id)?;
+            task.protocol_failures = task.protocol_failures.saturating_add(1);
+            task.last_error = Some(error.clone());
+            task.protocol_failures
+        } else {
+            run.protocol_failures = run.protocol_failures.saturating_add(1);
+            run.protocol_failures
+        };
+        run.last_error = Some(error.clone());
+        run.updated_at = now;
+        if failures >= MAX_PROTOCOL_FAILURES {
+            run.status = OrchestrationStatus::NeedsAttention;
+            run.next_action_at = None;
+            push_event(
+                run,
+                now,
+                "protocol_failed",
+                "Protocole structure invalide trois fois ; intervention requise".to_string(),
+            );
+        } else {
+            run.next_action_at = Some(now);
+            push_event(
+                run,
+                now,
+                "protocol_retry",
+                format!(
+                    "Nouvelle demande de format structure ({failures}/{MAX_PROTOCOL_FAILURES})"
+                ),
+            );
+        }
+        Ok(())
+    });
+    if let Err(persist_error) = update {
+        eprintln!("[orchestration] erreur de protocole non persistee: {persist_error}");
+    }
+}
+
+fn record_start_failure(
+    inner: &Arc<OrchestrationInner>,
+    run_id: &str,
+    start_id: &str,
+    error: String,
+) {
+    let now = metrics::now_ts();
+    let transient = error.to_ascii_lowercase().contains("deja")
+        || error.to_ascii_lowercase().contains("déjà")
+        || error.to_ascii_lowercase().contains("already");
+    let _ = inner.mutate_store(|store| {
+        let run = find_run_mut(store, run_id)?;
+        if run.current_start_id.as_deref() != Some(start_id) {
+            return Ok(());
+        }
+        run.current_start_id = None;
+        run.current_turn_id = None;
+        run.current_turn_kind = None;
+        run.last_error = Some(truncate(&error, MAX_TEXT_CHARS));
+        if transient {
+            run.next_action_at = Some(now + 2);
+        } else {
+            run.consecutive_start_failures = run.consecutive_start_failures.saturating_add(1);
+            if run.consecutive_start_failures >= MAX_START_FAILURES {
+                run.status = OrchestrationStatus::NeedsAttention;
+                run.next_action_at = None;
+            } else {
+                run.next_action_at = Some(now + 5);
+            }
+        }
+        run.updated_at = now;
+        Ok(())
+    });
+}
+
+fn mark_needs_attention(inner: &Arc<OrchestrationInner>, run_id: &str, error: String) {
+    let now = metrics::now_ts();
+    let error = truncate(&error, MAX_TEXT_CHARS);
+    if let Err(persist_error) = inner.mutate_store(|store| {
+        let run = find_run_mut(store, run_id)?;
+        run.status = OrchestrationStatus::NeedsAttention;
+        run.current_turn_id = None;
+        run.current_turn_kind = None;
+        run.current_start_id = None;
+        run.current_validation_id = None;
+        run.current_validation_kind = None;
+        run.next_action_at = None;
+        run.last_error = Some(error.clone());
+        run.updated_at = now;
+        push_event(run, now, "needs_attention", error.clone());
+        Ok(())
+    }) {
+        eprintln!("[orchestration] erreur non persistee pour {run_id}: {persist_error}");
+    }
+}
+
+fn ensure_worker_workspace(
+    inner: &Arc<OrchestrationInner>,
+    run: &OrchestrationSnapshot,
+    task: &OrchestrationTask,
+) -> Result<OrchestrationTask, String> {
+    if task
+        .workspace_dir
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_dir())
+        && task.base_commit.is_some()
+    {
+        return Ok(task.clone());
+    }
+    let generation = task.workspace_generation.saturating_add(1);
+    let workspace = Path::new(&run.sandbox_root)
+        .join("workers")
+        .join(format!("{}-{:02}", task.id, generation));
+    if let Some(parent) = workspace.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    add_worktree(
+        Path::new(&run.project_dir),
+        &workspace,
+        &run.integrated_commit,
+    )?;
+    let workspace_text = workspace.to_string_lossy().to_string();
+    inner.mutate_store(|store| {
+        let current = find_run_mut(store, &run.id)?;
+        let current_task = find_task_mut(current, &task.id)?;
+        current_task.workspace_dir = Some(workspace_text.clone());
+        current_task.base_commit = Some(run.integrated_commit.clone());
+        current_task.workspace_generation = generation;
+        Ok(current_task.clone())
+    })
+}
+
+fn apply_worker_candidate(
+    run: &OrchestrationSnapshot,
+    task: &OrchestrationTask,
+) -> Result<(), String> {
+    let workspace = task
+        .workspace_dir
+        .as_deref()
+        .ok_or_else(|| "Environnement du travailleur absent".to_string())?;
+    let base = task
+        .base_commit
+        .as_deref()
+        .ok_or_else(|| "Commit de base du travailleur absent".to_string())?;
+    reset_owned_worktree(Path::new(&run.orchestrator_dir), &run.integrated_commit)?;
+    stage_and_changed_files(Path::new(workspace), base)?;
+    let patch_path = Path::new(&run.sandbox_root).join(format!("{}.patch", task.id));
+    git_output_file(
+        Path::new(workspace),
+        ["diff", "--cached", "--binary", base],
+        &patch_path,
+    )?;
+    let metadata = fs::metadata(&patch_path).map_err(|error| error.to_string())?;
+    if metadata.len() == 0 {
+        return Err("Le patch du travailleur est vide".to_string());
+    }
+    run_git(
+        Path::new(&run.orchestrator_dir),
+        ["apply", "--index", "--whitespace=nowarn"],
+        Some(&patch_path),
+    )?;
+    Ok(())
+}
+
+fn publish_run(inner: &Arc<OrchestrationInner>, run: &OrchestrationSnapshot) {
+    match apply_final_patch(run) {
+        Ok(()) => {
+            let now = metrics::now_ts();
+            let update = inner.mutate_store(|store| {
+                let current = find_run_mut(store, &run.id)?;
+                current.status = OrchestrationStatus::Completed;
+                current.phase = OrchestrationPhase::Completed;
+                current.publish_applied = true;
+                current.next_action_at = None;
+                current.last_error = None;
+                current.updated_at = now;
+                push_event(
+                    current,
+                    now,
+                    "completed",
+                    "Projet final valide et applique au dossier source".to_string(),
+                );
+                Ok(())
+            });
+            if let Err(error) = update {
+                mark_needs_attention(inner, &run.id, error);
+            }
+        }
+        Err(error) => mark_needs_attention(inner, &run.id, error),
+    }
+}
+
+fn apply_final_patch(run: &OrchestrationSnapshot) -> Result<(), String> {
+    let source = Path::new(&run.project_dir);
+    let head = git_text(source, ["rev-parse", "HEAD"])?;
+    if head.trim() != run.base_commit {
+        return Err(
+            "Le projet source a change de commit pendant l'orchestration. Le rendu reste disponible dans le sandbox orchestrateur et n'a pas ete applique."
+                .to_string(),
+        );
+    }
+    let patch_path = Path::new(&run.sandbox_root).join("final.patch");
+    git_output_file(
+        Path::new(&run.orchestrator_dir),
+        ["diff", "--binary", &run.base_commit, &run.integrated_commit],
+        &patch_path,
+    )?;
+    if fs::metadata(&patch_path)
+        .map_err(|error| error.to_string())?
+        .len()
+        == 0
+    {
+        ensure_clean_repository(source)?;
+        return Ok(());
+    }
+    if let Err(clean_error) = ensure_clean_repository(source) {
+        if worktree_matches_commit(source, &run.integrated_commit, Path::new(&run.sandbox_root))? {
+            return Ok(());
+        }
+        return Err(clean_error);
+    }
+    run_git(source, ["apply", "--check"], Some(&patch_path))?;
+    run_git(source, ["apply", "--whitespace=nowarn"], Some(&patch_path))
+}
+
+fn worktree_matches_commit(path: &Path, commit: &str, scratch_dir: &Path) -> Result<bool, String> {
+    let index_path = scratch_dir.join(format!(".publish-verify-{}.index", Uuid::new_v4()));
+    let lock_path = index_path.with_extension("index.lock");
+    let result = (|| {
+        let read_tree = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .env("GIT_INDEX_FILE", &index_path)
+            .args(["read-tree", commit])
+            .output()
+            .map_err(|error| format!("Git est indisponible : {error}"))?;
+        if !read_tree.status.success() {
+            return Err(command_error(
+                "Preparation de la verification du rendu impossible",
+                &read_tree,
+            ));
+        }
+
+        // `read-tree` connait les blobs attendus mais pas encore les metadonnees
+        // du worktree courant. Le rafraichissement evite que Git signale chaque
+        // fichier comme modifie uniquement parce que son stat cache est vide.
+        let refresh = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .env("GIT_INDEX_FILE", &index_path)
+            .args(["update-index", "--refresh"])
+            .output()
+            .map_err(|error| format!("Git est indisponible : {error}"))?;
+        if !refresh.status.success() && refresh.status.code() != Some(1) {
+            return Err(command_error(
+                "Rafraichissement de la verification du rendu impossible",
+                &refresh,
+            ));
+        }
+
+        let tracked = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .env("GIT_INDEX_FILE", &index_path)
+            .args(["diff-files", "--quiet", "--ignore-submodules"])
+            .output()
+            .map_err(|error| format!("Git est indisponible : {error}"))?;
+        if !tracked.status.success() {
+            if tracked.status.code() == Some(1) {
+                return Ok(false);
+            }
+            return Err(command_error(
+                "Comparaison du rendu applique impossible",
+                &tracked,
+            ));
+        }
+
+        let untracked = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .env("GIT_INDEX_FILE", &index_path)
+            .args(["ls-files", "--others", "--exclude-standard", "-z"])
+            .output()
+            .map_err(|error| format!("Git est indisponible : {error}"))?;
+        if !untracked.status.success() {
+            return Err(command_error(
+                "Verification des fichiers supplementaires impossible",
+                &untracked,
+            ));
+        }
+        Ok(untracked.stdout.is_empty())
+    })();
+    let _ = fs::remove_file(&index_path);
+    let _ = fs::remove_file(lock_path);
+    result
+}
+
+fn commit_owned_worktree(run: &OrchestrationSnapshot, message: &str) -> Result<String, String> {
+    let dir = Path::new(&run.orchestrator_dir);
+    run_git(dir, ["add", "-A"], None)?;
+    let status = git_status(dir, ["diff", "--cached", "--quiet", "--exit-code"])?;
+    if status.success() {
+        return git_text(dir, ["rev-parse", "HEAD"]);
+    }
+    let hooks = Path::new(&run.sandbox_root).join("empty-hooks");
+    fs::create_dir_all(&hooks).map_err(|error| error.to_string())?;
+    let hooks_text = hooks.to_string_lossy().to_string();
+    run_git(
+        dir,
+        [
+            "-c",
+            "user.name=Codex Switch Orchestrator",
+            "-c",
+            "user.email=orchestrator@codex-switch.local",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            &format!("core.hooksPath={hooks_text}"),
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        ],
+        None,
+    )?;
+    git_text(dir, ["rev-parse", "HEAD"])
+}
+
+fn run_validation_command(run: &OrchestrationSnapshot, cancelled: &AtomicBool) -> ValidationResult {
+    let started = Instant::now();
+    let mut command = shell_command(&run.test_command);
+    command
+        .current_dir(&run.orchestrator_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_process_window(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return ValidationResult {
+                passed: false,
+                exit_code: None,
+                duration_ms: 0,
+                output: format!("Impossible de lancer la commande : {error}"),
+            };
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_thread = stdout.map(|stream| thread::spawn(move || read_capped(stream)));
+    let stderr_thread = stderr.map(|stream| thread::spawn(move || read_capped(stream)));
+    let timeout = Duration::from_secs(run.test_timeout_seconds);
+    let mut exit = None;
+    let mut forced_error = None;
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            terminate_process_tree(&mut child);
+            forced_error = Some("Validation annulee".to_string());
+            break;
+        }
+        if started.elapsed() >= timeout {
+            terminate_process_tree(&mut child);
+            forced_error = Some(format!(
+                "Validation interrompue apres le timeout de {} s",
+                run.test_timeout_seconds
+            ));
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit = Some(status);
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                terminate_process_tree(&mut child);
+                forced_error = Some(format!("Lecture du processus impossible : {error}"));
+                break;
+            }
+        }
+    }
+    let _ = child.wait();
+    let stdout = stdout_thread
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_thread
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default();
+    let mut output = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(ref error) = forced_error {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(error);
+    }
+    if output.is_empty() {
+        output = "Commande terminee sans sortie".to_string();
+    }
+    let exit_code = exit.as_ref().and_then(ExitStatus::code);
+    ValidationResult {
+        passed: exit.is_some_and(|status| status.success()) && forced_error.is_none(),
+        exit_code,
+        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        output: truncate(&output, MAX_TEST_OUTPUT_BYTES),
+    }
+}
+
+fn read_capped(mut reader: impl Read) -> String {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if retained.len() < MAX_TEST_OUTPUT_BYTES {
+            let remaining = MAX_TEST_OUTPUT_BYTES - retained.len();
+            retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+    }
+    String::from_utf8_lossy(&retained).to_string()
+}
+
+fn plan_prompt(run: &OrchestrationSnapshot) -> String {
+    let retry = run
+        .last_error
+        .as_deref()
+        .map(|error| format!("\nLe format precedent a ete refuse : {error}\n"))
+        .unwrap_or_default();
+    format!(
+        "Tu es l'agent orchestrateur du chat orchestre \"{}\". Tu travailles dans un worktree Git prive et tu ne dois rien modifier pendant cette phase de planification.\n\nObjectif utilisateur :\n{}\n\nInspecte le projet et decoupe l'objectif en exactement {} taches d'implementation coherentes, petites et testables : l'utilisateur a choisi {} workers en plus de toi, et chaque tache doit etre confiee a un worker distinct. L'execution sera sequentielle : chaque tache aura son propre chat travailleur et son propre worktree, puis tu reverras son patch dans ton environnement. Evite les taches purement administratives. Chaque critere d'acceptation doit etre observable.{}\nTermine par exactement une ligne, sans bloc Markdown :\nORCHESTRATION_PLAN: {{\"summary\":\"strategie concise\",\"tasks\":[{{\"title\":\"titre\",\"description\":\"travail attendu\",\"acceptanceCriteria\":[\"critere verifiable\"]}}]}}",
+        run.name, run.objective, run.worker_count, run.worker_count, retry
+    )
+}
+
+fn worker_prompt(run: &OrchestrationSnapshot, task: &OrchestrationTask) -> String {
+    let criteria = task
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let revision = task
+        .last_error
+        .as_deref()
+        .map(|feedback| {
+            format!(
+                "\nRetour obligatoire de l'orchestrateur ou de la validation :\n{feedback}\nCorrige cette cause avant de resoumettre."
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "Tu es le travailleur charge de la tache {} du chat orchestre \"{}\". Ton environnement Git est isole. Respecte les changements existants et reste strictement dans le perimetre de cette tache.\n\nObjectif global :\n{}\n\nTache : {}\n{}\n\nCriteres d'acceptation :\n{}{}\n\nImplemente la tache, inspecte le diff reel et execute les tests pertinents. Ne declare jamais une garantie absolue d'absence de bug : fournis des preuves reproductibles. Une preuve sans test reussi ou sans modification reelle sera refusee. N'effectue aucune publication ni action externe irreversible.\n\nTermine par exactement une ligne, sans bloc Markdown :\nORCHESTRATION_PROOF: {{\"summary\":\"resultat obtenu\",\"filesChanged\":[\"chemin\"],\"tests\":[{{\"command\":\"commande executee\",\"result\":\"resultat observe\",\"passed\":true}}],\"risks\":[]}}",
+        task.position,
+        run.name,
+        run.objective,
+        task.title,
+        task.description,
+        criteria,
+        revision
+    )
+}
+
+fn review_prompt(run: &OrchestrationSnapshot, task: &OrchestrationTask) -> String {
+    let proof = task
+        .evidence
+        .as_ref()
+        .map(|proof| serde_json::to_string(proof).unwrap_or_default())
+        .unwrap_or_default();
+    format!(
+        "Tu es l'agent orchestrateur. Le patch de la tache {} est applique et stage dans TON worktree prive. Inspecte `git diff --cached`, confronte-le aux criteres, execute des tests pertinents et cherche activement bugs, regressions, manque de couverture et ameliorations necessaires. Tu peux corriger de petites imperfections directement dans ton environnement ; toute correction substantielle doit etre renvoyee au travailleur.\n\nTache : {}\n{}\nCriteres :\n{}\n\nPreuve soumise :\n{}\n\nDecision `accept` seulement si la contribution est propre, complete et testee. Sinon `revise` avec un retour precis et actionnable. La commande globale `{}` sera executee mecaniquement apres ton acceptation.\n\nTermine par exactement une ligne, sans bloc Markdown :\nORCHESTRATION_REVIEW: {{\"decision\":\"accept\",\"summary\":\"constat\",\"feedback\":\"\",\"tests\":[{{\"command\":\"commande executee\",\"result\":\"resultat observe\",\"passed\":true}}]}}",
+        task.position,
+        task.title,
+        task.description,
+        task.acceptance_criteria.join("\n- "),
+        proof,
+        run.test_command
+    )
+}
+
+fn final_review_prompt(run: &OrchestrationSnapshot) -> String {
+    let tasks = run
+        .tasks
+        .iter()
+        .map(|task| format!("- {}: {}", task.id, task.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let previous_failure = run
+        .last_error
+        .as_deref()
+        .map(|error| format!("\nLa derniere validation finale a echoue :\n{error}\n"))
+        .unwrap_or_default();
+    format!(
+        "Tu es l'agent orchestrateur et toutes les contributions sont integrees dans ton environnement prive. Realise l'audit final de l'objectif complet : inspecte le diff depuis le commit de base, execute les tests, recherche les regressions et les ameliorations indispensables.{}\nObjectif :\n{}\n\nTaches disponibles pour un retour :\n{}\n\nSi un probleme subsiste, choisis exactement un taskId et renvoie-le au travailleur avec un feedback actionnable. Sinon declare complete. La commande globale `{}` sera encore executee mecaniquement avant le rendu.\n\nTermine par exactement une ligne, sans bloc Markdown :\nORCHESTRATION_FINAL: {{\"decision\":\"complete\",\"summary\":\"resultat final\",\"taskId\":null,\"feedback\":\"\",\"tests\":[{{\"command\":\"commande executee\",\"result\":\"resultat observe\",\"passed\":true}}]}}",
+        previous_failure, run.objective, tasks, run.test_command
+    )
+}
+
+fn snapshot_text(snapshot: &ChatTurnSnapshot) -> String {
+    snapshot
+        .parts
+        .iter()
+        .filter_map(|part| part.text.as_deref())
+        .chain(
+            snapshot
+                .thoughts
+                .iter()
+                .map(|thought| thought.text.as_str()),
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_marked_json<T: for<'de> Deserialize<'de>>(text: &str, marker: &str) -> Result<T, String> {
+    let payload = text
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix(marker).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("ligne {marker} absente"))?;
+    serde_json::from_str(payload).map_err(|error| format!("JSON invalide : {error}"))
+}
+
+fn validate_plan(mut plan: PlanEnvelope, worker_count: u32) -> Result<PlanEnvelope, String> {
+    plan.summary = validate_short_text(&plan.summary, "Le resume du plan")?;
+    if plan.tasks.is_empty() {
+        return Err("le plan ne contient aucune tache".to_string());
+    }
+    if plan.tasks.len() != worker_count as usize {
+        return Err(format!(
+            "le plan doit contenir exactement {worker_count} tache{} (une par worker), mais il en contient {}",
+            if worker_count > 1 { "s" } else { "" },
+            plan.tasks.len()
+        ));
+    }
+    for task in &mut plan.tasks {
+        task.title = validate_short_text(&task.title, "Le titre d'une tache")?;
+        task.description = validate_short_text(&task.description, "La description d'une tache")?;
+        task.acceptance_criteria = task
+            .acceptance_criteria
+            .drain(..)
+            .map(|value| validate_short_text(&value, "Un critere d'acceptation"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if task.acceptance_criteria.is_empty() {
+            return Err(format!("la tache '{}' n'a aucun critere", task.title));
+        }
+    }
+    Ok(plan)
+}
+
+fn validate_proof(mut proof: ProofEnvelope) -> Result<ProofEnvelope, String> {
+    proof.summary = validate_short_text(&proof.summary, "Le resume de la preuve")?;
+    if proof.tests.is_empty() {
+        return Err("aucun test n'est fourni".to_string());
+    }
+    if proof.tests.iter().any(|test| !test.passed) {
+        return Err("au moins un test soumis est en echec".to_string());
+    }
+    for test in &mut proof.tests {
+        test.command = validate_short_text(&test.command, "La commande de test")?;
+        test.result = validate_short_text(&test.result, "Le resultat de test")?;
+    }
+    proof.files_changed = proof
+        .files_changed
+        .into_iter()
+        .filter_map(|value| normalize_optional(Some(value)))
+        .collect();
+    proof.risks = proof
+        .risks
+        .into_iter()
+        .filter_map(|value| normalize_optional(Some(value)))
+        .map(|value| truncate(&value, 2_000))
+        .collect();
+    Ok(proof)
+}
+
+fn validate_review(mut review: ReviewEnvelope) -> Result<ReviewEnvelope, String> {
+    review.summary = validate_short_text(&review.summary, "Le resume de la revue")?;
+    review.feedback = truncate(review.feedback.trim(), MAX_TEXT_CHARS);
+    if review.decision == OrchestrationReviewDecision::Accept {
+        if review.tests.is_empty() {
+            return Err("une acceptation sans test est interdite".to_string());
+        }
+        if review.tests.iter().any(|test| !test.passed) {
+            return Err("une acceptation contient un test en echec".to_string());
+        }
+    } else if review.feedback.is_empty() {
+        return Err("une revision doit contenir un feedback".to_string());
+    }
+    Ok(review)
+}
+
+fn validate_final(
+    mut final_review: FinalEnvelope,
+    run: &OrchestrationSnapshot,
+) -> Result<FinalEnvelope, String> {
+    final_review.summary = validate_short_text(&final_review.summary, "Le resume final")?;
+    final_review.feedback = truncate(final_review.feedback.trim(), MAX_TEXT_CHARS);
+    match final_review.decision {
+        FinalDecision::Complete => {
+            if final_review.tests.is_empty() || final_review.tests.iter().any(|test| !test.passed) {
+                return Err("la conclusion finale exige au moins un test reussi".to_string());
+            }
+            final_review.task_id = None;
+        }
+        FinalDecision::Revise => {
+            let task_id = final_review
+                .task_id
+                .as_deref()
+                .ok_or_else(|| "taskId absent pour la revision".to_string())?;
+            if !run.tasks.iter().any(|task| task.id == task_id) {
+                return Err(format!("taskId inconnu : {task_id}"));
+            }
+            if final_review.feedback.is_empty() {
+                return Err("le feedback de revision est vide".to_string());
+            }
+        }
+    }
+    Ok(final_review)
+}
+
+fn next_open_task(run: &OrchestrationSnapshot) -> Option<&OrchestrationTask> {
+    if let Some(current_id) = run.current_task_id.as_deref() {
+        if let Some(task) = run
+            .tasks
+            .iter()
+            .find(|task| task.id == current_id && task.status != OrchestrationTaskStatus::Accepted)
+        {
+            return Some(task);
+        }
+    }
+    run.tasks
+        .iter()
+        .find(|task| task.status != OrchestrationTaskStatus::Accepted)
+}
+
+fn assign_session(
+    run: &mut OrchestrationSnapshot,
+    kind: OrchestrationTurnKind,
+    task_id: Option<&str>,
+    session_id: String,
+) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Ok(());
+    }
+    if kind == OrchestrationTurnKind::Worker {
+        let id = task_id.ok_or_else(|| "Tache absente pour la session".to_string())?;
+        find_task_mut(run, id)?.session_id = Some(session_id);
+    } else {
+        run.orchestrator_session_id = Some(session_id);
+    }
+    Ok(())
+}
+
+fn clear_current_turn(run: &mut OrchestrationSnapshot, snapshot: &ChatTurnSnapshot) {
+    run.current_turn_id = None;
+    run.current_turn_kind = None;
+    run.current_start_id = None;
+    if let Some(session_id) = snapshot.session_id.clone() {
+        if let Some(task_id) = run.current_task_id.clone() {
+            if let Ok(task) = find_task_mut(run, &task_id) {
+                if task.status == OrchestrationTaskStatus::Working {
+                    task.session_id = Some(session_id);
+                    return;
+                }
+            }
+        }
+        run.orchestrator_session_id = Some(session_id);
+    }
+}
+
+fn recover_phase_for_resume(run: &mut OrchestrationSnapshot, now: i64) {
+    run.current_turn_id = None;
+    run.current_turn_kind = None;
+    run.current_start_id = None;
+    run.current_validation_id = None;
+    run.current_validation_kind = None;
+    match run.phase {
+        OrchestrationPhase::Reviewing | OrchestrationPhase::Validating => {
+            if let Some(task_id) = run.current_task_id.clone() {
+                if let Ok(task) = find_task_mut(run, &task_id) {
+                    task.status = OrchestrationTaskStatus::RevisionRequested;
+                    task.last_error = Some(
+                        "Cycle de revue interrompu ; verifie le travail et resoumets la preuve"
+                            .to_string(),
+                    );
+                }
+            }
+            run.phase = OrchestrationPhase::Working;
+        }
+        OrchestrationPhase::FinalValidation => run.phase = OrchestrationPhase::FinalReview,
+        OrchestrationPhase::Completed => {}
+        _ => {}
+    }
+    run.next_action_at = Some(now);
+}
+
+fn inspect_source_repository(raw: &str) -> Result<(PathBuf, String), String> {
+    let path = Path::new(raw.trim());
+    if !path.is_dir() {
+        return Err("Le dossier projet n'existe pas".to_string());
+    }
+    let root_text = git_text(path, ["rev-parse", "--show-toplevel"])
+        .map_err(|_| "Le chat orchestre exige pour l'instant un depot Git".to_string())?;
+    let root = PathBuf::from(root_text.trim());
+    ensure_clean_repository(&root)?;
+    let base_commit = git_text(&root, ["rev-parse", "HEAD"])?;
+    Ok((root, base_commit))
+}
+
+fn ensure_clean_repository(path: &Path) -> Result<(), String> {
+    let status = git_text(path, ["status", "--porcelain", "--untracked-files=all"])?;
+    if status.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(
+            "Le depot doit etre propre avant de demarrer ou de publier un chat orchestre. Commit ou stash les changements presents."
+                .to_string(),
+        )
+    }
+}
+
+fn add_worktree(repo: &Path, target: &Path, commit: &str) -> Result<(), String> {
+    if target.exists() {
+        return Err(format!("Le sandbox existe deja : {}", target.display()));
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(target)
+        .arg(commit)
+        .output()
+        .map_err(|error| format!("Git est indisponible : {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error("Creation du worktree impossible", &output))
+    }
+}
+
+fn reset_owned_worktree(path: &Path, commit: &str) -> Result<(), String> {
+    if !path.is_dir() {
+        return Err(format!("Sandbox introuvable : {}", path.display()));
+    }
+    run_git(path, ["reset", "--hard", commit], None)?;
+    run_git(path, ["clean", "-fd"], None)
+}
+
+fn stage_and_changed_files(path: &Path, base: &str) -> Result<Vec<String>, String> {
+    run_git(path, ["add", "-A"], None)?;
+    let output = git_text(path, ["diff", "--cached", "--name-only", base])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.replace('\\', "/"))
+        .collect())
+}
+
+fn remove_owned_worktrees(
+    run: &OrchestrationSnapshot,
+    trusted_sandboxes_path: &Path,
+) -> Result<(), String> {
+    let repo = Path::new(&run.project_dir);
+    Uuid::parse_str(&run.id)
+        .map_err(|_| "Identifiant de sandbox invalide ; nettoyage refuse".to_string())?;
+    let trusted_root = fs::canonicalize(trusted_sandboxes_path)
+        .map_err(|error| format!("Racine des sandboxes introuvable : {error}"))?;
+    let expected_root = comparison_path(&trusted_root.join(&run.id));
+    let root = comparison_path(Path::new(&run.sandbox_root));
+    if root != expected_root || root == trusted_root || !root.starts_with(&trusted_root) {
+        return Err("Refus de nettoyer un dossier hors de la racine des sandboxes".to_string());
+    }
+    let mut paths = run
+        .tasks
+        .iter()
+        .filter_map(|task| task.workspace_dir.as_deref())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let workers_root = root.join("workers");
+    if let Ok(entries) = fs::read_dir(&workers_root) {
+        paths.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir()),
+        );
+    }
+    paths.push(PathBuf::from(&run.orchestrator_dir));
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let comparable = comparison_path(&path);
+        if !comparable.starts_with(&root) {
+            return Err("Refus de supprimer un worktree hors du sandbox".to_string());
+        }
+        if path.exists() {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["worktree", "remove", "--force"])
+                .arg(&path)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(command_error("Suppression du worktree impossible", &output));
+            }
+        }
+    }
+    let _ = run_git(repo, ["worktree", "prune"], None);
+    if root.exists() {
+        fs::remove_dir_all(root).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn comparison_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
+}
+
+fn git_text<'a>(path: &Path, args: impl IntoIterator<Item = &'a str>) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .map_err(|error| format!("Git est indisponible : {error}"))?;
+    if !output.status.success() {
+        return Err(command_error("Commande Git echouee", &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_status<'a>(
+    path: &Path,
+    args: impl IntoIterator<Item = &'a str>,
+) -> Result<ExitStatus, String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .status()
+        .map_err(|error| format!("Git est indisponible : {error}"))
+}
+
+fn git_output_file<'a>(
+    path: &Path,
+    args: impl IntoIterator<Item = &'a str>,
+    output_path: &Path,
+) -> Result<(), String> {
+    let file = File::create(output_path).map_err(|error| error.to_string())?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("Git est indisponible : {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error("Creation du patch impossible", &output))
+    }
+}
+
+fn run_git<'a>(
+    path: &Path,
+    args: impl IntoIterator<Item = &'a str>,
+    stdin_path: Option<&Path>,
+) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    if let Some(stdin_path) = stdin_path {
+        command.stdin(Stdio::from(
+            File::open(stdin_path).map_err(|error| error.to_string())?,
+        ));
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("Git est indisponible : {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error("Commande Git echouee", &output))
+    }
+}
+
+fn command_error(label: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    if detail.is_empty() {
+        format!("{label} (code {:?})", output.status.code())
+    } else {
+        format!("{label} : {}", truncate(&detail, MAX_TEXT_CHARS))
+    }
+}
+
+fn shell_command(command_text: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C", command_text]);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("sh");
+        command.args(["-lc", command_text]);
+        command.process_group(0);
+        command
+    }
+}
+
+fn terminate_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &child.id().to_string(), "/T", "/F"]);
+        hide_process_window(&mut command);
+        let _ = command.status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .status();
+    }
+    let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn hide_process_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000);
+}
+
+#[cfg(not(windows))]
+fn hide_process_window(_command: &mut Command) {}
+
+fn find_run_mut<'a>(
+    store: &'a mut OrchestrationStore,
+    id: &str,
+) -> Result<&'a mut OrchestrationSnapshot, String> {
+    store
+        .runs
+        .iter_mut()
+        .find(|run| run.id == id)
+        .ok_or_else(|| "Orchestration introuvable".to_string())
+}
+
+fn find_task_mut<'a>(
+    run: &'a mut OrchestrationSnapshot,
+    id: &str,
+) -> Result<&'a mut OrchestrationTask, String> {
+    run.tasks
+        .iter_mut()
+        .find(|task| task.id == id)
+        .ok_or_else(|| "Tache orchestree introuvable".to_string())
+}
+
+fn push_event(run: &mut OrchestrationSnapshot, timestamp: i64, kind: &str, message: String) {
+    run.events.push(OrchestrationEvent {
+        timestamp,
+        kind: kind.to_string(),
+        message: truncate(&message, 2_000),
+    });
+    if run.events.len() > MAX_EVENTS {
+        run.events.drain(0..run.events.len() - MAX_EVENTS);
+    }
+}
+
+fn validate_required_text(value: &str, max: usize, label: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{label} est vide"));
+    }
+    if value.len() > max {
+        return Err(format!("{label} depasse la taille autorisee"));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_short_text(value: &str, label: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{label} est vide"));
+    }
+    if value.chars().count() > MAX_TEXT_CHARS {
+        return Err(format!("{label} est trop long"));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_name(value: Option<&str>, objective: &str) -> Result<String, String> {
+    let name = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            objective
+                .lines()
+                .next()
+                .unwrap_or("Chat orchestre")
+                .to_string()
+        });
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(format!("Le nom depasse {MAX_NAME_CHARS} caracteres"));
+    }
+    Ok(name.chars().take(MAX_NAME_CHARS).collect())
+}
+
+fn validate_test_timeout(value: u64) -> Result<u64, String> {
+    if !(MIN_TEST_TIMEOUT_SECONDS..=MAX_TEST_TIMEOUT_SECONDS).contains(&value) {
+        return Err(format!(
+            "Le timeout doit etre compris entre {MIN_TEST_TIMEOUT_SECONDS} et {MAX_TEST_TIMEOUT_SECONDS} secondes"
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_worker_count(value: u32) -> Result<u32, String> {
+    if !(MIN_WORKER_COUNT..=MAX_WORKER_COUNT).contains(&value) {
+        return Err(format!(
+            "Le nombre de workers doit etre compris entre {MIN_WORKER_COUNT} et {MAX_WORKER_COUNT}, sans compter l'orchestrateur"
+        ));
+    }
+    Ok(value)
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn short_id(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn normalize_loaded_store(store: &mut OrchestrationStore, now: i64) -> bool {
+    let mut changed = store.version != STORE_VERSION;
+    store.version = STORE_VERSION;
+    for run in &mut store.runs {
+        if run.worker_count == 0 {
+            run.worker_count = if run.tasks.is_empty() {
+                DEFAULT_WORKER_COUNT
+            } else {
+                (run.tasks.len() as u32).clamp(MIN_WORKER_COUNT, MAX_WORKER_COUNT)
+            };
+            changed = true;
+        }
+        if run.orchestrator_account_id.trim().is_empty() {
+            run.orchestrator_account_id = run.account_id.clone();
+            changed = true;
+        }
+        if run.worker_account_ids.len() != run.worker_count as usize {
+            let previous = run.worker_account_ids.clone();
+            run.worker_account_ids = (0..run.worker_count)
+                .map(|position| {
+                    previous
+                        .get(position as usize)
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned()
+                        .or_else(|| {
+                            run.tasks
+                                .iter()
+                                .find(|task| task.position == position + 1)
+                                .map(|task| task.account_id.clone())
+                                .filter(|value| !value.trim().is_empty())
+                        })
+                        .unwrap_or_else(|| run.account_id.clone())
+                })
+                .collect();
+            changed = true;
+        }
+        for task in &mut run.tasks {
+            if task.account_id.trim().is_empty() {
+                task.account_id = run
+                    .worker_account_ids
+                    .get(task.position.saturating_sub(1) as usize)
+                    .cloned()
+                    .unwrap_or_else(|| run.account_id.clone());
+                changed = true;
+            }
+        }
+        let was_active = run.status == OrchestrationStatus::Active;
+        let interrupted = run.current_turn_id.take().is_some()
+            || run.current_start_id.take().is_some()
+            || run.current_validation_id.take().is_some();
+        run.current_turn_kind = None;
+        run.current_validation_kind = None;
+        if was_active {
+            if interrupted {
+                recover_phase_for_resume(run, now);
+                run.last_error = Some(
+                    "Execution interrompue par le redemarrage ; reprise automatique en cours"
+                        .to_string(),
+                );
+            } else {
+                run.next_action_at = Some(now);
+            }
+            run.status = OrchestrationStatus::Active;
+            run.next_action_at = Some(now);
+            push_event(
+                run,
+                now,
+                "recovered",
+                if interrupted {
+                    "Interruption detectee ; orchestration reprise automatiquement".to_string()
+                } else {
+                    "Orchestration active reprise au redemarrage".to_string()
+                },
+            );
+            changed = true;
+        } else if interrupted {
+            recover_phase_for_resume(run, now);
+            run.next_action_at = None;
+            run.last_error = Some(
+                "Execution interrompue par le redemarrage ; l'orchestration reste arretee"
+                    .to_string(),
+            );
+            push_event(
+                run,
+                now,
+                "recovered",
+                "Interruption detectee ; statut utilisateur conserve".to_string(),
+            );
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn load_store(path: &Path) -> Result<OrchestrationStore, String> {
+    if !path.exists() {
+        return Ok(OrchestrationStore::default());
+    }
+    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    match serde_json::from_str::<OrchestrationStore>(&content) {
+        Ok(store) if store.version <= STORE_VERSION => Ok(store),
+        Ok(store) => Err(format!(
+            "Version d'etat des orchestrations non supportee : {}",
+            store.version
+        )),
+        Err(error) => {
+            let backup = path.with_extension(format!("corrupt-{}.json", metrics::now_ts()));
+            fs::rename(path, &backup).map_err(|rename_error| {
+                format!(
+                    "Etat des orchestrations illisible ({error}) et sauvegarde impossible ({rename_error})"
+                )
+            })?;
+            Ok(OrchestrationStore::default())
+        }
+    }
+}
+
+fn persist_store(path: &Path, store: &OrchestrationStore) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(store).map_err(|error| error.to_string())?;
+    fs_util::atomic_write(path, content).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_orchestrations(
+    state: State<'_, OrchestrationManager>,
+) -> Result<Vec<OrchestrationSnapshot>, String> {
+    state.list()
+}
+
+#[tauri::command]
+pub fn create_orchestration(
+    state: State<'_, OrchestrationManager>,
+    request: CreateOrchestrationRequest,
+) -> Result<OrchestrationSnapshot, String> {
+    state.create(request)
+}
+
+#[tauri::command]
+pub fn promote_autonomous_agent_to_orchestration(
+    orchestration: State<'_, OrchestrationManager>,
+    autonomous: State<'_, AutonomousAgentManager>,
+    id: String,
+    request: PromoteAutonomousAgentRequest,
+) -> Result<OrchestrationSnapshot, String> {
+    orchestration.promote_autonomous_agent(&autonomous, &id, request)
+}
+
+#[tauri::command]
+pub fn control_orchestration(
+    state: State<'_, OrchestrationManager>,
+    id: String,
+    action: OrchestrationAction,
+) -> Result<OrchestrationSnapshot, String> {
+    state.control(&id, action)
+}
+
+#[tauri::command]
+pub fn reassign_orchestration_account(
+    state: State<'_, OrchestrationManager>,
+    id: String,
+    request: ReassignOrchestrationAccountRequest,
+) -> Result<OrchestrationSnapshot, String> {
+    state.reassign_account(&id, request)
+}
+
+#[tauri::command]
+pub fn delete_orchestration(
+    state: State<'_, OrchestrationManager>,
+    id: String,
+) -> Result<(), String> {
+    state.delete(&id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_line_plan_contract() {
+        let plan = parse_marked_json::<PlanEnvelope>(
+            "analyse\nORCHESTRATION_PLAN: {\"summary\":\"Plan\",\"tasks\":[{\"title\":\"API\",\"description\":\"Ajouter l'API\",\"acceptanceCriteria\":[\"Le test passe\"]}]}",
+            "ORCHESTRATION_PLAN:",
+        )
+        .and_then(|plan| validate_plan(plan, 1))
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].title, "API");
+    }
+
+    #[test]
+    fn plan_must_match_the_selected_worker_count() {
+        let plan = PlanEnvelope {
+            summary: "Plan".to_string(),
+            tasks: vec![PlanTask {
+                title: "API".to_string(),
+                description: "Ajouter l'API".to_string(),
+                acceptance_criteria: vec!["Le test passe".to_string()],
+            }],
+        };
+        let error = validate_plan(plan, 2).unwrap_err();
+        assert!(error.contains("exactement 2 taches"));
+        assert!(validate_worker_count(0).is_err());
+        assert!(validate_worker_count(MAX_WORKER_COUNT + 1).is_err());
+    }
+
+    #[test]
+    fn rejects_proof_without_successful_test() {
+        let proof = ProofEnvelope {
+            summary: "Implementation".to_string(),
+            files_changed: vec!["src/lib.rs".to_string()],
+            tests: vec![OrchestrationProofTest {
+                command: "cargo test".to_string(),
+                result: "failed".to_string(),
+                passed: false,
+            }],
+            risks: Vec::new(),
+        };
+        assert!(validate_proof(proof).is_err());
+    }
+
+    #[test]
+    fn final_revision_must_target_known_worker() {
+        let run = sample_run();
+        let review = FinalEnvelope {
+            decision: FinalDecision::Revise,
+            summary: "Bug trouve".to_string(),
+            task_id: Some("task-99".to_string()),
+            feedback: "Corriger".to_string(),
+            tests: Vec::new(),
+        };
+        assert!(validate_final(review, &run).is_err());
+    }
+
+    #[test]
+    fn active_orchestration_resumes_automatically_after_restart() {
+        let mut active = sample_run();
+        active.worker_count = 0;
+        active.orchestrator_account_id.clear();
+        active.worker_account_ids.clear();
+        active.tasks[0].account_id.clear();
+        active.phase = OrchestrationPhase::Working;
+        active.current_turn_id = Some(42);
+        active.current_turn_kind = Some(OrchestrationTurnKind::Worker);
+        active.current_task_id = Some("task-01".to_string());
+        active.tasks[0].status = OrchestrationTaskStatus::Working;
+        let mut paused = active.clone();
+        paused.id = "run-paused".to_string();
+        paused.status = OrchestrationStatus::Paused;
+        paused.current_turn_id = Some(43);
+        let mut store = OrchestrationStore {
+            version: 1,
+            runs: vec![active, paused],
+        };
+
+        assert!(normalize_loaded_store(&mut store, 100));
+        assert_eq!(store.version, STORE_VERSION);
+        assert_eq!(store.runs[0].worker_count, 1);
+        assert_eq!(store.runs[0].orchestrator_account_id, "account-1");
+        assert_eq!(store.runs[0].worker_account_ids, vec!["account-1"]);
+        assert_eq!(store.runs[0].tasks[0].account_id, "account-1");
+        assert_eq!(store.runs[0].status, OrchestrationStatus::Active);
+        assert_eq!(store.runs[0].current_turn_id, None);
+        assert_eq!(store.runs[0].next_action_at, Some(100));
+        assert!(store.runs[0]
+            .events
+            .iter()
+            .any(|event| event.kind == "recovered"));
+        assert_eq!(store.runs[1].status, OrchestrationStatus::Paused);
+        assert_eq!(store.runs[1].current_turn_id, None);
+        assert_eq!(store.runs[1].next_action_at, None);
+    }
+
+    #[test]
+    fn restart_keeps_a_ready_review_and_its_feedback() {
+        let mut run = sample_run();
+        run.phase = OrchestrationPhase::Reviewing;
+        run.current_task_id = Some("task-01".to_string());
+        run.tasks[0].status = OrchestrationTaskStatus::Submitted;
+        run.last_error = Some("contexte a conserver".to_string());
+        run.next_action_at = Some(500);
+        let mut store = OrchestrationStore {
+            version: STORE_VERSION,
+            runs: vec![run],
+        };
+
+        assert!(normalize_loaded_store(&mut store, 100));
+        assert_eq!(store.runs[0].phase, OrchestrationPhase::Reviewing);
+        assert_eq!(
+            store.runs[0].tasks[0].status,
+            OrchestrationTaskStatus::Submitted
+        );
+        assert_eq!(
+            store.runs[0].last_error.as_deref(),
+            Some("contexte a conserver")
+        );
+        assert_eq!(store.runs[0].next_action_at, Some(100));
+    }
+
+    #[test]
+    fn run_level_protocol_failures_stop_after_three_attempts() {
+        let dir =
+            std::env::temp_dir().join(format!("cst-orchestration-protocol-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let run = sample_run();
+        let inner = Arc::new(OrchestrationInner {
+            chat: ChatTurnManager::default(),
+            storage_path: dir.join("orchestrated-runs.json"),
+            sandboxes_path: dir.join("sandboxes"),
+            store: Mutex::new(OrchestrationStore {
+                version: STORE_VERSION,
+                runs: vec![run],
+            }),
+            validation_runs: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+        });
+
+        for attempt in 1..=MAX_PROTOCOL_FAILURES {
+            protocol_failure(&inner, "run-1", None, "JSON invalide".to_string());
+            let store = inner.store.lock().unwrap();
+            assert_eq!(store.runs[0].protocol_failures, attempt);
+            if attempt < MAX_PROTOCOL_FAILURES {
+                assert_eq!(store.runs[0].status, OrchestrationStatus::Active);
+            }
+        }
+        let store = inner.store.lock().unwrap();
+        assert_eq!(store.runs[0].status, OrchestrationStatus::NeedsAttention);
+        assert_eq!(store.runs[0].consecutive_start_failures, 0);
+        drop(store);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_state_transition_is_rolled_back_in_memory() {
+        let dir =
+            std::env::temp_dir().join(format!("cst-orchestration-rollback-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let inner = OrchestrationInner {
+            chat: ChatTurnManager::default(),
+            storage_path: dir.join("orchestrated-runs.json"),
+            sandboxes_path: dir.join("sandboxes"),
+            store: Mutex::new(OrchestrationStore {
+                version: STORE_VERSION,
+                runs: vec![sample_run()],
+            }),
+            validation_runs: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+        };
+
+        let result: Result<(), String> = inner.mutate_store(|store| {
+            store.runs[0].status = OrchestrationStatus::Completed;
+            Err("transition refusee".to_string())
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            inner.store.lock().unwrap().runs[0].status,
+            OrchestrationStatus::Active
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn git_sandboxes_apply_review_commit_and_publish_patch() {
+        let root = std::env::temp_dir().join(format!("cst-orchestration-test-{}", Uuid::new_v4()));
+        let repo = root.join("repo");
+        let sandboxes = root.join("sandboxes");
+        let run_id = Uuid::new_v4().to_string();
+        let sandbox = sandboxes.join(&run_id);
+        let orchestrator = sandbox.join("orchestrator");
+        let worker = sandbox.join("workers").join("task-01-01");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, ["init"], None).unwrap();
+        fs::write(repo.join("feature.txt"), "base\n").unwrap();
+        run_git(&repo, ["add", "-A"], None).unwrap();
+        run_git(
+            &repo,
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+            None,
+        )
+        .unwrap();
+        let (_, base) = inspect_source_repository(repo.to_str().unwrap()).unwrap();
+        fs::create_dir_all(worker.parent().unwrap()).unwrap();
+        add_worktree(&repo, &orchestrator, &base).unwrap();
+        add_worktree(&repo, &worker, &base).unwrap();
+        fs::write(worker.join("feature.txt"), "base\nworker change\n").unwrap();
+        fs::write(worker.join("new-file.txt"), "proof\n").unwrap();
+
+        let mut run = sample_run();
+        run.id = run_id;
+        run.project_dir = repo.to_string_lossy().to_string();
+        run.base_commit = base.clone();
+        run.integrated_commit = base.clone();
+        run.sandbox_root = sandbox.to_string_lossy().to_string();
+        run.orchestrator_dir = orchestrator.to_string_lossy().to_string();
+        run.tasks[0].workspace_dir = Some(worker.to_string_lossy().to_string());
+        run.tasks[0].base_commit = Some(base.clone());
+        run.tasks[0].workspace_generation = 1;
+
+        let changed = stage_and_changed_files(&worker, &base).unwrap();
+        assert_eq!(changed, vec!["feature.txt", "new-file.txt"]);
+        apply_worker_candidate(&run, &run.tasks[0]).unwrap();
+        assert_eq!(
+            fs::read_to_string(orchestrator.join("feature.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "base\nworker change\n"
+        );
+        assert_eq!(
+            fs::read_to_string(orchestrator.join("new-file.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "proof\n"
+        );
+        run.integrated_commit = commit_owned_worktree(&run, "orchestration test").unwrap();
+        fs::write(repo.join("source-changed.txt"), "do not overwrite\n").unwrap();
+        assert!(apply_final_patch(&run).is_err());
+        fs::remove_file(repo.join("source-changed.txt")).unwrap();
+        apply_final_patch(&run).unwrap();
+        // Simule un crash entre `git apply` et la persistance de l'etat final :
+        // le second passage doit reconnaitre le rendu exact deja present.
+        apply_final_patch(&run).unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.join("feature.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "base\nworker change\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("new-file.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "proof\n"
+        );
+        fs::write(
+            repo.join("feature.txt"),
+            "base\nworker change\nmodification utilisateur\n",
+        )
+        .unwrap();
+        assert!(apply_final_patch(&run).is_err());
+
+        remove_owned_worktrees(&run, &sandboxes).unwrap();
+        run_git(&repo, ["reset", "--hard", &base], None).unwrap();
+        run_git(&repo, ["clean", "-fd"], None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_a_sandbox_outside_the_trusted_root() {
+        let root = std::env::temp_dir().join(format!("cst-orchestration-test-{}", Uuid::new_v4()));
+        let trusted = root.join("trusted");
+        let outside = root.join("outside");
+        fs::create_dir_all(&trusted).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "keep\n").unwrap();
+
+        let mut run = sample_run();
+        run.id = Uuid::new_v4().to_string();
+        run.sandbox_root = outside.to_string_lossy().to_string();
+        run.orchestrator_dir = outside.join("orchestrator").to_string_lossy().to_string();
+        run.tasks.clear();
+
+        assert!(remove_owned_worktrees(&run, &trusted).is_err());
+        assert!(outside.join("keep.txt").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn sample_run() -> OrchestrationSnapshot {
+        OrchestrationSnapshot {
+            id: "run-1".to_string(),
+            name: "Feature".to_string(),
+            objective: "Construire".to_string(),
+            worker_count: 1,
+            account_id: "account-1".to_string(),
+            orchestrator_account_id: "account-1".to_string(),
+            worker_account_ids: vec!["account-1".to_string()],
+            orchestrator_handoff_pending: false,
+            orchestrator_handoff_count: 0,
+            project_dir: "/repo".to_string(),
+            model: None,
+            reasoning_effort: None,
+            test_command: "cargo test".to_string(),
+            test_timeout_seconds: 60,
+            status: OrchestrationStatus::Active,
+            phase: OrchestrationPhase::FinalReview,
+            created_at: 1,
+            updated_at: 1,
+            base_commit: "base".to_string(),
+            integrated_commit: "head".to_string(),
+            sandbox_root: "/tmp/run".to_string(),
+            orchestrator_dir: "/tmp/run/orchestrator".to_string(),
+            orchestrator_session_id: None,
+            current_turn_id: None,
+            current_turn_kind: None,
+            current_task_id: None,
+            current_start_id: None,
+            current_validation_id: None,
+            current_validation_kind: None,
+            next_action_at: None,
+            plan_summary: None,
+            tasks: vec![OrchestrationTask {
+                id: "task-01".to_string(),
+                position: 1,
+                title: "API".to_string(),
+                description: "Ajouter l'API".to_string(),
+                acceptance_criteria: vec!["Test".to_string()],
+                status: OrchestrationTaskStatus::Accepted,
+                account_id: "account-1".to_string(),
+                handoff_pending: false,
+                handoff_count: 0,
+                session_id: None,
+                workspace_dir: None,
+                base_commit: None,
+                workspace_generation: 0,
+                attempt_count: 1,
+                protocol_failures: 0,
+                evidence: None,
+                reviews: Vec::new(),
+                last_error: None,
+            }],
+            final_summary: None,
+            last_error: None,
+            consecutive_start_failures: 0,
+            protocol_failures: 0,
+            publish_applied: false,
+            events: Vec::new(),
+        }
+    }
+}

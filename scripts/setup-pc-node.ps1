@@ -53,6 +53,9 @@ if (-not $env:CST_ADMIN_TOKEN) {
 if ($null -eq $env:CST_GIT_PAT) {
   $env:CST_GIT_PAT = ""
 }
+if (-not $env:CST_CODEX_WINDOWS_SANDBOX) {
+  $env:CST_CODEX_WINDOWS_SANDBOX = "unelevated"
+}
 
 $allowedOrigins = @($publicUrl)
 if ($OracleUrl.Trim()) {
@@ -62,6 +65,7 @@ if ($OracleUrl.Trim()) {
 @(
   '$env:CST_ADMIN_TOKEN = ' + (Quote-PowerShellLiteral $env:CST_ADMIN_TOKEN)
   '$env:CST_GIT_PAT = ' + (Quote-PowerShellLiteral $env:CST_GIT_PAT)
+  '$env:CST_CODEX_WINDOWS_SANDBOX = ' + (Quote-PowerShellLiteral $env:CST_CODEX_WINDOWS_SANDBOX)
   '$env:CST_BIND = ' + (Quote-PowerShellLiteral "127.0.0.1:$Port")
   '$env:CST_PUBLIC_BASE_URL = ' + (Quote-PowerShellLiteral $publicUrl)
   '$env:CST_ALLOWED_ORIGINS = ' + (Quote-PowerShellLiteral ($allowedOrigins -join ","))

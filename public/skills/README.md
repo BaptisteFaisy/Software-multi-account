@@ -11,12 +11,17 @@ barre d'outils). Ils sont embarqués dans l'app : Vite copie `public/skills/` da
   {
     "skills": [
       { "id": "mon-skill", "file": "mon-skill.md", "name": "Mon skill",
+        "buttonLabel": "Mon skill", "icon": "sparkles",
         "description": "Use when … (déclencheur)", "tags": ["a", "b"] }
     ]
   }
   ```
-- `<id>.md` : le **contenu** du skill (markdown brut), injecté tel quel dans la
-  session Codex active (bouton « Injecter dans Codex », collage sans validation).
+- `<id>.md` : le **contenu** du skill (markdown brut). Un bouton épinglé et
+  activé le transmet au moteur hors du message utilisateur ; « Ajouter au
+  message » permet aussi de le placer directement dans le brouillon.
+- `buttonLabel` et `icon` sont optionnels. Ils personnalisent le bouton que
+  l'utilisateur peut épingler dans toutes ses fenêtres de chat depuis la vue
+  Skills. Sans ces champs, le nom du skill et l'icône `sparkles` sont utilisés.
 
 ## Ajouter / modifier un skill
 1. Déposer/éditer `public/skills/<id>.md`.

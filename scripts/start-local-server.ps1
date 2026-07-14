@@ -131,6 +131,9 @@ $isLanBind = ($bindHost -eq "0.0.0.0" -or $bindHost -eq "::")
 $displayHost = if ($isLanBind) { $ip } else { "127.0.0.1" }
 $env:CST_DATA_DIR = $DataDir
 $env:CST_STATIC_DIR = $StaticDir
+if (-not $env:CST_CODEX_WINDOWS_SANDBOX) {
+  $env:CST_CODEX_WINDOWS_SANDBOX = "unelevated"
+}
 if (-not $env:CST_PUBLIC_BASE_URL) {
   $env:CST_PUBLIC_BASE_URL = "http://${displayHost}:$bindPort"
 }

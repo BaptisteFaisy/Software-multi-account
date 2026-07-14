@@ -32,16 +32,19 @@ tauri-build = { version = "2", features = [] }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8.2"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
 axum = { version = "0.7", features = ["json", "ws"] }
 tower-http = { version = "0.5", features = ["compression-br", "compression-gzip", "cors", "fs"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls", "charset", "http2"] }
 futures-util = "0.3"
 async-stream = "0.3"
 bytes = "1"
 base64 = "0.22"
 sha2 = "0.10"
+argon2 = "0.5"
+url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rfd = "0.15"
 uuid = { version = "1", features = ["v4"] }

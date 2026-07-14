@@ -5,11 +5,15 @@
 //! continuent donc d'alimenter l'historique et le WebSocket de discussions.
 
 use crate::{
+    chat_model_tools::{
+        ChatModelToolServerConfig, AUTONOMOUS_AGENT_TOOL_NAME, MCP_BEARER_ENV, MCP_SERVER_NAME,
+    },
+    chat_tools::{chat_skills_document, chat_tool_instructions, ChatAgentSkill, ChatAgentTool},
     metrics,
     settings::{self, AccountProfile, AppSettings, Provider},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -37,7 +41,7 @@ const MAX_MODEL_CHARS: usize = 160;
 const MAX_RETAINED_TURNS: usize = 500;
 const PROVIDER_EXIT_GRACE: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatTurnMode {
     #[default]
@@ -115,6 +119,35 @@ pub struct ChatTurnSnapshot {
     pub parts: Vec<ChatPart>,
 }
 
+/// Etat leger destine au polling global : la timeline complete reste sur
+/// `chat_turn_status` afin de ne pas multiplier le trafic avec plusieurs chats.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveChatTurnSummary {
+    pub id: u64,
+    pub account_id: String,
+    pub session_id: Option<String>,
+    pub status: ChatTurnStatus,
+    pub started_at: i64,
+    pub waiting_for_user: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatAppConnector {
+    Gmail,
+    GoogleCalendar,
+}
+
+impl ChatAppConnector {
+    fn config_id(self) -> &'static str {
+        match self {
+            Self::Gmail => "gmail",
+            Self::GoogleCalendar => "connector_googlecalendar",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartChatTurnRequest {
@@ -130,12 +163,96 @@ pub struct StartChatTurnRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// `None` preserve la configuration habituelle d'un chat. `Some`, meme
+    /// vide, borne explicitement les apps exposees a un tour autonome.
+    #[serde(default)]
+    pub app_connectors: Option<Vec<ChatAppConnector>>,
+    #[serde(default)]
+    pub app_write_approved: bool,
+    #[serde(default)]
+    pub agent_tools: Vec<ChatAgentTool>,
+    #[serde(default)]
+    pub agent_skills: Vec<ChatAgentSkill>,
+    #[serde(default)]
+    pub question_tool: bool,
+    #[serde(default)]
+    pub proof_tool: bool,
+    #[serde(default)]
+    pub source_chat_key: Option<String>,
 }
 
 struct ChatTurn {
     snapshot: Mutex<ChatTurnSnapshot>,
     child: Mutex<Option<Child>>,
     provider_terminal: Mutex<Option<ProviderTerminalEvent>>,
+}
+
+struct TemporaryChatSkillsFile {
+    path: PathBuf,
+}
+
+impl TemporaryChatSkillsFile {
+    fn create(turn_id: u64, content: &str) -> Result<Self, String> {
+        let directory = env::temp_dir()
+            .join("codex-switch-terminal")
+            .join("chat-skills");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("Préparation des skills impossible : {error}"))?;
+        let path = directory.join(format!("turn-{turn_id}-{}.md", Uuid::new_v4()));
+        std::fs::write(&path, content)
+            .map_err(|error| format!("Préparation des skills impossible : {error}"))?;
+        Ok(Self { path })
+    }
+
+    fn instructions(&self) -> String {
+        format!(
+            "Skills explicitement activés par l'utilisateur pour ce tour. Avant toute action, lis intégralement le fichier UTF-8 `{}` avec les outils disponibles, puis applique toutes ses sections en plus de la demande utilisateur. Ne modifie pas ce fichier et ne l'affiche pas dans la réponse.",
+            self.path.display()
+        )
+    }
+}
+
+impl Drop for TemporaryChatSkillsFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct TemporaryModelToolConfigFile {
+    path: PathBuf,
+}
+
+impl TemporaryModelToolConfigFile {
+    fn create(turn_id: u64, config: &ChatModelToolServerConfig) -> Result<Self, String> {
+        let directory = env::temp_dir()
+            .join("codex-switch-terminal")
+            .join("chat-mcp");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("Preparation de l'outil autonome impossible : {error}"))?;
+        let path = directory.join(format!("turn-{turn_id}-{}.json", Uuid::new_v4()));
+        let document = json!({
+            "mcpServers": {
+                (MCP_SERVER_NAME): {
+                    "type": "http",
+                    "url": config.url.clone(),
+                    "headers": {
+                        "Authorization": format!("Bearer {}", config.bearer_token)
+                    }
+                }
+            }
+        });
+        let content = serde_json::to_vec(&document)
+            .map_err(|error| format!("Configuration de l'outil autonome invalide : {error}"))?;
+        std::fs::write(&path, content)
+            .map_err(|error| format!("Preparation de l'outil autonome impossible : {error}"))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TemporaryModelToolConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +271,7 @@ impl Drop for ChatTurn {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
             if let Some(child) = child.as_mut() {
-                let _ = child.kill();
+                let _ = terminate_chat_process_tree(child);
             }
         }
     }
@@ -169,11 +286,19 @@ pub struct ChatTurnManager {
 
 struct ChatClaim {
     claims: Arc<Mutex<HashSet<String>>>,
-    key: String,
+    key: Option<String>,
 }
 
 impl ChatTurnManager {
     pub fn start(&self, request: StartChatTurnRequest) -> Result<ChatTurnSnapshot, String> {
+        self.start_with_model_tools(request, None)
+    }
+
+    pub(crate) fn start_with_model_tools(
+        &self,
+        request: StartChatTurnRequest,
+        model_tool_server: Option<ChatModelToolServerConfig>,
+    ) -> Result<ChatTurnSnapshot, String> {
         self.prune_finished_turns();
         let prompt = request.prompt.trim().to_string();
         if prompt.is_empty() {
@@ -223,11 +348,55 @@ impl ChatTurnManager {
             )
             .map_err(|error| format!("Configuration du compte impossible : {error}"))?;
 
-        let program = resolve_cli_program(&settings::command_for_provider(
-            &app_settings,
+        let environment_instructions = project_dir
+            .as_deref()
+            .and_then(|path| settings::workspace_memory_for_path(&app_settings, path))
+            .map(environment_memory_instructions);
+        let tool_instructions = chat_tool_instructions(
+            &request.agent_tools,
+            request.question_tool,
+            request.proof_tool,
+        );
+        let skill_file = chat_skills_document(&request.agent_skills)?
+            .map(|document| TemporaryChatSkillsFile::create(id, &document))
+            .transpose()?;
+        let skill_instructions = skill_file
+            .as_ref()
+            .map(TemporaryChatSkillsFile::instructions);
+        let model_tool_file = if account.provider == Provider::Claude {
+            model_tool_server
+                .as_ref()
+                .map(|config| TemporaryModelToolConfigFile::create(id, config))
+                .transpose()?
+        } else {
+            None
+        };
+        let selected_agent_instructions =
+            merge_turn_instructions(tool_instructions.as_deref(), skill_instructions.as_deref());
+        let model_tool_instructions = model_tool_server
+            .as_ref()
+            .map(|_| autonomous_agent_tool_instructions());
+        let agent_instructions = merge_turn_instructions(
+            model_tool_instructions,
+            selected_agent_instructions.as_deref(),
+        );
+        let turn_instructions = merge_turn_instructions(
+            environment_instructions.as_deref(),
+            agent_instructions.as_deref(),
+        );
+        let provider_instructions = turn_instructions.as_deref().map(|instructions| {
+            if account.provider == Provider::Codex {
+                merge_codex_developer_instructions(&canonical_home, instructions)
+            } else {
+                instructions.to_string()
+            }
+        });
+
+        let program = resolve_provider_program(
+            &settings::command_for_provider(&app_settings, account.provider),
             account.provider,
-        ))?;
-        let mut command = Command::new(program);
+        )?;
+        let mut command = Command::new(&program.executable);
         configure_environment(
             &mut command,
             &app_settings,
@@ -235,6 +404,7 @@ impl ChatTurnManager {
             &canonical_home,
             project_dir.as_deref(),
         );
+        configure_resolved_program_environment(&mut command, &program);
         configure_provider_command(
             &mut command,
             &account,
@@ -242,6 +412,11 @@ impl ChatTurnManager {
             request.mode,
             model.as_deref(),
             reasoning_effort.as_deref(),
+            request.app_connectors.as_deref(),
+            request.app_write_approved,
+            provider_instructions.as_deref(),
+            model_tool_server.as_ref(),
+            model_tool_file.as_ref().map(|file| file.path.as_path()),
         );
         command
             .stdin(Stdio::piped())
@@ -339,6 +514,10 @@ impl ChatTurnManager {
         let account_id = account.id.clone();
         let account_label = account.label.clone();
         thread::spawn(move || {
+            // Le fichier doit rester lisible pendant tout le tour puis est
+            // automatiquement supprimé, succès, erreur ou annulation compris.
+            let _skill_file = skill_file;
+            let _model_tool_file = model_tool_file;
             let exit = wait_for_child(&supervisor_turn);
             // Un evenement terminal est la derniere sortie utile du provider.
             // Ne pas attendre indefiniment la fermeture de pipes herites par un
@@ -384,6 +563,35 @@ impl ChatTurnManager {
         Ok(snapshot)
     }
 
+    pub fn active(&self) -> Result<Vec<ActiveChatTurnSummary>, String> {
+        let turns = self
+            .turns
+            .lock()
+            .map_err(|_| "Etat des conversations verrouille".to_string())?;
+        let mut snapshots = Vec::new();
+        for turn in turns.values() {
+            let snapshot = turn
+                .snapshot
+                .lock()
+                .map_err(|_| "Etat du tour verrouille".to_string())?;
+            if matches!(
+                snapshot.status,
+                ChatTurnStatus::Running | ChatTurnStatus::Finalizing
+            ) {
+                snapshots.push(ActiveChatTurnSummary {
+                    id: snapshot.id,
+                    account_id: snapshot.account_id.clone(),
+                    session_id: snapshot.session_id.clone(),
+                    status: snapshot.status,
+                    started_at: snapshot.started_at,
+                    waiting_for_user: snapshot.parts.iter().any(part_waits_for_user_input),
+                });
+            }
+        }
+        snapshots.sort_by_key(|snapshot| snapshot.id);
+        Ok(snapshots)
+    }
+
     pub fn stop(&self, id: u64) -> Result<ChatTurnSnapshot, String> {
         let turn = self
             .turns
@@ -400,22 +608,29 @@ impl ChatTurnManager {
                 snapshot.error = None;
                 complete_running_activities(&mut snapshot, "cancelled");
                 complete_running_thoughts(&mut snapshot, "cancelled");
+                complete_running_parts(&mut snapshot, "cancelled");
             }
         }
         if let Ok(mut child) = turn.child.lock() {
             if let Some(child) = child.as_mut() {
-                let _ = child.kill();
+                terminate_chat_process_tree(child)
+                    .map_err(|error| format!("Arret du processus du tour impossible : {error}"))?;
             }
         }
         self.status(id)
     }
 
     fn reserve_turn(&self, request: &StartChatTurnRequest) -> Result<ChatClaim, String> {
-        let key = format!(
-            "{}\0{}",
-            request.account_id,
-            request.session_id.as_deref().unwrap_or("")
-        );
+        let Some(session_id) = request.session_id.as_deref() else {
+            // Sans identifiant fournisseur, la requete cree une conversation
+            // neuve et independante. Plusieurs agents peuvent donc demarrer
+            // simultanement avec le meme compte sans partager un verrou vide.
+            return Ok(ChatClaim {
+                claims: self.claims.clone(),
+                key: None,
+            });
+        };
+        let key = format!("{}\0{session_id}", request.account_id);
         let mut claims = self
             .claims
             .lock()
@@ -445,7 +660,7 @@ impl ChatTurnManager {
             claims.insert(key.clone());
             Ok(ChatClaim {
                 claims: self.claims.clone(),
-                key,
+                key: Some(key),
             })
         }
     }
@@ -482,8 +697,11 @@ impl ChatClaim {
 
 impl Drop for ChatClaim {
     fn drop(&mut self) {
+        let Some(key) = self.key.as_ref() else {
+            return;
+        };
         if let Ok(mut claims) = self.claims.lock() {
-            claims.remove(&self.key);
+            claims.remove(key);
         }
     }
 }
@@ -498,6 +716,11 @@ pub fn start_chat_turn(
     mode: Option<ChatTurnMode>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    agent_tools: Option<Vec<ChatAgentTool>>,
+    agent_skills: Option<Vec<ChatAgentSkill>>,
+    question_tool: Option<bool>,
+    proof_tool: Option<bool>,
+    source_chat_key: Option<String>,
 ) -> Result<ChatTurnSnapshot, String> {
     state.start(StartChatTurnRequest {
         account_id,
@@ -507,6 +730,13 @@ pub fn start_chat_turn(
         mode: mode.unwrap_or_default(),
         model,
         reasoning_effort,
+        app_connectors: None,
+        app_write_approved: false,
+        agent_tools: agent_tools.unwrap_or_default(),
+        agent_skills: agent_skills.unwrap_or_default(),
+        question_tool: question_tool.unwrap_or(false),
+        proof_tool: proof_tool.unwrap_or(false),
+        source_chat_key,
     })
 }
 
@@ -516,6 +746,13 @@ pub fn chat_turn_status(
     id: u64,
 ) -> Result<ChatTurnSnapshot, String> {
     state.status(id)
+}
+
+#[tauri::command]
+pub fn list_active_chat_turns(
+    state: State<'_, ChatTurnManager>,
+) -> Result<Vec<ActiveChatTurnSummary>, String> {
+    state.active()
 }
 
 #[tauri::command]
@@ -533,6 +770,11 @@ fn configure_provider_command(
     mode: ChatTurnMode,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    app_connectors: Option<&[ChatAppConnector]>,
+    app_write_approved: bool,
+    environment_instructions: Option<&str>,
+    model_tool_server: Option<&ChatModelToolServerConfig>,
+    model_tool_config_path: Option<&Path>,
 ) {
     match account.provider {
         Provider::Codex => {
@@ -540,7 +782,10 @@ fn configure_provider_command(
             if session_id.is_some() {
                 command.arg("resume");
             }
-            command.arg("--json");
+            // La memoire automatique locale du CLI est desactivee par defaut.
+            // Chaque compte conserve son store dans son CODEX_HOME ; le cwd du
+            // tour permet ensuite a Codex de retrouver le contexte pertinent.
+            command.arg("--enable").arg("memories").arg("--json");
             // Expose uniquement les resumes prevus pour l'utilisateur. Le
             // raisonnement interne brut reste volontairement masque.
             command
@@ -548,9 +793,16 @@ fn configure_provider_command(
                 .arg("hide_agent_reasoning=false")
                 .arg("-c")
                 .arg("show_raw_agent_reasoning=false");
+            configure_codex_app_connectors(command, app_connectors, app_write_approved);
+            configure_codex_model_tool(command, model_tool_server);
+            // Le bypass global court-circuiterait aussi les demandes
+            // d'approbation des apps. Un agent avec connecteurs conserve donc
+            // le sandbox normal, meme si le compte autorise le bypass ailleurs.
             if matches!(mode, ChatTurnMode::Plan | ChatTurnMode::Ask) {
                 command.arg("-c").arg("sandbox_mode=\"read-only\"");
-            } else if account.bypass {
+            } else if account.bypass
+                && app_connectors.is_none_or(|connectors| connectors.is_empty())
+            {
                 command.arg(account.provider.bypass_flag());
             }
             if let Some(model) = model {
@@ -560,6 +812,13 @@ fn configure_provider_command(
                 command
                     .arg("-c")
                     .arg(format!("model_reasoning_effort=\"{effort}\""));
+            }
+            if let Some(instructions) = environment_instructions {
+                command.arg("-c").arg(format!(
+                    "developer_instructions={}",
+                    serde_json::to_string(instructions)
+                        .expect("une chaine Rust est toujours serialisable en JSON")
+                ));
             }
             if let Some(session_id) = session_id {
                 command.arg(session_id);
@@ -589,7 +848,130 @@ fn configure_provider_command(
             if let Some(model) = model {
                 command.arg("--model").arg(model);
             }
+            if let Some(instructions) = environment_instructions {
+                command.arg("--append-system-prompt").arg(instructions);
+            }
+            if let Some(path) = model_tool_config_path {
+                command
+                    .arg("--mcp-config")
+                    .arg(path)
+                    .arg("--allowedTools")
+                    .arg(format!(
+                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME}"
+                    ));
+            }
         }
+    }
+}
+
+fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelToolServerConfig>) {
+    let Some(config) = config else {
+        return;
+    };
+    command.env(MCP_BEARER_ENV, &config.bearer_token);
+    let prefix = format!("mcp_servers.{MCP_SERVER_NAME}");
+    let url =
+        serde_json::to_string(&config.url).expect("une URL Rust est toujours serialisable en JSON");
+    for value in [
+        format!("{prefix}.url={url}"),
+        format!("{prefix}.bearer_token_env_var=\"{MCP_BEARER_ENV}\""),
+        format!("{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\"]"),
+        format!("{prefix}.enabled=true"),
+        format!("{prefix}.required=true"),
+        format!("{prefix}.startup_timeout_sec=5"),
+        format!("{prefix}.tool_timeout_sec=30"),
+        format!("{prefix}.default_tools_approval_mode=\"approve\""),
+        format!("{prefix}.tools.{AUTONOMOUS_AGENT_TOOL_NAME}.approval_mode=\"approve\""),
+    ] {
+        command.arg("-c").arg(value);
+    }
+}
+
+fn configure_codex_app_connectors(
+    command: &mut Command,
+    connectors: Option<&[ChatAppConnector]>,
+    app_write_approved: bool,
+) {
+    let Some(connectors) = connectors else {
+        return;
+    };
+
+    // Un agent autonome ne voit aucune app par defaut. Chaque connecteur est
+    // reactive pour ce processus uniquement ; le config.toml du compte reste
+    // intact et les chats ordinaires conservent leur comportement historique.
+    command
+        .arg("--enable")
+        .arg("apps")
+        .arg("-c")
+        .arg("apps._default.enabled=false");
+
+    let approval_mode = if app_write_approved {
+        // L'interface a deja obtenu une autorisation humaine, precise et a
+        // usage unique. Le prochain tour peut donc executer cette tranche.
+        "approve"
+    } else {
+        // Les lectures annotees read-only restent autonomes ; les outils qui
+        // ecrivent doivent demander une autorisation et echouent ferme en mode
+        // non interactif si le modele ne respecte pas le protocole autonome.
+        "writes"
+    };
+    for connector in [ChatAppConnector::Gmail, ChatAppConnector::GoogleCalendar] {
+        if !connectors.contains(&connector) {
+            continue;
+        }
+        let prefix = format!("apps.{}", connector.config_id());
+        for value in [
+            format!("{prefix}.enabled=true"),
+            format!("{prefix}.default_tools_enabled=true"),
+            format!("{prefix}.destructive_enabled=false"),
+            format!("{prefix}.default_tools_approval_mode=\"{approval_mode}\""),
+        ] {
+            command.arg("-c").arg(value);
+        }
+    }
+}
+
+fn environment_memory_instructions(memory: &str) -> String {
+    format!(
+        "Memoire partagee de cet environnement, definie par l'utilisateur dans Codex Switch Terminal.\n\
+Utilise-la comme contexte durable dans cette conversation. Une demande explicite plus recente et les fichiers du projet restent prioritaires. N'invente pas de details absents et ne mentionne cette memoire que si c'est utile.\n\n\
+<environment_memory>\n{}\n</environment_memory>",
+        memory.trim()
+    )
+}
+
+fn autonomous_agent_tool_instructions() -> &'static str {
+    "Capacite native Codex Switch Terminal : l'outil MCP `create_autonomous_agent` cree et demarre un agent autonome persistant, automatiquement lie a ce chat. Quand l'utilisateur demande explicitement de creer, lancer, demarrer ou rendre autonome un agent, utilise cet outil directement avec un objectif precis. Deduis les reglages non critiques et conserve les garde-fous par defaut au lieu de renvoyer l'utilisateur vers un formulaire. N'appelle pas l'outil pour une question theorique sur les agents. Ne pretends jamais qu'un agent a ete cree si l'appel n'a pas reussi."
+}
+
+fn merge_turn_instructions(
+    environment_memory: Option<&str>,
+    tool_instructions: Option<&str>,
+) -> Option<String> {
+    let sections = [environment_memory, tool_instructions]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
+fn merge_codex_developer_instructions(account_home: &Path, turn_instructions: &str) -> String {
+    let existing = std::fs::read_to_string(account_home.join("config.toml"))
+        .ok()
+        .and_then(|content| content.parse::<toml::Value>().ok())
+        .and_then(|config| {
+            config
+                .get("developer_instructions")
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    match existing {
+        Some(existing) => format!("{existing}\n\n{turn_instructions}"),
+        None => turn_instructions.to_string(),
     }
 }
 
@@ -696,6 +1078,106 @@ fn resolve_project_dir(
     Ok(Some(path))
 }
 
+struct ResolvedProviderProgram {
+    executable: PathBuf,
+    managed_codex_package_root: Option<PathBuf>,
+}
+
+fn resolve_provider_program(
+    raw: &str,
+    provider: Provider,
+) -> Result<ResolvedProviderProgram, String> {
+    let wrapper = resolve_cli_program(raw)?;
+    if provider == Provider::Codex {
+        if let Some((executable, package_root)) = resolve_native_npm_codex(&wrapper) {
+            return Ok(ResolvedProviderProgram {
+                executable,
+                managed_codex_package_root: Some(package_root),
+            });
+        }
+    }
+    Ok(ResolvedProviderProgram {
+        executable: wrapper,
+        managed_codex_package_root: None,
+    })
+}
+
+fn configure_resolved_program_environment(
+    command: &mut Command,
+    program: &ResolvedProviderProgram,
+) {
+    let Some(package_root) = program.managed_codex_package_root.as_ref() else {
+        return;
+    };
+    // Reproduit l'environnement utile du lanceur JS officiel. Le serveur gere
+    // deja les signaux et l'arret de l'arbre ; conserver Node et cmd.exe entre
+    // le serveur et le binaire Rust ne ferait qu'ajouter deux processus par
+    // tour. Le chemin npm classique est le seul layout optimise ici ; toute
+    // installation personnalisee conserve son lanceur historique.
+    for key in [
+        "CODEX_MANAGED_BY_NPM",
+        "CODEX_MANAGED_BY_PNPM",
+        "CODEX_MANAGED_BY_BUN",
+    ] {
+        command.env_remove(key);
+    }
+    command
+        .env("CODEX_MANAGED_PACKAGE_ROOT", package_root)
+        .env("CODEX_MANAGED_BY_NPM", "1");
+}
+
+#[cfg(windows)]
+fn resolve_native_npm_codex(wrapper: &Path) -> Option<(PathBuf, PathBuf)> {
+    let is_official_shim = wrapper
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex.cmd"));
+    if !is_official_shim {
+        return None;
+    }
+
+    let shim_directory = wrapper.parent()?;
+    let package_root = shim_directory
+        .join("node_modules")
+        .join("@openai")
+        .join("codex");
+    if !package_root.join("bin").join("codex.js").is_file() {
+        return None;
+    }
+    let (platform_package, target_triple) = match env::consts::ARCH {
+        "x86_64" => ("codex-win32-x64", "x86_64-pc-windows-msvc"),
+        "aarch64" => ("codex-win32-arm64", "aarch64-pc-windows-msvc"),
+        _ => return None,
+    };
+    let relative_binary = Path::new("vendor")
+        .join(target_triple)
+        .join("bin")
+        .join("codex.exe");
+    let candidates = [
+        package_root
+            .join("node_modules")
+            .join("@openai")
+            .join(platform_package)
+            .join(&relative_binary),
+        shim_directory
+            .join("node_modules")
+            .join("@openai")
+            .join(platform_package)
+            .join(&relative_binary),
+        package_root.join(relative_binary),
+    ];
+    let executable = candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())?;
+    let canonical_root = std::fs::canonicalize(&package_root).unwrap_or(package_root);
+    Some((executable, canonical_root))
+}
+
+#[cfg(not(windows))]
+fn resolve_native_npm_codex(_wrapper: &Path) -> Option<(PathBuf, PathBuf)> {
+    None
+}
+
 fn resolve_cli_program(raw: &str) -> Result<PathBuf, String> {
     let value = raw.trim().trim_matches('"');
     if value.is_empty() {
@@ -741,6 +1223,38 @@ fn hide_process_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn hide_process_window(_command: &mut Command) {}
 
+#[cfg(windows)]
+fn terminate_chat_process_tree(child: &mut Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    // `codex.cmd` demarre via cmd.exe, puis Node/Codex peut lui-meme lancer une
+    // commande PowerShell. `Child::kill` ne termine que le wrapper direct et
+    // laisse alors l'outil bloque en arriere-plan. `/T` ferme tout cet arbre.
+    let pid = child.id().to_string();
+    let mut taskkill = Command::new("taskkill.exe");
+    taskkill
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_process_window(&mut taskkill);
+    match taskkill.status() {
+        Ok(status) if status.success() => Ok(()),
+        _ if child.try_wait()?.is_some() => Ok(()),
+        _ => child.kill(),
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_chat_process_tree(child: &mut Child) -> std::io::Result<()> {
+    if child.try_wait()?.is_some() {
+        Ok(())
+    } else {
+        child.kill()
+    }
+}
+
 fn wait_for_child(turn: &Arc<ChatTurn>) -> Result<ExitStatus, String> {
     loop {
         let terminal_grace_elapsed = provider_terminal_event(turn)
@@ -760,7 +1274,7 @@ fn wait_for_child(turn: &Arc<ChatTurn>) -> Result<ExitStatus, String> {
             // `turn.completed` / `result` est plus fiable que la survie d'un
             // wrapper CLI. Après un court délai de flush, termine le wrapper
             // resté vivant afin de libérer le tour et son workspace.
-            let _ = child.kill();
+            terminate_chat_process_tree(child).map_err(|error| error.to_string())?;
             return child.wait().map_err(|error| error.to_string());
         }
         drop(child_guard);
@@ -860,6 +1374,44 @@ fn complete_running_parts(snapshot: &mut ChatTurnSnapshot, status: &str) {
             part.status = status.to_string();
         }
     }
+}
+
+fn is_request_user_input_name(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "request_user_input" {
+        return true;
+    }
+    normalized
+        .strip_suffix("request_user_input")
+        .and_then(|prefix| prefix.chars().last())
+        .is_some_and(|separator| matches!(separator, '.' | ':' | '/' | '_'))
+}
+
+fn part_waits_for_user_input(part: &ChatPart) -> bool {
+    if part.kind != "tool"
+        || matches!(part.status.as_str(), "error" | "failed" | "cancelled")
+        || part
+            .output
+            .as_deref()
+            .is_some_and(|output| !output.trim().is_empty())
+    {
+        return false;
+    }
+    [
+        part.tool.as_deref(),
+        part.title.as_deref(),
+        part.subtitle.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(is_request_user_input_name)
+        || [part.detail.as_deref(), part.subtitle.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|value| {
+                let normalized = value.to_ascii_lowercase();
+                normalized.contains("tools.") && normalized.contains("request_user_input")
+            })
 }
 
 fn remove_final_commentary(snapshot: &mut ChatTurnSnapshot) {
@@ -983,7 +1535,19 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
         return;
     }
     if event_type == "error" {
-        snapshot.error = event_error(&value);
+        let error = event_error(&value);
+        if error
+            .as_deref()
+            .is_some_and(is_terminal_provider_error_message)
+        {
+            mark_provider_terminal(
+                turn,
+                &mut snapshot,
+                ProviderTerminalOutcome::Failed(error.unwrap_or_default()),
+            );
+        } else {
+            snapshot.error = error;
+        }
         return;
     }
     if event_type != "item.started" && event_type != "item.completed" {
@@ -1203,6 +1767,35 @@ fn event_error(value: &Value) -> Option<String> {
         })
         .or_else(|| value.get("message").and_then(Value::as_str))
         .map(|message| message.chars().take(1200).collect())
+}
+
+pub(crate) fn is_quota_exhaustion_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "usage limit",
+        "rate limit",
+        "insufficient_quota",
+        "insufficient quota",
+        "too many requests",
+        "quota exceeded",
+        "quota exhausted",
+        "no tokens left",
+        "zero tokens remaining",
+        "out of tokens",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+pub(crate) fn is_model_capacity_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("selected model is at capacity")
+        || (normalized.contains("model")
+            && (normalized.contains("at capacity") || normalized.contains("overloaded")))
+}
+
+fn is_terminal_provider_error_message(message: &str) -> bool {
+    is_quota_exhaustion_message(message) || is_model_capacity_message(message)
 }
 
 fn thought_from_item(item: &Value, completed: bool) -> Option<ChatThought> {
@@ -1457,6 +2050,7 @@ mod tests {
         AccountProfile {
             id: "account".to_string(),
             label: "Compte test".to_string(),
+            created_at: None,
             provider,
             codex_home: ".codex-test".to_string(),
             project_dir: None,
@@ -1609,6 +2203,56 @@ mod tests {
     }
 
     #[test]
+    fn codex_quota_error_is_terminal_even_if_a_command_wrapper_stays_alive() {
+        let turn = test_turn();
+        apply_provider_event(
+            &turn,
+            Provider::Codex,
+            r#"{"type":"error","message":"You've hit your usage limit. Try again later."}"#,
+        );
+
+        let snapshot = turn.snapshot.lock().unwrap();
+        assert_eq!(snapshot.status, ChatTurnStatus::Finalizing);
+        assert!(snapshot
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("usage limit")));
+        drop(snapshot);
+        assert!(matches!(
+            provider_terminal_event(&turn).map(|event| event.outcome),
+            Some(ProviderTerminalOutcome::Failed(error)) if error.contains("usage limit")
+        ));
+
+        finish_turn(&turn, Err("wrapper reste vivant".to_string()), "");
+        assert_eq!(turn.snapshot.lock().unwrap().status, ChatTurnStatus::Failed);
+    }
+
+    #[test]
+    fn codex_model_capacity_error_is_terminal_for_an_immediate_retry() {
+        let turn = test_turn();
+        apply_provider_event(
+            &turn,
+            Provider::Codex,
+            r#"{"type":"error","message":"Selected model is at capacity. Please try a different model."}"#,
+        );
+
+        let snapshot = turn.snapshot.lock().unwrap();
+        assert_eq!(snapshot.status, ChatTurnStatus::Finalizing);
+        assert!(snapshot
+            .error
+            .as_deref()
+            .is_some_and(is_model_capacity_message));
+        drop(snapshot);
+        assert!(matches!(
+            provider_terminal_event(&turn).map(|event| event.outcome),
+            Some(ProviderTerminalOutcome::Failed(error)) if is_model_capacity_message(&error)
+        ));
+
+        finish_turn(&turn, Err("wrapper reste vivant".to_string()), "");
+        assert_eq!(turn.snapshot.lock().unwrap().status, ChatTurnStatus::Failed);
+    }
+
+    #[test]
     fn codex_command_applies_chat_model_and_effort_overrides() {
         let account = test_account(Provider::Codex);
         let mut command = Command::new("codex");
@@ -1619,6 +2263,11 @@ mod tests {
             ChatTurnMode::Build,
             Some("gpt-chat-test"),
             Some("ultra"),
+            None,
+            false,
+            None,
+            None,
+            None,
         );
 
         let args = command
@@ -1637,6 +2286,239 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-c", "show_raw_agent_reasoning=false"]));
+        assert!(args.windows(2).any(|pair| pair == ["--enable", "memories"]));
+    }
+
+    #[test]
+    fn codex_chat_gets_the_scoped_autonomous_agent_mcp_tool() {
+        let account = test_account(Provider::Codex);
+        let config = ChatModelToolServerConfig {
+            url: "http://127.0.0.1:8080/mcp/chat-tools".to_string(),
+            bearer_token: "secret-capability".to_string(),
+        };
+        let mut command = Command::new("codex");
+        configure_provider_command(
+            &mut command,
+            &account,
+            None,
+            ChatTurnMode::Build,
+            None,
+            None,
+            None,
+            false,
+            Some(autonomous_agent_tool_instructions()),
+            Some(&config),
+            None,
+        );
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        for expected in [
+            "mcp_servers.cst_chat.url=\"http://127.0.0.1:8080/mcp/chat-tools\"",
+            "mcp_servers.cst_chat.bearer_token_env_var=\"CST_CHAT_AUTONOMOUS_TOOL_TOKEN\"",
+            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\"]",
+            "mcp_servers.cst_chat.required=true",
+            "mcp_servers.cst_chat.default_tools_approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.create_autonomous_agent.approval_mode=\"approve\"",
+        ] {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == expected));
+        }
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(environment.iter().any(|(key, value)| {
+            key == MCP_BEARER_ENV && value.as_deref() == Some("secret-capability")
+        }));
+        assert!(autonomous_agent_tool_instructions().contains("utilise cet outil directement"));
+    }
+
+    #[test]
+    fn autonomous_connectors_are_scoped_and_writes_need_a_one_turn_approval() {
+        let account = test_account(Provider::Codex);
+        let connectors = [ChatAppConnector::Gmail, ChatAppConnector::GoogleCalendar];
+        let mut guarded = Command::new("codex");
+        configure_provider_command(
+            &mut guarded,
+            &account,
+            None,
+            ChatTurnMode::Build,
+            None,
+            None,
+            Some(&connectors),
+            false,
+            None,
+            None,
+            None,
+        );
+        let guarded_args = guarded
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(!guarded_args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        for expected in [
+            "apps._default.enabled=false",
+            "apps.gmail.enabled=true",
+            "apps.gmail.destructive_enabled=false",
+            "apps.gmail.default_tools_approval_mode=\"writes\"",
+            "apps.connector_googlecalendar.enabled=true",
+            "apps.connector_googlecalendar.destructive_enabled=false",
+            "apps.connector_googlecalendar.default_tools_approval_mode=\"writes\"",
+        ] {
+            assert!(guarded_args
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == expected));
+        }
+
+        let mut approved = Command::new("codex");
+        configure_provider_command(
+            &mut approved,
+            &account,
+            None,
+            ChatTurnMode::Build,
+            None,
+            None,
+            Some(&[ChatAppConnector::Gmail]),
+            true,
+            None,
+            None,
+            None,
+        );
+        let approved_args = approved
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(approved_args
+            .windows(2)
+            .any(|pair| { pair == ["-c", "apps.gmail.default_tools_approval_mode=\"approve\""] }));
+        assert!(!approved_args
+            .iter()
+            .any(|arg| arg.contains("connector_googlecalendar.enabled=true")));
+    }
+
+    #[test]
+    fn environment_memory_is_injected_outside_the_visible_user_prompt() {
+        let memory = environment_memory_instructions(
+            "API publique en version 2.\nConserver les migrations SQLite.",
+        );
+
+        let codex_account = test_account(Provider::Codex);
+        let mut codex = Command::new("codex");
+        configure_provider_command(
+            &mut codex,
+            &codex_account,
+            None,
+            ChatTurnMode::Build,
+            None,
+            None,
+            None,
+            false,
+            Some(&memory),
+            None,
+            None,
+        );
+        let codex_args = codex
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let configured = codex_args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("developer_instructions="))
+            .expect("instructions developpeur Codex");
+        let parsed = format!("value={configured}")
+            .parse::<toml::Value>()
+            .expect("chaine TOML valide");
+        assert_eq!(
+            parsed.get("value").and_then(toml::Value::as_str),
+            Some(memory.as_str())
+        );
+
+        let claude_account = test_account(Provider::Claude);
+        let mut claude = Command::new("claude");
+        configure_provider_command(
+            &mut claude,
+            &claude_account,
+            None,
+            ChatTurnMode::Build,
+            None,
+            None,
+            None,
+            false,
+            Some(&memory),
+            None,
+            None,
+        );
+        let claude_args = claude
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(claude_args
+            .windows(2)
+            .any(|pair| pair[0] == "--append-system-prompt" && pair[1] == memory));
+    }
+
+    #[test]
+    fn question_and_proof_tools_generate_independent_hidden_instructions() {
+        assert_eq!(chat_tool_instructions(&[], false, false), None);
+
+        let question = chat_tool_instructions(&[], true, false).expect("mode Question");
+        assert!(question.contains("[Mode Question]"));
+        assert!(question.contains("request_user_input"));
+        assert!(!question.contains("[Mode Preuve]"));
+
+        let proof = chat_tool_instructions(&[], false, true).expect("mode Preuve");
+        assert!(proof.contains("[Mode Preuve]"));
+        assert!(proof.contains("capture d'écran"));
+        assert!(!proof.contains("[Mode Question]"));
+
+        let combined = merge_turn_instructions(Some("memoire environnement"), Some(&proof))
+            .expect("instructions combinees");
+        assert!(combined.starts_with("memoire environnement\n\n"));
+        assert!(combined.contains("[Mode Preuve]"));
+    }
+
+    #[test]
+    fn selected_skills_use_a_temporary_file_outside_the_provider_command_line() {
+        let path;
+        {
+            let file = TemporaryChatSkillsFile::create(42, "# Skill\n\nInstructions").unwrap();
+            path = file.path.clone();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "# Skill\n\nInstructions"
+            );
+            let instructions = file.instructions();
+            assert!(instructions.contains(&path.display().to_string()));
+            assert!(!instructions.contains("# Skill"));
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn environment_memory_keeps_existing_codex_developer_instructions() {
+        let home = env::temp_dir().join(format!("cst-memory-config-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "developer_instructions = \"Toujours lancer les tests.\"\n",
+        )
+        .unwrap();
+
+        let merged = merge_codex_developer_instructions(&home, "Memoire de Produit");
+        assert!(merged.starts_with("Toujours lancer les tests."));
+        assert!(merged.ends_with("Memoire de Produit"));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1668,6 +2550,39 @@ mod tests {
         .unwrap();
         assert_eq!(request.model, None);
         assert_eq!(request.reasoning_effort, None);
+        assert_eq!(request.app_connectors, None);
+        assert!(!request.app_write_approved);
+        assert!(request.agent_tools.is_empty());
+        assert!(request.agent_skills.is_empty());
+        assert!(!request.question_tool);
+        assert!(!request.proof_tool);
+
+        let enabled_tools: StartChatTurnRequest = serde_json::from_value(serde_json::json!({
+            "accountId": "account",
+            "prompt": "Bonjour",
+            "agentTools": [
+                "thermo-nuclear-code-quality-review",
+                "impeccable-make-interfaces-feel-better"
+            ],
+            "agentSkills": [{
+                "id": "impeccable",
+                "name": "Impeccable",
+                "content": "Inspecte l'interface."
+            }],
+            "questionTool": true,
+            "proofTool": true
+        }))
+        .unwrap();
+        assert!(enabled_tools.question_tool);
+        assert!(enabled_tools.proof_tool);
+        assert_eq!(
+            enabled_tools.agent_tools,
+            vec![
+                ChatAgentTool::ThermoNuclearCodeQualityReview,
+                ChatAgentTool::ImpeccableMakeInterfacesFeelBetter,
+            ]
+        );
+        assert_eq!(enabled_tools.agent_skills[0].id, "impeccable");
 
         assert_eq!(
             selected_model(Some(" gpt-chat-test "), Some("fallback")).unwrap(),
@@ -1700,10 +2615,194 @@ mod tests {
             mode: ChatTurnMode::Build,
             model: None,
             reasoning_effort: None,
+            app_connectors: None,
+            app_write_approved: false,
+            agent_tools: Vec::new(),
+            agent_skills: Vec::new(),
+            question_tool: false,
+            proof_tool: false,
+            source_chat_key: None,
         };
         let claim = manager.reserve_turn(&request).unwrap();
         assert!(manager.reserve_turn(&request).is_err());
         drop(claim);
         assert!(manager.reserve_turn(&request).is_ok());
+    }
+
+    #[test]
+    fn new_conversations_do_not_share_an_empty_provider_session_claim() {
+        let manager = ChatTurnManager::default();
+        let request = StartChatTurnRequest {
+            account_id: "account".to_string(),
+            session_id: None,
+            prompt: "test".to_string(),
+            project_dir: None,
+            mode: ChatTurnMode::Build,
+            model: None,
+            reasoning_effort: None,
+            app_connectors: None,
+            app_write_approved: false,
+            agent_tools: Vec::new(),
+            agent_skills: Vec::new(),
+            question_tool: false,
+            proof_tool: false,
+            source_chat_key: None,
+        };
+
+        let first = manager.reserve_turn(&request).unwrap();
+        let second = manager.reserve_turn(&request).unwrap();
+        drop((first, second));
+
+        // Reproduit le court intervalle observe au redemarrage : le premier
+        // agent tourne deja, mais Codex n'a pas encore emis `thread.started`.
+        manager.turns.lock().unwrap().insert(1, test_turn());
+        assert!(manager.reserve_turn(&request).is_ok());
+    }
+
+    #[test]
+    fn active_turn_catalog_only_returns_busy_snapshots() {
+        let manager = ChatTurnManager::default();
+        let running = test_turn();
+        let finalizing = test_turn();
+        {
+            let mut snapshot = finalizing.snapshot.lock().unwrap();
+            snapshot.id = 2;
+            snapshot.status = ChatTurnStatus::Finalizing;
+            snapshot.parts.push(ChatPart {
+                id: "question".to_string(),
+                kind: "tool".to_string(),
+                status: "running".to_string(),
+                text: None,
+                tool: Some("tool".to_string()),
+                title: Some("Utilisation d'un outil".to_string()),
+                subtitle: Some("functions.request_user_input".to_string()),
+                detail: None,
+                output: None,
+            });
+        }
+        let completed = test_turn();
+        {
+            let mut snapshot = completed.snapshot.lock().unwrap();
+            snapshot.id = 3;
+            snapshot.status = ChatTurnStatus::Completed;
+            snapshot.finished_at = Some(1);
+        }
+        manager
+            .turns
+            .lock()
+            .unwrap()
+            .extend([(3, completed), (1, running), (2, finalizing)]);
+
+        let active = manager.active().unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .map(|snapshot| snapshot.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!active[0].waiting_for_user);
+        assert!(active[1].waiting_for_user);
+    }
+
+    #[test]
+    fn stopping_a_turn_cancels_its_running_command_card() {
+        let manager = ChatTurnManager::default();
+        let turn = test_turn();
+        turn.snapshot.lock().unwrap().parts.push(ChatPart {
+            id: "command".to_string(),
+            kind: "tool".to_string(),
+            status: "running".to_string(),
+            text: None,
+            tool: Some("command".to_string()),
+            title: Some("Execution d'une commande".to_string()),
+            subtitle: None,
+            detail: None,
+            output: None,
+        });
+        manager.turns.lock().unwrap().insert(1, turn);
+
+        let stopped = manager.stop(1).unwrap();
+        assert_eq!(stopped.status, ChatTurnStatus::Cancelled);
+        assert_eq!(stopped.parts[0].status, "cancelled");
+    }
+
+    #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[test]
+    fn official_npm_codex_uses_its_native_binary_with_safe_fallbacks() {
+        let root = env::temp_dir().join(format!("cst-native-codex-{}", Uuid::new_v4()));
+        let shim = root.join("codex.cmd");
+        let package_root = root.join("node_modules").join("@openai").join("codex");
+        let (platform_package, target_triple) = if cfg!(target_arch = "aarch64") {
+            ("codex-win32-arm64", "aarch64-pc-windows-msvc")
+        } else {
+            ("codex-win32-x64", "x86_64-pc-windows-msvc")
+        };
+        let native = package_root
+            .join("node_modules")
+            .join("@openai")
+            .join(platform_package)
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join("codex.exe");
+        std::fs::create_dir_all(package_root.join("bin")).unwrap();
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&shim, "@echo off\r\n").unwrap();
+        std::fs::write(
+            package_root.join("bin").join("codex.js"),
+            "// official shim\n",
+        )
+        .unwrap();
+        std::fs::write(&native, b"").unwrap();
+
+        let resolved = resolve_provider_program(shim.to_str().unwrap(), Provider::Codex).unwrap();
+        assert_eq!(resolved.executable, native);
+        assert_eq!(
+            resolved.managed_codex_package_root,
+            Some(std::fs::canonicalize(&package_root).unwrap())
+        );
+
+        let custom = root.join("codex-custom.cmd");
+        std::fs::write(&custom, "@echo off\r\n").unwrap();
+        let custom_resolved =
+            resolve_provider_program(custom.to_str().unwrap(), Provider::Codex).unwrap();
+        assert_eq!(custom_resolved.executable, custom);
+        assert!(custom_resolved.managed_codex_package_root.is_none());
+
+        std::fs::remove_file(&native).unwrap();
+        let fallback = resolve_provider_program(shim.to_str().unwrap(), Provider::Codex).unwrap();
+        assert_eq!(fallback.executable, shim);
+        assert!(fallback.managed_codex_package_root.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_chat_turn_kills_its_descendant_command() {
+        let marker = env::temp_dir().join(format!("cst-chat-tree-stop-{}.txt", Uuid::new_v4()));
+        let escaped_marker = marker.to_string_lossy().replace('\'', "''");
+        let command_line = format!(
+            "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 900; [IO.File]::WriteAllText('{escaped_marker}', 'survived')\""
+        );
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/S", "/C", command_line.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_process_window(&mut command);
+        let mut child = command.spawn().expect("wrapper de test");
+
+        thread::sleep(Duration::from_millis(200));
+        terminate_chat_process_tree(&mut child).expect("arret de l'arbre du tour");
+        let _ = child.wait();
+        thread::sleep(Duration::from_millis(1_000));
+
+        assert!(
+            !marker.exists(),
+            "la commande descendante a survecu a l'arret du tour"
+        );
+        let _ = std::fs::remove_file(marker);
     }
 }

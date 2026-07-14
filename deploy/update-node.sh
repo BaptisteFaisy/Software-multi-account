@@ -27,6 +27,7 @@ APP_DIR="/opt/codex-switch-terminal"
 SOURCE_DIR="/opt/codex-switch-terminal-src"
 SOURCE_ARCHIVE="/tmp/cst-source.tar.gz"
 RELEASES_DIR="$APP_DIR/releases"
+BUILD_CACHE="$APP_DIR/build-cache"
 CURRENT_LINK="$APP_DIR/current"
 ENV_FILE="/etc/codex-switch-terminal.env"
 SERVICE="codex-switch-terminal.service"
@@ -201,12 +202,16 @@ else
     chown -R cst:cst "$SOURCE_DIR"
   fi
   log "Build de la nouvelle release depuis $SOURCE_DIR"
+  install -d -o cst -g cst "$BUILD_CACHE"
+  ln -sfn "$BUILD_CACHE" "$SOURCE_DIR/src-tauri/target"
+  chown -h cst:cst "$SOURCE_DIR/src-tauri/target"
   runuser -u cst -- env \
     HOME=/home/cst \
     PATH=/home/cst/.cargo/bin:/usr/local/bin:/usr/bin:/bin \
+    CARGO_TARGET_DIR="$BUILD_CACHE" \
     CST_GIT_COMMIT="$CST_GIT_COMMIT" \
     bash -c "cd '$SOURCE_DIR' && cargo +1.88.0 build --manifest-path src-tauri/Cargo.toml --release --bin cst-server"
-  BUILT_BIN="$SOURCE_DIR/src-tauri/target/release/cst-server"
+  BUILT_BIN="$BUILD_CACHE/release/cst-server"
   DIST_SRC="$SOURCE_DIR/dist"
 fi
 

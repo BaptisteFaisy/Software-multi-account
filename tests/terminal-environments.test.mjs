@@ -83,8 +83,9 @@ test("un environnement vide ne recoit jamais de chat de base", () => {
     main,
     /!expertChatPanes\.length\)[^\n]*createExpertChatPane/,
   );
-  assert.match(main, /<strong>Aucun chat ouvert<\/strong>/);
-  assert.match(main, /Cliquez sur « Ouvrir un chat » pour commencer\./);
+  assert.match(main, /Commencez une nouvelle conversation/);
+  assert.match(main, /id="emptyNewChat"/);
+  assert.match(main, /Dernière discussion/);
 });
 
 test("le choix d'environnement propose un explorateur de dossiers navigable", () => {
@@ -158,4 +159,15 @@ test("les backends desktop et serveur refusent un environnement implicite", () =
   assert.ok(desktop.includes(error));
   assert.ok(server.includes(error));
   assert.doesNotMatch(server, /prepare_local\(&agent_id, &canonical_home, None\)/);
+});
+
+test("le terminal temporaire de login reste dans le home du compte sans projet", () => {
+  assert.match(
+    desktop,
+    /let project_dir = if login_only \{\s*account_home\.clone\(\)\s*\} else \{\s*resolve_terminal_environment/,
+  );
+  assert.match(
+    server,
+    /if request\.login_only \{[\s\S]*?workspace_id_for_dir\(&canonical_home\)[\s\S]*?canonical_home\.clone\(\)/,
+  );
 });

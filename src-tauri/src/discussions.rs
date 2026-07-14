@@ -56,6 +56,52 @@ use std::{
 const TITLE_MAX_CHARS: usize = 80;
 const PREVIEW_MAX_CHARS: usize = 200;
 
+/// Construit un titre a partir du sens de la demande. Les agents Codex et
+/// Claude reformulent generalement la tache dans leur premier message de
+/// travail : cette reformulation est un bien meilleur titre que les 80
+/// premiers caracteres du prompt. Le prompt reste le repli pour une session
+/// interrompue avant la premiere reponse.
+#[derive(Default)]
+struct TaskTitleBuilder {
+    user_prompt: Option<String>,
+    assistant_plan: Option<String>,
+    assistant_result: Option<String>,
+}
+
+impl TaskTitleBuilder {
+    fn observe_user(&mut self, text: &str) {
+        if self.user_prompt.is_none() {
+            self.user_prompt = Some(text.to_string());
+        }
+    }
+
+    fn observe_assistant(&mut self, text: &str, phase: Option<&str>) {
+        let Some(candidate) = assistant_title_candidate(text) else {
+            return;
+        };
+        match phase {
+            Some("commentary") if self.assistant_plan.is_none() => {
+                self.assistant_plan = Some(candidate);
+            }
+            Some("final_answer") if self.assistant_result.is_none() => {
+                self.assistant_result = Some(candidate);
+            }
+            None if self.assistant_result.is_none() => {
+                self.assistant_result = Some(candidate);
+            }
+            _ => {}
+        }
+    }
+
+    fn title(&self) -> Option<String> {
+        self.assistant_plan
+            .as_deref()
+            .or(self.assistant_result.as_deref())
+            .map(ToString::to_string)
+            .or_else(|| self.user_prompt.as_deref().and_then(user_title_candidate))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SummaryCacheKey {
     path: PathBuf,
@@ -418,6 +464,7 @@ fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
         settings::Provider::Codex => scan_codex_discussions(&home, account),
         settings::Provider::Claude => scan_claude_discussions(&home, account),
     };
+    discussions.retain(|discussion| !discussion_summary_is_autonomous(discussion));
 
     // Les plus recemment actives d'abord (le HEAD porte le dernier `mtime`).
     discussions.sort_by(|a, b| {
@@ -512,11 +559,12 @@ fn scan_claude_session_file(path: &Path, account: &AccountProfile) -> Option<Dis
     let mut cwd: Option<String> = None;
     let mut started_at: Option<i64> = None;
     let mut cli_version: Option<String> = None;
-    let mut title: Option<String> = None;
+    let mut title_builder = TaskTitleBuilder::default();
     let mut preview: Option<String> = None;
     let mut message_count: u64 = 0;
     let mut total_tokens: u64 = 0;
     let mut saw_tokens = false;
+    let mut autonomous = false;
 
     for line in reader.lines().map_while(Result::ok) {
         if line.trim().is_empty() {
@@ -556,11 +604,15 @@ fn scan_claude_session_file(path: &Path, account: &AccountProfile) -> Option<Dis
             "user" => {
                 if let Some(text) = claude_message_text(&value) {
                     let msg = text.trim();
+                    if is_autonomous_prompt(msg) {
+                        autonomous = true;
+                    }
                     if !msg.is_empty() {
                         message_count += 1;
-                        if title.is_none() && !is_synthetic_prompt(msg) {
-                            let first_line = msg.lines().next().unwrap_or(msg).trim();
-                            title = Some(truncate_chars(first_line, TITLE_MAX_CHARS));
+                        if !is_synthetic_prompt(msg) {
+                            title_builder.observe_user(msg);
+                        }
+                        if preview.is_none() && !is_synthetic_prompt(msg) {
                             preview = Some(truncate_chars(msg, PREVIEW_MAX_CHARS));
                         }
                     }
@@ -568,6 +620,9 @@ fn scan_claude_session_file(path: &Path, account: &AccountProfile) -> Option<Dis
             }
             "assistant" => {
                 message_count += 1;
+                if let Some(text) = claude_message_text(&value) {
+                    title_builder.observe_assistant(&text, None);
+                }
                 if let Some(usage) = value.pointer("/message/usage") {
                     saw_tokens = true;
                     total_tokens += claude_usage_total(usage);
@@ -578,7 +633,7 @@ fn scan_claude_session_file(path: &Path, account: &AccountProfile) -> Option<Dis
     }
 
     // Session vide / avortee (aucun message reel) : on la filtre.
-    if message_count == 0 {
+    if message_count == 0 || autonomous {
         return None;
     }
 
@@ -603,7 +658,7 @@ fn scan_claude_session_file(path: &Path, account: &AccountProfile) -> Option<Dis
         cwd,
         started_at,
         last_activity,
-        title,
+        title: title_builder.title(),
         preview,
         message_count,
         total_tokens: if saw_tokens { Some(total_tokens) } else { None },
@@ -751,9 +806,10 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
     let last_activity = mtime.unwrap_or(started_at);
 
     let mut message_count: u64 = 0;
-    let mut title: Option<String> = None;
+    let mut title_builder = TaskTitleBuilder::default();
     let mut preview: Option<String> = None;
     let mut total_tokens: Option<u64> = None;
+    let mut autonomous = false;
 
     let mut line = String::new();
     loop {
@@ -766,23 +822,32 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
 
         if line.contains("\"type\":\"user_message\"") {
             message_count += 1;
-            if title.is_none() {
-                if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
-                    if let Some(message) = value.pointer("/payload/message").and_then(Value::as_str)
-                    {
-                        let msg = message.trim();
-                        // Le premier contenu utilisateur synthetique
-                        // (`<environment_context>...`) ne doit pas servir de titre.
-                        if !msg.is_empty() && !msg.starts_with('<') {
-                            let first_line = msg.lines().next().unwrap_or(msg).trim();
-                            title = Some(truncate_chars(first_line, TITLE_MAX_CHARS));
-                            preview = Some(truncate_chars(msg, PREVIEW_MAX_CHARS));
-                        }
+            if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+                if let Some(message) = value.pointer("/payload/message").and_then(Value::as_str) {
+                    let msg = message.trim();
+                    if is_autonomous_prompt(msg) {
+                        autonomous = true;
+                    }
+                    // Le premier contenu utilisateur synthetique
+                    // (`<environment_context>...`) ne doit pas servir de titre.
+                    if !msg.is_empty() && !is_synthetic_prompt(msg) {
+                        title_builder.observe_user(msg);
+                    }
+                    if preview.is_none() && !msg.is_empty() && !is_synthetic_prompt(msg) {
+                        preview = Some(truncate_chars(msg, PREVIEW_MAX_CHARS));
                     }
                 }
             }
         } else if line.contains("\"type\":\"agent_message\"") {
             message_count += 1;
+            if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+                if let Some(message) = value.pointer("/payload/message").and_then(Value::as_str) {
+                    title_builder.observe_assistant(
+                        message,
+                        value.pointer("/payload/phase").and_then(Value::as_str),
+                    );
+                }
+            }
         }
 
         if line.contains("\"type\":\"token_count\"") {
@@ -798,7 +863,7 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
     }
 
     // Session vide / avortee : on la filtre.
-    if message_count == 0 {
+    if message_count == 0 || autonomous {
         return None;
     }
 
@@ -814,7 +879,7 @@ fn scan_discussion_file(path: &Path, account: &AccountProfile) -> Option<Discuss
         cwd,
         started_at,
         last_activity,
-        title,
+        title: title_builder.title(),
         preview,
         message_count,
         total_tokens,
@@ -2504,10 +2569,21 @@ fn is_synthetic_prompt(msg: &str) -> bool {
     msg.starts_with("<environment_context>") || msg.starts_with("<user_instructions>")
 }
 
+fn is_autonomous_prompt(msg: &str) -> bool {
+    msg.contains("CST_AUTONOMOUS_AGENT_SESSION: true")
+        || msg.contains("chat de type agent autonome")
+        || msg.contains("Poursuis de maniere autonome l'objectif durable")
+        || (msg.contains("AUTONOMOUS_STATUS:") && msg.contains("AUTONOMOUS_MEMORY:"))
+}
+
+fn discussion_summary_is_autonomous(summary: &DiscussionSummary) -> bool {
+    summary.title.as_deref().is_some_and(is_autonomous_prompt)
+        || summary.preview.as_deref().is_some_and(is_autonomous_prompt)
+}
+
 /// Extrait toutes les demandes utilisateur d'un rollout et les pousse dans
-/// `out`. Seules les lignes contenant `"type":"user_message"` sont parsees en
-/// JSON (filtre `contains` peu couteux) : les grosses reponses de l'agent ne
-/// sont jamais deserialisees.
+/// `out`. Les messages de l'agent sont aussi lus pour reutiliser sa
+/// reformulation semantique de la tache comme titre de session.
 fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptEntry>) {
     let Ok(file) = fs::File::open(path) else {
         return;
@@ -2552,7 +2628,7 @@ fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptE
 
     let file_path = path.to_string_lossy().to_string();
     let start_index = out.len();
-    let mut session_title: Option<String> = None;
+    let mut title_builder = TaskTitleBuilder::default();
 
     let mut line = String::new();
     loop {
@@ -2563,6 +2639,17 @@ fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptE
             Err(_) => break,
         }
 
+        if line.contains("\"type\":\"agent_message\"") {
+            if let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) {
+                if let Some(message) = value.pointer("/payload/message").and_then(Value::as_str) {
+                    title_builder.observe_assistant(
+                        message,
+                        value.pointer("/payload/phase").and_then(Value::as_str),
+                    );
+                }
+            }
+            continue;
+        }
         if !line.contains("\"type\":\"user_message\"") {
             continue;
         }
@@ -2574,6 +2661,10 @@ fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptE
             continue;
         };
         let msg = message.trim();
+        if is_autonomous_prompt(msg) {
+            out.truncate(start_index);
+            return;
+        }
         if msg.is_empty() || is_synthetic_prompt(msg) {
             continue;
         }
@@ -2584,10 +2675,7 @@ fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptE
             .and_then(parse_rfc3339_secs)
             .unwrap_or(started_at);
 
-        if session_title.is_none() {
-            let first_msg_line = msg.lines().next().unwrap_or(msg).trim();
-            session_title = Some(truncate_chars(first_msg_line, TITLE_MAX_CHARS));
-        }
+        title_builder.observe_user(msg);
 
         out.push(PromptEntry {
             session_id: session_id.clone(),
@@ -2603,7 +2691,7 @@ fn scan_prompt_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptE
         });
     }
 
-    if let Some(title) = session_title {
+    if let Some(title) = title_builder.title() {
         for entry in &mut out[start_index..] {
             entry.session_title = Some(title.clone());
         }
@@ -2718,6 +2806,275 @@ fn append_suffix_before_ext(path: &Path, suffix: i64) -> PathBuf {
     }
 }
 
+fn assistant_title_candidate(value: &str) -> Option<String> {
+    meaningful_segments(value)
+        .into_iter()
+        .take(4)
+        .find_map(|segment| assistant_segment_title(&segment))
+}
+
+fn assistant_segment_title(segment: &str) -> Option<String> {
+    let mut title = strip_assistant_intro(&segment);
+
+    // Les introductions de type "Je prends cet objectif en charge : ..."
+    // placent la vraie reformulation apres les deux-points.
+    if let Some((intro, summary)) = title.split_once(':') {
+        let intro = intro.to_lowercase();
+        if summary.split_whitespace().count() >= 3
+            && ["objectif", "tache", "tâche", "travail", "charge"]
+                .iter()
+                .any(|marker| intro.contains(marker))
+        {
+            title = summary.trim().to_string();
+        }
+    }
+
+    let lower = title.to_lowercase();
+    let generic = [
+        "je regarde",
+        "je m'en occupe",
+        "je m’en occupe",
+        "bien sur",
+        "bien sûr",
+        "d'accord",
+        "d’accord",
+        "i'll take a look",
+        "i will take a look",
+    ];
+    if title.chars().count() < 24
+        || title.split_whitespace().count() < 4
+        || generic.iter().any(|value| lower == *value)
+        || (lower.contains("skill")
+            && (lower.contains("j'utilise")
+                || lower.contains("j’utilise")
+                || lower.contains("using")))
+    {
+        return None;
+    }
+    Some(finalize_title(&title))
+}
+
+fn user_title_candidate(value: &str) -> Option<String> {
+    let segments = meaningful_segments(value);
+    if segments.is_empty() {
+        return None;
+    }
+
+    // Une section explicitement nommee porte mieux l'intention que le contexte
+    // qui la precede souvent dans les prompts structures.
+    for segment in &segments {
+        let lower = segment.to_lowercase();
+        for label in [
+            "tache :",
+            "tâche :",
+            "objectif :",
+            "demande :",
+            "task:",
+            "goal:",
+            "request:",
+        ] {
+            if lower.starts_with(label) {
+                let candidate = segment.get(label.len()..).unwrap_or("").trim();
+                if candidate.split_whitespace().count() >= 2 {
+                    return Some(finalize_title(&strip_user_intro(candidate)));
+                }
+            }
+        }
+    }
+
+    // Favorise une phrase qui exprime une action/demande, meme si elle arrive
+    // apres quelques lignes de contexte.
+    let mut best: Option<(&str, i32)> = None;
+    for (index, segment) in segments.iter().enumerate() {
+        let lower = segment.to_lowercase();
+        let mut score = 20_i32.saturating_sub(index as i32);
+        if [
+            "je veux",
+            "j'aimerais",
+            "j’aimerais",
+            "peux-tu",
+            "pourrais-tu",
+            "il faut",
+            "merci de",
+            "i want",
+            "can you",
+            "could you",
+            "please",
+            "we need",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            score += 40;
+        }
+        if [
+            "corrig",
+            "ajout",
+            "cré",
+            "cre",
+            "implément",
+            "implement",
+            "modifi",
+            "supprim",
+            "amélior",
+            "amelior",
+            "résum",
+            "resum",
+            "répar",
+            "repar",
+            "fix",
+            "build",
+            "create",
+            "update",
+            "remove",
+            "improve",
+            "summar",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+        {
+            score += 20;
+        }
+        if lower.starts_with("contexte")
+            || lower.starts_with("context")
+            || lower.starts_with("voici")
+        {
+            score -= 30;
+        }
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((segment, score));
+        }
+    }
+
+    best.map(|(segment, _)| finalize_title(&strip_user_intro(segment)))
+}
+
+fn meaningful_segments(value: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut in_code = false;
+    for raw_line in value.lines().take(64) {
+        let line = raw_line.trim();
+        if line.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code || line.is_empty() || is_synthetic_prompt(line) {
+            continue;
+        }
+        let cleaned = line
+            .trim_start_matches(|character: char| {
+                character == '#'
+                    || character == '-'
+                    || character == '*'
+                    || character.is_whitespace()
+            })
+            .trim()
+            .trim_matches('*')
+            .replace('`', "");
+        for sentence in cleaned.split(|character| matches!(character, '.' | '!' | '?')) {
+            let sentence = normalize_spaces(sentence);
+            if sentence.chars().count() >= 8 {
+                segments.push(sentence);
+            }
+        }
+    }
+    segments
+}
+
+fn strip_assistant_intro(value: &str) -> String {
+    strip_known_prefix(
+        value,
+        &[
+            "je vais maintenant ",
+            "je vais d'abord ",
+            "je vais d’abord ",
+            "je vais donc ",
+            "je vais ",
+            "je commence par ",
+            "i will now ",
+            "i'll now ",
+            "i will ",
+            "i'll ",
+            "let me ",
+        ],
+    )
+}
+
+fn strip_user_intro(value: &str) -> String {
+    strip_known_prefix(
+        value,
+        &[
+            "je voudrais que tu ",
+            "j'aimerais que tu ",
+            "j’aimerais que tu ",
+            "je veux que tu ",
+            "je veux que ",
+            "peux-tu ",
+            "pourrais-tu ",
+            "merci de ",
+            "s'il te plait, ",
+            "s’il te plaît, ",
+            "i would like you to ",
+            "i want you to ",
+            "could you ",
+            "can you ",
+            "please ",
+        ],
+    )
+}
+
+fn strip_known_prefix(value: &str, prefixes: &[&str]) -> String {
+    let trimmed = value.trim();
+    let lower = trimmed.to_lowercase();
+    for prefix in prefixes {
+        if lower.starts_with(prefix) {
+            return trimmed
+                .get(prefix.len()..)
+                .unwrap_or(trimmed)
+                .trim()
+                .to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn normalize_spaces(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn finalize_title(value: &str) -> String {
+    let normalized = normalize_spaces(value)
+        .trim_matches(|character: char| matches!(character, ':' | ';' | ',' | '-' | '—'))
+        .trim()
+        .to_string();
+    let mut capitalized = String::with_capacity(normalized.len());
+    let mut chars = normalized.chars();
+    if let Some(first) = chars.next() {
+        capitalized.extend(first.to_uppercase());
+        capitalized.extend(chars);
+    }
+    truncate_title_words(&capitalized, TITLE_MAX_CHARS)
+}
+
+fn truncate_title_words(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let available = max.saturating_sub(1);
+    let prefix = value.chars().take(available).collect::<String>();
+    let boundary = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace() || matches!(character, ',' | ';' | ':'))
+        .map(|(index, _)| index)
+        .filter(|index| *index >= available / 2)
+        .unwrap_or(prefix.len());
+    format!(
+        "{}…",
+        prefix[..boundary].trim_end_matches([' ', ',', ';', ':'])
+    )
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
@@ -2756,6 +3113,7 @@ mod tests {
         AccountProfile {
             id: id.to_string(),
             label: format!("Compte {id}"),
+            created_at: None,
             provider: settings::Provider::Codex,
             codex_home: home.to_string_lossy().to_string(),
             project_dir: None,
@@ -2776,6 +3134,72 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn task_title_prefers_the_agents_semantic_reformulation() {
+        let mut title = TaskTitleBuilder::default();
+        title.observe_user(
+            "Contexte tres long avant la demande. Je veux que le titre de la conversation decrive vraiment le travail attendu.",
+        );
+        title.observe_assistant(
+            "Je vais remplacer le titre tronque par un resume descriptif de la tache, puis verifier l'historique.",
+            Some("commentary"),
+        );
+
+        assert_eq!(
+            title.title().as_deref(),
+            Some("Remplacer le titre tronque par un resume descriptif de la tache, puis verifier…")
+        );
+    }
+
+    #[test]
+    fn task_title_fallback_finds_a_labeled_task_after_context() {
+        let mut title = TaskTitleBuilder::default();
+        title.observe_user(
+            "Contexte : ancienne interface encore en production\nTache : Corriger le bouton de connexion sur mobile",
+        );
+
+        assert_eq!(
+            title.title().as_deref(),
+            Some("Corriger le bouton de connexion sur mobile")
+        );
+    }
+
+    #[test]
+    fn task_title_never_cuts_a_regular_word_in_half() {
+        let title = truncate_title_words(
+            "Ajouter une generation de titres semantiques fiable pour toutes les conversations existantes et futures",
+            48,
+        );
+
+        assert_eq!(title, "Ajouter une generation de titres semantiques…");
+        assert!(title.chars().count() <= 48);
+    }
+
+    #[test]
+    fn discussion_scan_uses_the_agent_plan_instead_of_the_prompt_prefix() {
+        let dir = fresh_dir();
+        let account = test_account("acc", &dir);
+        let uuid = "019f0000-0000-7000-8000-0000000000f1";
+        let path = dir.join(format!("rollout-2026-07-07T10-00-00-{uuid}.jsonl"));
+        let content = [
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{uuid}\",\"id\":\"{uuid}\"}}}}"
+            ),
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Avant toute chose, voici beaucoup de contexte qui ne doit pas devenir le titre.\"}}".to_string(),
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"phase\":\"commentary\",\"message\":\"Je vais corriger la generation des titres de conversation et ajouter les tests associes.\"}}".to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, content).unwrap();
+
+        let summary = scan_discussion_file(&path, &account).expect("discussion visible");
+        assert_eq!(
+            summary.title.as_deref(),
+            Some("Corriger la generation des titres de conversation et ajouter les tests associes")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3051,6 +3475,51 @@ mod tests {
             scan_discussion_file(&sub, &account).is_none(),
             "un sous-agent ne doit jamais apparaitre comme discussion"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autonomous_rollout_is_neither_a_discussion_nor_prompt_history() {
+        let dir = fresh_dir();
+        let account = test_account("acc", &dir);
+        let uuid = "019f0000-0000-7000-8000-0000000000c3";
+        let rollout =
+            write_rollout_meta(&dir, "2026-07-07T12-00-00", uuid, uuid, uuid, "user", None);
+        let existing = fs::read_to_string(&rollout).unwrap();
+        let autonomous = r#"{"type":"user_message","payload":{"message":"CST_AUTONOMOUS_AGENT_SESSION: true\nPoursuis le travail"}}"#;
+        fs::write(&rollout, format!("{existing}\n{autonomous}\n")).unwrap();
+
+        assert!(
+            scan_discussion_file(&rollout, &account).is_none(),
+            "un rollout autonome ne doit jamais apparaitre dans Discussions"
+        );
+        let mut prompts = Vec::new();
+        scan_prompt_file(&rollout, &account, &mut prompts);
+        assert!(
+            prompts.is_empty(),
+            "ses demandes internes ne doivent pas alimenter l'historique des prompts"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_autonomous_rollout_is_not_a_discussion() {
+        let dir = fresh_dir();
+        let uuid = "019f0000-0000-7000-8000-0000000000d4";
+        let rollout = dir.join(format!("{uuid}.jsonl"));
+        fs::write(
+            &rollout,
+            format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{uuid}\",\"cwd\":\"C:\\\\projet\",\"timestamp\":\"2026-07-07T12:00:00Z\",\"message\":{{\"content\":\"CST_AUTONOMOUS_AGENT_SESSION: true\\nObjectif autonome\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let mut account = test_account("claude", &dir);
+        account.provider = settings::Provider::Claude;
+
+        assert!(scan_claude_session_file(&rollout, &account).is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

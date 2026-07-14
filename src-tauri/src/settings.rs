@@ -41,6 +41,11 @@ impl Provider {
 pub struct AccountProfile {
     pub id: String,
     pub label: String,
+    /// Date d'ajout du profil (secondes Unix). Les profils historiques sans
+    /// cette date sont conserves : seuls les nouveaux comptes explicitement
+    /// crees par l'interface sont soumis au delai de premiere connexion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
     /// Fournisseur CLI de ce compte. `#[serde(default)]` => les comptes crees
     /// par une version anterieure (sans ce champ) sont interpretes comme Codex.
     #[serde(default)]
@@ -84,6 +89,7 @@ pub struct AccountLimitTracking {
 pub struct AccountLimitView {
     pub id: String,
     pub label: String,
+    pub provider: Provider,
     pub codex_home: String,
     pub has_tokens: bool,
     pub connected_at: Option<i64>,
@@ -190,7 +196,13 @@ pub struct WorkspaceProfile {
     pub label: String,
     /// Chemin du dossier projet (tel que saisi/choisi par l'utilisateur).
     pub path: String,
+    /// Contexte durable partage par tous les chats de cet environnement.
+    /// Le champ absent des anciens settings est migre vers une memoire vide.
+    #[serde(default)]
+    pub memory: String,
 }
+
+pub const MAX_WORKSPACE_MEMORY_CHARS: usize = 8_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -220,6 +232,11 @@ pub struct AppSettings {
     /// (import + suppression).
     #[serde(default)]
     pub auto_discover_accounts: bool,
+    /// Homes retires apres expiration de leur premiere connexion. Cette liste
+    /// empeche l'auto-decouverte de recreer aussitot leur profil a cause d'un
+    /// simple config.toml, sans jamais supprimer le dossier lui-meme.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired_unconnected_account_homes: Vec<String>,
     /// Registre des workspaces (dossiers projets ouverts). `#[serde(default)]`
     /// => les settings.json anterieurs (sans ce champ) restent lisibles et
     /// demarrent avec une liste vide, ensuite peuplee par migration du
@@ -357,6 +374,7 @@ fn default_true() -> bool {
     true
 }
 
+const UNCONNECTED_ACCOUNT_EXPIRY_SECS: i64 = 10 * 60;
 const DEFAULT_ACCOUNT_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_ACCOUNT_REASONING_EFFORT: &str = "medium";
 
@@ -387,6 +405,12 @@ pub fn load_settings() -> Result<AppSettings, String> {
     if sync_account_limit_trackers(&mut settings) {
         changed = true;
     }
+    if remove_expired_unconnected_accounts(&mut settings, now_unix()) {
+        changed = true;
+    }
+    if clear_expired_home_tombstones_for_registered_accounts(&mut settings) {
+        changed = true;
+    }
     if changed {
         write_settings(&path, &settings)?;
     }
@@ -396,11 +420,70 @@ pub fn load_settings() -> Result<AppSettings, String> {
 #[tauri::command]
 pub fn save_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
     let path = settings_path()?;
+    let now = now_unix();
+    merge_persisted_account_lifecycle(&path, &mut settings, now);
     ensure_agents(&mut settings);
     ensure_workspaces(&mut settings);
     sync_account_limit_trackers(&mut settings);
+    remove_expired_unconnected_accounts(&mut settings, now);
+    clear_expired_home_tombstones_for_registered_accounts(&mut settings);
     write_settings(&path, &settings)?;
     Ok(settings)
+}
+
+/// Fusionne l'etat de cycle de vie dont le serveur est l'autorite : dates des
+/// profils deja connus et tombstones ajoutes apres une expiration. Un client
+/// web obsolete ne peut ainsi ni repousser l'echeance, ni faire reapparaitre un
+/// compte supprime. La lecture reste best-effort si le fichier n'existe pas.
+fn merge_persisted_account_lifecycle(path: &Path, settings: &mut AppSettings, now: i64) {
+    let persisted = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<AppSettings>(&content).ok());
+
+    for home in persisted
+        .as_ref()
+        .map(|value| value.expired_unconnected_account_homes.as_slice())
+        .unwrap_or_default()
+    {
+        let normalized = normalize_string_path(home);
+        if !settings
+            .expired_unconnected_account_homes
+            .iter()
+            .any(|existing| normalize_string_path(existing) == normalized)
+        {
+            settings.expired_unconnected_account_homes.push(normalized);
+        }
+    }
+
+    let tombstoned_homes = settings
+        .expired_unconnected_account_homes
+        .iter()
+        .map(|home| normalize_string_path(home))
+        .collect::<HashSet<_>>();
+    for account in &mut settings.accounts {
+        if let Some(existing) = persisted
+            .as_ref()
+            .and_then(|value| value.accounts.iter().find(|item| item.id == account.id))
+        {
+            // Un client ne peut ni vieillir ni rajeunir un profil existant.
+            account.created_at = existing.created_at;
+            // `connected_at` signifie "connecte au moins une fois". Une copie
+            // cliente plus ancienne ne doit jamais pouvoir effacer cette preuve.
+            if account.limits.connected_at.is_none() {
+                account.limits.connected_at = existing.limits.connected_at;
+            }
+            if account.limits.session_anchor_at.is_none() {
+                account.limits.session_anchor_at = existing.limits.session_anchor_at;
+            }
+            if account.limits.weekly_anchor_at.is_none() {
+                account.limits.weekly_anchor_at = existing.limits.weekly_anchor_at;
+            }
+        } else if !tombstoned_homes.contains(&normalize_string_path(&account.codex_home)) {
+            // Le serveur fait autorite sur l'instant de creation, notamment en
+            // mode web ou l'horloge du navigateur peut etre decalee.
+            account.created_at = Some(now);
+        }
+    }
 }
 
 #[tauri::command]
@@ -699,6 +782,7 @@ mod tests {
         AccountProfile {
             id: "test-account".to_string(),
             label: "Test".to_string(),
+            created_at: None,
             provider: Provider::Codex,
             codex_home: home.to_string_lossy().to_string(),
             project_dir: None,
@@ -709,6 +793,133 @@ mod tests {
             model: None,
             reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn unconnected_new_account_expires_after_exactly_ten_minutes() {
+        let mut pending = account_for_home(&fresh_account_home("pending-expiry"));
+        pending.id = "pending".to_string();
+        pending.created_at = Some(1_000);
+
+        let mut connected = account_for_home(&fresh_account_home("connected-expiry"));
+        connected.id = "connected".to_string();
+        connected.created_at = Some(1_000);
+        connected.limits.connected_at = Some(1_120);
+
+        let mut legacy = account_for_home(&fresh_account_home("legacy-expiry"));
+        legacy.id = "legacy".to_string();
+        legacy.created_at = None;
+
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.accounts = vec![pending, connected, legacy];
+        settings.default_account_id = Some("pending".to_string());
+
+        assert!(!remove_expired_unconnected_accounts(&mut settings, 1_599));
+        assert_eq!(settings.accounts.len(), 3);
+
+        assert!(remove_expired_unconnected_accounts(&mut settings, 1_600));
+        assert_eq!(
+            settings
+                .accounts
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["connected", "legacy"]
+        );
+        assert_eq!(settings.default_account_id.as_deref(), Some("connected"));
+        assert_eq!(settings.expired_unconnected_account_homes.len(), 1);
+        assert!(settings.expired_unconnected_account_homes[0].contains("pending-expiry"));
+    }
+
+    #[test]
+    fn credentials_preserve_an_expired_account_and_mark_it_connected() {
+        let home = fresh_account_home("authenticated-expiry");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"access_token":"connected"}}"#,
+        )
+        .unwrap();
+
+        let mut account = account_for_home(&home);
+        account.created_at = Some(1_000);
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.accounts.push(account);
+
+        assert!(sync_account_limit_trackers(&mut settings));
+        assert!(!remove_expired_unconnected_accounts(&mut settings, 1_600));
+        assert!(settings.accounts[0].limits.connected_at.is_some());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn stale_legacy_client_cannot_restore_an_already_expired_home() {
+        let home = fresh_account_home("stale-expired-home");
+        let mut stale_account = account_for_home(&home);
+        stale_account.created_at = None;
+
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings
+            .expired_unconnected_account_homes
+            .push(normalize_string_path(home.to_string_lossy().as_ref()));
+        settings.accounts.push(stale_account);
+
+        assert!(remove_expired_unconnected_accounts(&mut settings, 10_000));
+        assert!(settings.accounts.is_empty());
+        assert_eq!(settings.expired_unconnected_account_homes.len(), 1);
+    }
+
+    #[test]
+    fn stale_save_preserves_expiration_tombstones_from_disk() {
+        let dir = fresh_account_home("persisted-expired-home");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut persisted = empty_settings("codex", Vec::new(), None);
+        persisted
+            .expired_unconnected_account_homes
+            .push("C:\\Users\\Test\\.codex-expired".to_string());
+        write_settings(&path, &persisted).unwrap();
+
+        let mut stale = empty_settings("codex", Vec::new(), None);
+        merge_persisted_account_lifecycle(&path, &mut stale, 12_345);
+
+        assert_eq!(stale.expired_unconnected_account_homes.len(), 1);
+        assert_eq!(
+            stale.expired_unconnected_account_homes[0],
+            normalize_string_path("C:\\Users\\Test\\.codex-expired")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn server_clock_stamps_only_new_account_profiles() {
+        let dir = fresh_account_home("account-created-at");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut persisted = empty_settings("codex", Vec::new(), None);
+        let mut legacy = account_for_home(&dir.join("legacy"));
+        legacy.id = "legacy".to_string();
+        legacy.created_at = None;
+        legacy.limits.connected_at = Some(10_000);
+        persisted.accounts.push(legacy.clone());
+        write_settings(&path, &persisted).unwrap();
+
+        // Le client tente de modifier la date du profil existant et envoie un
+        // nouveau profil sans date (cas d'un ancien frontend).
+        legacy.created_at = Some(1);
+        legacy.limits = AccountLimitTracking::default();
+        let mut new_account = account_for_home(&dir.join("new"));
+        new_account.id = "new".to_string();
+        let mut incoming = empty_settings("codex", Vec::new(), None);
+        incoming.accounts = vec![legacy, new_account];
+
+        merge_persisted_account_lifecycle(&path, &mut incoming, 12_345);
+
+        assert_eq!(incoming.accounts[0].created_at, None);
+        assert_eq!(incoming.accounts[0].limits.connected_at, Some(10_000));
+        assert_eq!(incoming.accounts[1].created_at, Some(12_345));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -800,6 +1011,42 @@ mod tests {
     }
 
     #[test]
+    fn windows_sandbox_override_updates_only_the_windows_table() {
+        let existing = concat!(
+            "sandbox_mode = \"workspace-write\"\n",
+            "\n",
+            "[windows]\n",
+            "sandbox = \"elevated\"\n",
+            "private_desktop = true\n",
+            "\n",
+            "[mcp_servers.example]\n",
+            "url = \"http://127.0.0.1:8123/mcp\"\n",
+        );
+
+        let updated = upsert_table_string(existing, "windows", "sandbox", "unelevated");
+
+        assert!(updated.contains("[windows]\nsandbox = \"unelevated\""));
+        assert!(updated.contains("private_desktop = true"));
+        assert!(updated.contains("[mcp_servers.example]"));
+        assert_eq!(updated.matches("sandbox =").count(), 1);
+        assert_eq!(
+            upsert_table_string(&updated, "windows", "sandbox", "unelevated"),
+            updated
+        );
+    }
+
+    #[test]
+    fn windows_sandbox_override_adds_a_missing_table() {
+        let existing = "model = \"gpt-test\"\n";
+        let updated = upsert_table_string(existing, "windows", "sandbox", "unelevated");
+
+        assert_eq!(
+            updated,
+            "model = \"gpt-test\"\n\n[windows]\nsandbox = \"unelevated\"\n"
+        );
+    }
+
+    #[test]
     fn account_config_rejects_invalid_reasoning_effort() {
         let home = fresh_account_home("invalid-effort");
         let error = ensure_codex_account_config(&home, true, None, Some("ultra mode"))
@@ -854,6 +1101,7 @@ mod tests {
         }))
         .expect("legacy account should deserialize");
 
+        assert_eq!(account.created_at, None);
         assert_eq!(account.model, None);
         assert_eq!(account.reasoning_effort, None);
     }
@@ -995,6 +1243,7 @@ mod tests {
             kombai: KombaiConfig::default(),
             codex_bypass: true,
             auto_discover_accounts: false,
+            expired_unconnected_account_homes: Vec::new(),
             workspaces: Vec::new(),
             closed_workspace_ids: Vec::new(),
         }
@@ -1023,6 +1272,7 @@ mod tests {
             WorkspaceProfile {
                 id: "ancien-id-local".to_string(),
                 label: String::new(),
+                memory: String::new(),
                 path: "C:\\Projects\\Éire\\".to_string(),
             },
             // Meme chemin avec une autre casse, d'autres separateurs et un id
@@ -1030,12 +1280,14 @@ mod tests {
             WorkspaceProfile {
                 id: "ancien-id-distant".to_string(),
                 label: "dup".to_string(),
+                memory: "Conserver cette decision".to_string(),
                 path: "c:/projects/éire".to_string(),
             },
             // Chemin vide : retire.
             WorkspaceProfile {
                 id: "x".to_string(),
                 label: "vide".to_string(),
+                memory: String::new(),
                 path: "   ".to_string(),
             },
         ];
@@ -1048,6 +1300,7 @@ mod tests {
         assert_eq!(ws.id, "c:/projects/éire");
         // Label vide comble par le nom du dossier (UTF-8 safe).
         assert_eq!(ws.label, "Éire");
+        assert_eq!(ws.memory, "Conserver cette decision");
     }
 
     #[test]
@@ -1056,6 +1309,7 @@ mod tests {
         settings.workspaces = vec![WorkspaceProfile {
             id: "ancien-id".to_string(),
             label: "Projet".to_string(),
+            memory: "Decision durable".to_string(),
             path: "C:\\Projects\\Projet".to_string(),
         }];
         settings.closed_workspace_ids = vec![
@@ -1068,6 +1322,28 @@ mod tests {
         assert!(changed);
         assert!(settings.workspaces.is_empty());
         assert_eq!(settings.closed_workspace_ids, vec!["c:/projects/projet"]);
+    }
+
+    #[test]
+    fn workspace_memory_is_bounded_and_only_matches_its_environment() {
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.workspaces = vec![WorkspaceProfile {
+            id: "ancien-id".to_string(),
+            label: "Produit".to_string(),
+            path: "C:\\Projects\\Produit".to_string(),
+            memory: format!("  {}  ", "é".repeat(MAX_WORKSPACE_MEMORY_CHARS + 20)),
+        }];
+
+        assert!(ensure_workspaces(&mut settings));
+        assert_eq!(
+            settings.workspaces[0].memory.chars().count(),
+            MAX_WORKSPACE_MEMORY_CHARS
+        );
+        assert!(workspace_memory_for_path(&settings, Path::new("c:/projects/produit/")).is_some());
+        assert_eq!(
+            workspace_memory_for_path(&settings, Path::new("C:\\Projects\\Autre")),
+            None
+        );
     }
 
     #[test]
@@ -1097,6 +1373,8 @@ mod tests {
         assert_eq!(claude.command, "claude");
         assert_eq!(claude.kind, "cli");
         assert_eq!(claude.provider, Provider::Claude);
+        assert_eq!(claude.login_command.as_deref(), Some("auth login"));
+        assert_eq!(claude.status_command.as_deref(), Some("auth status"));
         // Kombai n'est pas un agent terminal : il ne doit PAS etre seed ici.
         assert!(!settings
             .agents
@@ -1187,6 +1465,32 @@ mod tests {
         let _ = ensure_agents(&mut settings);
 
         assert_eq!(settings.active_agent_id.as_deref(), Some(CODEX_AGENT_ID));
+    }
+
+    #[test]
+    fn claude_limit_view_reports_auth_without_calling_codex_rate_limits() {
+        let home = fresh_account_home("claude-limit-auth");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"claude-token"}}"#,
+        )
+        .unwrap();
+        let mut account = account_for_home(&home);
+        account.provider = Provider::Claude;
+        account.label = "Claude personnel".to_string();
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.accounts.push(account.clone());
+
+        let view = account_limit_view(&account, &settings);
+
+        assert_eq!(view.provider, Provider::Claude);
+        assert!(view.has_tokens);
+        assert_eq!(view.source, "authenticated");
+        assert!(view.error.is_none());
+        assert!(view.buckets.is_empty());
+
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1430,6 +1734,19 @@ fn settings_path() -> Result<PathBuf, String> {
     Ok(base.join("codex-switch-terminal").join("settings.json"))
 }
 
+/// Fichier d'etat persistant place a cote de `settings.json`.
+///
+/// Les runtimes desktop, serveur et portable suivent ainsi exactement les
+/// memes variables `CST_ACCOUNTS_DIR` / `CST_DATA_DIR`, sans dupliquer la
+/// resolution des repertoires dans chaque moteur de fond.
+pub(crate) fn runtime_data_path(file_name: &str) -> Result<PathBuf, String> {
+    let parent = settings_path()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "Repertoire de donnees de l'application introuvable".to_string())?;
+    Ok(parent.join(file_name))
+}
+
 fn discover_initial_settings() -> Result<AppSettings, String> {
     let mut settings = AppSettings {
         accounts: Vec::new(),
@@ -1445,6 +1762,7 @@ fn discover_initial_settings() -> Result<AppSettings, String> {
         kombai: KombaiConfig::default(),
         codex_bypass: true,
         auto_discover_accounts: false,
+        expired_unconnected_account_homes: Vec::new(),
         workspaces: Vec::new(),
         closed_workspace_ids: Vec::new(),
     };
@@ -1502,8 +1820,8 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
 
     // Agent Claude Code integre. Comme l'agent Codex, il est (re)cree s'il
     // manque : Claude Code est un fournisseur pris en charge de premier rang.
-    // `login`/`status` se font en session interactive (`/login`, `/status`) et
-    // ne sont donc pas des sous-commandes CLI ; seul `claude doctor` en est une.
+    // Les versions recentes du CLI exposent l'authentification via
+    // `claude auth login` et son controle via `claude auth status`.
     if !settings
         .agents
         .iter()
@@ -1516,8 +1834,8 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
             provider: Provider::Claude,
             kind: "cli".to_string(),
             builtin: true,
-            login_command: None,
-            status_command: None,
+            login_command: Some("auth login".to_string()),
+            status_command: Some("auth status".to_string()),
             doctor_command: Some("doctor".to_string()),
         });
         changed = true;
@@ -1615,6 +1933,30 @@ fn workspace_base_name(path: &str) -> String {
     }
 }
 
+fn normalize_workspace_memory(memory: &str) -> String {
+    memory
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .take(MAX_WORKSPACE_MEMORY_CHARS)
+        .collect()
+}
+
+/// Retourne uniquement la memoire du dossier exact. Une conversation ouverte
+/// dans un autre environnement ne peut donc jamais recevoir ce contexte.
+pub(crate) fn workspace_memory_for_path<'a>(
+    settings: &'a AppSettings,
+    path: &Path,
+) -> Option<&'a str> {
+    let id = normalize_workspace_path(path.to_string_lossy().as_ref());
+    settings
+        .workspaces
+        .iter()
+        .find(|workspace| normalize_workspace_path(&workspace.path) == id)
+        .map(|workspace| workspace.memory.trim())
+        .filter(|memory| !memory.is_empty())
+}
+
 /// Garantit la coherence du registre de workspaces :
 /// - retire les entrees a chemin vide ;
 /// - recalcule un `id` manquant/incoherent depuis le chemin normalise ;
@@ -1654,11 +1996,17 @@ fn ensure_workspaces(settings: &mut AppSettings) -> bool {
         // incoherent ne doit jamais permettre a deux chemins equivalents de
         // survivre comme deux workspaces distincts.
         let id = normalize_workspace_path(&path);
+        let memory = normalize_workspace_memory(&ws.memory);
         if closed_seen.contains(&id) {
             changed = true;
             continue;
         }
         if !seen.insert(id.clone()) {
+            if let Some(existing) = deduped.iter_mut().find(|workspace| workspace.id == id) {
+                if existing.memory.is_empty() && !memory.is_empty() {
+                    existing.memory = memory;
+                }
+            }
             changed = true;
             continue;
         }
@@ -1667,12 +2015,13 @@ fn ensure_workspaces(settings: &mut AppSettings) -> bool {
         } else {
             ws.label.trim().to_string()
         };
-        if ws.id != id || ws.label != label || ws.path != path {
+        if ws.id != id || ws.label != label || ws.path != path || ws.memory != memory {
             changed = true;
         }
         ws.id = id;
         ws.label = label;
         ws.path = path;
+        ws.memory = memory;
         deduped.push(ws);
     }
 
@@ -1692,6 +2041,11 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
         .accounts
         .iter()
         .map(|account| normalize_string_path(&account.codex_home))
+        .collect::<HashSet<_>>();
+    let mut expired_homes = settings
+        .expired_unconnected_account_homes
+        .iter()
+        .map(|home| normalize_string_path(home))
         .collect::<HashSet<_>>();
     let mut proxy_urls = settings
         .proxies
@@ -1718,6 +2072,17 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
         let normalized = normalize_string_path(&path_string);
         let has_auth = path.join("auth.json").is_file();
         let has_config = path.join("config.toml").is_file();
+        if expired_homes.contains(&normalized) {
+            if Provider::Codex.has_auth(&path) {
+                settings
+                    .expired_unconnected_account_homes
+                    .retain(|home| normalize_string_path(home) != normalized);
+                expired_homes.remove(&normalized);
+                changed = true;
+            } else {
+                continue;
+            }
+        }
         let proxy_file = path.join("proxy.txt");
         let proxy_id = if proxy_file.is_file() {
             let proxy_url = fs::read_to_string(&proxy_file)
@@ -1758,6 +2123,10 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
             settings.accounts.push(AccountProfile {
                 id,
                 label: label_from_codex_dir(name),
+                // Une decouverte nouvelle est bien un ajout de compte : si ce
+                // home ne contient encore aucun credential valide, il dispose
+                // du meme delai de dix minutes qu'une creation dans l'UI.
+                created_at: Some(now_unix()),
                 provider: Provider::Codex,
                 codex_home: path_string.clone(),
                 project_dir: None,
@@ -1851,6 +2220,93 @@ pub fn command_for_provider(settings: &AppSettings, provider: Provider) -> Strin
         })
 }
 
+/// Retire uniquement le profil des comptes crees depuis au moins dix minutes
+/// qui n'ont encore jamais obtenu de credentials. Le dossier du compte reste
+/// sur le disque : une expiration automatique ne doit jamais effacer des
+/// fichiers utilisateur. Les profils historiques (`created_at` absent) et les
+/// comptes qui se sont connectes au moins une fois sont toujours preserves.
+fn remove_expired_unconnected_accounts(settings: &mut AppSettings, now: i64) -> bool {
+    let tombstoned_homes = settings
+        .expired_unconnected_account_homes
+        .iter()
+        .map(|home| normalize_string_path(home))
+        .collect::<HashSet<_>>();
+    let expired = settings
+        .accounts
+        .iter()
+        .filter(|account| {
+            if account.limits.connected_at.is_some() || account_has_auth_tokens(account) {
+                return false;
+            }
+            match account.created_at {
+                Some(created_at) => {
+                    now.saturating_sub(created_at) >= UNCONNECTED_ACCOUNT_EXPIRY_SECS
+                }
+                // Un ancien frontend peut tenter de sauvegarder a nouveau un
+                // profil deja expire sans connaitre `createdAt`. Le tombstone
+                // du home doit alors primer sur cette copie obsolete.
+                None => tombstoned_homes.contains(&normalize_string_path(&account.codex_home)),
+            }
+        })
+        .map(|account| {
+            (
+                account.id.clone(),
+                normalize_string_path(&account.codex_home),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if expired.is_empty() {
+        return false;
+    }
+
+    let expired_ids = expired
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<HashSet<_>>();
+    settings
+        .accounts
+        .retain(|account| !expired_ids.contains(account.id.as_str()));
+    for (_, home) in expired {
+        if !settings
+            .expired_unconnected_account_homes
+            .iter()
+            .any(|existing| normalize_string_path(existing) == home)
+        {
+            settings.expired_unconnected_account_homes.push(home);
+        }
+    }
+
+    let default_still_exists = settings
+        .default_account_id
+        .as_deref()
+        .is_some_and(|id| settings.accounts.iter().any(|account| account.id == id));
+    if !default_still_exists {
+        settings.default_account_id = settings.accounts.first().map(|account| account.id.clone());
+    }
+    true
+}
+
+/// Une creation explicite reutilisant un ancien home reprend un nouveau delai
+/// normal. On retire donc son exclusion, mais seulement apres avoir purge les
+/// profils deja expires afin qu'une sauvegarde cliente obsolete ne les ressuscite
+/// pas.
+fn clear_expired_home_tombstones_for_registered_accounts(settings: &mut AppSettings) -> bool {
+    if settings.expired_unconnected_account_homes.is_empty() {
+        return false;
+    }
+    let registered_homes = settings
+        .accounts
+        .iter()
+        .map(|account| normalize_string_path(&account.codex_home))
+        .collect::<HashSet<_>>();
+    let previous_len = settings.expired_unconnected_account_homes.len();
+    settings
+        .expired_unconnected_account_homes
+        .retain(|home| !registered_homes.contains(&normalize_string_path(home)));
+    settings.expired_unconnected_account_homes.len() != previous_len
+}
+
 fn sync_account_limit_trackers(settings: &mut AppSettings) -> bool {
     let now = now_unix();
     let mut changed = false;
@@ -1891,7 +2347,7 @@ fn new_connected_limits(now: i64) -> AccountLimitTracking {
     }
 }
 
-fn account_limit_views(settings: &AppSettings) -> Vec<AccountLimitView> {
+pub(crate) fn account_limit_views(settings: &AppSettings) -> Vec<AccountLimitView> {
     let accounts = settings.accounts.clone();
     let handles = accounts
         .into_iter()
@@ -1915,7 +2371,13 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
     let mut error = None;
     let mut source = "none";
 
-    if has_tokens {
+    if has_tokens && account.provider == Provider::Claude {
+        // Claude Code ne fournit pas l'equivalent de `account/rateLimits/read`.
+        // La vue Limites doit tout de meme reconnaitre sa session comme valide
+        // sans lancer par erreur le `codex app-server` avec son home Claude.
+        refreshed_at = Some(now);
+        source = "authenticated";
+    } else if has_tokens {
         let local_snapshot = read_local_rate_limit_snapshot(account).ok().flatten();
         match read_server_rate_limits(account, settings) {
             Ok(server_buckets) => {
@@ -1971,6 +2433,7 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
     AccountLimitView {
         id: account.id.clone(),
         label: account.label.clone(),
+        provider: account.provider,
         codex_home: account.codex_home.clone(),
         has_tokens,
         connected_at: account.limits.connected_at,
@@ -2596,7 +3059,7 @@ fn normalize_rate_limit_buckets(buckets: &mut Vec<AccountRateLimitBucketView>) {
     });
 }
 
-fn codex_app_server_command(settings: &AppSettings) -> Command {
+pub(crate) fn codex_app_server_command(settings: &AppSettings) -> Command {
     let codex = settings.codex_command.trim();
     let codex = if codex.is_empty() { "codex" } else { codex };
 
@@ -2624,7 +3087,10 @@ fn quote_windows_command(command: &str) -> String {
     }
 }
 
-fn proxy_url_for_account(account: &AccountProfile, settings: &AppSettings) -> Option<String> {
+pub(crate) fn proxy_url_for_account(
+    account: &AccountProfile,
+    settings: &AppSettings,
+) -> Option<String> {
     if !settings.proxy_controls_enabled {
         return None;
     }
@@ -2824,6 +3290,7 @@ fn import_single_account(
             settings.accounts.push(AccountProfile {
                 id,
                 label: account.label,
+                created_at: Some(now),
                 provider: Provider::Codex,
                 codex_home: home_string,
                 project_dir: None,
@@ -3243,12 +3710,38 @@ pub fn ensure_codex_account_config(
     if let Some(effort) = reasoning_effort {
         updated = upsert_top_level_string(&updated, "model_reasoning_effort", effort);
     }
+    if let Some(windows_sandbox) = codex_windows_sandbox_override()? {
+        updated = upsert_table_string(&updated, "windows", "sandbox", &windows_sandbox);
+    }
 
     if updated == existing {
         return Ok(());
     }
 
     crate::fs_util::atomic_write(&path, updated)
+}
+
+/// Sur un noeud Windows sans operateur local (serveur web/Tailscale), le
+/// sandbox natif `elevated` relance son programme d'installation avec UAC pour
+/// chaque nouveau workspace. Le demarreur du noeud fixe donc explicitement le
+/// mode `unelevated`, qui conserve l'isolation sans demander un administrateur.
+/// Le desktop local ne definit pas cette variable et garde le choix Codex de
+/// l'utilisateur.
+fn codex_windows_sandbox_override() -> std::io::Result<Option<String>> {
+    let Some(raw) = env::var_os("CST_CODEX_WINDOWS_SANDBOX") else {
+        return Ok(None);
+    };
+    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if matches!(value.as_str(), "elevated" | "unelevated") {
+        return Ok(Some(value));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "CST_CODEX_WINDOWS_SANDBOX doit valoir elevated ou unelevated",
+    ))
 }
 
 /// Le catalogue Codex est la source de verite des valeurs disponibles. Cette
@@ -3325,6 +3818,69 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
     } else {
         format!("{desired}\n{content}")
     }
+}
+
+/// Insere ou remplace une chaine dans une table TOML simple sans reserialiser
+/// le document entier (les commentaires et les tables MCP restent intacts).
+fn upsert_table_string(content: &str, table: &str, key: &str, value: &str) -> String {
+    let header = format!("[{table}]");
+    let desired = format!("{key} = \"{}\"", escape_toml_basic_string(value));
+    let mut out = String::with_capacity(content.len() + header.len() + desired.len() + 4);
+    let mut found_table = false;
+    let mut in_target_table = false;
+    let mut replaced = false;
+    let mut ml: Option<&'static str> = None;
+    let mut depth: i32 = 0;
+
+    for line in content.lines() {
+        let at_structural_level = ml.is_none() && depth == 0;
+        let trimmed = line.trim_start();
+
+        if at_structural_level && trimmed.starts_with('[') {
+            if in_target_table && !replaced {
+                out.push_str(&desired);
+                out.push('\n');
+                replaced = true;
+            }
+            in_target_table = trimmed.trim_end() == header;
+            found_table |= in_target_table;
+        }
+
+        let is_target = at_structural_level
+            && in_target_table
+            && !replaced
+            && !trimmed.starts_with('#')
+            && trimmed
+                .strip_prefix(key)
+                .map(|rest| rest.trim_start().starts_with('='))
+                .unwrap_or(false);
+
+        if is_target {
+            out.push_str(&desired);
+            out.push('\n');
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+
+        advance_toml_lex(line, &mut ml, &mut depth);
+    }
+
+    if found_table && !replaced {
+        out.push_str(&desired);
+        out.push('\n');
+    } else if !found_table {
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&header);
+        out.push('\n');
+        out.push_str(&desired);
+        out.push('\n');
+    }
+
+    out
 }
 
 /// Echappe une valeur pour une chaine TOML basique delimitee par `"`. Les
