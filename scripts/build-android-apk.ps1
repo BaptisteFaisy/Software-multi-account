@@ -24,6 +24,16 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $ScriptDir
 $AndroidDir = Join-Path $Root "android"
 
+# Refuse de produire un APK si les versions ou les tests frontend divergent.
+Push-Location $Root
+try {
+  npm run verify:quick
+  if ($LASTEXITCODE -ne 0) { throw "La verification avant build Android a echoue." }
+}
+finally {
+  Pop-Location
+}
+
 # --- JDK (fourni par Android Studio) ---
 $JbrCandidates = @(
   "C:\Program Files\Android\Android Studio\jbr",

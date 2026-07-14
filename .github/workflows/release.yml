@@ -38,6 +38,29 @@ env:
   ASSET_WINDOWS: cst-server-windows-x86_64.zip
 
 jobs:
+  # Barriere de release : aucun brouillon ni artefact n'est cree avant que les
+  # versions, les tests frontend, les tests Rust et le build web soient valides.
+  verify-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Installer les dependances
+        run: npm ci
+      - name: Verifier versions et tests
+        run: npm run verify
+      - name: Verifier le build frontend
+        run: npm run build:frontend
+
   # 0) Detecte si la signature serveur (minisign) est configuree. Sinon tout le
   #    track serveur est saute et la Release publie quand meme le desktop
   #    (mode "desktop d'abord" : seuls les secrets Tauri sont requis).
@@ -58,6 +81,7 @@ jobs:
 
   # 1) Cree une Release en brouillon ; les jobs suivants y deposent leurs assets.
   create-release:
+    needs: verify-release
     runs-on: ubuntu-latest
     outputs:
       release_id: ${{ steps.create.outputs.release_id }}

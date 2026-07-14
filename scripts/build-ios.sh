@@ -17,6 +17,7 @@ if [[ "$MODE" != "simulator" && "$MODE" != "archive" ]]; then
   exit 2
 fi
 
+(cd "$ROOT_DIR" && npm run verify:quick)
 node "$ROOT_DIR/scripts/clean-build-artifacts.mjs" ios
 
 case "$MODE" in
