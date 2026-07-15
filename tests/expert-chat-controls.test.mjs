@@ -24,6 +24,20 @@ test("les controles restent visibles dans le bandeau des chats inactifs", () => 
   assert.doesNotMatch(style, /chat-panel--expert:not\(\.active\)[^{]*\.expert-chat-pane-controls\s*\{[^}]*display:\s*none/);
 });
 
+test("l'historique reste accessible sans mettre le chat en plein ecran", () => {
+  assert.match(
+    view,
+    /\$\{compact \? `<button id="\$\{id\("chatHistoryToggle"\)\}" data-chat-action="history-toggle"/,
+  );
+  assert.doesNotMatch(view, /compact && fullscreen \? `<button[^>]+data-chat-action="history-toggle"/);
+  const compactHistoryStyle = style.match(
+    /\.chat-panel--compact:not\(\.is-fullscreen\) \.chat-history-button\s*\{([^}]*)\}/,
+  )?.[1] ?? "";
+  assert.match(compactHistoryStyle, /\swidth:\s*28px;/);
+  assert.match(compactHistoryStyle, /\smin-width:\s*28px;/);
+  assert.match(compactHistoryStyle, /\sheight:\s*24px;/);
+});
+
 test("le plein ecran mobile reste dans la coque avec un compositeur compact", () => {
   const rdvLabIndex = style.indexOf("/* RDV Lab");
   const mobileChatIndex = style.lastIndexOf("@media (max-width: 860px) {", rdvLabIndex);

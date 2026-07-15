@@ -889,7 +889,7 @@ export const renderChatPanel = (
          <button id="${id("chatRefresh")}" data-chat-action="refresh" class="icon-button wide" title="Actualiser" aria-label="Actualiser">
            <i data-lucide="refresh-ccw"></i>
          </button>`}
-        ${compact && fullscreen ? `<button id="${id("chatHistoryToggle")}" data-chat-action="history-toggle" class="tool-button chat-history-button ${model.historyOpen ? "primary" : ""}" title="Afficher les messages envoyes dans ce chat" aria-label="Historique de ce chat" aria-expanded="${model.historyOpen}">
+        ${compact ? `<button id="${id("chatHistoryToggle")}" data-chat-action="history-toggle" class="tool-button chat-history-button ${model.historyOpen ? "primary" : ""}" title="Afficher les messages envoyes dans ce chat" aria-label="Historique de ce chat" aria-expanded="${model.historyOpen}">
           <i data-lucide="history"></i><span>Historique</span><small>${userMessageCount}</small>
         </button>` : ""}
         ${compact ? "" : `<button id="${id("chatNew")}" data-chat-action="new" class="tool-button primary chat-new-button" title="Nouvelle conversation">

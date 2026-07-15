@@ -10079,6 +10079,20 @@ div.chat-tool-part {
   height: 24px;
 }
 
+.chat-app-layout .expert-chat-wall .chat-panel--compact:not(.is-fullscreen) .chat-history-button {
+  width: 28px;
+  min-width: 28px;
+  height: 24px;
+  min-height: 24px;
+  max-height: 24px;
+  padding: 0;
+}
+
+.chat-app-layout .expert-chat-wall .chat-panel--compact:not(.is-fullscreen) .chat-history-button > span,
+.chat-app-layout .expert-chat-wall .chat-panel--compact:not(.is-fullscreen) .chat-history-button > small {
+  display: none;
+}
+
 /* La selection ne change pas la hauteur du bandeau. */
 .chat-app-layout .expert-chat-wall .chat-panel--expert:not(.active) .chat-head {
   border-bottom-color: transparent;
