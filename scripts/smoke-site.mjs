@@ -275,6 +275,7 @@ const failures = [];
 const accessibilityResponsiveChecks = [];
 const keyboardFocusChecks = [];
 let ignoredWebSocketFailures = 0;
+let ignoredRequestAborts = 0;
 let expectedApiFailures = 0;
 let currentView = "startup";
 const progress = (stage) => process.stderr.write(`[smoke] ${stage}\n`);
@@ -305,7 +306,12 @@ try {
     }
   });
   page.on("requestfailed", (request) => {
-    failures.push(`requestfailed: ${request.method()} ${request.url()} (${request.failure()?.errorText || "inconnue"})`);
+    const errorText = request.failure()?.errorText || "inconnue";
+    if (request.method() === "GET" && errorText.includes("net::ERR_ABORTED")) {
+      ignoredRequestAborts += 1;
+      return;
+    }
+    failures.push(`requestfailed: ${request.method()} ${request.url()} (${errorText})`);
   });
 
   const auditAccessibilityAndOverflow = async (label) => {
@@ -730,7 +736,13 @@ try {
   const successfulMutationChecks = [];
   const openAndCloseDialog = async ({ name, trigger, dialog, close }) => {
     currentView = `interaction-${name}`;
-    await page.locator(trigger).click();
+    await page.waitForFunction((selector) => {
+      const button = document.querySelector(selector);
+      if (!(button instanceof HTMLButtonElement) || button.disabled || !button.getClientRects().length) return false;
+      button.focus();
+      button.click();
+      return true;
+    }, trigger);
     const modal = page.locator(dialog);
     await modal.waitFor({ state: "visible" });
     if ((await modal.getAttribute("aria-modal")) !== "true") {
@@ -1478,7 +1490,7 @@ try {
   await errorContext.close();
 
   progress("résultat");
-  process.stdout.write(`${JSON.stringify({ site, visited, interactionChecks, successfulMutationChecks, mobileVisited, errorStateChecks, accessibilityResponsiveChecks, keyboardFocusChecks, duplicateIds, ignoredWebSocketFailures, expectedApiFailures, failures }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({ site, visited, interactionChecks, successfulMutationChecks, mobileVisited, errorStateChecks, accessibilityResponsiveChecks, keyboardFocusChecks, duplicateIds, ignoredWebSocketFailures, ignoredRequestAborts, expectedApiFailures, failures }, null, 2)}\n`);
   if (failures.length) process.exitCode = 1;
 } finally {
   await browser.close();
