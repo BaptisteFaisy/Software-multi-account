@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   STATS_RANGE_OPTIONS,
   accountTokenUsageForDate,
+  aggregateApiModelUsage,
   aggregateAccountTokenDays,
   buildAccountTokenSeries,
   buildWorkTimeBuckets,
@@ -22,6 +23,22 @@ const usageDay = (date, totalTokens, inputTokens = totalTokens, outputTokens = 0
   costUsd: totalTokens / 1_000_000,
 });
 
+const modelUsage = (model, totalTokens, inputTokens, outputTokens, apiEquivalentUsd) => ({
+  model,
+  pricingModel: model,
+  priced: true,
+  inputTokens,
+  cachedInputTokens: 0,
+  outputTokens,
+  reasoningOutputTokens: 0,
+  totalTokens,
+  apiEquivalentUsd,
+  inputPricePerMillion: 1,
+  cachedInputPricePerMillion: 0.1,
+  outputPricePerMillion: 6,
+  longContextRequests: 0,
+});
+
 test("les périodes proposées sont aujourd'hui, 7 jours et 30 jours", () => {
   assert.deepEqual(
     STATS_RANGE_OPTIONS.map(({ days, label }) => [days, label]),
@@ -36,8 +53,16 @@ test("les périodes proposées sont aujourd'hui, 7 jours et 30 jours", () => {
 test("les tokens de tous les comptes sont additionnés par jour", () => {
   const totals = aggregateAccountTokenDays({
     accounts: [
-      { days: [usageDay("2026-07-12", 100, 80, 20), usageDay("2026-07-13", 250)] },
-      { days: [usageDay("2026-07-12", 400, 300, 100), usageDay("2026-07-13", 50)] },
+      {
+        id: "first",
+        label: "Premier",
+        days: [usageDay("2026-07-12", 100, 80, 20), usageDay("2026-07-13", 250)],
+      },
+      {
+        id: "second",
+        label: "Second",
+        days: [usageDay("2026-07-12", 400, 300, 100), usageDay("2026-07-13", 50)],
+      },
     ],
   });
 
@@ -47,20 +72,52 @@ test("les tokens de tous les comptes sont additionnés par jour", () => {
   assert.equal(totals.get("2026-07-13")?.totalTokens, 300);
 });
 
+test("les jetons et l'equivalent API sont additionnes par modele", () => {
+  const models = aggregateApiModelUsage([
+    modelUsage("gpt-5.6-luna", 100, 90, 10, 0.00015),
+    modelUsage("gpt-5.6-sol", 250, 225, 25, 0.001875),
+    modelUsage("GPT-5.6-LUNA", 50, 45, 5, 0.000075),
+  ]);
+
+  assert.deepEqual(
+    models.map(({ model, totalTokens }) => [model, totalTokens]),
+    [
+      ["gpt-5.6-sol", 250],
+      ["gpt-5.6-luna", 150],
+    ],
+  );
+  assert.equal(models[1].inputTokens, 135);
+  assert.equal(models[1].outputTokens, 15);
+  assert.equal(models[1].apiEquivalentUsd, 0.000225);
+});
+
+test("la page affiche les tarifs publics et la ventilation par modele", () => {
+  const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  const backend = readFileSync(new URL("../src-tauri/src/metrics.rs", import.meta.url), "utf8");
+
+  assert.match(main, /Jetons et coût public par modèle/);
+  assert.match(main, /Prix public \/ 1 M/);
+  assert.match(main, /formatApiUsd\(model\.apiEquivalentUsd\)/);
+  assert.match(main, /developers\.openai\.com\/api\/docs\/pricing/);
+  assert.match(backend, /pub fn public_rates_for_model/);
+  assert.match(backend, /long_context_threshold_tokens: Some\(272_000\)/);
+  assert.match(backend, /tarif arbitraire/);
+});
+
 test("les profils qui partagent le meme CODEX_HOME ne sont comptes qu'une fois", () => {
   const sharedDay = usageDay("2026-07-13", 100);
   const accounts = deduplicateAccountTokenAccounts([
     {
       id: "copy-a",
       label: "Compte copie A",
-      codexHome: "%CST_DATA_DIR%\\codex-homes/shared",
+      codexHome: "%CST_DATA_DIR%\\Codex-Homes/Shared",
       totalTokens: 100,
       days: [sharedDay],
     },
     {
       id: "copy-b",
       label: "Compte copie B",
-      codexHome: "%CST_DATA_DIR%/codex-homes/shared/",
+      codexHome: "%cst_data_dir%/codex-homes/shared/",
       totalTokens: 100,
       days: [sharedDay],
     },
@@ -74,7 +131,11 @@ test("les profils qui partagent le meme CODEX_HOME ne sont comptes qu'une fois",
   ]);
 
   assert.equal(accounts.length, 2);
-  assert.equal(aggregateAccountTokenDays({ accounts }).get("2026-07-13")?.totalTokens, 150);
+  assert.equal(
+    aggregateAccountTokenDays({ accounts: [...accounts, accounts[0]] }).get("2026-07-13")
+      ?.totalTokens,
+    150,
+  );
 });
 
 test("la fenêtre de 30 jours est calendaire et traverse les changements de mois", () => {
@@ -140,7 +201,7 @@ test("l'onglet temps de travail charge la mesure locale et exclut explicitement 
   assert.match(main, /invoke<WorkTimeDashboard>\("work_time_dashboard"\)/);
   assert.match(main, /data-work-time-granularity=/);
   assert.match(platform, /case "work_time_dashboard":\s*return api<T>\("GET", "\/api\/work-time"\)/);
-  assert.match(backend, /fn is_autonomous_prompt/);
+  assert.match(backend, /discussions::is_autonomous_prompt/);
   assert.match(backend, /interval\.start_ms <= \*end/);
 });
 
@@ -151,6 +212,19 @@ test("les tokens par compte sont relus pendant le poll temps reel", () => {
     /runWhenPageVisible\(\(\) => \{\s*void refreshUsageDashboard\(\);\s*void refreshAccountUsage\(\);/,
   );
   assert.match(main, /accountUsageChanged =\s*!accountUsageLoaded \|\| nextSignature !== accountUsageSignature/);
+});
+
+test("les stats gardent les rollouts locaux comme source canonique", () => {
+  const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  const backend = readFileSync(
+    new URL("../src-tauri/src/account_usage.rs", import.meta.url),
+    "utf8",
+  );
+
+  assert.doesNotMatch(backend, /account\/usage\/read/);
+  assert.match(backend, /delta_above\(&high_water\)/);
+  assert.match(main, /sans estimation distante/);
+  assert.doesNotMatch(main, /Source prioritaire : usage du compte Codex/);
 });
 
 test("l'actualisation conserve le scroll interne de la page stats", () => {
@@ -167,12 +241,29 @@ test("l'actualisation conserve le scroll interne de la page stats", () => {
 
 test("les points restent atteignables au doigt et le jour actif est revele", () => {
   const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-  const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+  const style = readFileSync(new URL("../src/stats-view.css", import.meta.url), "utf8");
   assert.match(main, /const hitRadius = days\.length === 1 \? 65 : days\.length <= 7 \? 36 : 16/);
   assert.match(main, /const revealSelectedStatsPoint = \(\) =>/);
   assert.match(main, /pointRect\.left - chartRect\.left - chart\.clientWidth \/ 2/);
   assert.match(style, /\.stats-point-chart\.range-30 svg \{\s*min-width: 1440px;/);
   assert.match(style, /\.stats-range button \{\s*min-height: 44px;/);
+});
+
+test("les styles stats quittent le chemin initial et se chargent avec la vue", () => {
+  const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  const initialStyles = ["style.css", "theme.css"]
+    .map((file) => readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"))
+    .join("\n");
+  const view = readFileSync(new URL("../src/stats-view.ts", import.meta.url), "utf8");
+  const viewStyle = readFileSync(new URL("../src/stats-view.css", import.meta.url), "utf8");
+
+  assert.match(main, /type StatsViewModule = typeof import\("\.\/stats-view"\)/);
+  assert.match(main, /statsViewModulePromise = import\("\.\/stats-view"\)/);
+  assert.match(main, /if \(view === "dashboard" && !statsViewModule\)/);
+  assert.match(view, /import "\.\/stats-view\.css";/);
+  assert.doesNotMatch(initialStyles, /\.(?:stats-|work-time-)/);
+  assert.match(viewStyle, /\.stats-dashboard\s*\{/);
+  assert.match(viewStyle, /:root\[data-theme="light"\] \.stats-dashboard/);
 });
 
 test("le detail d'un jour conserve tous les comptes et calcule leur part", () => {
@@ -220,4 +311,15 @@ test("la page reste compatible avec les reponses d'usage de l'ancienne stable", 
   assert.match(main, /profileLabels: profileLabels\.length \? profileLabels : \[account\.label\]/);
   assert.match(main, /: "local-sessions";/);
   assert.match(main, /const nextAccountUsage = normalizeAccountUsageDashboard\(/);
+});
+
+test("les stats détaillent et totalisent les tokens des agents autonomes", () => {
+  const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  const style = readFileSync(new URL("../src/stats-view.css", import.meta.url), "utf8");
+  assert.match(main, /const renderStatsAutonomousTokenUsage =/);
+  assert.match(main, /Consommation détaillée par agent/);
+  assert.match(main, /Total des agents/);
+  assert.match(main, /reasoningOutputTokens/);
+  assert.match(main, /renderStatsAutonomousTokenUsage\(\)/);
+  assert.match(style, /\.stats-autonomous-token-card \.stats-api-table tfoot th/);
 });

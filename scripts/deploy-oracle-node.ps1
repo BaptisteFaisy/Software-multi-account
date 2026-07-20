@@ -97,7 +97,7 @@ try {
     Pop-Location
   }
 
-  @(
+  $environmentLines = @(
     'CST_BIND="127.0.0.1:8080"'
     'CST_DATA_DIR="/srv/cst"'
     'CST_STATIC_DIR="/opt/codex-switch-terminal/current/dist"'
@@ -108,7 +108,20 @@ try {
     'CST_NODE_ID="oracle-free"'
     'CST_NODE_LABEL="Oracle Free"'
     'CST_NODE_CAPACITY=' + (Quote-SystemdEnvironment ([string]$Capacity))
-  ) | Set-Content -Path $remoteEnv -Encoding ASCII
+  )
+  foreach ($name in @(
+    'CST_ALLOW_REGISTRATION'
+    'CST_AUTH_SECURE_COOKIE'
+    'CST_GOOGLE_CLIENT_ID'
+    'CST_GOOGLE_CLIENT_SECRET'
+    'CST_GOOGLE_REDIRECT_URI'
+  )) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ($null -ne $value -and $value.Trim()) {
+      $environmentLines += $name + '=' + (Quote-SystemdEnvironment $value.Trim())
+    }
+  }
+  $environmentLines | Set-Content -Path $remoteEnv -Encoding ASCII
 
   Write-Host "Transfert chiffre vers $SshTarget..." -ForegroundColor Cyan
   & scp @sshArgs `

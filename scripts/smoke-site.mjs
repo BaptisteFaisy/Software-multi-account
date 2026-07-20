@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { chromium } from "playwright-core";
 
 const site = process.env.CST_SMOKE_URL || "http://127.0.0.1:8080";
@@ -19,6 +19,8 @@ if (!executablePath) {
 
 const workspace = "C:\\Smoke\\Projet";
 const accountId = "smoke-account";
+const automaticOrchestrationPrompt = "Construire une fonctionnalité complexe avec plusieurs chantiers parallèles";
+const automaticOrchestrationVerdict = 'CST_AUTO_ORCHESTRATION: {"decision":"orchestrate","workerCount":3,"reason":"Trois chantiers indépendants à intégrer"}';
 const settings = {
   accounts: [{
     id: accountId,
@@ -207,6 +209,11 @@ const orchestrationSnapshotFixture = (request) => {
 const jsonFor = (path) => {
   if (path === "/api/settings") return settings;
   if (path === "/api/discussions") return discussions;
+  if (path === "/api/forum/topics") return [];
+  if (
+    path === "/api/private-messages/users"
+    || path === "/api/private-messages/conversations"
+  ) return [];
   if (path === "/api/fs/list") {
     return {
       root: "C:\\Smoke",
@@ -216,6 +223,15 @@ const jsonFor = (path) => {
     };
   }
   if (path === "/api/limits" || path === "/api/chat/models") return [];
+  if (path === "/api/video/capabilities") {
+    return {
+      configured: false,
+      service: "smoke",
+      configurationHint: "Configuration vidéo simulée",
+      maxImageBytes: 10 * 1024 * 1024,
+      models: [],
+    };
+  }
   if (path === "/api/usage") {
     return {
       generatedAt: Date.now(),
@@ -278,6 +294,7 @@ let ignoredWebSocketFailures = 0;
 let ignoredRequestAborts = 0;
 let expectedApiFailures = 0;
 let currentView = "startup";
+const contextTasksOnly = process.env.CST_SMOKE_CONTEXT_TASKS_ONLY === "1";
 const progress = (stage) => process.stderr.write(`[smoke] ${stage}\n`);
 
 try {
@@ -286,11 +303,19 @@ try {
     locale: "fr-FR",
     serviceWorkers: "block",
   });
-  await context.addInitScript(({ workspacePath }) => {
+  await context.addInitScript(({ workspacePath, contextTasksEnabled }) => {
     localStorage.setItem("codex-switch-terminal.remote.token", "smoke-token");
     localStorage.setItem("codex-switch-terminal.workspace.path", workspacePath);
     localStorage.setItem("codex-switch-terminal.workspaces.v1", JSON.stringify([workspacePath]));
-  }, { workspacePath: workspace });
+    if (contextTasksEnabled) {
+      localStorage.removeItem("codex-switch-terminal.chat-context-tasks-visible.v1");
+      localStorage.setItem("codex-switch-terminal.tasks.v1", JSON.stringify([
+        { id: "smoke-active-high", title: "Corriger le menu droit", completed: false, createdAt: 2, completedAt: null, priority: "high", dueDate: null, environmentPath: null },
+        { id: "smoke-active-normal", title: "Vérifier les limites", completed: false, createdAt: 1, completedAt: null, priority: "normal", dueDate: null, environmentPath: null },
+        { id: "smoke-completed", title: "Tâche déjà terminée", completed: true, createdAt: 0, completedAt: 1, priority: "normal", dueDate: null, environmentPath: null },
+      ]));
+    }
+  }, { workspacePath: workspace, contextTasksEnabled: contextTasksOnly });
 
   const page = await context.newPage();
   const capturedChatTurns = [];
@@ -299,7 +324,10 @@ try {
   page.on("pageerror", (error) => failures.push(`pageerror[${currentView}]: ${error.stack || error}`));
   page.on("console", (message) => {
     if (message.type() !== "error") return;
-    if (message.text().includes("WebSocket connection to") && message.text().includes("/ws/discussions")) {
+    if (
+      message.text().includes("WebSocket connection to")
+      && (message.text().includes("/ws/discussions") || message.text().includes("/ws/runtime"))
+    ) {
       ignoredWebSocketFailures += 1;
     } else {
       failures.push(`console[${currentView}]: ${message.text()}`);
@@ -312,6 +340,11 @@ try {
       return;
     }
     failures.push(`requestfailed: ${request.method()} ${request.url()} (${errorText})`);
+  });
+  page.on("request", (request) => {
+    if (process.env.CST_SMOKE_TRACE && request.method() !== "GET") {
+      trace(`request-${request.method().toLowerCase()}-${new URL(request.url()).pathname}`);
+    }
   });
 
   const auditAccessibilityAndOverflow = async (label) => {
@@ -347,6 +380,17 @@ try {
         return element.textContent?.trim() || element.getAttribute("title")?.trim() || "";
       };
       const parseColor = (value) => {
+        const srgb = value.match(
+          /^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\)$/i,
+        );
+        if (srgb) {
+          return [
+            Number(srgb[1]) * 255,
+            Number(srgb[2]) * 255,
+            Number(srgb[3]) * 255,
+            srgb[4] === undefined ? 1 : Number(srgb[4]),
+          ];
+        }
         const parts = value.match(/[\d.]+/g)?.map(Number) || [];
         return parts.length >= 3 ? [parts[0], parts[1], parts[2], parts[3] ?? 1] : null;
       };
@@ -632,6 +676,9 @@ try {
       const payload = request.postDataJSON();
       capturedChatTurns.push(payload);
       const timestamp = Math.floor(Date.now() / 1000);
+      const answer = payload.prompt === automaticOrchestrationPrompt
+        ? automaticOrchestrationVerdict
+        : "Réponse smoke reçue";
       chatTurn = {
         id: 42,
         accountId: payload.accountId,
@@ -642,7 +689,7 @@ try {
         error: null,
         activities: [],
         thoughts: [],
-        parts: [{ id: "answer", kind: "text", status: "completed", text: "Réponse smoke reçue" }],
+        parts: [{ id: "answer", kind: "text", status: "completed", text: answer }],
       };
       discussions.totalDiscussions = 1;
       discussions.accounts[0].discussionCount = 1;
@@ -690,6 +737,367 @@ try {
   if (!response?.ok()) failures.push(`navigation: HTTP ${response?.status() ?? "sans réponse"}`);
   await page.locator("#chatAppSidebar").waitFor({ state: "visible" });
   trace("startup-ready");
+  const navigationTarget = (process.env.CST_SMOKE_NAVIGATION_TARGET || "").trim();
+  const navigationOnly = process.env.CST_SMOKE_NAVIGATION_ONLY === "1" || !!navigationTarget;
+  const automaticOrchestrationOnly = process.env.CST_SMOKE_AUTO_ORCHESTRATION_ONLY === "1";
+  const staleChunkRecoveryOnly = process.env.CST_SMOKE_STALE_CHUNK_RECOVERY_ONLY === "1";
+  const rightMenuOnly = process.env.CST_SMOKE_RIGHT_MENU_ONLY === "1";
+
+  const verifyAutonomousMonitorDrag = async () => {
+    await page.waitForFunction(() => {
+      const launcher = document.querySelector("#autonomousMonitorLauncher");
+      return launcher instanceof HTMLButtonElement
+        && !launcher.getAttribute("aria-label")?.includes("Chargement des agents");
+    });
+    await page.locator("#autonomousMonitorLauncher").click();
+    const monitor = page.locator("#autonomousMonitorWindow");
+    await monitor.waitFor({ state: "visible" });
+    const dragHandle = page.locator("[data-autonomous-monitor-drag-handle]");
+    await dragHandle.waitFor({ state: "visible" });
+    if (await page.locator("[data-autonomous-open-chat], [data-autonomous-monitor-chat]").count()) {
+      failures.push("autonomous-success: un agent autonome expose encore un lien vers Discussions");
+    }
+    const geometry = await page.waitForFunction(() => {
+      const monitorElement = document.querySelector("#autonomousMonitorWindow");
+      const titleElement = document.querySelector(".autonomous-monitor-head > div");
+      if (!(monitorElement instanceof HTMLElement) || !(titleElement instanceof HTMLElement)) return null;
+      const monitorBounds = monitorElement.getBoundingClientRect();
+      const titleBounds = titleElement.getBoundingClientRect();
+      if (!monitorBounds.width || !monitorBounds.height || !titleBounds.width || !titleBounds.height) return null;
+      return {
+        before: { x: monitorBounds.x, y: monitorBounds.y },
+        dragHandleBounds: {
+          x: titleBounds.x,
+          y: titleBounds.y,
+          width: titleBounds.width,
+          height: titleBounds.height,
+        },
+      };
+    }).then((handle) => handle.jsonValue());
+    const before = geometry?.before;
+    const dragHandleBounds = geometry?.dragHandleBounds;
+    if (!before || !dragHandleBounds) {
+      failures.push("autonomous-monitor-drag: fenetre ou poignee introuvable");
+    } else {
+      const pointerStart = {
+        x: dragHandleBounds.x + Math.min(250, dragHandleBounds.width * .55),
+        y: dragHandleBounds.y + dragHandleBounds.height / 2,
+      };
+      const expected = { x: 80, y: 8 };
+      await page.mouse.move(pointerStart.x, pointerStart.y);
+      await page.mouse.down();
+      await page.mouse.move(
+        pointerStart.x + expected.x - before.x,
+        pointerStart.y + expected.y - before.y,
+        { steps: 8 },
+      );
+      await page.mouse.up();
+      await page.waitForFunction(() => {
+        const stored = JSON.parse(
+          localStorage.getItem("codex-switch-terminal.autonomous-monitor-position.v1") || "null",
+        );
+        return stored && Math.abs(stored.x - 80) <= 2 && Math.abs(stored.y - 8) <= 2;
+      });
+      const after = await monitor.boundingBox();
+      const stored = await page.evaluate(() => JSON.parse(
+        localStorage.getItem("codex-switch-terminal.autonomous-monitor-position.v1") || "null",
+      ));
+      if (
+        !after
+        || Math.abs(after.x - expected.x) > 2
+        || Math.abs(after.y - expected.y) > 2
+        || Math.abs(stored?.x - expected.x) > 2
+        || Math.abs(stored?.y - expected.y) > 2
+      ) {
+        failures.push(
+          `autonomous-monitor-drag: position inattendue ${JSON.stringify({ after, stored })}`,
+        );
+      }
+    }
+    await monitor.locator("[data-autonomous-monitor-close]").click();
+    await page.locator("#autonomousMonitorLauncher").click();
+    await monitor.waitFor({ state: "visible" });
+    const reopened = await monitor.boundingBox();
+    if (!reopened || Math.abs(reopened.x - 80) > 2 || Math.abs(reopened.y - 8) > 2) {
+      failures.push(`autonomous-monitor-drag: position non restauree ${JSON.stringify(reopened)}`);
+    }
+    await monitor.locator("[data-autonomous-monitor-close]").click();
+  };
+
+  if (process.env.CST_SMOKE_AUTONOMOUS_MONITOR_ONLY === "1") {
+    await verifyAutonomousMonitorDrag();
+    const relevantFailures = failures.filter(
+      (failure) => !failure.startsWith("requestfailed:") || !failure.includes("net::ERR_ABORTED"),
+    );
+    process.stdout.write(`${JSON.stringify({
+      site,
+      check: "autonomous-monitor-drag-position",
+      ignoredRequestAborts: failures.length - relevantFailures.length,
+      failures: relevantFailures,
+    }, null, 2)}\n`);
+    await context.close();
+    await browser.close();
+    process.exit(relevantFailures.length ? 1 : 0);
+  }
+
+  const activateSidebarDestination = async (targetPage, selector) => {
+    const button = targetPage.locator(selector);
+    if (await button.count() !== 1) return false;
+    if (!(await button.isVisible())) {
+      const more = targetPage.locator("#chatSideMoreToggle");
+      if (await more.count() !== 1 || !(await more.isVisible())) return false;
+      if ((await more.getAttribute("aria-expanded")) !== "true") await more.click();
+      await button.waitFor({ state: "visible" });
+    }
+    // Plusieurs vues sont chargees en import dynamique et peuvent provoquer un
+    // rerendu entre la resolution du locator et l'action pointeur de Playwright.
+    // Le clic DOM est atomique une fois la visibilite verifiee ci-dessus.
+    await button.evaluate((element) => element.click());
+    return true;
+  };
+
+  if (!automaticOrchestrationOnly && !navigationTarget && !staleChunkRecoveryOnly && !contextTasksOnly) {
+  currentView = "desktop-more-keyboard";
+  const expectedRestingNavigationCount = await page.locator(
+    ".chat-side-tools > button, .chat-side-tools > .chat-side-more > #chatSideMoreToggle",
+  ).count();
+  const restingNavigationCount = await page.locator(".chat-side-tools button:visible").count();
+  if (restingNavigationCount !== expectedRestingNavigationCount) {
+    failures.push(`navigation desktop: ${restingNavigationCount} controles visibles au repos au lieu de ${expectedRestingNavigationCount}`);
+  }
+  const desktopMore = page.locator("#chatSideMoreToggle");
+  await desktopMore.focus();
+  await page.keyboard.press("ArrowDown");
+  const desktopMoreMenu = page.locator("#chatSideMoreMenu");
+  await desktopMoreMenu.waitFor({ state: "visible" });
+  if ((await desktopMore.getAttribute("aria-expanded")) !== "true") {
+    failures.push("navigation desktop: Plus n'annonce pas son ouverture");
+  }
+  const focusedMoreItem = await page.evaluate(() => document.activeElement?.id || "");
+  if (focusedMoreItem !== "bugReportToggle") {
+    failures.push(`navigation desktop: le premier item de Plus ne recoit pas le focus (${focusedMoreItem || "aucun"})`);
+  }
+  await auditAccessibilityAndOverflow("desktop-more");
+  await page.keyboard.press("Escape");
+  if ((await desktopMore.getAttribute("aria-expanded")) !== "false" || !(await desktopMore.evaluate((button) => button === document.activeElement))) {
+    failures.push("navigation desktop: Echap ne ferme pas Plus avec retour du focus");
+  }
+  for (const viewport of [
+    { name: "compact", width: 1024, height: 600 },
+    { name: "low", width: 861, height: 390 },
+  ]) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.waitForTimeout(80);
+    if (await page.locator(".chat-side-tools button:visible").count() !== expectedRestingNavigationCount) {
+      failures.push(`navigation desktop ${viewport.name}: le repos n'affiche pas ${expectedRestingNavigationCount} controles`);
+    }
+    await desktopMore.click();
+    await desktopMoreMenu.waitFor({ state: "visible" });
+    await page.evaluate(() => {
+      document.querySelector("#chatSideMoreMenu [role='menuitem']:last-child")
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    const menuLayout = await page.evaluate(() => {
+      const menu = document.querySelector("#chatSideMoreMenu");
+      const last = menu?.querySelector("[role='menuitem']:last-child");
+      if (!(menu instanceof HTMLElement) || !(last instanceof HTMLElement)) return null;
+      const menuRect = menu.getBoundingClientRect();
+      const lastRect = last.getBoundingClientRect();
+      return {
+        insideViewport: menuRect.top >= 0 && menuRect.right <= document.documentElement.clientWidth && menuRect.bottom <= document.documentElement.clientHeight && menuRect.left >= 0,
+        lastReachable: lastRect.top >= menuRect.top - 1 && lastRect.bottom <= menuRect.bottom + 1,
+        menuRect: { top: menuRect.top, right: menuRect.right, bottom: menuRect.bottom, left: menuRect.left },
+        overflowY: getComputedStyle(menu).overflowY,
+      };
+    });
+    if (!menuLayout?.insideViewport || !menuLayout.lastReachable || menuLayout.overflowY !== "auto") {
+      failures.push(`navigation desktop ${viewport.name}: menu Plus hors limites ${JSON.stringify(menuLayout)}`);
+    }
+    await page.keyboard.press("Escape");
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(80);
+  currentView = "startup";
+  }
+
+  if (rightMenuOnly) {
+    process.stdout.write(`${JSON.stringify({
+      site,
+      check: "right-menu-navigation",
+      accessibilityResponsiveChecks,
+      failures,
+    }, null, 2)}\n`);
+    await context.close();
+    await browser.close();
+    process.exit(failures.length ? 1 : 0);
+  }
+
+  if (contextTasksOnly) {
+    currentView = "context-tasks";
+    const panel = page.locator("#chatContextTasks");
+    await panel.waitFor({ state: "visible" });
+    const initialPreference = await page.evaluate(() => localStorage.getItem("codex-switch-terminal.chat-context-tasks-visible.v1"));
+    if (initialPreference !== null) {
+      failures.push(`context-tasks: la préférence initiale devrait être absente (${initialPreference})`);
+    }
+    await page.locator("#settingsToggle").click();
+    await page.locator('[data-chat-context-tasks="hide"]').waitFor({ state: "visible" });
+    await page.locator('[data-chat-context-tasks="hide"]').click();
+    await panel.waitFor({ state: "detached" });
+    await page.waitForFunction(() => localStorage.getItem("codex-switch-terminal.chat-context-tasks-visible.v1") === "false");
+    await page.locator('[data-chat-context-tasks="show"]').waitFor({ state: "visible" });
+    await page.locator('[data-chat-context-tasks="show"]').click();
+    await page.waitForFunction(() => localStorage.getItem("codex-switch-terminal.chat-context-tasks-visible.v1") === "true");
+    await panel.waitFor({ state: "visible" });
+    const screenshotDir = process.env.CST_SMOKE_SCREENSHOT_DIR?.trim();
+    await page.locator("#chatContextSidebarCollapse").click();
+    await page.waitForFunction(() =>
+      document.querySelector(".chat-app-layout")?.classList.contains("is-context-sidebar-collapsed"),
+    );
+    const collapsedSidebar = await page.evaluate(() => {
+      const layout = document.querySelector(".chat-app-layout");
+      const sidebar = document.querySelector("#chatContextSidebar");
+      const workspace = document.querySelector("#chatMainWorkspace");
+      const expand = document.querySelector("#chatContextSidebarExpand");
+      if (!(layout instanceof HTMLElement)
+        || !(sidebar instanceof HTMLElement)
+        || !(workspace instanceof HTMLElement)
+        || !(expand instanceof HTMLElement)) return null;
+      const workspaceRect = workspace.getBoundingClientRect();
+      return {
+        storedWidth: localStorage.getItem("codex-switch-terminal.chat-context-sidebar-width.v1"),
+        sidebarVisibility: getComputedStyle(sidebar).visibility,
+        expandDisplay: getComputedStyle(expand).display,
+        workspaceRight: Math.round(workspaceRect.right),
+        viewportWidth: document.documentElement.clientWidth,
+      };
+    });
+    if (
+      collapsedSidebar?.storedWidth !== "0"
+      || collapsedSidebar.sidebarVisibility !== "hidden"
+      || !["flex", "inline-flex"].includes(collapsedSidebar.expandDisplay)
+      || collapsedSidebar.workspaceRight !== collapsedSidebar.viewportWidth
+    ) {
+      failures.push(`context-sidebar: repli incomplet ${JSON.stringify(collapsedSidebar)}`);
+    }
+    if (screenshotDir) {
+      mkdirSync(screenshotDir, { recursive: true });
+      await page.screenshot({ path: `${screenshotDir}/context-sidebar-collapsed-1440.png` });
+    }
+    await page.locator("#chatContextSidebarExpand").click();
+    await page.waitForFunction(() =>
+      !document.querySelector(".chat-app-layout")?.classList.contains("is-context-sidebar-collapsed"),
+    );
+    const restoredSidebar = await page.evaluate(() => {
+      const sidebar = document.querySelector("#chatContextSidebar");
+      if (!(sidebar instanceof HTMLElement)) return null;
+      return {
+        storedWidth: Number(localStorage.getItem("codex-switch-terminal.chat-context-sidebar-width.v1")),
+        visibility: getComputedStyle(sidebar).visibility,
+        width: Math.round(sidebar.getBoundingClientRect().width),
+      };
+    });
+    if (
+      !restoredSidebar
+      || restoredSidebar.storedWidth <= 0
+      || restoredSidebar.visibility !== "visible"
+      || restoredSidebar.width <= 0
+    ) {
+      failures.push(`context-sidebar: restauration impossible ${JSON.stringify(restoredSidebar)}`);
+    }
+    if (screenshotDir) {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.waitForTimeout(180);
+      await auditAccessibilityAndOverflow("context-tasks-1440");
+      await page.screenshot({ path: `${screenshotDir}/context-tasks-1440.png` });
+      await page.setViewportSize({ width: 1024, height: 700 });
+      await page.waitForTimeout(180);
+      await auditAccessibilityAndOverflow("context-tasks-1024");
+      await page.screenshot({ path: `${screenshotDir}/context-tasks-1024.png` });
+      await page.setViewportSize({ width: 1440, height: 900 });
+    }
+    const panelText = await panel.innerText();
+    if (!panelText.includes("Corriger le menu droit") || !panelText.includes("Vérifier les limites")) {
+      failures.push(`context-tasks: tâches actives absentes (${panelText})`);
+    }
+    if (panelText.includes("Tâche déjà terminée")) {
+      failures.push("context-tasks: une tâche terminée est affichée");
+    }
+    await page.locator('[data-context-task-toggle="smoke-active-high"]').evaluate((input) => input.click());
+    await page.waitForFunction(() => {
+      const tasks = JSON.parse(localStorage.getItem("codex-switch-terminal.tasks.v1") || "[]");
+      return tasks.find((task) => task.id === "smoke-active-high")?.completed === true;
+    });
+    if (await page.locator('[data-context-task-toggle="smoke-active-high"]').count()) {
+      failures.push("context-tasks: la tâche terminée reste dans le panneau");
+    }
+    await page.locator("#chatContextTasksOpenAll").click();
+    await page.locator("#tasksPanel").waitFor({ state: "visible" });
+    process.stdout.write(`${JSON.stringify({
+      site,
+      check: "context-tasks-setting",
+      defaultActive: true,
+      activeTasksVisible: 2,
+      completionPersisted: true,
+      fullTasksViewOpened: true,
+      failures,
+    }, null, 2)}\n`);
+    await context.close();
+    await browser.close();
+    process.exit(failures.length ? 1 : 0);
+  }
+
+  if (staleChunkRecoveryOnly) {
+    currentView = "stale-chunk-recovery";
+    let rejectedPromptChunkCount = 0;
+    await page.route(/\/assets\/prompts-view-[^/]+\.js(?:\?.*)?$/, async (route) => {
+      if (rejectedPromptChunkCount === 0) {
+        rejectedPromptChunkCount += 1;
+        await route.fulfill({
+          status: 404,
+          contentType: "text/javascript",
+          body: "",
+        });
+        return;
+      }
+      await route.continue();
+    });
+    const expectedFailureStart = failures.length;
+    await page.locator("#promptsToggle").click();
+    let recovered = false;
+    try {
+      await page.waitForURL((url) => url.searchParams.has("cst-chunk-build"));
+      await page.locator("#promptLibraryPanel").waitFor({ state: "visible" });
+      recovered = true;
+    } catch (error) {
+      failures.push(`stale-chunk: récupération absente (${String(error)}) · URL ${page.url()}`);
+    }
+    const expectedResourceFailures = failures.splice(expectedFailureStart).filter(
+      (failure) => !failure.includes("Failed to load resource")
+        && !failure.includes("prompts-view-")
+        && !failure.includes("net::ERR_ABORTED"),
+    );
+    failures.push(...expectedResourceFailures);
+    if (rejectedPromptChunkCount !== 1) {
+      failures.push(`stale-chunk: ${rejectedPromptChunkCount} ancien(s) chunk(s) rejeté(s) au lieu de 1`);
+    }
+    const recoveryUrl = new URL(page.url());
+    if (recoveryUrl.searchParams.has("cst-chunk-view")) {
+      failures.push("stale-chunk: la destination de récupération reste dans l'URL");
+    }
+    process.stdout.write(`${JSON.stringify({
+      site,
+      check: "stale-chunk-recovery",
+      rejectedPromptChunkCount,
+      recovered,
+      recoveredView: await page.locator(".chat-admin-head strong").textContent({ timeout: 500 }).catch(() => null),
+      accessibilityResponsiveChecks,
+      failures,
+    }, null, 2)}\n`);
+    await context.close();
+    await browser.close();
+    process.exit(failures.length ? 1 : 0);
+  }
 
   const views = [
     ["#autonomousToggle", "autonomous"],
@@ -700,22 +1108,44 @@ try {
     ["#promptsToggle", "prompts"],
     ["#skillsToggle", "skills"],
     ["#settingsToggle", "settings"],
-    ["#kombaiToggle", "kombai"],
-    ["#historyToggle", "history"],
+    ["#designToggle", "design"],
     ["#auditToggle", "audit"],
   ];
+  const navigationViews = automaticOrchestrationOnly
+    ? []
+    : navigationTarget
+      ? views.filter(([, name]) => name === navigationTarget)
+      : navigationOnly
+      ? [
+        ["#tasksToggle", "tasks"],
+        ["#scheduledChatToggle", "scheduled-chat"],
+        ["#promptsToggle", "prompts"],
+        ["#autonomousToggle", "autonomous"],
+        ["#designToggle", "design"],
+        ["#videoToggle", "video"],
+        ["#bugReportToggle", "bug-report"],
+        ["#orchestrationToggle", "orchestration"],
+        ["#forumToggle", "forum"],
+        ["#sideDiscussions", "discussions"],
+        ["#dashboardToggle", "dashboard"],
+        ["#limitsToggle", "limits"],
+        ["#skillsToggle", "skills"],
+        ["#settingsToggle", "settings"],
+        ]
+      : views;
+  if (navigationTarget && navigationViews.length === 0) {
+    failures.push(`navigation: destination inconnue ${navigationTarget}`);
+  }
   const visited = [];
   const mobileVisited = [];
   progress("navigation desktop");
 
-  for (const [selector, name] of views) {
+  for (const [selector, name] of navigationViews) {
     currentView = name;
-    const button = page.locator(selector);
-    if (await button.count() !== 1) {
+    if (!(await activateSidebarDestination(page, selector))) {
       failures.push(`${name}: bouton ${selector} absent`);
       continue;
     }
-    await button.click();
     await page.waitForTimeout(150);
     const panel = page.locator(".chat-admin-panel");
     if (await panel.count() !== 1 || !(await panel.isVisible())) {
@@ -725,15 +1155,31 @@ try {
     const text = (await panel.innerText()).trim();
     if (!text) failures.push(`${name}: panneau vide`);
     visited.push({ name, characters: text.length });
-    await auditAccessibilityAndOverflow(`desktop-${name}`);
+    if (!navigationOnly) await auditAccessibilityAndOverflow(`desktop-${name}`);
     trace(`view-${name}`);
   }
 
-  await page.locator("#chatHome").click();
-  await auditKeyboardFocus(30);
+  if (navigationOnly) {
+    const duplicateIds = await page.evaluate(() => {
+      const counts = new Map();
+      for (const element of document.querySelectorAll("[id]")) {
+        counts.set(element.id, (counts.get(element.id) || 0) + 1);
+      }
+      return [...counts].filter(([, count]) => count > 1);
+    });
+    if (duplicateIds.length) failures.push(`DOM: identifiants dupliqués ${JSON.stringify(duplicateIds)}`);
+    process.stdout.write(`${JSON.stringify({ site, visited, accessibilityResponsiveChecks, duplicateIds, failures }, null, 2)}\n`);
+    await context.close();
+    await browser.close();
+    process.exit(failures.length ? 1 : 0);
+  }
 
   const interactionChecks = [];
   const successfulMutationChecks = [];
+  if (!automaticOrchestrationOnly) {
+  await page.locator("#chatHome").click();
+  await auditKeyboardFocus(30);
+
   const openAndCloseDialog = async ({ name, trigger, dialog, close }) => {
     currentView = `interaction-${name}`;
     await page.waitForFunction((selector) => {
@@ -801,11 +1247,15 @@ try {
     return true;
   });
   await page.locator("#autonomousCreateForm").waitFor({ state: "visible" });
+  if (!(await page.locator("#autonomousName").isHidden())) {
+    failures.push("autonomous-simple: les options avancées sont visibles au premier affichage");
+  }
+  await page.locator("#autonomousCreateOptions > summary").click();
   await page.locator("#autonomousEnvironmentPreset").selectOption("__custom__");
   const customProject = page.locator("#autonomousProjectDir");
   if (await customProject.isHidden()) failures.push("autonomous: le chemin personnalisé reste masqué");
   await page.locator("#autonomousObjective").fill("Objectif de validation smoke");
-  await page.locator(".autonomous-advanced > summary").click();
+  await page.locator("details.autonomous-advanced:has(#autonomousTestCommand) > summary").click();
   await page.locator("#autonomousTestCommand").fill("npm test");
   await page.locator("#autonomousCreateForm button[type='submit']").click();
   await page.waitForTimeout(50);
@@ -824,6 +1274,7 @@ try {
   await page.locator("#autonomousProjectDir").fill(workspace);
   await page.locator("#autonomousInterval").selectOption("300");
   await page.locator("#autonomousMode").selectOption("plan");
+  await page.locator("details.autonomous-advanced:has(#autonomousConnectorTitle) > summary").click();
   await page.locator("#autonomousRequireUserReview").check();
   await page.locator('[data-autonomous-connector="gmail"]').check();
   await page.locator('[data-autonomous-connector="google_calendar"]').check();
@@ -846,6 +1297,12 @@ try {
   }
   successfulMutationChecks.push("autonomous-create");
   const autonomousAccountSelect = page.locator('[data-autonomous-account="autonomous-smoke"]');
+  if (!(await autonomousAccountSelect.isHidden())) {
+    failures.push("autonomous-simple: les réglages détaillés sont visibles par défaut");
+  }
+  await page.locator('[data-autonomous-agent-more="autonomous-smoke"] > summary').click();
+  await page.locator('[data-autonomous-agent-section="autonomous-smoke:configuration"] > summary').click();
+  await autonomousAccountSelect.waitFor({ state: "visible" });
   await autonomousAccountSelect.selectOption("smoke-account-2");
   await page.waitForFunction(() => {
     const select = document.querySelector('[data-autonomous-account="autonomous-smoke"]');
@@ -858,12 +1315,8 @@ try {
     failures.push(`autonomous-account: payload inattendu ${JSON.stringify(autonomousAccountMutation?.payload)}`);
   }
   successfulMutationChecks.push("autonomous-account-reassign");
-  await page.locator("#autonomousMonitorLauncher").click();
-  await page.locator("#autonomousMonitorWindow").waitFor({ state: "visible" });
-  if (await page.locator("[data-autonomous-open-chat], [data-autonomous-monitor-chat]").count()) {
-    failures.push("autonomous-success: un agent autonome expose encore un lien vers Discussions");
-  }
-  await page.locator("#autonomousMonitorWindow [data-autonomous-monitor-close]").click();
+  await verifyAutonomousMonitorDrag();
+  interactionChecks.push("autonomous-monitor-drag-position");
   interactionChecks.push("autonomous-isolated-from-discussions");
   trace("autonomous-success");
 
@@ -945,7 +1398,9 @@ try {
 
   currentView = "interaction-orchestration-validation";
   progress("validation orchestration");
-  await page.locator("#orchestrationToggle").click();
+  if (!(await page.locator(".orchestration-panel").isVisible())) {
+    await activateSidebarDestination(page, "#orchestrationToggle");
+  }
   await page.locator("#orchestrationNew").click();
   await page.locator("#orchestrationCreateForm button[type='submit']").click();
   const objectiveValidation = await page.locator("#orchestrationObjective").evaluate(
@@ -958,6 +1413,7 @@ try {
   trace("orchestration-validation");
 
   currentView = "interaction-orchestration-success";
+  await page.locator("#orchestrationCreateAdvanced > summary").click();
   await page.locator("#orchestrationName").fill("Orchestration smoke réussie");
   await page.locator("#orchestrationObjective").fill("Construire la feature smoke");
   await page.locator("#orchestrationProjectDir").fill(workspace);
@@ -979,13 +1435,14 @@ try {
   trace("orchestration-success");
 
   currentView = "interaction-orchestration-account-handoff";
+  await page.locator(".orchestration-run-details > summary").click();
   const orchestratorAccountSelect = page.locator(
     '[data-orchestration-account-role="orchestrator"][data-orchestration-run-id="orchestration-smoke"]',
   );
   await orchestratorAccountSelect.selectOption("smoke-account-2");
   await page.locator(
     '[data-orchestration-account-role="orchestrator"][data-orchestration-run-id="orchestration-smoke"]',
-  ).waitFor();
+  ).waitFor({ state: "attached" });
   const accountMutation = mutationRequests.findLast(
     (entry) => entry.path === "/api/orchestrations/orchestration-smoke/account",
   );
@@ -996,6 +1453,7 @@ try {
   ) {
     failures.push(`orchestration-account: payload inattendu ${JSON.stringify(accountMutation?.payload)}`);
   }
+  await page.locator(".orchestration-run-details > summary").click();
   const workerAccountSelect = page.locator(
     '[data-orchestration-account-role="worker"][data-orchestration-worker-index="1"][data-orchestration-run-id="orchestration-smoke"]',
   );
@@ -1025,6 +1483,7 @@ try {
   await page.locator('[data-orchestration-action="resume"][data-orchestration-id="orchestration-smoke"]').waitFor();
   await page.locator('[data-orchestration-action="resume"][data-orchestration-id="orchestration-smoke"]').click();
   await page.locator('[data-orchestration-action="pause"][data-orchestration-id="orchestration-smoke"]').waitFor();
+  await page.locator(".orchestration-run-details > summary").click();
   await page.locator('[data-orchestration-delete="orchestration-smoke"]').click();
   await page.locator('[data-orchestration-delete-confirm="orchestration-smoke"]').click();
   await page.locator(".orchestration-runs").getByText("Orchestration smoke réussie", { exact: true }).waitFor({ state: "detached" });
@@ -1034,6 +1493,7 @@ try {
   currentView = "interaction-autonomous-direct-orchestrator";
   await page.locator("#autonomousToggle").click();
   await page.locator("#autonomousNewAgent").click();
+  await page.locator("#autonomousCreateOptions > summary").click();
   await page.locator("#autonomousName").fill("Orchestrateur direct smoke");
   await page.locator("#autonomousRole").fill("Orchestrateur de validation smoke");
   await page.locator("#autonomousObjective").fill("Lancer directement une équipe orchestrée smoke");
@@ -1046,7 +1506,7 @@ try {
   await directWorkerAccounts.nth(1).waitFor();
   await directWorkerAccounts.nth(0).selectOption(accountId);
   await directWorkerAccounts.nth(1).selectOption("smoke-account-2");
-  const directAdvanced = page.locator(".autonomous-advanced");
+  const directAdvanced = page.locator("details.autonomous-advanced:has(#autonomousTestCommand)");
   if (!(await directAdvanced.evaluate((details) => details.open))) {
     await directAdvanced.locator("summary").click();
   }
@@ -1077,6 +1537,7 @@ try {
   }
   successfulMutationChecks.push("autonomous-direct-orchestrator-launch");
   trace("autonomous-direct-orchestrator");
+  }
 
   currentView = "interaction-chat-success";
   await page.locator("#chatHome").click();
@@ -1084,11 +1545,24 @@ try {
   await page.locator("#confirmNewChat").click();
   const chatPane = page.locator(".chat-panel--expert").first();
   await chatPane.waitFor({ state: "visible" });
+  await page.waitForFunction(() => {
+    const send = document.querySelector(".chat-panel--expert [data-chat-action='send']");
+    return send instanceof HTMLButtonElement && !send.disabled;
+  });
   await chatPane.locator("[data-chat-control='prompt']").fill("Message smoke de bout en bout");
   const chatRequest = page.waitForRequest((request) =>
     new URL(request.url()).pathname === "/api/chat/turns" && request.method() === "POST",
   );
-  await chatPane.locator("[data-chat-action='send']").click();
+  await chatPane.locator("[data-chat-action='send']").evaluate((button) => button.click());
+  if (process.env.CST_SMOKE_TRACE) {
+    await page.waitForTimeout(150);
+    const diagnostics = await chatPane.evaluate((panel) => ({
+      prompt: panel.querySelector("[data-chat-control='prompt']")?.value,
+      sendDisabled: panel.querySelector("[data-chat-action='send']")?.disabled,
+      text: panel.textContent?.replace(/\s+/g, " ").trim().slice(-300),
+    }));
+    trace(`chat-send-${JSON.stringify(diagnostics)}`);
+  }
   await chatRequest;
   await chatPane.getByText("Réponse smoke reçue", { exact: true }).waitFor();
   const chatPayload = capturedChatTurns.at(-1);
@@ -1105,37 +1579,137 @@ try {
   successfulMutationChecks.push("chat-create-and-send");
   trace("chat-success");
 
-  currentView = "interaction-chat-orchestration-conversion";
+  currentView = "interaction-chat-fullscreen-fluidity";
+  const fullscreenStart = await chatPane.evaluate((panel) => {
+    globalThis.__cstDesktopFullscreenPanelIdentity = panel;
+    globalThis.__cstDesktopFullscreenFeedIdentity = panel.querySelector(".chat-feed");
+    panel.querySelector("[data-chat-action='fullscreen']")?.click();
+    return {
+      domPreserved: panel.isConnected,
+      transitionStarted: panel.classList.contains("is-fullscreen-transitioning"),
+    };
+  });
+  await page.locator(".chat-panel--expert.is-fullscreen").waitFor({ state: "visible" });
+  await page.waitForFunction(() =>
+    !document.querySelector(".chat-panel--expert.is-fullscreen-transitioning"));
+  const desktopFullscreenDiagnostics = await chatPane.evaluate((panel) => {
+    const bounds = panel.getBoundingClientRect();
+    return {
+      bottom: bounds.bottom,
+      domPreserved: panel === globalThis.__cstDesktopFullscreenPanelIdentity
+        && panel.querySelector(".chat-feed") === globalThis.__cstDesktopFullscreenFeedIdentity,
+      height: bounds.height,
+      left: bounds.left,
+      position: getComputedStyle(panel).position,
+      right: bounds.right,
+      top: bounds.top,
+      width: bounds.width,
+    };
+  });
+  if (
+    !fullscreenStart.domPreserved
+    || !fullscreenStart.transitionStarted
+    || !desktopFullscreenDiagnostics.domPreserved
+    || desktopFullscreenDiagnostics.position !== "fixed"
+    || Math.abs(desktopFullscreenDiagnostics.left) > 1
+    || Math.abs(desktopFullscreenDiagnostics.top) > 1
+    || Math.abs(desktopFullscreenDiagnostics.right - await page.evaluate(() => innerWidth)) > 1
+    || Math.abs(desktopFullscreenDiagnostics.bottom - await page.evaluate(() => innerHeight)) > 1
+  ) {
+    failures.push(`chat-fullscreen-fluidity: bascule non ciblée ${JSON.stringify({
+      fullscreenStart,
+      desktopFullscreenDiagnostics,
+    })}`);
+  }
+  await chatPane.locator("[data-chat-action='fullscreen']").click();
+  await page.locator(".chat-panel--expert.is-fullscreen").waitFor({ state: "detached" });
+  await page.waitForFunction(() =>
+    !document.querySelector(".chat-panel--expert.is-fullscreen-transitioning"));
+  interactionChecks.push("chat-fullscreen-fluidity");
+  trace("chat-fullscreen-fluidity");
+
+  currentView = "interaction-chat-automatic-orchestration";
   const orchestrationMutationCount = mutationRequests.filter(
     (entry) => entry.path === "/api/orchestrations",
   ).length;
-  await chatPane.locator("[data-chat-action='orchestrate']").click();
-  const conversionForm = page.locator("#orchestrationConvertForm");
-  await conversionForm.waitFor({ state: "visible" });
-  await page.locator("#orchestrationConvertName").fill("Chat orchestrateur smoke");
-  await page.locator("#orchestrationConvertObjective").fill("Orchestrer le chat smoke de bout en bout");
-  await page.locator("#orchestrationConvertProject").fill(workspace);
-  await page.locator("#orchestrationConvertTestCommand").fill("npm run verify:quick");
-  await page.locator("#orchestrationConvertWorkerCount").fill("2");
-  await conversionForm.locator("button[type='submit']").click();
+  if (await chatPane.locator(".chat-panel-header [data-chat-action='orchestrate']").count()) {
+    failures.push("chat-automatic-orchestration: l'ancien bouton Orchestrer est encore présent dans le bandeau");
+  }
+  const automaticToggle = chatPane.locator("[data-chat-action='toggle-automatic-orchestration']");
+  await automaticToggle.waitFor({ state: "visible" });
+  if ((await automaticToggle.getAttribute("aria-pressed")) !== "false") {
+    failures.push("chat-automatic-orchestration: le mode n'est pas inactif à la création du chat");
+  }
+  await automaticToggle.evaluate((button) => button.click());
+  await page.waitForFunction(() =>
+    document.querySelector("[data-chat-action='toggle-automatic-orchestration']")?.getAttribute("aria-pressed") === "true");
+  const persistedAutomaticMode = await page.evaluate(() => {
+    const value = localStorage.getItem("codex-switch-terminal.expert-open-chats.v1");
+    if (!value) return false;
+    return JSON.parse(value).panes?.some((pane) => pane.automaticOrchestrationEnabled === true) === true;
+  });
+  if (!persistedAutomaticMode) {
+    failures.push("chat-automatic-orchestration: l'activation n'est pas persistée pour le chat");
+  }
+
+  await chatPane.locator("[data-chat-control='prompt']").fill(automaticOrchestrationPrompt);
+  const automaticChatRequest = page.waitForRequest((request) =>
+    new URL(request.url()).pathname === "/api/chat/turns" && request.method() === "POST",
+  );
+  const automaticOrchestrationRequest = page.waitForRequest((request) =>
+    new URL(request.url()).pathname === "/api/orchestrations" && request.method() === "POST",
+  );
+  await chatPane.locator("[data-chat-action='send']").evaluate((button) => button.click());
+  await automaticChatRequest;
+  await automaticOrchestrationRequest;
   await chatPane.locator("[data-chat-control='orchestration-managed']").waitFor({ state: "visible" });
-  const conversionMutations = mutationRequests.filter(
+  const automaticChatPayload = capturedChatTurns.at(-1);
+  const routingSkill = automaticChatPayload?.agentSkills?.find(
+    (skill) => skill.id === "automatic-orchestration-router",
+  );
+  if (
+    !automaticChatPayload
+    || automaticChatPayload.prompt !== automaticOrchestrationPrompt
+    || automaticChatPayload.sessionId !== "smoke-session"
+    || !routingSkill?.content?.includes("CST_AUTO_ORCHESTRATION:")
+  ) {
+    failures.push(`chat-automatic-orchestration-routing: payload inattendu ${JSON.stringify(automaticChatPayload)}`);
+  }
+  const automaticMutations = mutationRequests.filter(
     (entry) => entry.path === "/api/orchestrations",
   );
-  const conversionPayload = conversionMutations[orchestrationMutationCount]?.payload;
+  const automaticPayload = automaticMutations[orchestrationMutationCount]?.payload;
   if (
-    !conversionPayload
-    || conversionPayload.orchestratorSessionId !== "smoke-session"
-    || conversionPayload.orchestratorAccountId !== accountId
-    || conversionPayload.workerCount !== 2
-    || JSON.stringify(conversionPayload.workerAccountIds) !== JSON.stringify([accountId, accountId])
-    || conversionPayload.objective !== "Orchestrer le chat smoke de bout en bout"
-    || conversionPayload.projectDir !== workspace
+    !automaticPayload
+    || automaticPayload.orchestratorSessionId !== "smoke-session"
+    || automaticPayload.orchestratorAccountId !== accountId
+    || automaticPayload.workerCount !== 3
+    || JSON.stringify(automaticPayload.workerAccountIds) !== JSON.stringify([accountId, accountId, accountId])
+    || automaticPayload.objective !== automaticOrchestrationPrompt
+    || automaticPayload.projectDir !== workspace
   ) {
-    failures.push(`chat-orchestration-conversion: payload inattendu ${JSON.stringify(conversionPayload)}`);
+    failures.push(`chat-automatic-orchestration-launch: payload inattendu ${JSON.stringify(automaticPayload)}`);
   }
-  successfulMutationChecks.push("chat-to-orchestration");
-  trace("chat-orchestration-conversion");
+  if (await page.locator("#orchestrationConvertForm").count()) {
+    failures.push("chat-automatic-orchestration: la modale manuelle s'est ouverte");
+  }
+  successfulMutationChecks.push("chat-automatic-orchestration");
+  trace("chat-automatic-orchestration");
+
+  if (automaticOrchestrationOnly) {
+    const duplicateIds = await page.evaluate(() => {
+      const counts = new Map();
+      for (const element of document.querySelectorAll("[id]")) {
+        counts.set(element.id, (counts.get(element.id) || 0) + 1);
+      }
+      return [...counts].filter(([, count]) => count > 1);
+    });
+    if (duplicateIds.length) failures.push(`DOM: identifiants dupliqués ${JSON.stringify(duplicateIds)}`);
+    process.stdout.write(`${JSON.stringify({ site, interactionChecks, successfulMutationChecks, duplicateIds, failures }, null, 2)}\n`);
+    await context.close();
+    await browser.close();
+    process.exit(failures.length ? 1 : 0);
+  }
 
   currentView = "mobile-startup";
   progress("navigation mobile");
@@ -1168,6 +1742,10 @@ try {
   await page.locator("#confirmNewChat").click();
   const mobileChatPane = page.locator(".chat-panel--expert.active").first();
   await mobileChatPane.waitFor({ state: "visible" });
+  await mobileChatPane.evaluate((panel) => {
+    globalThis.__cstFullscreenPanelIdentity = panel;
+    globalThis.__cstFullscreenFeedIdentity = panel.querySelector(".chat-feed");
+  });
 
   const mobileChatFullscreenViewports = [
     { name: "portrait", width: 390, height: 844 },
@@ -1258,6 +1836,8 @@ try {
         composer: rect(composer),
         composerHorizontalOverflow: composerBox ? composerBox.scrollWidth - composerBox.clientWidth : null,
         conversation: rect(conversation),
+        domPreserved: panel === globalThis.__cstFullscreenPanelIdentity
+          && feed === globalThis.__cstFullscreenFeedIdentity,
         feed: rect(feed),
         feedOverflowY: feed ? getComputedStyle(feed).overflowY : null,
         panel: rect(panel),
@@ -1280,7 +1860,7 @@ try {
     const feed = fullscreenDiagnostics.feed;
     const composer = fullscreenDiagnostics.composer;
     if (
-      !panel || !workspace || !topbar || !bottomnav
+      !panel || !workspace || !topbar || !bottomnav || !fullscreenDiagnostics.domPreserved
       || fullscreenDiagnostics.panelPosition !== "absolute"
       || Math.abs(panel.top - workspace.top) > 1
       || Math.abs(panel.bottom - workspace.bottom) > 1
@@ -1315,7 +1895,7 @@ try {
     await page.locator(".chat-panel--expert.is-fullscreen").waitFor({ state: "detached" });
   }
 
-  for (const name of ["chat", "terminal", "pool", "dashboard"]) {
+  for (const name of ["chat", "terminal", "messaging", "forum"]) {
     currentView = `mobile-${name}`;
     const tab = page.locator(`.m-bottomnav [data-view="${name}"]`);
     if (await tab.count() !== 1) {
@@ -1401,7 +1981,7 @@ try {
     if (viewport.mustScroll && sheetDiagnostics.scrollHeight <= sheetDiagnostics.clientHeight) {
       failures.push(`mobile-${viewport.name}: la faible hauteur ne declenche pas le defilement`);
     }
-    if (sheetDiagnostics.itemCount !== 14 || sheetDiagnostics.unreachable.length) {
+    if (sheetDiagnostics.itemCount !== 21 || sheetDiagnostics.unreachable.length) {
       failures.push(`mobile-${viewport.name}: actions inaccessibles ${JSON.stringify(sheetDiagnostics)}`);
     }
     await auditAccessibilityAndOverflow(`mobile-more-${viewport.name}`);
@@ -1414,8 +1994,10 @@ try {
   await moreButton.click();
   const autonomousEntry = morePanel.locator('[data-view="autonomous"]');
   await autonomousEntry.click();
-  await page.waitForTimeout(100);
-  if (!(await page.locator(".autonomous-overview").isVisible())) {
+  if (!await page.locator(".autonomous-panel").waitFor({ state: "visible" }).then(
+    () => true,
+    () => false,
+  )) {
     failures.push("mobile: la navigation Plus vers Agents autonomes échoue");
   }
   mobileVisited.push("more/autonomous");
@@ -1450,7 +2032,10 @@ try {
   });
   errorPage.on("console", (message) => {
     if (message.type() !== "error") return;
-    if (message.text().includes("WebSocket connection to") && message.text().includes("/ws/discussions")) {
+    if (
+      message.text().includes("WebSocket connection to")
+      && (message.text().includes("/ws/discussions") || message.text().includes("/ws/runtime"))
+    ) {
       ignoredWebSocketFailures += 1;
     } else if (message.text().includes("Failed to load resource") && message.text().includes("503")) {
       expectedApiFailures += 1;
@@ -1461,6 +2046,18 @@ try {
   await errorPage.route("**/api/**", (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/settings") return route.fulfill({ json: settings });
+    // L'authentification fait partie du bootstrap, pas des vues fonctionnelles
+    // testees ci-dessous. Si son endpoint tombe aussi en 503, l'application
+    // s'arrete avant le premier rendu et aucun etat degrade ne peut etre audite.
+    if (path === "/api/auth/config") {
+      return route.fulfill({
+        json: {
+          enabled: false,
+          registrationEnabled: false,
+          googleEnabled: false,
+        },
+      });
+    }
     return route.fulfill({
       status: 503,
       contentType: "application/json",
@@ -1478,7 +2075,10 @@ try {
     ["#settingsToggle", "settings"],
   ]) {
     errorCurrentView = name;
-    await errorPage.locator(selector).click();
+    if (!(await activateSidebarDestination(errorPage, selector))) {
+      failures.push(`error-state ${name}: bouton ${selector} absent`);
+      continue;
+    }
     await errorPage.waitForTimeout(100);
     const panel = errorPage.locator(".chat-admin-panel");
     if (!(await panel.isVisible()) || !(await panel.innerText()).trim()) {

@@ -17,8 +17,27 @@
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
     <script>
       (() => {
+        if (/CodexTerminalAndroid/i.test(navigator.userAgent)) {
+          document.documentElement.classList.add("native-android");
+        }
         let theme = "dark";
         try {
+          const remoteBaseKey = "codex-switch-terminal.remote.base-url";
+          const savedRemoteBase = localStorage.getItem(remoteBaseKey)?.trim();
+          if (savedRemoteBase) {
+            try {
+              const savedUrl = new URL(savedRemoteBase);
+              const loopbackHosts = new Set(["127.0.0.1", "localhost", "::1"]);
+              if (
+                loopbackHosts.has(savedUrl.hostname.toLowerCase())
+                && !loopbackHosts.has(window.location.hostname.toLowerCase())
+              ) {
+                localStorage.removeItem(remoteBaseKey);
+              }
+            } catch {
+              localStorage.removeItem(remoteBaseKey);
+            }
+          }
           theme = localStorage.getItem("codex-switch-terminal.theme") === "light" ? "light" : "dark";
         } catch {}
         document.documentElement.dataset.theme = theme;

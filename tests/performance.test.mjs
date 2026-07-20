@@ -47,6 +47,8 @@ test("le serveur conserve les assets hashes et les preflights", async () => {
   const server = await read("src-tauri/src/server.rs");
 
   assert.match(server, /max-age=31536000, immutable/);
+  assert.match(server, /frontend_response_cache_control/);
+  assert.match(server, /path\.starts_with\("\/assets\/"\)[\s\S]*?Some\("no-store"\)/);
   assert.match(server, /stale-while-revalidate/);
   assert.match(server, /CorsLayer::very_permissive\(\)\.max_age/);
 });

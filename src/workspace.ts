@@ -7,6 +7,8 @@ export type WorkspaceProfile = {
   path: string;
   /** Contexte durable partage par tous les chats ouverts dans cet environnement. */
   memory: string;
+  /** VPS utilise par defaut pour les nouveaux chats et terminaux. */
+  executionTargetId?: string | null;
 };
 
 /**
@@ -82,6 +84,47 @@ export const workspacePathBreadcrumbs = (
 export const userEnvironmentPath = (
   path: string | null | undefined,
 ): string | null => terminalEnvironmentPath(path);
+
+const comparableEnvironmentPath = (path: string): string => {
+  const normalized = normalizeWorkspacePath(path);
+  const caseInsensitive =
+    /^[a-zA-Z]:\//.test(normalized) ||
+    normalized.startsWith("//") ||
+    /^%[^%]+%\//.test(normalized);
+  return caseInsensitive ? normalized.toLowerCase() : normalized;
+};
+
+/**
+ * Un home d'authentification (CODEX_HOME / CLAUDE_CONFIG_DIR) est un dossier
+ * technique, jamais un environnement projet. Les variantes de separateurs et
+ * de casse des chemins Windows ou a variable `%...%` sont equivalentes.
+ */
+export const userEnvironmentPathExcluding = (
+  path: string | null | undefined,
+  excludedPaths: Iterable<string | null | undefined>,
+): string | null => {
+  const environment = userEnvironmentPath(path);
+  if (!environment) return null;
+  const key = comparableEnvironmentPath(environment);
+  for (const excluded of excludedPaths) {
+    const candidate = userEnvironmentPath(excluded);
+    if (candidate && comparableEnvironmentPath(candidate) === key) return null;
+  }
+  return environment;
+};
+
+/** Un environnement distant est toujours un chemin Unix absolu du serveur. */
+export const remoteEnvironmentPath = (
+  path: string | null | undefined,
+): string | null => {
+  const environment = userEnvironmentPath(path);
+  return environment?.startsWith("/") ? environment : null;
+};
+
+/** Identite canonique d'une cible d'execution distante (actuellement son URL). */
+export const normalizeWorkspaceExecutionTargetId = (
+  value: string | null | undefined,
+): string | null => value?.trim().replace(/\/+$/, "").toLowerCase() || null;
 
 export type FolderLinkedTerminal = {
   folderPath?: string | null;
@@ -160,11 +203,15 @@ export const mergeWorkspaceProfiles = (
     const id = workspaceIdForPath(path);
     const label = profile.label.trim() || workspaceBaseName(path);
     const memory = (profile.memory ?? "").trim();
+    const executionTargetId = normalizeWorkspaceExecutionTargetId(profile.executionTargetId);
     const existing = byId.get(id);
     if (existing) {
       // Une ancienne copie sans memoire ne doit pas effacer la copie renseignee
       // du meme environnement lors de la migration/deduplication.
       if (!existing.memory && memory) existing.memory = memory;
+      if (!existing.executionTargetId && executionTargetId) {
+        existing.executionTargetId = executionTargetId;
+      }
       changed = true;
       return;
     }
@@ -173,11 +220,18 @@ export const mergeWorkspaceProfiles = (
       profile.id !== id ||
       profile.label !== label ||
       profile.path !== path ||
-      profile.memory !== memory
+      profile.memory !== memory ||
+      (profile.executionTargetId ?? null) !== executionTargetId
     ) {
       changed = true;
     }
-    byId.set(id, { id, label, path, memory });
+    byId.set(id, {
+      id,
+      label,
+      path,
+      memory,
+      ...(executionTargetId ? { executionTargetId } : {}),
+    });
   });
 
   return { workspaces: [...byId.values()], changed };
@@ -261,6 +315,47 @@ export const setWorkspaceMemory = (
     workspaces: merged.workspaces.map((workspace) =>
       workspace.id === id ? { ...workspace, memory: normalizedMemory } : workspace,
     ),
+    changed: true,
+  };
+};
+
+/** Definit le VPS par defaut d'un environnement, ou revient au routage automatique. */
+export const setWorkspaceExecutionTarget = (
+  profiles: readonly WorkspaceProfile[],
+  path: string,
+  executionTargetId: string | null | undefined,
+): MergedWorkspaceProfiles => {
+  const merged = mergeWorkspaceProfiles(profiles);
+  const environmentPath = userEnvironmentPath(path);
+  if (!environmentPath) return merged;
+
+  const id = workspaceIdForPath(environmentPath);
+  const normalizedTargetId = normalizeWorkspaceExecutionTargetId(executionTargetId);
+  const existing = merged.workspaces.find((workspace) => workspace.id === id);
+  if (!existing) {
+    return {
+      workspaces: [
+        ...merged.workspaces,
+        {
+          id,
+          label: workspaceBaseName(environmentPath),
+          path: environmentPath,
+          memory: "",
+          ...(normalizedTargetId ? { executionTargetId: normalizedTargetId } : {}),
+        },
+      ],
+      changed: true,
+    };
+  }
+  if ((existing.executionTargetId ?? null) === normalizedTargetId) return merged;
+
+  return {
+    workspaces: merged.workspaces.map((workspace) => {
+      if (workspace.id !== id) return workspace;
+      if (normalizedTargetId) return { ...workspace, executionTargetId: normalizedTargetId };
+      const { executionTargetId: _removed, ...withoutTarget } = workspace;
+      return withoutTarget;
+    }),
     changed: true,
   };
 };

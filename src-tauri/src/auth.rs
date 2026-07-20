@@ -1,4 +1,8 @@
-use crate::{fs_util, security::constant_time_eq};
+use crate::{
+    fs_util,
+    runtime_sync::{RuntimeSync, RuntimeSyncTopic},
+    security::constant_time_eq,
+};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -38,6 +42,7 @@ pub(crate) struct AuthManager {
     inner: Arc<Mutex<AuthState>>,
     config: Arc<AuthRuntimeConfig>,
     http: reqwest::Client,
+    runtime_sync: Option<RuntimeSync>,
 }
 
 struct AuthRuntimeConfig {
@@ -53,6 +58,7 @@ struct GoogleConfig {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    login_url: String,
 }
 
 struct AuthState {
@@ -123,6 +129,13 @@ pub(crate) struct AuthUser {
     updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AuthIdentity {
+    pub id: String,
+    pub username: String,
+    pub avatar_url: Option<String>,
+}
+
 impl From<&StoredUser> for AuthUser {
     fn from(user: &StoredUser) -> Self {
         Self {
@@ -144,6 +157,7 @@ struct PublicAuthConfig {
     enabled: bool,
     registration_enabled: bool,
     google_enabled: bool,
+    google_login_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -258,14 +272,12 @@ pub(crate) fn router(manager: AuthManager) -> Router {
 }
 
 impl AuthManager {
-    pub(crate) fn load(
-        data_dir: PathBuf,
-        public_base_url: &str,
-    ) -> Result<Self, String> {
+    pub(crate) fn load(data_dir: PathBuf, public_base_url: &str) -> Result<Self, String> {
         let store_path = data_dir.join("user-auth.json");
         let store = if store_path.exists() {
-            let content = fs::read_to_string(&store_path)
-                .map_err(|error| format!("lecture de {} impossible: {error}", store_path.display()))?;
+            let content = fs::read_to_string(&store_path).map_err(|error| {
+                format!("lecture de {} impossible: {error}", store_path.display())
+            })?;
             let mut parsed: AuthStore = serde_json::from_str(&content)
                 .map_err(|error| format!("{} invalide: {error}", store_path.display()))?;
             if parsed.version == 0 {
@@ -293,19 +305,19 @@ impl AuthManager {
                         public_base_url.trim_end_matches('/')
                     )
                 });
+                let login_url = google_login_url(&redirect_uri)?;
                 Some(GoogleConfig {
                     client_id,
                     client_secret,
                     redirect_uri,
+                    login_url,
                 })
             }
             (None, None) => None,
-            _ => {
-                return Err(
-                    "CST_GOOGLE_CLIENT_ID et CST_GOOGLE_CLIENT_SECRET doivent etre definis ensemble"
-                        .to_string(),
-                )
-            }
+            _ => return Err(
+                "CST_GOOGLE_CLIENT_ID et CST_GOOGLE_CLIENT_SECRET doivent etre definis ensemble"
+                    .to_string(),
+            ),
         };
 
         let secure_cookie = env_bool("CST_AUTH_SECURE_COOKIE")
@@ -329,6 +341,7 @@ impl AuthManager {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .map_err(|error| format!("client OAuth impossible: {error}"))?,
+            runtime_sync: None,
         };
 
         let mut state = manager
@@ -342,8 +355,71 @@ impl AuthManager {
         Ok(manager)
     }
 
+    pub(crate) fn with_runtime_sync(mut self, runtime_sync: RuntimeSync) -> Self {
+        self.runtime_sync = Some(runtime_sync);
+        self
+    }
+
     pub(crate) fn authorize_headers(&self, headers: &HeaderMap) -> bool {
         self.user_from_headers(headers).ok().flatten().is_some()
+    }
+
+    /// Identite publique associee au cookie de session. Les fonctionnalites
+    /// collaboratives (comme le forum) n'ont ainsi jamais acces a l'e-mail ni
+    /// aux secrets d'authentification de l'utilisateur.
+    pub(crate) fn identity_from_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<AuthIdentity>, String> {
+        self.user_from_headers(headers)
+            .map(|user| {
+                user.map(|user| AuthIdentity {
+                    id: user.id,
+                    username: user.username,
+                    avatar_url: user.avatar_url,
+                })
+            })
+            .map_err(|error| error.message)
+    }
+
+    /// Catalogue public des utilisateurs pour les fonctions collaboratives.
+    /// Les e-mails, fournisseurs OAuth et secrets restent dans le module auth.
+    pub(crate) fn public_identities(&self) -> Result<Vec<AuthIdentity>, String> {
+        let state = self.lock().map_err(|error| error.message)?;
+        let mut identities = state
+            .store
+            .users
+            .iter()
+            .map(|user| AuthIdentity {
+                id: user.id.clone(),
+                username: user.username.clone(),
+                avatar_url: user.avatar_url.clone(),
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by(|left, right| {
+            left.username
+                .to_lowercase()
+                .cmp(&right.username.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(identities)
+    }
+
+    pub(crate) fn public_identity_by_id(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<AuthIdentity>, String> {
+        let state = self.lock().map_err(|error| error.message)?;
+        Ok(state
+            .store
+            .users
+            .iter()
+            .find(|user| user.id == user_id)
+            .map(|user| AuthIdentity {
+                id: user.id.clone(),
+                username: user.username.clone(),
+                avatar_url: user.avatar_url.clone(),
+            }))
     }
 
     fn public_config(&self) -> Result<PublicAuthConfig, AuthError> {
@@ -352,6 +428,11 @@ impl AuthManager {
             enabled: true,
             registration_enabled: self.config.registration_enabled || state.store.users.is_empty(),
             google_enabled: self.config.google.is_some(),
+            google_login_url: self
+                .config
+                .google
+                .as_ref()
+                .map(|google| google.login_url.clone()),
         })
     }
 
@@ -386,6 +467,8 @@ impl AuthManager {
         state.store.users.push(stored);
         let token = issue_session(&mut state.store.sessions, &user_id, now);
         self.persist_locked(&state).map_err(AuthError::internal)?;
+        drop(state);
+        self.notify_public_identities_changed();
         Ok((user, token))
     }
 
@@ -456,10 +539,7 @@ impl AuthManager {
                 .iter()
                 .find(|session| {
                     session.expires_at > now
-                        && constant_time_eq(
-                            session.token_hash.as_bytes(),
-                            expected_hash.as_bytes(),
-                        )
+                        && constant_time_eq(session.token_hash.as_bytes(), expected_hash.as_bytes())
                 })
                 .map(|session| session.user_id.clone())
         });
@@ -519,6 +599,8 @@ impl AuthManager {
         user.updated_at = now_ts();
         let public = AuthUser::from(&*user);
         self.persist_locked(&state).map_err(AuthError::internal)?;
+        drop(state);
+        self.notify_public_identities_changed();
         Ok(public)
     }
 
@@ -533,9 +615,9 @@ impl AuthManager {
         let mut state = self.lock()?;
         let previous_len = state.store.sessions.len();
         state.store.sessions.retain(|session| {
-            !token_hashes.iter().any(|hash| {
-                constant_time_eq(session.token_hash.as_bytes(), hash.as_bytes())
-            })
+            !token_hashes
+                .iter()
+                .any(|hash| constant_time_eq(session.token_hash.as_bytes(), hash.as_bytes()))
         });
         if state.store.sessions.len() != previous_len {
             self.persist_locked(&state).map_err(AuthError::internal)?;
@@ -544,11 +626,9 @@ impl AuthManager {
     }
 
     fn begin_google(&self) -> Result<(String, String), AuthError> {
-        let google = self
-            .config
-            .google
-            .as_ref()
-            .ok_or_else(|| AuthError::new(StatusCode::NOT_FOUND, "Connexion Google non configuree"))?;
+        let google = self.config.google.as_ref().ok_or_else(|| {
+            AuthError::new(StatusCode::NOT_FOUND, "Connexion Google non configuree")
+        })?;
         let state_token = random_secret();
         let code_verifier = format!("{}{}", random_secret(), random_secret()).replace('-', "");
         let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
@@ -590,7 +670,9 @@ impl AuthManager {
             .config
             .google
             .as_ref()
-            .ok_or_else(|| AuthError::new(StatusCode::NOT_FOUND, "Connexion Google non configuree"))?
+            .ok_or_else(|| {
+                AuthError::new(StatusCode::NOT_FOUND, "Connexion Google non configuree")
+            })?
             .clone();
         let cookie_state = cookie_value(headers, OAUTH_STATE_COOKIE)
             .ok_or_else(|| AuthError::bad_request("Session OAuth Google absente"))?;
@@ -684,6 +766,12 @@ impl AuthManager {
             state.store.users[index].google_sub = Some(google_user.sub.clone());
             index
         } else {
+            if !self.config.registration_enabled && !state.store.users.is_empty() {
+                return Err(AuthError::new(
+                    StatusCode::FORBIDDEN,
+                    "La creation de nouveaux comptes est desactivee",
+                ));
+            }
             let username = google_username(&email, &state.store.users);
             state.store.users.push(StoredUser {
                 id: Uuid::new_v4().to_string(),
@@ -703,7 +791,15 @@ impl AuthManager {
         let stored = state.store.users[user_index].clone();
         let token = issue_session(&mut state.store.sessions, &stored.id, now);
         self.persist_locked(&state).map_err(AuthError::internal)?;
+        drop(state);
+        self.notify_public_identities_changed();
         Ok((AuthUser::from(&stored), token))
+    }
+
+    fn notify_public_identities_changed(&self) {
+        if let Some(runtime_sync) = &self.runtime_sync {
+            runtime_sync.notify(RuntimeSyncTopic::PrivateMessages);
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, AuthState>, AuthError> {
@@ -818,8 +914,7 @@ async fn api_google_start(State(manager): State<AuthManager>) -> Result<Response
     let mut response = StatusCode::SEE_OTHER.into_response();
     response.headers_mut().insert(
         LOCATION,
-        HeaderValue::from_str(&location)
-            .map_err(|_| AuthError::internal("URL Google invalide"))?,
+        HeaderValue::from_str(&location).map_err(|_| AuthError::internal("URL Google invalide"))?,
     );
     set_cookie(&mut response, &manager.oauth_state_cookie(&state));
     Ok(no_store(response))
@@ -846,18 +941,24 @@ async fn api_google_callback(
     }
 }
 
-fn google_redirect(manager: &AuthManager, result: Result<(), String>, token: Option<&str>) -> Response {
+fn google_redirect(
+    manager: &AuthManager,
+    result: Result<(), String>,
+    token: Option<&str>,
+) -> Response {
     let location = match result {
         Ok(()) => "/?auth=google".to_string(),
         Err(message) => {
-            let encoded = url::form_urlencoded::byte_serialize(message.as_bytes()).collect::<String>();
+            let encoded =
+                url::form_urlencoded::byte_serialize(message.as_bytes()).collect::<String>();
             format!("/?auth_error={encoded}")
         }
     };
     let mut response = StatusCode::SEE_OTHER.into_response();
-    response
-        .headers_mut()
-        .insert(LOCATION, HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("/")));
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("/")),
+    );
     set_cookie(&mut response, &manager.expired_cookie(OAUTH_STATE_COOKIE));
     if let Some(token) = token {
         set_cookie(&mut response, &manager.session_cookie(token));
@@ -973,7 +1074,9 @@ fn ensure_identity_available(
     if users.iter().any(|user| {
         Some(user.id.as_str()) != except_user_id && user.email.eq_ignore_ascii_case(email)
     }) {
-        return Err(AuthError::conflict("Cette adresse e-mail est deja utilisee"));
+        return Err(AuthError::conflict(
+            "Cette adresse e-mail est deja utilisee",
+        ));
     }
     Ok(())
 }
@@ -986,9 +1089,10 @@ fn normalize_username(value: &str) -> Result<String, AuthError> {
             "Le nom d'utilisateur doit contenir entre 3 et 32 caracteres",
         ));
     }
-    if !value.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-    }) {
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
         return Err(AuthError::bad_request(
             "Le nom d'utilisateur accepte uniquement lettres, chiffres, point, tiret et underscore",
         ));
@@ -1000,7 +1104,9 @@ fn normalize_email(value: &str) -> Result<String, AuthError> {
     let value = value.trim().to_lowercase();
     if value.is_empty()
         || value.len() > 254
-        || value.chars().any(|character| character.is_whitespace() || character.is_control())
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
     {
         return Err(AuthError::bad_request("Adresse e-mail invalide"));
     }
@@ -1044,9 +1150,11 @@ fn hash_password(value: &str) -> Result<String, String> {
 }
 
 fn verify_password(encoded: &str, value: &str) -> bool {
-    PasswordHash::new(encoded)
-        .ok()
-        .is_some_and(|hash| Argon2::default().verify_password(value.as_bytes(), &hash).is_ok())
+    PasswordHash::new(encoded).ok().is_some_and(|hash| {
+        Argon2::default()
+            .verify_password(value.as_bytes(), &hash)
+            .is_ok()
+    })
 }
 
 fn google_username(email: &str, users: &[StoredUser]) -> String {
@@ -1097,6 +1205,18 @@ fn random_secret() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+fn google_login_url(redirect_uri: &str) -> Result<String, String> {
+    let mut url = Url::parse(redirect_uri)
+        .map_err(|error| format!("CST_GOOGLE_REDIRECT_URI invalide: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("CST_GOOGLE_REDIRECT_URI doit etre une URL HTTP(S) absolue".to_string());
+    }
+    url.set_path("/api/auth/google/start");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.into())
+}
+
 fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -1133,10 +1253,16 @@ mod tests {
 
     #[test]
     fn validates_and_normalizes_account_fields() {
-        assert_eq!(normalize_username("  jean-pierre  ").unwrap(), "jean-pierre");
+        assert_eq!(
+            normalize_username("  jean-pierre  ").unwrap(),
+            "jean-pierre"
+        );
         assert!(normalize_username("ab").is_err());
         assert!(normalize_username("jean pierre").is_err());
-        assert_eq!(normalize_email(" Jean@Example.COM ").unwrap(), "jean@example.com");
+        assert_eq!(
+            normalize_email(" Jean@Example.COM ").unwrap(),
+            "jean@example.com"
+        );
         assert!(normalize_email("jean@example").is_err());
         assert!(validate_password("mot-de-passe-solide").is_ok());
         assert!(validate_password("court").is_err());
@@ -1166,5 +1292,17 @@ mod tests {
         let generated = google_username("jean@example.org", &[existing]);
         assert!(generated.starts_with("jean-"));
         assert_ne!(generated, "jean");
+    }
+
+    #[test]
+    fn google_login_starts_on_the_callback_origin() {
+        assert_eq!(
+            google_login_url(
+                "https://pc-fixe-cst.example.test/api/auth/google/callback?ignored=true"
+            )
+            .unwrap(),
+            "https://pc-fixe-cst.example.test/api/auth/google/start"
+        );
+        assert!(google_login_url("javascript:alert(1)").is_err());
     }
 }

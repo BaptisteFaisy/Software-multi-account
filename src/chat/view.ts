@@ -5,11 +5,17 @@
 // maniere ciblee pour conserver le scroll et le brouillon pendant le streaming.
 
 import { escapeHtml, renderMarkdown } from "./markdown";
+import type { ChatImageAttachment } from "./image-attachments";
+import { resolveChatTurnWindow } from "./render-window";
+import { chatRuntimeShowsStateLabel } from "./status-display";
 import {
   type ChatAgentToolDefinition,
   type ChatAgentToolId,
 } from "./agent-tools";
 import {
+  chatMessageHasVisibleContent,
+  chatPartHasVisibleContent,
+  chatTextHasVisibleContent,
   chatTurnIsBusy,
   collapseRepeatedWaitParts,
   conversationWaitsForUser,
@@ -19,6 +25,10 @@ import {
   type RuntimeChatPart,
   type RuntimeChatMessage,
 } from "./runtime";
+import {
+  chatTokenUsagePresentation,
+  type ChatContextWindowUsage,
+} from "./token-usage";
 
 export type ChatRole = "user" | "assistant";
 export type ChatMode = "build" | "plan" | "ask";
@@ -60,6 +70,11 @@ export type ChatSelectOption = {
   label: string;
 };
 
+export type ChatFavoritePrompt = {
+  id: string;
+  title: string;
+};
+
 export type ChatQuotaSuggestion = {
   accountId: string;
   accountLabel: string;
@@ -82,16 +97,26 @@ export type ChatSyncState =
   | "unsupported"
   | "polling";
 
+export type ChatTurnStatusDisplayMode = "dot" | "label";
+
 export type ChatPanelModel = {
   title: string;
   subtitle: string;
+  totalTokens: number | null;
+  contextUsage: ChatContextWindowUsage | null;
+  contextCompacting: boolean;
+  supportsCompact: boolean;
+  hasCompactableSession: boolean;
   accountLabel: string;
   providerLabel: string;
+  nodeLabel: string | null;
   loading: boolean;
   error: string | null;
   truncated: boolean;
   syncState: ChatSyncState;
   messages: ChatMessage[];
+  /** Nombre maximal de tours montes dans le DOM, null pour tout afficher. */
+  visibleTurnLimit: number | null;
   activities: ChatActivity[];
   thoughts: ChatThought[];
   parts: ChatPart[];
@@ -100,6 +125,7 @@ export type ChatPanelModel = {
   turnFinishedAt: number | null;
   turnError: string | null;
   waitingForUser: boolean;
+  turnStatusDisplayMode: ChatTurnStatusDisplayMode;
   quotaStatus: ChatQuotaStatus;
   quotaSuggestion: ChatQuotaSuggestion | null;
   accounts: ChatAccountOption[];
@@ -109,11 +135,14 @@ export type ChatPanelModel = {
   selectedReasoningEffort: string;
   reasoningEffortOptions: ChatSelectOption[];
   supportsReasoningEffort: boolean;
+  composerSelectorsEnabled: boolean;
+  favoritePrompts: ChatFavoritePrompt[];
   supportsGoals: boolean;
   agentTools: ChatAgentToolDefinition[];
   enabledTools: ChatAgentToolId[];
   mode: ChatMode;
   draft: string;
+  imageAttachments: ChatImageAttachment[];
   queuedCount: number;
   newConversation: boolean;
   workspaceLabel: string;
@@ -134,8 +163,13 @@ export type ChatPanelRenderOptions = {
     disabled?: boolean;
   };
   orchestration?: {
-    role: "available" | "orchestrator" | "worker";
+    role: "orchestrator" | "worker";
     label: string;
+    detail: string;
+    disabled?: boolean;
+  };
+  automaticOrchestration?: {
+    enabled: boolean;
     detail: string;
     disabled?: boolean;
   };
@@ -175,7 +209,9 @@ const renderMessage = (
   showIdentity: boolean,
   highlightQuestion: boolean,
   instanceId = "",
-): string => `
+): string => {
+  if (!chatTextHasVisibleContent(message.text)) return "";
+  return `
   <article id="${instanceId ? `chat-message-${instanceId}-${index}` : `chat-message-${index}`}" data-chat-message-index="${index}" class="chat-msg chat-msg--${message.role} ${message.deliveryState ? `chat-msg--${message.deliveryState}` : ""} ${highlightQuestion ? "chat-msg--question" : ""}">
     ${showIdentity
       ? `<div class="chat-msg-meta">
@@ -189,6 +225,7 @@ const renderMessage = (
       : ""}
     <div class="chat-msg-body">${renderMarkdown(message.text)}</div>
   </article>`;
+};
 
 const activityIcon = (kind: string): string => {
   switch (kind) {
@@ -280,7 +317,9 @@ const renderOpenCodeUserMessage = (
   message: ChatMessage,
   index: number,
   instanceId: string,
-): string => `
+): string => {
+  if (!chatTextHasVisibleContent(message.text)) return "";
+  return `
   <article id="${instanceId ? `chat-message-${instanceId}-${index}` : `chat-message-${index}`}" data-chat-message-index="${index}" data-component="user-message" class="chat-user-message ${message.deliveryState ? `chat-msg--${message.deliveryState}` : ""}">
     <div class="chat-user-bubble" data-chat-copy-source>
       <div class="chat-msg-body">${renderMarkdown(message.text)}</div>
@@ -292,6 +331,7 @@ const renderOpenCodeUserMessage = (
       ${renderOpenCodeCopyAction("Copier le message")}
     </div>
   </article>`;
+};
 
 const renderOpenCodeToolOutput = (part: ChatPart): string => {
   const sections = [
@@ -428,14 +468,15 @@ const renderOpenCodePart = (
   },
 ): string => {
   if (part.kind === "tool") return renderOpenCodeToolPart(part);
-  if (!part.text?.trim()) return "";
+  const text = part.text ?? "";
+  if (!chatTextHasVisibleContent(text)) return "";
   if (part.kind === "reasoning") {
     return `<div data-component="reasoning-part" class="chat-reasoning-part chat-part--${escapeHtml(part.status)}">
-      <div class="chat-reasoning-markdown">${renderMarkdown(part.text)}</div>
+      <div class="chat-reasoning-markdown">${renderMarkdown(text)}</div>
     </div>`;
   }
   return `<article data-component="text-part" class="chat-text-part chat-part--${escapeHtml(part.status)}" data-chat-copy-source>
-    <div class="chat-assistant-markdown">${renderMarkdown(part.text)}</div>
+    <div class="chat-assistant-markdown">${renderMarkdown(text)}</div>
     ${options.finalText ? `<div class="chat-text-actions">${renderOpenCodeAssistantMeta(options.providerLabel, options.timestamp, options.startedAt, options.finishedAt)}${renderOpenCodeCopyAction("Copier la reponse")}</div>` : ""}
   </article>`;
 };
@@ -448,8 +489,9 @@ const renderOpenCodeParts = (
   finishedAt: number | null = null,
 ): string => {
   const visible = collapseRepeatedWaitParts(
-    parts.filter((part) => part.kind === "tool" || !!part.text?.trim()),
+    parts.filter(chatPartHasVisibleContent),
   );
+  if (!visible.length) return "";
   const groups = groupConsecutiveToolParts(visible);
   const lastTextIndex = groups
     .map((group) => group.length === 1 && group[0]?.kind === "text")
@@ -468,7 +510,7 @@ const renderOpenCodeParts = (
 };
 
 const renderOpenCodeThinking = (model: ChatPanelModel): string => {
-  if (model.turnStatus !== "running" || model.parts.length) return "";
+  if (model.turnStatus !== "running" || model.parts.some(chatPartHasVisibleContent)) return "";
   return `<div data-component="thinking-row" class="chat-thinking-row" aria-live="polite">
     <span class="chat-thinking-shimmer">Thinking</span>
   </div>`;
@@ -482,6 +524,7 @@ type RenderTurn = {
 const groupMessagesIntoTurns = (messages: ChatMessage[]): RenderTurn[] => {
   const turns: RenderTurn[] = [];
   messages.forEach((message, index) => {
+    if (!chatMessageHasVisibleContent(message)) return;
     if (message.role === "user") {
       turns.push({ user: { message, index }, assistants: [] });
       return;
@@ -492,17 +535,26 @@ const groupMessagesIntoTurns = (messages: ChatMessage[]): RenderTurn[] => {
   return turns;
 };
 
-const openCodeMessageParts = (message: ChatMessage): ChatPart[] =>
-  message.parts?.length
-    ? message.parts
-    : message.text.trim()
-      ? [{
-          id: `message-${message.timestamp}`,
-          kind: "text",
-          status: "complete",
-          text: message.text,
-        }]
-      : [];
+const chatTurns = (model: ChatPanelModel): RenderTurn[] => {
+  const turns = groupMessagesIntoTurns(model.messages);
+  if (!turns.length && (model.parts.some(chatPartHasVisibleContent) || model.turnStatus === "running")) {
+    turns.push({ user: null, assistants: [] });
+  }
+  return turns;
+};
+
+const openCodeMessageParts = (message: ChatMessage): ChatPart[] => {
+  const parts = message.parts ?? [];
+  if (parts.some(chatPartHasVisibleContent)) return parts;
+  return chatTextHasVisibleContent(message.text)
+    ? [{
+        id: `message-${message.timestamp}`,
+        kind: "text",
+        status: "complete",
+        text: message.text,
+      }]
+    : [];
+};
 
 const renderOpenCodeTurn = (
   turn: RenderTurn,
@@ -512,7 +564,8 @@ const renderOpenCodeTurn = (
   instanceId: string,
 ): string => {
   const lastTurn = turnIndex === turnCount - 1;
-  const livePartsTakeOver = lastTurn && model.parts.length > 0 && model.turnStatus !== "completed";
+  const hasLiveParts = model.parts.some(chatPartHasVisibleContent);
+  const livePartsTakeOver = lastTurn && hasLiveParts && model.turnStatus !== "completed";
   const assistantMessages = livePartsTakeOver ? [] : turn.assistants;
   const assistant = assistantMessages.map(({ message }, assistantIndex) => {
     const lastAssistant = assistantIndex === assistantMessages.length - 1;
@@ -525,7 +578,7 @@ const renderOpenCodeTurn = (
       currentCompletedTurn ? model.turnFinishedAt : null,
     );
   }).join("");
-  const live = lastTurn && model.parts.length && (livePartsTakeOver || !assistantMessages.length)
+  const live = lastTurn && hasLiveParts && (livePartsTakeOver || !assistantMessages.length)
     ? renderOpenCodeParts(model.parts, model.providerLabel, 0, model.turnStartedAt, model.turnFinishedAt)
     : "";
   return `<section data-component="session-turn" class="chat-turn ${lastTurn ? "is-latest" : ""}">
@@ -534,6 +587,19 @@ const renderOpenCodeTurn = (
     ${live}
     ${lastTurn ? renderOpenCodeThinking(model) : ""}
   </section>`;
+};
+
+/** Rend uniquement le tour vivant afin que le streaming ne reconstruise pas
+ * tout l'historique de la conversation a chaque evenement. */
+export const renderChatLatestTurn = (
+  model: ChatPanelModel,
+  instanceId = "",
+): string => {
+  const turns = chatTurns(model);
+  const latest = turns.at(-1);
+  return latest
+    ? renderOpenCodeTurn(latest, turns.length - 1, turns.length, model, instanceId)
+    : "";
 };
 
 const quotaStatusLabel = (quota: ChatQuotaStatus): string => {
@@ -627,6 +693,7 @@ const renderLegacyChatRuntimeStatus = (model: ChatPanelModel): string => {
 
 export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
   const waitingForUser = model.waitingForUser;
+  const showStateLabel = chatRuntimeShowsStateLabel(model.turnStatus, waitingForUser);
   const runningActivity = [...model.activities]
     .reverse()
     .find((activity) => activity.status === "running" || activity.status === "queued");
@@ -645,7 +712,7 @@ export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
     .filter(Boolean)
     .join(" - ");
 
-  let stateLabel = "Pret";
+  let stateLabel: string | null = null;
   if (waitingForUser) stateLabel = "Question";
   else if (model.turnStatus === "running") {
     stateLabel = latestPart?.title || runningActivity?.label || "Thinking";
@@ -654,13 +721,12 @@ export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
   }
   else if (model.turnStatus === "failed") stateLabel = "Echec";
   else if (model.turnStatus === "cancelled") stateLabel = "Arrete";
-  else if (model.turnStatus === "completed") stateLabel = "Termine";
 
   return `<div data-chat-control="runtime" class="chat-runtime-inline chat-runtime-inline--${waitingForUser ? "waiting" : escapeHtml(model.turnStatus)}" aria-live="polite">
-    <span class="chat-runtime-state" title="${escapeHtml(stateLabel)}">
+    ${showStateLabel && stateLabel ? `<span class="chat-runtime-state" title="${escapeHtml(stateLabel)}">
       <span class="chat-runtime-dot" aria-hidden="true"></span>
       <span>${escapeHtml(stateLabel)}</span>
-    </span>
+    </span>` : ""}
     ${startedAt ? `<span class="chat-runtime-elapsed" data-chat-elapsed data-chat-started-at="${startedAt}" ${finishedAt ? `data-chat-finished-at="${finishedAt}"` : ""} title="Temps ecoule depuis le debut du tour"><i data-lucide="clock-3"></i><strong data-chat-elapsed-value>${escapeHtml(duration)}</strong></span>` : ""}
     <span class="chat-runtime-quota chat-runtime-quota--${escapeHtml(quota.state)}" title="${escapeHtml(quotaTitle)}">
       <i data-lucide="gauge"></i>
@@ -691,10 +757,38 @@ export const renderChatTurnStatus = (model: ChatPanelModel): string => {
     : state === "running"
       ? "Le chat est en cours d'execution"
       : "Le chat est disponible";
-  return `<span data-chat-control="turn-status" class="chat-turn-status chat-turn-status--${state}" role="status" title="${title}" aria-label="${title}">
-    <span class="chat-turn-status-dot" aria-hidden="true"></span>
-    <span class="chat-turn-status-label">${label}</span>
+  const displayMode = model.turnStatusDisplayMode === "dot" ? "dot" : "label";
+  const content = displayMode === "dot"
+    ? '<span class="chat-turn-status-dot" aria-hidden="true"></span>'
+    : `<span class="chat-turn-status-label">${label}</span>`;
+  return `<span data-chat-control="turn-status" data-chat-status-display="${displayMode}" class="chat-turn-status chat-turn-status--${state} chat-turn-status--${displayMode}" role="status" title="${title}" aria-label="${title}">
+    ${content}
   </span>`;
+};
+
+export const renderChatTokenUsage = (
+  model: ChatPanelModel,
+  blocked = false,
+): string => {
+  const usage = chatTokenUsagePresentation(model.totalTokens, model.contextUsage);
+  const canCompact = model.supportsCompact
+    && model.hasCompactableSession
+    && !model.contextCompacting
+    && model.queuedCount === 0
+    && !blocked;
+  const title = model.contextCompacting
+    ? "Compaction du contexte Codex en cours…"
+    : model.supportsCompact && model.hasCompactableSession
+      ? `${usage.title} Cliquez ici ou saisissez /compact pour compacter.`
+      : model.supportsCompact
+        ? `${usage.title} Démarrez d'abord la conversation pour pouvoir la compacter.`
+        : `${usage.title} La commande /compact est réservée aux conversations Codex.`;
+  const detail = usage.usedPercent === null ? usage.unit : `${usage.usedPercent} %`;
+  return `<button type="button" data-chat-control="tokens" data-chat-action="compact" data-chat-token-count="${usage.count ?? ""}" data-chat-token-signature="${escapeHtml(usage.signature)}" data-chat-context-percent="${usage.usedPercent ?? ""}" class="chat-token-usage pressure-${usage.pressure} ${usage.count === null ? "is-unavailable" : ""} ${model.contextCompacting ? "is-compacting" : ""}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}" ${model.contextCompacting ? 'aria-busy="true"' : ""} ${canCompact ? "" : "disabled"}>
+    <i data-lucide="${model.contextCompacting ? "loader-circle" : "gauge"}" aria-hidden="true"></i>
+    <strong data-chat-token-value>${escapeHtml(usage.value)}</strong>
+    <small>${escapeHtml(detail)}</small>
+  </button>`;
 };
 
 const renderWelcome = (): string => `
@@ -726,13 +820,16 @@ const renderLegacyChatFeedInner = (model: ChatPanelModel, instanceId = ""): stri
   const notice = model.truncated
     ? `<div class="chat-notice">Discussion tres longue : seuls les derniers messages sont affiches.</div>`
     : "";
-  const messages = model.messages.length
-    ? model.messages
-        .map((message, index) => {
-          const previousMessage = model.messages[index - 1];
+  const visibleMessages = model.messages
+    .map((message, index) => ({ message, index }))
+    .filter(({ message }) => chatMessageHasVisibleContent(message));
+  const messages = visibleMessages.length
+    ? visibleMessages
+        .map(({ message, index }, visibleIndex) => {
+          const previousMessage = visibleMessages[visibleIndex - 1]?.message;
           const showIdentity = message.role !== "assistant" || previousMessage?.role !== "assistant";
           const highlightQuestion =
-            index === model.messages.length - 1 &&
+            visibleIndex === visibleMessages.length - 1 &&
             message.role === "assistant" &&
             conversationWaitsForUser([message]);
           return renderMessage(message, model.providerLabel, index, showIdentity, highlightQuestion, instanceId);
@@ -745,10 +842,7 @@ const renderLegacyChatFeedInner = (model: ChatPanelModel, instanceId = ""): stri
     : "";
   const quotaSuggestion = model.quotaSuggestion
     ? `<div class="chat-quota-suggestion" role="status" aria-live="polite">
-        <span><strong>Quota épuisé.</strong> Transfert automatique vers
-          <strong>${escapeHtml(model.quotaSuggestion.accountLabel)}</strong>
-          (${Math.round(model.quotaSuggestion.remainingPercent)} % disponible) en cours…
-        </span>
+        <span><strong>Continuité automatique.</strong> Une capacité compatible prend le relais…</span>
       </div>`
     : "";
   return notice + messages + thinking + renderActivities(model.activities) + turnError + quotaSuggestion;
@@ -765,13 +859,19 @@ export const renderChatFeedInner = (model: ChatPanelModel, instanceId = ""): str
   const notice = model.truncated
     ? `<div class="chat-notice">Discussion tres longue : seuls les derniers messages sont affiches.</div>`
     : "";
-  const turns = groupMessagesIntoTurns(model.messages);
-  if (!turns.length && model.parts.length) {
-    turns.push({ user: null, assistants: [] });
-  }
-  const conversation = turns.length
+  const turns = chatTurns(model);
+  const { hiddenTurnCount } = resolveChatTurnWindow(turns.length, model.visibleTurnLimit);
+  const visibleTurns = hiddenTurnCount > 0 ? turns.slice(hiddenTurnCount) : turns;
+  const olderTurns = hiddenTurnCount > 0
+    ? `<div class="chat-render-window" role="status">
+        <button type="button" data-chat-action="show-older-turns" data-hidden-turn-count="${hiddenTurnCount}">
+          Afficher les ${hiddenTurnCount} echange${hiddenTurnCount > 1 ? "s" : ""} precedent${hiddenTurnCount > 1 ? "s" : ""}
+        </button>
+      </div>`
+    : "";
+  const conversation = visibleTurns.length
     ? `<div data-component="message-timeline" class="chat-message-timeline">
-        ${turns.map((turn, index) => renderOpenCodeTurn(turn, index, turns.length, model, instanceId)).join("")}
+        ${visibleTurns.map((turn, index) => renderOpenCodeTurn(turn, index, visibleTurns.length, model, instanceId)).join("")}
       </div>`
     : renderWelcome();
   const turnError = model.turnError
@@ -779,13 +879,10 @@ export const renderChatFeedInner = (model: ChatPanelModel, instanceId = ""): str
     : "";
   const quotaSuggestion = model.quotaSuggestion
     ? `<div class="chat-quota-suggestion" role="status" aria-live="polite">
-        <span><strong>Quota epuise.</strong> Transfert automatique vers
-          <strong>${escapeHtml(model.quotaSuggestion.accountLabel)}</strong>
-          (${Math.round(model.quotaSuggestion.remainingPercent)} % disponible) en cours...
-        </span>
+        <span><strong>Continuité automatique.</strong> Une capacité compatible prend le relais...</span>
       </div>`
     : "";
-  return notice + conversation + turnError + quotaSuggestion;
+  return notice + olderTurns + conversation + turnError + quotaSuggestion;
 };
 
 const modelSuggestions = (model: ChatPanelModel): string =>
@@ -805,7 +902,21 @@ const reasoningEffortOptions = (model: ChatPanelModel): string => {
     .join("");
 };
 
-const renderChatHistory = (model: ChatPanelModel, instanceId = ""): string => {
+const renderChatImageAttachments = (
+  images: readonly ChatImageAttachment[],
+): string => images.length ? `<div class="chat-image-attachments" data-chat-control="image-attachments" role="list" aria-label="Images jointes au prochain message">
+  ${images.map((image) => {
+    const imageId = escapeHtml(image.id);
+    const name = escapeHtml(image.name);
+    return `<figure class="chat-image-attachment" role="listitem">
+      <img src="${escapeHtml(image.previewUrl)}" alt="" />
+      <figcaption title="${name}">${name}</figcaption>
+      <button type="button" data-chat-action="remove-image" data-chat-image-id="${imageId}" title="Retirer ${name}" aria-label="Retirer l'image ${name}"><i data-lucide="x"></i></button>
+    </figure>`;
+  }).join("")}
+</div>` : "";
+
+export const renderChatHistory = (model: ChatPanelModel, instanceId = ""): string => {
   if (!model.historyOpen) return "";
   const userMessages = model.messages
     .map((message, index) => ({ message, index }))
@@ -848,7 +959,7 @@ export const renderChatPanel = (
 ): string => {
   const accountTransition = options.accountTransition;
   const running = model.turnStatus === "running";
-  const busy = chatTurnIsBusy(model.turnStatus) || !!accountTransition;
+  const busy = chatTurnIsBusy(model.turnStatus) || !!accountTransition || model.contextCompacting;
   const queued = model.queuedCount > 0;
   const userMessageCount = model.messages.filter((message) => message.role === "user").length;
   const instanceId = (options.instanceId ?? "").replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -857,6 +968,7 @@ export const renderChatPanel = (
   const fullscreen = options.fullscreen === true;
   const autonomous = options.autonomous;
   const orchestration = options.orchestration;
+  const automaticOrchestration = options.automaticOrchestration;
   const managedByOrchestration =
     orchestration?.role === "orchestrator" || orchestration?.role === "worker";
   const expertClass = instanceId
@@ -874,12 +986,14 @@ export const renderChatPanel = (
         ${compact ? "" : `<span id="${id("chatSubtitle")}" data-chat-control="subtitle" class="chat-sub">${escapeHtml(model.subtitle)}</span>`}
       </div>
       ${renderChatTurnStatus(model)}
+      ${renderChatTokenUsage(model, busy)}
       <div class="chat-head-actions">
         ${compact ? "" : `<span id="${id("chatSync")}" data-chat-control="sync" class="chat-sync chat-sync--${model.syncState}" aria-live="polite">
           <span class="chat-sync-dot" aria-hidden="true"></span>
           <span data-chat-sync-label>${escapeHtml(chatSyncLabel(model.syncState))}</span>
         </span>
         <span class="chat-provider">${escapeHtml(model.providerLabel)}</span>
+        ${model.nodeLabel ? `<span class="chat-node" title="Chat alloue a ${escapeHtml(model.nodeLabel)}"><i data-lucide="server"></i><span>${escapeHtml(model.nodeLabel)}</span></span>` : ""}
         <button id="${id("chatResume")}" type="button" data-open-discussions class="tool-button chat-resume-button" title="Choisir une discussion a reprendre" aria-label="Reprendre une discussion">
           <i data-lucide="messages-square"></i><span>Reprendre une discussion</span>
         </button>
@@ -917,12 +1031,12 @@ export const renderChatPanel = (
           id="${id("chatOrchestration")}"
           type="button"
           class="expert-chat-orchestration-action role-${orchestration.role}"
-          data-chat-action="${orchestration.role === "available" ? "orchestrate" : "open-orchestration"}"
+          data-chat-action="open-orchestration"
           title="${escapeHtml(orchestration.detail)}"
           aria-label="${escapeHtml(orchestration.detail)}"
           ${orchestration.disabled || accountTransition ? "disabled" : ""}
         >
-          <i data-lucide="${orchestration.role === "orchestrator" ? "brain-circuit" : orchestration.role === "worker" ? "bot" : "users"}"></i>
+          <i data-lucide="${orchestration.role === "orchestrator" ? "brain-circuit" : "bot"}"></i>
           <span>${escapeHtml(orchestration.label)}</span>
         </button>` : ""}
         <button id="${id("chatFullscreen")}" type="button" class="expert-chat-pane-fullscreen" data-chat-action="fullscreen" title="${fullscreen ? "Quitter le plein écran" : "Afficher ce chat en plein écran"}" aria-label="${fullscreen ? "Quitter le plein écran" : "Afficher ce chat en plein écran"}" aria-pressed="${fullscreen}" ${accountTransition ? "disabled" : ""}>
@@ -947,29 +1061,47 @@ export const renderChatPanel = (
       <button type="button" class="tool-button" data-chat-action="open-orchestration"><i data-lucide="users"></i><span>Suivre</span></button>
     </footer>` : `<form id="${id("chatComposer")}" data-chat-control="composer" class="chat-composer ${busy ? "is-running" : ""} ${queued ? "has-queued-message" : ""}">
       <div class="chat-composer-box">
+        ${renderChatImageAttachments(model.imageAttachments)}
         <textarea id="${id("chatPrompt")}" data-chat-control="prompt" rows="1" placeholder="${busy ? "Écrivez le prochain message à envoyer…" : `Demandez a ${escapeHtml(model.providerLabel || "l'agent")} de construire quelque chose…`}" aria-label="${busy ? "Prochain message à mettre en attente" : "Message à envoyer"}">${escapeHtml(model.draft)}</textarea>
+        ${model.favoritePrompts.length ? `<div class="chat-favorite-prompts" data-chat-control="favorite-prompts" role="group" aria-label="Prompts favoris à insérer">
+          ${model.favoritePrompts.map((prompt) => {
+            const promptId = escapeHtml(prompt.id);
+            const promptTitle = escapeHtml(prompt.title);
+            return `<button type="button" class="chat-favorite-prompt-button" data-chat-action="favorite-prompt" data-chat-prompt-id="${promptId}" title="Insérer le prompt favori : ${promptTitle}" aria-label="Insérer le prompt favori : ${promptTitle}"><i data-lucide="star"></i><span>${promptTitle}</span></button>`;
+          }).join("")}
+        </div>` : ""}
         ${queued ? `<div class="chat-queue-state" role="status" aria-live="polite">
           <span><i data-lucide="clock-3"></i><strong>${model.queuedCount}</strong> message${model.queuedCount > 1 ? "s" : ""} en attente${busy ? " · envoi automatique à la fin du tour" : ""}</span>
           <button type="button" data-chat-action="clear-queue" title="Annuler ${model.queuedCount > 1 ? "les messages en attente" : "le message en attente"}">Annuler</button>
         </div>` : ""}
         <div class="chat-composer-toolbar">
           <div class="chat-composer-context">
-            <label class="chat-mode-select" title="Mode de travail">
+            <button
+              id="${id("chatPrompts")}"
+              data-chat-action="prompts"
+              type="button"
+              class="chat-prompt-button"
+              title="Insérer un prompt enregistré"
+              aria-label="Choisir un prompt enregistré"
+            >
+              <i data-lucide="message-square-text"></i><span>Prompts</span>
+            </button>
+            <label class="chat-mode-select" title="${model.composerSelectorsEnabled ? "Mode de travail" : "Sélection verrouillée dans les paramètres"}">
               <i data-lucide="sparkles"></i>
-              <select id="${id("chatMode")}" data-chat-control="mode" ${busy ? "disabled" : ""} aria-label="Mode de travail">
+              <select id="${id("chatMode")}" data-chat-control="mode" ${busy || !model.composerSelectorsEnabled ? "disabled" : ""} aria-label="Mode de travail">
                 <option value="build" ${model.mode === "build" ? "selected" : ""}>Construire</option>
                 <option value="plan" ${model.mode === "plan" ? "selected" : ""}>Planifier</option>
                 <option value="ask" ${model.mode === "ask" ? "selected" : ""}>Question</option>
               </select>
             </label>
-            <label class="chat-model-select" title="Modele utilise pour les prochains messages">
+            <label class="chat-model-select" title="${model.composerSelectorsEnabled ? "Modele utilise pour les prochains messages" : "Sélection verrouillée dans les paramètres"}">
               <i data-lucide="cpu"></i>
-              <input id="${id("chatModel")}" data-chat-control="model" list="${id("chatModelSuggestions")}" value="${escapeHtml(model.selectedModel)}" ${busy || !model.selectedAccountId ? "disabled" : ""} aria-label="Modele" autocomplete="off" spellcheck="false" maxlength="160" />
+              <input id="${id("chatModel")}" data-chat-control="model" list="${id("chatModelSuggestions")}" value="${escapeHtml(model.selectedModel)}" ${busy || !model.selectedAccountId || !model.composerSelectorsEnabled ? "disabled" : ""} aria-label="Modele" autocomplete="off" spellcheck="false" maxlength="160" />
               <datalist id="${id("chatModelSuggestions")}">${modelSuggestions(model)}</datalist>
             </label>
-            <label class="chat-effort-select" title="${model.supportsReasoningEffort ? "Intensite de raisonnement Codex" : "Ce fournisseur ne gere pas l'intensite de raisonnement"}">
+            <label class="chat-effort-select" title="${!model.composerSelectorsEnabled ? "Sélection verrouillée dans les paramètres" : model.supportsReasoningEffort ? "Intensite de raisonnement Codex" : "Ce fournisseur ne gere pas l'intensite de raisonnement"}">
               <i data-lucide="gauge"></i>
-              <select id="${id("chatReasoningEffort")}" data-chat-control="reasoning-effort" ${busy || !model.selectedAccountId || !model.supportsReasoningEffort ? "disabled" : ""} aria-label="Intensite de raisonnement">
+              <select id="${id("chatReasoningEffort")}" data-chat-control="reasoning-effort" ${busy || !model.selectedAccountId || !model.supportsReasoningEffort || !model.composerSelectorsEnabled ? "disabled" : ""} aria-label="Intensite de raisonnement">
                 ${reasoningEffortOptions(model)}
               </select>
             </label>
@@ -977,6 +1109,18 @@ export const renderChatPanel = (
           </div>
           <div class="chat-agent-tools" role="group" aria-label="Outils de conduite de l'agent">
             ${renderChatAgentTools(model.agentTools, model.enabledTools)}
+            ${automaticOrchestration ? `<button
+              id="${id("chatAutomaticOrchestration")}"
+              data-chat-action="toggle-automatic-orchestration"
+              type="button"
+              class="chat-agent-tool chat-agent-tool--orchestration"
+              title="${escapeHtml(automaticOrchestration.detail)}"
+              aria-label="Orchestration automatique ${automaticOrchestration.enabled ? "active" : "inactive"}. ${escapeHtml(automaticOrchestration.detail)}"
+              aria-pressed="${automaticOrchestration.enabled}"
+              ${automaticOrchestration.disabled || accountTransition ? "disabled" : ""}
+            >
+              <i data-lucide="users"></i><span>Orchestration auto · ${automaticOrchestration.enabled ? "Actif" : "Inactif"}</span>
+            </button>` : ""}
           </div>
           ${renderChatRuntimeStatus(model)}
           <div class="chat-voice-control">
@@ -1011,7 +1155,7 @@ export const renderChatPanel = (
           <button id="${id("chatSend")}" data-chat-action="send" type="submit" class="chat-send ${busy ? "chat-queue-send" : ""}" title="${busy ? "Mettre le message en attente" : "Envoyer"}" aria-label="${busy ? "Mettre le message en attente" : "Envoyer"}" ${model.accounts.length && !accountTransition ? "" : "disabled"}><i data-lucide="arrow-up"></i></button>
         </div>
       </div>
-      <small>${busy ? "Entree pour mettre en attente" : "Entree pour envoyer"} · Maj + Entree pour une nouvelle ligne</small>
+      <small>${busy ? "Entree pour mettre en attente" : "Entree pour envoyer"} · Maj + Entree pour une nouvelle ligne · Collez une image avec Ctrl + V</small>
     </form>`}
   </section>`;
 };

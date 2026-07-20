@@ -522,7 +522,7 @@ const renderScheduledChatCard = (
       </div>
       <div class="scheduled-chat-card-actions">
         ${canRun ? `<button type="button" data-scheduled-chat-run="${id}" title="Lancer ce chat maintenant"><i data-lucide="play"></i><span>Maintenant</span></button>` : ""}
-        ${isPending && !editing ? `<button type="button" data-scheduled-chat-reschedule="${id}" title="Modifier l’heure"><i data-lucide="calendar-cog"></i><span>Reporter</span></button>` : ""}
+        ${canCancel && !editing ? `<button type="button" data-scheduled-chat-reschedule="${id}" title="Modifier l’heure"><i data-lucide="calendar-cog"></i><span>Reporter</span></button>` : ""}
         ${canCancel ? `<button type="button" data-scheduled-chat-cancel="${id}" title="Annuler cette programmation"><i data-lucide="circle-slash"></i><span>Annuler</span></button>` : ""}
         ${!isPending ? `<button type="button" data-scheduled-chat-delete="${id}" title="Supprimer de l’historique"><i data-lucide="trash-2"></i><span>Supprimer</span></button>` : ""}
       </div>
@@ -591,13 +591,16 @@ export const renderScheduledChatsPanel = (
             </select></label>
           </div>
           <footer>
-            <p><i data-lucide="info"></i><span>Switch doit être lancé à l’heure prévue. Une échéance manquée démarre automatiquement au prochain lancement.</span></p>
+            <div class="scheduled-chat-info">
+              <button type="button" class="scheduled-chat-info-trigger" aria-label="Informations sur les lancements planifiés" aria-describedby="scheduledChatLaunchInfo"><i data-lucide="info" aria-hidden="true"></i></button>
+              <span id="scheduledChatLaunchInfo" class="scheduled-chat-info-tooltip" role="tooltip">Switch doit être lancé à l’heure prévue. Une échéance manquée démarre automatiquement au prochain lancement.</span>
+            </div>
             <button type="submit" class="scheduled-chat-primary" ${canSchedule ? "" : "disabled"}><i data-lucide="calendar-plus"></i><span>Planifier le chat</span></button>
           </footer>
         </form>
 
         <section class="scheduled-chat-list-section" aria-labelledby="scheduledChatUpcomingTitle">
-          <header><div><span><i data-lucide="clock-3"></i></span><div><h3 id="scheduledChatUpcomingTitle">À venir</h3><p>Les tâches démarrent automatiquement à l’heure locale de cet appareil.</p></div></div><b>${pending.length}</b></header>
+          <header><div><span><i data-lucide="clock-3"></i></span><div><h3 id="scheduledChatUpcomingTitle">À venir</h3></div></div><b>${pending.length}</b></header>
           ${pending.length
             ? `<div class="scheduled-chat-list">${pending.map((item) => renderScheduledChatCard(item, environments, accounts)).join("")}</div>`
             : `<div class="scheduled-chat-empty"><span><i data-lucide="calendar-check"></i></span><h3>Aucun chat en attente</h3><p>La prochaine tâche que vous planifierez apparaîtra ici.</p></div>`}

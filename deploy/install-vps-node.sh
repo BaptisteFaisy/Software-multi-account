@@ -48,8 +48,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y \
-  build-essential ca-certificates curl file git jq libayatana-appindicator3-dev \
-  librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf pkg-config sudo
+  build-essential ca-certificates curl file git jq libssl-dev pkg-config sudo
 
 if ! id cst >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /home/cst --shell /bin/bash cst
@@ -79,9 +78,9 @@ runuser -u cst -- env \
   PATH=/home/cst/.cargo/bin:/usr/local/bin:/usr/bin:/bin \
   CARGO_TARGET_DIR="$BUILD_CACHE" \
   CST_GIT_COMMIT="$CST_GIT_COMMIT" \
-  bash -c "cd '$SOURCE_DIR' && cargo +1.88.0 build --manifest-path src-tauri/Cargo.toml --release --bin cst-server"
+  bash -c "cd '$SOURCE_DIR' && cargo +1.88.0 build --manifest-path src-tauri/Cargo.toml --profile server --bin cst-server"
 
-BUILT_BIN="$BUILD_CACHE/release/cst-server"
+BUILT_BIN="$BUILD_CACHE/server/cst-server"
 VERSION="$($BUILT_BIN --version | awk '{print $2}')"
 if [[ -z "$VERSION" ]]; then
   echo "Impossible de lire la version via 'cst-server --version'." >&2
@@ -139,7 +138,7 @@ BIND="${CST_BIND:-127.0.0.1:8080}"
 PORT="${BIND##*:}"
 READY=0
 for _ in $(seq 1 60); do
-  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null; then
+  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
     READY=1
     break
   fi

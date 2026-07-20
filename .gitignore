@@ -1,10 +1,15 @@
 node_modules
 dist
+.cst-data
+.cst-images
 src-tauri/target
 src-tauri/target-alt
 src-tauri/gen
 android/.gradle
 android/local.properties
+android/app/google-services.json
+android/app/src/debug/google-services.json
+android/app/src/release/google-services.json
 android/app/build
 ios/build
 ios/DerivedData
@@ -21,10 +26,15 @@ ios/*.xcodeproj/xcuserdata
 # Local machine tooling / editor state (personal, not shared)
 .claude/settings.local.json
 .codex/
+.codex-proof/
 .kombai/
+/clawsweeper/
+/clawsweeper-state/
 
 # Local server env files (real secrets also live outside the repo in %APPDATA%)
 server.local.env.ps1
 **/server.local.env.ps1
+deploy/cst-server.env
+deploy/cst-container.env
 
 .mcp.json

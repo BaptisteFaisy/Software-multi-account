@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { BUILD_ARTIFACTS, cleanBuildArtifacts } from "../scripts/clean-build-artifacts.mjs";
+import { createTauriFrontendOverride } from "../scripts/build-tauri-isolated.mjs";
 
 test("le nettoyage supprime toutes les anciennes sorties web et app connues", async () => {
   const root = await mkdtemp(fileURLToPath(new URL(".tmp-clean-", import.meta.url)));
@@ -34,4 +35,25 @@ test("les commandes de build nettoient leur ancienne sortie avant compilation", 
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.match(pkg.scripts.build, /^npm run clean:app && /);
   assert.match(pkg.scripts["build:frontend"], /^npm run clean:web && /);
+  assert.match(pkg.scripts.build, /build-tauri-isolated\.mjs/);
+  assert.match(pkg.scripts["build:signed"], /build-tauri-isolated\.mjs/);
+});
+
+test("le build Tauri utilise un snapshot frontend isole du dist partage", () => {
+  const configRoot = fileURLToPath(new URL("../src-tauri", import.meta.url));
+  const snapshotDir = join(configRoot, "target", "tauri-frontend", "build-test");
+
+  assert.deepEqual(createTauriFrontendOverride({ snapshotDir, configRoot }), {
+    build: {
+      beforeBuildCommand: "",
+      frontendDist: "target/tauri-frontend/build-test",
+    },
+  });
+  assert.throws(
+    () => createTauriFrontendOverride({
+      snapshotDir: fileURLToPath(new URL("../dist", import.meta.url)),
+      configRoot,
+    }),
+    /doit rester dans src-tauri/,
+  );
 });

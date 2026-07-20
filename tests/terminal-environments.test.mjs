@@ -16,6 +16,12 @@ const server = readFileSync(
   new URL("../src-tauri/src/server.rs", import.meta.url),
   "utf8",
 );
+const platform = readFileSync(new URL("../src/platform.ts", import.meta.url), "utf8");
+const desktopApp = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+const gitDockerBackend = readFileSync(
+  new URL("../src-tauri/src/git_docker_environment.rs", import.meta.url),
+  "utf8",
+);
 
 test("un menu separe est l'unique selecteur d'environnement", () => {
   for (const marker of [
@@ -33,10 +39,7 @@ test("un menu separe est l'unique selecteur d'environnement", () => {
 
 test("la touche accent grave ouvre le menu des environnements", () => {
   assert.match(main, /keyboardShortcutMatchesAction\("toggle-environments", event\)/);
-  assert.match(
-    keyboardShortcuts,
-    /id: "toggle-environments"[\s\S]*?defaultBinding: "Backquote"/,
-  );
+  assert.match(keyboardShortcuts, /id: "toggle-environments"[\s\S]*?defaultBinding: "Backquote"/);
   assert.match(keyboardShortcuts, /event\.code === "Digit7"/);
   assert.match(main, /renderTerminalEnvironmentMenu/);
   assert.match(main, /terminalEnvironmentMenuOpen/);
@@ -56,19 +59,25 @@ test("l'environnement actif contient ses propres chats", () => {
   assert.match(main, /discussion\.folderPath = capturedWorkspace/);
 });
 
-test("un nouveau chat s'ouvre via une fenetre de choix du compte", () => {
-  // La fenetre "nouveau chat" (compte + modele + mode) remplace le selecteur
-  // d'agent inline de la barre d'outils.
+test("un nouveau chat attribue l'agent automatiquement avec un reglage facultatif", () => {
+  // La fenetre garde le modele et le mode, tandis que le routage de compte est
+  // automatique dans le parcours principal et facultatif dans un <details>.
   assert.doesNotMatch(main, /id="newChatAgent"/);
   assert.match(main, /const renderNewChatModal =/);
   assert.match(main, /data-new-chat-account/);
+  assert.match(main, /new-chat-routing-details/);
+  assert.match(main, /data-new-chat-routing-auto/);
   assert.match(main, /id="newChatModel"/);
   assert.match(main, /id="newChatMode"/);
+  assert.doesNotMatch(main, /Compte \/ agent|Choisis le compte, le modele et le mode/);
   // Tous les points d'entree "nouveau chat" passent par la fenetre.
   assert.match(main, /const openNewChat = \(\) => \{\s*openNewChatModal\(\);/);
   assert.match(main, /#addExpertChat"\)\?\.addEventListener\("click", \(\) => \{\s*openNewChatModal\(\);/);
-  // La fenetre cree le pane avec le compte, le modele et le mode choisis.
-  assert.match(main, /addExpertChatPane\(account\.id, \{ mode, pendingWorkspace \}\)/);
+  // La fenetre cree le pane avec le routage, le modele et le mode retenus.
+  assert.match(
+    main,
+    /addExpertChatPane\(account\.id, \{\s*mode,\s*pendingWorkspace,\s*executionTargetId,\s*\}\)/,
+  );
   assert.match(main, /accountId: accountId \?\?/);
   assert.match(style, /\.new-chat-account-option/);
 });
@@ -113,7 +122,7 @@ test("le choix d'environnement propose un explorateur de dossiers navigable", ()
 });
 
 test("les dossiers choisis sont utilises directement", () => {
-  assert.match(main, /userEnvironmentPath\(stored\)/);
+  assert.match(main, /userWorkspacePath\(stored\)/);
   assert.match(main, /userEnvironmentPath\(discussion\?\.folderPath\)/);
   assert.match(desktop, /provider\.home_env_var\(\)/);
   assert.match(desktop, /builder\.cwd\(project_dir\.as_os_str\(\)\)/);
@@ -129,7 +138,7 @@ test("un environnement peut etre retire depuis son menu sans effacer ses fichier
 });
 
 test("la creation exige un environnement avant tout appel PTY", () => {
-  assert.match(main, /const environmentPath = userEnvironmentPath\(folderPath\)/);
+  assert.match(main, /const environmentPath = loginOnly \? null : userWorkspacePath\(folderPath\)/);
   assert.match(main, /Creation bloquee: choisis d'abord un environnement/);
   assert.match(main, /Environnement de ce terminal \/ session \(obligatoire\)/);
   assert.match(main, /aria-required="true"/);
@@ -167,6 +176,38 @@ test("les backends desktop et serveur refusent un environnement implicite", () =
   assert.ok(desktop.includes(error));
   assert.ok(server.includes(error));
   assert.doesNotMatch(server, /prepare_local\(&agent_id, &canonical_home, None\)/);
+});
+
+test("un nouvel environnement peut etre cree directement depuis un lien Git Docker", () => {
+  for (const marker of [
+    'id="createGitDockerEnvironmentFromMenu"',
+    'id="gitDockerRepositoryUrl"',
+    'id="gitDockerMode"',
+    "Analyser et preparer",
+    "Construire et exporter l'image",
+    "Deployer et lancer sur un VPS",
+    'invoke<GitDockerEnvironmentResult>("create_git_docker_environment"',
+    "selectEnvironment(result.workspacePath)",
+  ]) {
+    assert.ok(main.includes(marker), `parcours Git Docker incomplet: ${marker}`);
+  }
+  assert.match(style, /\.git-docker-environment-modal/);
+  assert.match(style, /\.git-docker-form-grid/);
+  assert.match(platform, /case "create_git_docker_environment":\s*return api<T>\("POST", "\/api\/workspaces\/git-docker", args\.request\)/);
+  assert.match(desktopApp, /git_docker_environment::create_git_docker_environment/);
+  assert.match(server, /"\/workspaces\/git-docker",\s*post\(api_create_git_docker_environment\)/);
+});
+
+test("le backend Git Docker clone sans shell et conserve l'environnement si Docker echoue", () => {
+  assert.match(gitDockerBackend, /Command::new\("git"\)/);
+  assert.match(
+    gitDockerBackend,
+    /\.arg\("--"\)\s*\.arg\(repository\)\s*\.arg\(command_path\(target\)\)/,
+  );
+  assert.match(gitDockerBackend, /GIT_TERMINAL_PROMPT/);
+  assert.match(gitDockerBackend, /docker_status: "failed"\.to_string\(\)/);
+  assert.match(gitDockerBackend, /Le projet a ete clone, mais/);
+  assert.doesNotMatch(gitDockerBackend, /cmd\.exe|\/bin\/sh|-Command/);
 });
 
 test("le terminal temporaire de login reste dans le home du compte sans projet", () => {

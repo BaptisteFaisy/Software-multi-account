@@ -1,4 +1,6 @@
-export const PROMPTS_STORAGE_KEY = "codex-switch-terminal.prompts.v1";
+import { PROMPTS_STORAGE_KEY } from "./prompt-shortcuts.ts";
+
+export { PROMPTS_STORAGE_KEY } from "./prompt-shortcuts.ts";
 export const PROMPT_TITLE_MAX_LENGTH = 160;
 export const PROMPT_CONTENT_MAX_LENGTH = 50_000;
 export const PROMPT_CATEGORY_MAX_LENGTH = 64;
@@ -34,6 +36,10 @@ type PromptLibraryPanelOptions = {
   storage?: PromptLibraryStorage | null;
   renderIcons?: (root: ParentNode) => void;
   onUsePrompt?: (prompt: PromptLibraryItem) => void | Promise<void>;
+};
+
+export type PromptQuickPickerOptions = PromptLibraryPanelOptions & {
+  onManagePrompts?: () => void;
 };
 
 const DEFAULT_PROMPT_CATEGORY = "Général";
@@ -236,7 +242,17 @@ export const markPromptUsed = (
       useCount: item.useCount + 1,
       lastUsedAt: Math.floor(timestamp),
     }
-  : item);
+    : item);
+
+export const recordPromptUse = (
+  id: string,
+  storage?: PromptLibraryStorage | null,
+  timestamp = Date.now(),
+): boolean => {
+  const items = loadPromptItems(storage);
+  if (!items.some((item) => item.id === id)) return false;
+  return persistPromptItems(markPromptUsed(items, id, timestamp), storage);
+};
 
 const comparableText = (value: string): string => value
   .normalize("NFD")
@@ -544,6 +560,207 @@ export const renderPromptLibraryPanel = (
         <footer class="prompt-library-note"><i data-lucide="lock-keyhole"></i><span>Vos prompts sont enregistrés localement sur cet appareil. Utilisez l’export pour créer une sauvegarde.</span></footer>
       </div>
     </section>`;
+};
+
+const PROMPT_QUICK_PICKER_LIMIT = 12;
+
+const quickPromptPreview = (content: string): string => {
+  const compact = content.replace(/\s+/g, " ").trim();
+  return compact.length > 150 ? `${compact.slice(0, 150).trimEnd()}…` : compact;
+};
+
+const renderPromptQuickResults = (
+  items: readonly PromptLibraryItem[],
+  search: string,
+  scope: PromptLibraryScope,
+): string => {
+  const visible = filterPromptItems(items, { search, scope })
+    .slice(0, PROMPT_QUICK_PICKER_LIMIT);
+  if (!visible.length) {
+    const libraryEmpty = items.length === 0;
+    return `<div class="prompt-quick-empty">
+      <span aria-hidden="true"><i data-lucide="${libraryEmpty ? "message-square-text" : "search-x"}"></i></span>
+      <h3>${libraryEmpty ? "Aucun prompt enregistré" : "Aucun prompt trouvé"}</h3>
+      <p>${libraryEmpty
+        ? "Créez votre premier prompt pour pouvoir l’insérer ici en un clic."
+        : "Modifiez la recherche ou affichez tous les prompts."}</p>
+      ${libraryEmpty
+        ? `<button type="button" class="prompt-primary-button" data-prompt-quick-manage><i data-lucide="plus"></i><span>Créer un prompt</span></button>`
+        : ""}
+    </div>`;
+  }
+
+  return `<div class="prompt-quick-list" role="list" aria-label="Prompts disponibles">
+    ${visible.map((item) => {
+      const id = escapeHtml(item.id);
+      const title = escapeHtml(item.title);
+      return `<article class="prompt-quick-item ${item.favorite ? "is-favorite" : ""}" role="listitem">
+        <button type="button" class="prompt-quick-use" data-prompt-quick-use="${id}" title="Insérer : ${title}">
+          <span class="prompt-quick-item-meta">
+            <span><i data-lucide="tag"></i>${escapeHtml(item.category)}</span>
+            ${item.favorite ? `<span class="prompt-quick-favorite"><i data-lucide="star"></i>Favori</span>` : ""}
+          </span>
+          <strong>${title}</strong>
+          <small>${escapeHtml(quickPromptPreview(item.content))}</small>
+        </button>
+        <button type="button" class="prompt-quick-copy" data-prompt-quick-copy="${id}" title="Copier le prompt" aria-label="Copier : ${title}"><i data-lucide="copy"></i></button>
+      </article>`;
+    }).join("")}
+  </div>`;
+};
+
+/**
+ * Ouvre un sélecteur léger au-dessus du chat. Le prompt choisi est confié au
+ * composeur appelant : il n'est jamais envoyé automatiquement.
+ */
+export const openPromptQuickPicker = (
+  options: PromptQuickPickerOptions = {},
+): void => {
+  document.querySelector<HTMLDialogElement>("#promptQuickPicker")?.close();
+
+  const items = loadPromptItems(options.storage);
+  const dialog = document.createElement("dialog");
+  dialog.id = "promptQuickPicker";
+  dialog.className = "prompt-quick-picker";
+  dialog.setAttribute("aria-labelledby", "promptQuickPickerTitle");
+  dialog.innerHTML = `<div class="prompt-quick-shell">
+    <header class="prompt-quick-head">
+      <span aria-hidden="true"><i data-lucide="message-square-text"></i></span>
+      <div>
+        <p>Insertion rapide</p>
+        <h2 id="promptQuickPickerTitle">Choisir un prompt</h2>
+      </div>
+      <button type="button" class="prompt-icon-button" data-prompt-quick-close title="Fermer" aria-label="Fermer le sélecteur de prompts"><i data-lucide="x"></i></button>
+    </header>
+    <div class="prompt-quick-tools">
+      <label class="prompt-quick-search">
+        <i data-lucide="search"></i>
+        <span class="prompt-visually-hidden">Rechercher un prompt</span>
+        <input id="promptQuickSearch" type="search" placeholder="Rechercher un prompt…" autocomplete="off" />
+      </label>
+      <div class="prompt-quick-scopes" role="group" aria-label="Filtrer les prompts">
+        <button type="button" class="active" data-prompt-quick-scope="all" aria-pressed="true">Tous</button>
+        <button type="button" data-prompt-quick-scope="favorites" aria-pressed="false"><i data-lucide="star"></i>Favoris</button>
+      </div>
+    </div>
+    <div class="prompt-quick-results" data-prompt-quick-results>
+      ${renderPromptQuickResults(items, "", "all")}
+    </div>
+    <footer class="prompt-quick-footer">
+      <p data-prompt-quick-status role="status" aria-live="polite">${promptCountLabel(items.length)} disponible${items.length === 1 ? "" : "s"}</p>
+      <button type="button" class="prompt-secondary-button" data-prompt-quick-manage><i data-lucide="library"></i><span>Gérer la bibliothèque</span></button>
+    </footer>
+  </div>`;
+
+  const returnFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+  let search = "";
+  let scope: PromptLibraryScope = "all";
+  let usingPrompt = false;
+  let restoreFocus = true;
+
+  const status = (message: string): void => {
+    const target = dialog.querySelector<HTMLElement>("[data-prompt-quick-status]");
+    if (target) target.textContent = message;
+  };
+  const renderResults = (): void => {
+    const target = dialog.querySelector<HTMLElement>("[data-prompt-quick-results]");
+    if (!target) return;
+    target.innerHTML = renderPromptQuickResults(items, search, scope);
+    options.renderIcons?.(target);
+  };
+  const close = (): void => {
+    if (dialog.open) dialog.close();
+    else dialog.remove();
+  };
+
+  dialog.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement | null;
+    if (target === dialog || target?.closest("[data-prompt-quick-close]")) {
+      close();
+      return;
+    }
+
+    const scopeButton = target?.closest<HTMLButtonElement>("[data-prompt-quick-scope]");
+    if (scopeButton) {
+      const nextScope = scopeButton.dataset.promptQuickScope;
+      if (nextScope !== "all" && nextScope !== "favorites") return;
+      scope = nextScope;
+      dialog.querySelectorAll<HTMLButtonElement>("[data-prompt-quick-scope]").forEach((button) => {
+        const active = button.dataset.promptQuickScope === scope;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", String(active));
+      });
+      status(scope === "favorites" ? "Prompts favoris" : "Tous les prompts");
+      renderResults();
+      return;
+    }
+
+    const manageButton = target?.closest<HTMLButtonElement>("[data-prompt-quick-manage]");
+    if (manageButton) {
+      restoreFocus = false;
+      close();
+      options.onManagePrompts?.();
+      return;
+    }
+
+    const copyButton = target?.closest<HTMLButtonElement>("[data-prompt-quick-copy]");
+    if (copyButton) {
+      const item = items.find((candidate) => candidate.id === copyButton.dataset.promptQuickCopy);
+      if (!item) return;
+      void navigator.clipboard.writeText(item.content).then(() => {
+        status(`« ${item.title} » copié dans le presse-papiers.`);
+        copyButton.classList.add("copied");
+        window.setTimeout(() => copyButton.classList.remove("copied"), 1200);
+      }).catch(() => status("Copie impossible : le presse-papiers n’est pas disponible."));
+      return;
+    }
+
+    const useButton = target?.closest<HTMLButtonElement>("[data-prompt-quick-use]");
+    if (!useButton || usingPrompt) return;
+    const item = items.find((candidate) => candidate.id === useButton.dataset.promptQuickUse);
+    if (!item) return;
+    usingPrompt = true;
+    useButton.disabled = true;
+    status(`Insertion de « ${item.title} »…`);
+    const usedItems = markPromptUsed(items, item.id);
+    const used = usedItems.find((candidate) => candidate.id === item.id) ?? item;
+    void Promise.resolve()
+      .then(() => options.onUsePrompt
+        ? options.onUsePrompt(used)
+        : navigator.clipboard.writeText(used.content))
+      .then(() => {
+        persistPromptItems(usedItems, options.storage);
+        restoreFocus = false;
+        close();
+      })
+      .catch(() => {
+        usingPrompt = false;
+        useButton.disabled = false;
+        status("Impossible d’insérer ce prompt dans le chat.");
+      });
+  });
+  dialog.querySelector<HTMLInputElement>("#promptQuickSearch")?.addEventListener(
+    "input",
+    (event) => {
+      search = (event.currentTarget as HTMLInputElement).value.slice(0, 500);
+      status(search ? "Résultats de la recherche" : promptCountLabel(items.length));
+      renderResults();
+    },
+  );
+  dialog.addEventListener("close", () => {
+    dialog.remove();
+    if (restoreFocus && returnFocus?.isConnected) {
+      window.requestAnimationFrame(() => returnFocus.focus());
+    }
+  }, { once: true });
+
+  document.body.appendChild(dialog);
+  options.renderIcons?.(dialog);
+  dialog.showModal();
+  window.requestAnimationFrame(() =>
+    dialog.querySelector<HTMLInputElement>("#promptQuickSearch")?.focus());
 };
 
 type PromptFocusTarget =

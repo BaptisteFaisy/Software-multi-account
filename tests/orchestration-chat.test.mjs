@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  AUTOMATIC_ORCHESTRATION_MARKER,
+  automaticOrchestrationNotice,
   orchestrationIsRunning,
   orchestrationOrchestratorAccountId,
   orchestrationPhaseLabel,
@@ -10,6 +12,7 @@ import {
   orchestrationStatusLabel,
   orchestrationTaskStatusLabel,
   orchestrationWorkerAccountId,
+  parseAutomaticOrchestrationDecision,
 } from "../src/chat/orchestration.ts";
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
@@ -42,6 +45,30 @@ test("les statuts et la progression du chat orchestré sont explicites", () => {
   assert.equal(orchestrationIsRunning(run({ status: "paused", currentTurnId: 42 })), false);
 });
 
+test("la décision d'orchestration automatique exige un marqueur structuré valide", () => {
+  const decision = parseAutomaticOrchestrationDecision(
+    `${AUTOMATIC_ORCHESTRATION_MARKER} {"decision":"orchestrate","workerCount":3,"reason":"trois lots indépendants"}`,
+  );
+  assert.deepEqual(decision, { workerCount: 3, reason: "trois lots indépendants" });
+  assert.equal(
+    automaticOrchestrationNotice(decision),
+    "Orchestration automatique retenue · 3 workers · trois lots indépendants",
+  );
+  assert.equal(parseAutomaticOrchestrationDecision("Réponse normale"), null);
+  assert.equal(
+    parseAutomaticOrchestrationDecision(
+      `${AUTOMATIC_ORCHESTRATION_MARKER} {"decision":"orchestrate","workerCount":13}`,
+    ),
+    null,
+  );
+  assert.equal(
+    parseAutomaticOrchestrationDecision(
+      `Le protocole cite ${AUTOMATIC_ORCHESTRATION_MARKER} mais sans ligne de décision.`,
+    ),
+    null,
+  );
+});
+
 test("chaque rôle résout son propre compte avec migration des anciens snapshots", () => {
   const legacy = { accountId: "legacy" };
   assert.equal(orchestrationOrchestratorAccountId(legacy), "legacy");
@@ -68,18 +95,24 @@ test("chaque rôle résout son propre compte avec migration des anciens snapshot
 test("la vue dédiée crée et expose chaque chat de l'équipe", () => {
   assert.match(main, /\| "orchestration"/);
   assert.match(main, /id="orchestrationCreateForm"/);
+  assert.match(main, /id="orchestrationCreateAdvanced"/);
+  assert.match(main, /class="orchestration-required-grid"/);
+  assert.match(main, /id="orchestrationRunSelect"/);
+  assert.match(main, /class="orchestration-run-details"/);
+  assert.doesNotMatch(main, /class="orchestration-overview"/);
+  assert.doesNotMatch(main, /class="orchestration-run-rail"/);
   assert.match(main, /id="orchestrationWorkerCount"[^>]*min="1"[^>]*max="12"/);
   assert.match(main, /id="orchestrationConvertWorkerCount"[^>]*min="1"[^>]*max="12"/);
   assert.match(main, /orchestratorSessionId: sessionId,[\s\S]*?workerCount|workerCount,[\s\S]*?orchestratorSessionId: sessionId/);
-  assert.match(main, /Attends la fin du message en cours avant d'orchestrer ce chat/);
-  assert.match(main, /Envoie ou annule les messages en attente avant d'orchestrer ce chat/);
+  assert.match(main, /automaticOrchestrationEnabled: persisted\.automaticOrchestrationEnabled === true/);
+  assert.match(main, /testCommand: orchestrationTestCommandDraft\.trim\(\) \|\| "git diff --check"/);
   assert.match(main, /discussionForSession\(allDiscussions\(\), accountId, sessionId\)/);
   assert.match(main, /workerCount,/);
   assert.match(main, /workerAccountIds,/);
   assert.match(main, /data-orchestration-account-role/);
   assert.match(main, /Adresse e-mail \/ compte/);
   assert.match(main, /reassign_orchestration_account/);
-  assert.match(main, /1 orchestrateur \+ \$\{workerCount\} worker/);
+  assert.match(main, /\$\{workerCount \+ 1\} agents/);
   assert.match(main, /id="orchestrationToggle"/);
   assert.match(main, /data-view="orchestration"/);
   assert.match(main, /create_orchestration/);
@@ -91,14 +124,33 @@ test("la vue dédiée crée et expose chaque chat de l'équipe", () => {
   assert.match(style, /\.orchestration-panel/);
   assert.match(style, /\.orchestration-task-list/);
   assert.match(style, /\.orchestration-workbench/);
+  assert.match(style, /Fenêtre d’orchestration simplifiée/);
+  assert.match(style, /\.orchestration-create-advanced/);
+  assert.match(style, /\.orchestration-run-picker/);
   assert.match(style, /\.orchestration-member-account/);
   assert.match(style, /@media \(max-width: 860px\)[\s\S]*\.m-sheet-grid button\.m-orchestration-entry/);
 });
 
-test("un chat normal peut devenir l'orchestrateur et matérialiser ses workers", () => {
-  assert.match(chatView, /data-chat-action="\$\{orchestration\.role === "available" \? "orchestrate" : "open-orchestration"\}"/);
+test("un chat normal route automatiquement ses demandes sans ancien bouton dans le bandeau", () => {
+  assert.match(chatView, /data-chat-action="toggle-automatic-orchestration"/);
+  assert.match(chatView, /aria-pressed="\$\{automaticOrchestration\.enabled\}"/);
+  assert.match(chatView, /Orchestration auto · \$\{automaticOrchestration\.enabled \? "Actif" : "Inactif"\}/);
+  assert.match(chatView, /data-chat-action="open-orchestration"/);
+  assert.doesNotMatch(chatView, /data-chat-action="[^"\n]*orchestrate/);
+  assert.doesNotMatch(chatView, /role: "available" \| "orchestrator" \| "worker"/);
+  assert.match(style, /\.chat-agent-tool--orchestration\[aria-pressed="true"\]/);
   assert.match(chatView, /managedByOrchestration \? `<footer class="chat-orchestration-managed"/);
-  assert.match(main, /id="orchestrationConvertForm"/);
+  assert.match(main, /automaticOrchestrationRoutingSkill/);
+  assert.match(main, /parseAutomaticOrchestrationDecision/);
+  assert.match(main, /launchAutomaticOrchestration/);
+  assert.match(main, /data-chat-action='toggle-automatic-orchestration'/);
+  assert.match(main, /pane\.automaticOrchestrationEnabled = !pane\.automaticOrchestrationEnabled/);
+  const routingDecision = main.indexOf("const shouldLaunchAutomaticOrchestration");
+  const launchReservation = main.indexOf("pane.automaticOrchestrationLaunching = true", routingDecision);
+  const sessionAttachment = main.indexOf("await attachCreatedExpertChat", routingDecision);
+  assert.ok(routingDecision >= 0 && launchReservation > routingDecision && sessionAttachment > launchReservation);
+  assert.match(main, /text: automaticOrchestrationNotice\(automaticDecision\)/);
+  assert.match(main, /else if \(automaticOrchestrationPending\) \{[\s\S]*?else if \(!chatTurnIsBusy\(snapshot\.status\)\)/);
   assert.match(main, /id="autonomousOrchestrationAccount"/);
   assert.match(main, /data-autonomous-orchestration-worker=/);
   assert.match(main, /workerAccountIds: state\.workerAccountIds\.slice/);
@@ -110,6 +162,8 @@ test("un chat normal peut devenir l'orchestrateur et matérialiser ses workers",
   assert.match(main, /activeView === "chat" && expertChatPanes\.some\(\(pane\) => !!pane\.orchestrationId\)/);
   assert.match(backend, /pub orchestrator_session_id: Option<String>/);
   assert.match(backend, /orchestrator_session_id: orchestrator_session_id\.clone\(\)/);
+  assert.match(backend, /session_is_busy\(&account_id, session_id\)/);
+  assert.match(backend, /Ok\(true\) => return/);
 });
 
 test("desktop et serveur partagent le contrat API orchestré", () => {

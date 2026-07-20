@@ -6,11 +6,15 @@ import {
   draftEnvironmentChatPanes,
   mergeWorkspaceProfiles,
   normalizeWorkspacePath,
+  normalizeWorkspaceExecutionTargetId,
   openWorkspaceRegistry,
+  remoteEnvironmentPath,
+  setWorkspaceExecutionTarget,
   setWorkspaceMemory,
   terminalEnvironmentPath,
   terminalsForFolder,
   userEnvironmentPath,
+  userEnvironmentPathExcluding,
   workspacePathBreadcrumbs,
 } from "../src/workspace.ts";
 
@@ -113,6 +117,40 @@ test("la memoire reste isolee dans son environnement", () => {
   );
 });
 
+test("le VPS par defaut reste isole dans son environnement", () => {
+  const profiles = [
+    { id: "a", label: "Produit", path: "C:\\Projects\\Produit", memory: "" },
+    { id: "b", label: "Site", path: "C:\\Projects\\Site", memory: "" },
+  ];
+
+  const updated = setWorkspaceExecutionTarget(
+    profiles,
+    "c:/projects/produit/",
+    " HTTP://127.0.0.1:18082/ ",
+  );
+
+  assert.equal(updated.changed, true);
+  assert.equal(
+    updated.workspaces.find((workspace) => workspace.id === "c:/projects/produit")?.executionTargetId,
+    "http://127.0.0.1:18082",
+  );
+  assert.equal(
+    updated.workspaces.find((workspace) => workspace.id === "c:/projects/site")?.executionTargetId,
+    undefined,
+  );
+  assert.equal(normalizeWorkspaceExecutionTargetId("  "), null);
+
+  const automatic = setWorkspaceExecutionTarget(
+    updated.workspaces,
+    "C:\\Projects\\Produit",
+    null,
+  );
+  assert.equal(
+    automatic.workspaces.find((workspace) => workspace.id === "c:/projects/produit")?.executionTargetId,
+    undefined,
+  );
+});
+
 test("un dossier regroupe plusieurs terminaux dans le meme projet", () => {
   const terminals = [
     {
@@ -153,6 +191,31 @@ test("un environnement de terminal doit contenir un dossier explicite", () => {
     terminalEnvironmentPath("  C:\\Projects\\Produit  "),
     "C:\\Projects\\Produit",
   );
+});
+
+test("un home de compte ne peut pas devenir un environnement projet", () => {
+  const accountHome = "%CST_DATA_DIR%\\codex-homes\\compte";
+  assert.equal(
+    userEnvironmentPathExcluding(
+      "%cst_data_dir%/codex-homes/compte/",
+      [accountHome],
+    ),
+    null,
+  );
+  assert.equal(
+    userEnvironmentPathExcluding("/srv/cst/workspaces/produit", [accountHome]),
+    "/srv/cst/workspaces/produit",
+  );
+  assert.equal(
+    userEnvironmentPathExcluding("/srv/App", ["/srv/app"]),
+    "/srv/App",
+  );
+});
+
+test("un VPS ignore les chemins locaux Windows", () => {
+  assert.equal(remoteEnvironmentPath("C:\\Users\\jeanp\\projet"), null);
+  assert.equal(remoteEnvironmentPath("%USERPROFILE%\\projet"), null);
+  assert.equal(remoteEnvironmentPath("/srv/cst/workspaces/projet"), "/srv/cst/workspaces/projet");
 });
 
 test("le navigateur construit un fil d'Ariane Windows borne a sa racine", () => {

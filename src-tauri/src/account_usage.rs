@@ -1,12 +1,11 @@
 //! Suivi de la consommation de tokens **par compte**.
 //!
-//! La source principale est `account/usage/read` du Codex app-server : elle
-//! couvre l'usage du compte dans toutes les surfaces Codex, pas uniquement le
-//! trafic passé par cette application. Les rollouts de chaque `CODEX_HOME`
-//! restent un repli local lorsque cette source n'est pas disponible.
+//! La source canonique est l'historique local des rollouts de chaque
+//! `CODEX_HOME`. Elle est vérifiable, attribuable à un profil local et conserve
+//! le détail entrée/cache/sortie nécessaire au tableau de statistiques.
 //!
 //! Plusieurs profils locaux pouvant pointer vers le même compte ChatGPT, leur
-//! `account_id` est utilisé pour éviter de compter deux fois les mêmes buckets.
+//! `account_id` est utilisé pour éviter de compter deux fois les mêmes sessions.
 //!
 //! Format d'un événement pertinent (JSONL, une ligne = un événement) :
 //! ```json
@@ -16,9 +15,10 @@
 //!         "output_tokens":..,"reasoning_output_tokens":..,"total_tokens":..},
 //!     "last_token_usage":{..}}}}
 //! ```
-//! `total_token_usage` est **cumulatif** sur la session : le dernier événement
-//! `token_count` du fichier donne le total final de la session. Le modèle est
-//! lu dans les événements `turn_context` (`payload.model`).
+//! `total_token_usage` est **cumulatif** sur la session. Des notifications de
+//! tours concurrents pouvant être entrelacées, le total final correspond au
+//! plus haut cumul cohérent observé, pas forcément au dernier snapshot lu. Le
+//! modèle est lu dans les événements `turn_context` (`payload.model`).
 
 use crate::metrics;
 use crate::settings::{self, expand_home, AccountProfile, AppSettings, Provider};
@@ -27,17 +27,16 @@ use base64::{
     Engine as _,
 };
 use chrono::{Local, TimeZone};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::{mpsc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::SystemTime,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,7 +47,32 @@ pub struct AccountUsageDashboard {
     pub total_tokens: u64,
     pub total_cost_usd: f64,
     pub total_sessions: u64,
+    pub pricing_source_url: String,
+    pub pricing_as_of: String,
+    pub models: Vec<ModelUsageView>,
     pub accounts: Vec<AccountUsageView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageView {
+    pub model: String,
+    pub pricing_model: Option<String>,
+    pub priced: bool,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
+    pub api_equivalent_usd: f64,
+    pub input_price_per_million: Option<f64>,
+    pub cached_input_price_per_million: Option<f64>,
+    pub output_price_per_million: Option<f64>,
+    pub long_context_threshold_tokens: Option<u64>,
+    pub long_input_price_per_million: Option<f64>,
+    pub long_cached_input_price_per_million: Option<f64>,
+    pub long_output_price_per_million: Option<f64>,
+    pub long_context_requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,6 +98,7 @@ pub struct AccountUsageView {
     pub month_cost_usd: f64,
     pub first_activity: Option<i64>,
     pub last_activity: Option<i64>,
+    pub models: Vec<ModelUsageView>,
     pub days: Vec<AccountUsageDay>,
     pub error: Option<String>,
 }
@@ -89,17 +114,16 @@ pub struct AccountUsageDay {
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: f64,
+    pub models: Vec<ModelUsageView>,
 }
 
 const MAX_DAYS_RETURNED: usize = 60;
 const SESSION_STORAGE_DIRS: &[&str] = &["sessions", "sessions-archive", "archived_sessions"];
-const ACCOUNT_USAGE_READ_TIMEOUT_SECS: u64 = 20;
-const ACCOUNT_USAGE_SERVER_CACHE_SECS: u64 = 60;
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn account_token_usage() -> Result<AccountUsageDashboard, String> {
     let settings = settings::load_settings_for_terminal()?;
-    tauri::async_runtime::spawn_blocking(move || build_dashboard(&settings))
+    tokio::task::spawn_blocking(move || build_dashboard(&settings))
         .await
         .map_err(|error| error.to_string())
 }
@@ -111,15 +135,15 @@ pub fn account_token_usage_dashboard() -> Result<AccountUsageDashboard, String> 
 
 fn build_dashboard(settings: &AppSettings) -> AccountUsageDashboard {
     let groups = group_account_profiles(&settings.accounts);
+    let default_model = settings.pool.default_model.clone();
 
-    // Un thread par compte réel : la lecture réseau et le repli disque sont
-    // indépendants, tandis que les profils dupliqués restent dans le même
-    // groupe pour ne pas additionner plusieurs fois un usage global identique.
+    // Un thread par compte réel. Les profils dupliqués restent dans le même
+    // groupe afin que leur union de rollouts soit dédupliquée avant agrégation.
     let handles = groups
         .into_iter()
         .map(|profiles| {
-            let settings = settings.clone();
-            thread::spawn(move || account_group_usage_view(&profiles, &settings))
+            let default_model = default_model.clone();
+            thread::spawn(move || local_account_group_usage_view(&profiles, &default_model))
         })
         .collect::<Vec<_>>();
 
@@ -138,12 +162,17 @@ fn build_dashboard(settings: &AppSettings) -> AccountUsageDashboard {
         total.saturating_add(account.session_count)
     });
 
+    let models = aggregate_account_model_views(&accounts);
+
     AccountUsageDashboard {
         generated_at: metrics::now_ts(),
         profile_count: settings.accounts.len() as u64,
         total_tokens,
         total_cost_usd,
         total_sessions,
+        pricing_source_url: metrics::API_PRICING_SOURCE_URL.to_string(),
+        pricing_as_of: metrics::API_PRICING_AS_OF.to_string(),
+        models,
         accounts,
     }
 }
@@ -193,8 +222,12 @@ fn account_identity(account: &AccountProfile) -> Option<String> {
 }
 
 fn account_identity_for_home(home: &Path) -> Option<String> {
-    let content = fs::read_to_string(home.join("auth.json")).ok()?;
-    let value = serde_json::from_str::<Value>(&content).ok()?;
+    let content = fs::read(home.join("auth.json")).ok()?;
+    account_identity_from_auth_json(&content)
+}
+
+fn account_identity_from_auth_json(content: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(content).ok()?;
     for pointer in ["/tokens/account_id", "/account_id", "/chatgpt_account_id"] {
         if let Some(identity) = value
             .pointer(pointer)
@@ -211,6 +244,20 @@ fn account_identity_for_home(home: &Path) -> Option<String> {
         .or_else(|| value.get("access_token"))
         .and_then(Value::as_str)?;
     jwt_account_identity(access_token)
+}
+
+fn codex_auth_json_is_usable(content: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(content)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/tokens/access_token")
+                .or_else(|| value.get("access_token"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(|token| !token.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 fn jwt_account_identity(token: &str) -> Option<String> {
@@ -237,12 +284,12 @@ fn jwt_account_identity(token: &str) -> Option<String> {
 }
 
 #[derive(Default, Clone, Copy)]
-struct TokenTotals {
-    input: u64,
-    cached: u64,
-    output: u64,
-    reasoning: u64,
-    total: u64,
+pub(crate) struct TokenTotals {
+    pub(crate) input: u64,
+    pub(crate) cached: u64,
+    pub(crate) output: u64,
+    pub(crate) reasoning: u64,
+    pub(crate) total: u64,
 }
 
 impl TokenTotals {
@@ -254,18 +301,22 @@ impl TokenTotals {
         self.total = self.total.saturating_add(other.total);
     }
 
-    fn delta_since(&self, previous: &TokenTotals) -> TokenTotals {
-        fn counter_delta(current: u64, previous: u64) -> u64 {
-            current.checked_sub(previous).unwrap_or(current)
-        }
-
+    fn delta_above(&self, high_water: &TokenTotals) -> TokenTotals {
         TokenTotals {
-            input: counter_delta(self.input, previous.input),
-            cached: counter_delta(self.cached, previous.cached),
-            output: counter_delta(self.output, previous.output),
-            reasoning: counter_delta(self.reasoning, previous.reasoning),
-            total: counter_delta(self.total, previous.total),
+            input: self.input.saturating_sub(high_water.input),
+            cached: self.cached.saturating_sub(high_water.cached),
+            output: self.output.saturating_sub(high_water.output),
+            reasoning: self.reasoning.saturating_sub(high_water.reasoning),
+            total: self.total.saturating_sub(high_water.total),
         }
+    }
+
+    fn include(&mut self, other: &TokenTotals) {
+        self.input = self.input.max(other.input);
+        self.cached = self.cached.max(other.cached);
+        self.output = self.output.max(other.output);
+        self.reasoning = self.reasoning.max(other.reasoning);
+        self.total = self.total.max(other.total);
     }
 }
 
@@ -274,12 +325,21 @@ struct DayAgg {
     totals: TokenTotals,
     cost: f64,
     sessions: u64,
+    models: BTreeMap<String, ModelAgg>,
 }
 
 #[derive(Default, Clone)]
 struct SessionDayUsage {
     totals: TokenTotals,
     cost: f64,
+    models: BTreeMap<String, ModelAgg>,
+}
+
+#[derive(Default, Clone)]
+struct ModelAgg {
+    totals: TokenTotals,
+    cost: f64,
+    long_context_requests: u64,
 }
 
 /// Résultat du scan d'un seul fichier rollout (une session).
@@ -287,38 +347,10 @@ struct SessionDayUsage {
 struct SessionUsage {
     session_id: Option<String>,
     days: BTreeMap<String, SessionDayUsage>,
+    models: BTreeMap<String, ModelAgg>,
     totals: TokenTotals,
     cost: f64,
     ts: Option<i64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerTokenUsage {
-    summary: ServerTokenUsageSummary,
-    #[serde(default, alias = "daily_usage_buckets")]
-    daily_usage_buckets: Option<Vec<ServerDailyUsageBucket>>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerTokenUsageSummary {
-    #[serde(default, alias = "lifetime_tokens")]
-    lifetime_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerDailyUsageBucket {
-    #[serde(alias = "start_date")]
-    start_date: String,
-    tokens: u64,
-}
-
-#[derive(Clone)]
-struct CachedServerTokenUsage {
-    fetched_at: Instant,
-    result: Result<ServerTokenUsage, String>,
 }
 
 #[derive(Clone)]
@@ -329,39 +361,106 @@ struct CachedRolloutUsage {
     usage: Option<SessionUsage>,
 }
 
-static SERVER_TOKEN_USAGE_CACHE: OnceLock<Mutex<HashMap<String, CachedServerTokenUsage>>> =
-    OnceLock::new();
 static ROLLOUT_USAGE_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedRolloutUsage>>> = OnceLock::new();
 
-fn account_group_usage_view(
-    profiles: &[AccountProfile],
-    settings: &AppSettings,
-) -> AccountUsageView {
-    let mut view = local_account_group_usage_view(profiles, &settings.pool.default_model);
+fn normalized_model_name(model: &str) -> String {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "modele-inconnu".to_string()
+    } else {
+        normalized
+    }
+}
 
-    let mut server_errors = Vec::new();
-    let mut server_usage = None;
-    for profile in profiles.iter().filter(|profile| {
-        profile.provider == Provider::Codex && settings::account_has_auth_tokens(profile)
-    }) {
-        match read_server_token_usage_cached(profile, settings) {
-            Ok(usage) => {
-                server_usage = Some(usage);
-                break;
+fn add_model_usage(
+    target: &mut BTreeMap<String, ModelAgg>,
+    model: &str,
+    totals: &TokenTotals,
+    cost: f64,
+    long_context_requests: u64,
+) {
+    if totals.total == 0 && totals.input == 0 && totals.output == 0 {
+        return;
+    }
+    let entry = target.entry(normalized_model_name(model)).or_default();
+    entry.totals.add(totals);
+    entry.cost += cost;
+    entry.long_context_requests = entry
+        .long_context_requests
+        .saturating_add(long_context_requests);
+}
+
+fn merge_model_usage(target: &mut BTreeMap<String, ModelAgg>, source: &BTreeMap<String, ModelAgg>) {
+    for (model, usage) in source {
+        add_model_usage(
+            target,
+            model,
+            &usage.totals,
+            usage.cost,
+            usage.long_context_requests,
+        );
+    }
+}
+
+fn model_usage_views(models: BTreeMap<String, ModelAgg>) -> Vec<ModelUsageView> {
+    let mut views = models
+        .into_iter()
+        .map(|(model, usage)| {
+            let rates = metrics::public_rates_for_model(&model);
+            ModelUsageView {
+                model,
+                pricing_model: rates.map(|rates| rates.pricing_model.to_string()),
+                priced: rates.is_some(),
+                input_tokens: usage.totals.input,
+                cached_input_tokens: usage.totals.cached,
+                output_tokens: usage.totals.output,
+                reasoning_output_tokens: usage.totals.reasoning,
+                total_tokens: usage.totals.total,
+                api_equivalent_usd: usage.cost,
+                input_price_per_million: rates.map(|rates| rates.input_per_million),
+                cached_input_price_per_million: rates.map(|rates| rates.cached_input_per_million),
+                output_price_per_million: rates.map(|rates| rates.output_per_million),
+                long_context_threshold_tokens: rates
+                    .and_then(|rates| rates.long_context_threshold_tokens),
+                long_input_price_per_million: rates.and_then(|rates| rates.long_input_per_million),
+                long_cached_input_price_per_million: rates
+                    .and_then(|rates| rates.long_cached_input_per_million),
+                long_output_price_per_million: rates
+                    .and_then(|rates| rates.long_output_per_million),
+                long_context_requests: usage.long_context_requests,
             }
-            Err(error) => server_errors.push(error),
+        })
+        .collect::<Vec<_>>();
+    views.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    views
+}
+
+fn aggregate_account_model_views(accounts: &[AccountUsageView]) -> Vec<ModelUsageView> {
+    let mut models = BTreeMap::<String, ModelAgg>::new();
+    for account in accounts {
+        for usage in &account.models {
+            let totals = TokenTotals {
+                input: usage.input_tokens,
+                cached: usage.cached_input_tokens,
+                output: usage.output_tokens,
+                reasoning: usage.reasoning_output_tokens,
+                total: usage.total_tokens,
+            };
+            add_model_usage(
+                &mut models,
+                &usage.model,
+                &totals,
+                usage.api_equivalent_usd,
+                usage.long_context_requests,
+            );
         }
     }
-
-    if let Some(server) = server_usage {
-        apply_server_usage(&mut view, server);
-    } else if let Some(error) = server_errors.last() {
-        view.source_error = Some(error.clone());
-    } else if !view.has_tokens {
-        view.source_error = Some("Compte non connecte : historique local uniquement.".to_string());
-    }
-
-    view
+    model_usage_views(models)
 }
 
 /// Construit l'usage local d'un compte reel a partir de l'union de tous ses
@@ -406,173 +505,6 @@ fn local_account_group_usage_view(
     view
 }
 
-/// Concilie la vue globale renvoyee par Codex avec les rollouts locaux. La
-/// source distante peut etre vide ou en retard (notamment juste apres un tour)
-/// et ne doit jamais effacer une consommation deja observee sur disque.
-fn apply_server_usage(view: &mut AccountUsageView, server: ServerTokenUsage) {
-    let local_total = view.total_tokens;
-    let local_days = view.days.clone();
-    let lifetime_tokens = server.summary.lifetime_tokens;
-    let has_daily_measurement = server.daily_usage_buckets.is_some();
-    let buckets = server.daily_usage_buckets.unwrap_or_default();
-    let server_days = aggregate_server_days(&buckets);
-    let server_daily_total = server_days
-        .values()
-        .fold(0_u64, |total, tokens| total.saturating_add(*tokens));
-    let server_has_usage = lifetime_tokens.unwrap_or(0) > 0 || server_daily_total > 0;
-
-    view.days = merge_server_day_totals(&server_days, &local_days);
-    let merged_daily_total = view
-        .days
-        .iter()
-        .fold(0_u64, |total, day| total.saturating_add(day.total_tokens));
-    if server_has_usage && !server_days.is_empty() {
-        // `lifetimeTokens` est le cumul canonique du compte. Les rollouts ne
-        // complètent ce cumul que pour les jours postérieurs au dernier bucket
-        // renvoyé par Codex (ou pour le bucket du jour encore en retard).
-        // Prendre le maximum jour par jour sur tout l'historique peut compter
-        // deux fois une session commencée un jour et poursuivie le lendemain.
-        let official_total = lifetime_tokens.unwrap_or(0).max(server_daily_total);
-        let pending_local = pending_local_tokens(&local_days, &server_days);
-        view.total_tokens = official_total.saturating_add(pending_local);
-    } else {
-        view.total_tokens = local_total
-            .max(lifetime_tokens.unwrap_or(0))
-            .max(merged_daily_total);
-    }
-    refresh_period_totals(view);
-
-    if server_has_usage {
-        view.usage_source = "codex-account".to_string();
-        view.source_error = None;
-        view.error = None;
-    } else if local_total > 0 || merged_daily_total > 0 {
-        view.usage_source = "local-sessions".to_string();
-        view.source_error = Some(
-            "Codex remonte temporairement 0 token ; les sessions locales en temps reel sont affichees."
-                .to_string(),
-        );
-    } else if lifetime_tokens.is_some() || has_daily_measurement {
-        // Zero confirme pour un compte qui n'a pas encore de consommation.
-        view.usage_source = "codex-account".to_string();
-        view.source_error = None;
-        view.error = None;
-    } else {
-        view.source_error =
-            Some("Le compte Codex ne fournit pas encore de donnees d'usage.".to_string());
-    }
-}
-
-fn merge_server_days(
-    buckets: Vec<ServerDailyUsageBucket>,
-    local_days: &[AccountUsageDay],
-) -> Vec<AccountUsageDay> {
-    let server = aggregate_server_days(&buckets);
-    merge_server_day_totals(&server, local_days)
-}
-
-fn aggregate_server_days(buckets: &[ServerDailyUsageBucket]) -> BTreeMap<String, u64> {
-    let mut server = BTreeMap::<String, u64>::new();
-    for bucket in buckets
-        .iter()
-        .filter(|bucket| valid_date_key(&bucket.start_date))
-    {
-        let total = server.entry(bucket.start_date.clone()).or_default();
-        *total = total.saturating_add(bucket.tokens);
-    }
-    server
-}
-
-fn merge_server_day_totals(
-    server: &BTreeMap<String, u64>,
-    local_days: &[AccountUsageDay],
-) -> Vec<AccountUsageDay> {
-    let mut days = local_days
-        .iter()
-        .cloned()
-        .map(|day| (day.date.clone(), day))
-        .collect::<BTreeMap<_, _>>();
-    let today = Local::now().format("%Y-%m-%d").to_string();
-
-    for (date, total_tokens) in server {
-        let day = days.entry(date.clone()).or_insert(AccountUsageDay {
-            date: date.clone(),
-            sessions: 0,
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            output_tokens: 0,
-            reasoning_output_tokens: 0,
-            total_tokens: 0,
-            cost_usd: 0.0,
-        });
-        // Les jours clos viennent intégralement du compte Codex. Pour le jour
-        // courant seulement, le rollout local peut avoir quelques secondes
-        // d'avance sur le bucket distant.
-        day.total_tokens = if date >= &today {
-            day.total_tokens.max(*total_tokens)
-        } else {
-            *total_tokens
-        };
-    }
-
-    truncate_usage_days(days.into_values().collect())
-}
-
-fn pending_local_tokens(
-    local_days: &[AccountUsageDay],
-    server_days: &BTreeMap<String, u64>,
-) -> u64 {
-    let Some(latest_server_day) = server_days.keys().next_back() else {
-        return 0;
-    };
-    let today = Local::now().format("%Y-%m-%d").to_string();
-
-    local_days.iter().fold(0_u64, |pending, local| {
-        let extra = match server_days.get(&local.date) {
-            Some(server_tokens) if local.date >= today => {
-                local.total_tokens.saturating_sub(*server_tokens)
-            }
-            Some(_) => 0,
-            None if &local.date > latest_server_day => local.total_tokens,
-            None => 0,
-        };
-        pending.saturating_add(extra)
-    })
-}
-
-fn refresh_period_totals(view: &mut AccountUsageView) {
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let month = today.get(0..7).unwrap_or("");
-    view.today_tokens = view
-        .days
-        .iter()
-        .filter(|day| day.date == today)
-        .fold(0_u64, |total, day| total.saturating_add(day.total_tokens));
-    view.month_tokens = view
-        .days
-        .iter()
-        .filter(|day| !month.is_empty() && day.date.starts_with(month))
-        .fold(0_u64, |total, day| total.saturating_add(day.total_tokens));
-}
-
-fn truncate_usage_days(mut days: Vec<AccountUsageDay>) -> Vec<AccountUsageDay> {
-    if days.len() > MAX_DAYS_RETURNED {
-        days.drain(0..days.len() - MAX_DAYS_RETURNED);
-    }
-    days
-}
-
-fn valid_date_key(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
-}
-
 fn account_usage_view(account: &AccountProfile, default_model: &str) -> AccountUsageView {
     let has_tokens = settings::account_has_auth_tokens(account);
 
@@ -595,6 +527,7 @@ fn account_usage_view_from_homes(
     let sessions = unique_session_usages(&files, default_model);
 
     let mut all_time = TokenTotals::default();
+    let mut all_models = BTreeMap::<String, ModelAgg>::new();
     let mut total_cost = 0.0_f64;
     let mut session_count = 0_u64;
     let mut first_activity: Option<i64> = None;
@@ -604,6 +537,7 @@ fn account_usage_view_from_homes(
     for session in &sessions {
         session_count += 1;
         all_time.add(&session.totals);
+        merge_model_usage(&mut all_models, &session.models);
         total_cost += session.cost;
 
         if let Some(ts) = session.ts {
@@ -614,6 +548,7 @@ fn account_usage_view_from_homes(
         for (day, usage) in &session.days {
             let entry = per_day.entry(day.clone()).or_default();
             entry.totals.add(&usage.totals);
+            merge_model_usage(&mut entry.models, &usage.models);
             entry.cost += usage.cost;
             entry.sessions += 1;
         }
@@ -648,6 +583,7 @@ fn account_usage_view_from_homes(
             reasoning_output_tokens: agg.totals.reasoning,
             total_tokens: agg.totals.total,
             cost_usd: agg.cost,
+            models: model_usage_views(agg.models),
         })
         .collect::<Vec<_>>();
     // Trié par date croissante (BTreeMap) ; on ne renvoie que les plus récents.
@@ -680,6 +616,7 @@ fn account_usage_view_from_homes(
         month_cost_usd: month_cost,
         first_activity,
         last_activity,
+        models: model_usage_views(all_models),
         days,
         error: None,
     }
@@ -719,144 +656,29 @@ fn unique_session_usages(files: &[PathBuf], default_model: &str) -> Vec<SessionU
     sessions
 }
 
-/// Interroge le compte Codex lui-même. Contrairement aux rollouts locaux, cette
-/// source inclut les usages réalisés dans les autres surfaces Codex.
-fn read_server_token_usage_cached(
-    account: &AccountProfile,
-    settings: &AppSettings,
-) -> Result<ServerTokenUsage, String> {
-    let key = format!("{}:{}", account.id, account.codex_home);
-    let cache = SERVER_TOKEN_USAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(entries) = cache.lock() {
-        if let Some(entry) = entries.get(&key) {
-            if entry.fetched_at.elapsed() < Duration::from_secs(ACCOUNT_USAGE_SERVER_CACHE_SECS) {
-                return entry.result.clone();
-            }
-        }
+/// Retourne le cumul final d'une session precise afin que les fonctionnalites
+/// qui creent des discussions ephemeres puissent conserver leur consommation
+/// avant de supprimer le rollout de l'historique visible.
+pub(crate) fn token_totals_for_account_session(
+    account_id: &str,
+    session_id: &str,
+) -> Option<TokenTotals> {
+    let settings = settings::load_settings_for_terminal().ok()?;
+    let account = settings
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)?;
+    if account.provider != Provider::Codex {
+        return None;
     }
 
-    let result = read_server_token_usage(account, settings);
-    if let Ok(mut entries) = cache.lock() {
-        entries.insert(
-            key,
-            CachedServerTokenUsage {
-                fetched_at: Instant::now(),
-                result: result.clone(),
-            },
-        );
-    }
-    result
-}
-
-fn read_server_token_usage(
-    account: &AccountProfile,
-    settings: &AppSettings,
-) -> Result<ServerTokenUsage, String> {
-    let codex_home = expand_home(&account.codex_home)?;
-    let mut command = settings::codex_app_server_command(settings);
-    command
-        .env("CODEX_HOME", codex_home.to_string_lossy().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    if let Some(proxy_url) = settings::proxy_url_for_account(account, settings) {
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            command.env(key, proxy_url.clone());
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("codex app-server impossible: {error}"))?;
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.kill();
-        return Err("stdin app-server indisponible".to_string());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        return Err("stdout app-server indisponible".to_string());
-    };
-
-    let (tx, rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    for request in [
-        json!({
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "clientInfo": {
-                    "name": "codex_switch_terminal",
-                    "title": "Codex Switch Terminal",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }
-        }),
-        json!({ "method": "initialized", "params": {} }),
-        json!({ "method": "account/usage/read", "id": 2 }),
-    ] {
-        if let Err(error) = writeln!(stdin, "{request}") {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("ecriture app-server impossible: {error}"));
-        }
-    }
-    let _ = stdin.flush();
-
-    let response = loop {
-        match rx.recv_timeout(Duration::from_secs(ACCOUNT_USAGE_READ_TIMEOUT_SECS)) {
-            Ok(line) => {
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if value.get("id").and_then(Value::as_i64) == Some(2) {
-                    break value;
-                }
-            }
-            Err(_) => {
-                drop(stdin);
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("timeout lecture usage du compte".to_string());
-            }
-        }
-    };
-
-    drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
-    if let Some(error) = response.get("error") {
-        return Err(error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("usage du compte indisponible")
-            .to_string());
-    }
-    let result = response
-        .get("result")
-        .cloned()
-        .ok_or_else(|| "reponse app-server sans result".to_string())?;
-    serde_json::from_value(result).map_err(|error| format!("usage Codex illisible: {error}"))
+    let primary_home = expand_home(&account.codex_home).ok()?;
+    let homes = account_usage_homes(account, &primary_home);
+    let files = collect_account_rollouts_from_homes(&homes);
+    unique_session_usages(&files, &settings.pool.default_model)
+        .into_iter()
+        .find(|usage| usage.session_id.as_deref() == Some(session_id))
+        .map(|usage| usage.totals)
 }
 
 /// Un même compte peut être ouvert par plusieurs serveurs locaux (par exemple
@@ -874,7 +696,12 @@ fn account_usage_homes(account: &AccountProfile, primary_home: &Path) -> Vec<Pat
     let Some(current_data_dir) = std::env::var_os("CST_DATA_DIR").map(PathBuf::from) else {
         return homes;
     };
-    let Some(identity) = account_identity_for_home(primary_home) else {
+    // Une instance secondaire peut ne pas encore avoir cree son CODEX_HOME
+    // local. Dans ce cas, l'identite reste recuperable depuis les homes freres
+    // du meme profil. On ne l'accepte que si toutes les copies authentifiees
+    // presentes convergent vers une seule identite reelle.
+    let Some(identity) = account_usage_identity(&current_data_dir, &relative_home, primary_home)
+    else {
         return homes;
     };
 
@@ -885,6 +712,169 @@ fn account_usage_homes(account: &AccountProfile, primary_home: &Path) -> Vec<Pat
         }
     }
     homes
+}
+
+/// Resout un `CODEX_HOME` relatif a `CST_DATA_DIR` vers une copie authentifiee
+/// d'une instance locale soeur lorsque la copie de l'instance courante ne
+/// contient aucun credential exploitable.
+///
+/// Le repli est volontairement strict : il ne s'applique qu'aux chemins sous
+/// `codex-homes`, uniquement aux credentials Codex, et seulement lorsque toutes
+/// les copies authentifiees trouvees designent une identite de compte unique.
+/// Une collision de slug entre deux comptes reels conserve donc le chemin local
+/// au lieu de risquer d'ouvrir le mauvais compte.
+pub(crate) fn resolve_data_dir_account_home(
+    current_data_dir: &Path,
+    relative_home: &Path,
+    primary_home: PathBuf,
+) -> PathBuf {
+    if !is_data_dir_account_home(relative_home) {
+        return primary_home;
+    }
+
+    // Une copie locale utilisable reste toujours prioritaire. Les marqueurs
+    // Claude/OpenCode evitent aussi de rediriger par erreur un autre provider
+    // dont le slug ressemblerait a celui d'un compte Codex frere.
+    if Provider::Codex.has_auth(&primary_home, None)
+        || Provider::Claude.has_auth(&primary_home, None)
+        || primary_home
+            .join("data")
+            .join("opencode")
+            .join("auth.json")
+            .is_file()
+    {
+        return primary_home;
+    }
+
+    let Some(identity) = unambiguous_instance_account_identity(current_data_dir, relative_home)
+    else {
+        return primary_home;
+    };
+
+    discover_matching_instance_homes(current_data_dir, relative_home, &identity)
+        .into_iter()
+        .filter(|home| Provider::Codex.has_auth(home, None))
+        // En presence de plusieurs copies du meme compte, la plus recemment
+        // authentifiee a le plus de chances de contenir le refresh token actif.
+        .max_by_key(|home| {
+            fs::metadata(home.join("auth.json"))
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        })
+        .unwrap_or(primary_home)
+}
+
+fn is_data_dir_account_home(relative_home: &Path) -> bool {
+    let mut components = relative_home.components();
+    let is_account_home = components
+        .next()
+        .and_then(|component| match component {
+            Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case("codex-homes"));
+    let remaining_components = components.collect::<Vec<_>>();
+    is_account_home
+        && !remaining_components.is_empty()
+        && remaining_components
+            .iter()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Copie uniquement le credential Codex manquant vers le home de l'instance
+/// courante. Le choix de la source reprend exactement les garde-fous de
+/// `resolve_data_dir_account_home`, puis revalide le contenu lu avant l'ecriture
+/// atomique. Les sessions et la configuration ne sont jamais partagees.
+pub(crate) fn seed_local_data_dir_account_auth(
+    current_data_dir: &Path,
+    relative_home: &Path,
+    primary_home: &Path,
+) -> bool {
+    if !is_data_dir_account_home(relative_home) {
+        return false;
+    }
+
+    let target = primary_home.join("auth.json");
+    if target.exists() {
+        return false;
+    }
+
+    let Some(expected_identity) =
+        unambiguous_instance_account_identity(current_data_dir, relative_home)
+    else {
+        return false;
+    };
+    let source_home =
+        resolve_data_dir_account_home(current_data_dir, relative_home, primary_home.to_path_buf());
+    if source_home == primary_home {
+        return false;
+    }
+
+    let Ok(content) = fs::read(source_home.join("auth.json")) else {
+        return false;
+    };
+    if !codex_auth_json_is_usable(&content)
+        || account_identity_from_auth_json(&content).as_deref() != Some(expected_identity.as_str())
+    {
+        return false;
+    }
+
+    crate::fs_util::atomic_write(&target, content).is_ok()
+}
+
+fn account_usage_identity(
+    current_data_dir: &Path,
+    relative_home: &Path,
+    primary_home: &Path,
+) -> Option<String> {
+    account_identity_for_home(primary_home)
+        .or_else(|| unambiguous_instance_account_identity(current_data_dir, relative_home))
+}
+
+fn instance_home_candidates(current_data_dir: &Path, relative_home: &Path) -> Vec<PathBuf> {
+    const DATA_DIR_PREFIX: &str = "codex-switch-terminal-server";
+
+    let Some(parent) = current_data_dir.parent() else {
+        return Vec::new();
+    };
+    let mut homes = fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name != DATA_DIR_PREFIX && !name.starts_with(&format!("{DATA_DIR_PREFIX}-")) {
+                return None;
+            }
+
+            let candidate = entry.path().join(relative_home);
+            candidate.is_dir().then_some(candidate)
+        })
+        .collect::<Vec<_>>();
+    if let Some(accounts_dir) = std::env::var_os("CST_ACCOUNTS_DIR").map(PathBuf::from) {
+        let candidate = accounts_dir.join(relative_home);
+        if candidate.is_dir() {
+            homes.push(candidate);
+        }
+    }
+    homes.sort();
+    homes.dedup();
+    homes
+}
+
+fn unambiguous_instance_account_identity(
+    current_data_dir: &Path,
+    relative_home: &Path,
+) -> Option<String> {
+    let identities = instance_home_candidates(current_data_dir, relative_home)
+        .into_iter()
+        .filter_map(|candidate| account_identity_for_home(&candidate))
+        .collect::<HashSet<_>>();
+    if identities.len() == 1 {
+        identities.into_iter().next()
+    } else {
+        None
+    }
 }
 
 fn data_dir_relative_path(value: &str) -> Option<PathBuf> {
@@ -905,32 +895,10 @@ fn discover_matching_instance_homes(
     relative_home: &Path,
     identity: &str,
 ) -> Vec<PathBuf> {
-    const DATA_DIR_PREFIX: &str = "codex-switch-terminal-server";
-
-    let Some(parent) = current_data_dir.parent() else {
-        return Vec::new();
-    };
-    let mut homes = fs::read_dir(parent)
+    instance_home_candidates(current_data_dir, relative_home)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if name != DATA_DIR_PREFIX && !name.starts_with(&format!("{DATA_DIR_PREFIX}-")) {
-                return None;
-            }
-
-            let candidate = entry.path().join(relative_home);
-            if !candidate.is_dir()
-                || account_identity_for_home(&candidate).as_deref() != Some(identity)
-            {
-                return None;
-            }
-            Some(candidate)
-        })
-        .collect::<Vec<_>>();
-    homes.sort();
-    homes
+        .filter(|candidate| account_identity_for_home(candidate).as_deref() == Some(identity))
+        .collect()
 }
 
 fn collect_account_rollouts_from_homes(homes: &[PathBuf]) -> Vec<PathBuf> {
@@ -1000,6 +968,7 @@ fn error_view(account: &AccountProfile, has_tokens: bool, error: String) -> Acco
         month_cost_usd: 0.0,
         first_activity: None,
         last_activity: None,
+        models: Vec::new(),
         days: Vec::new(),
         error: Some(error),
     }
@@ -1026,10 +995,10 @@ pub(crate) fn is_rollout_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Lit un rollout et renvoie l'usage final de la session (dernier
-/// `total_token_usage`), le modèle (dernier `turn_context`) et l'horodatage du
-/// dernier événement `token_count`. Renvoie `None` si aucun `token_count`
-/// n'est présent (session avortée / sans échange).
+/// Lit un rollout et renvoie l'usage final de la session (plus haut cumul
+/// cohérent de `total_token_usage`), le modèle (dernier `turn_context`) et
+/// l'horodatage du dernier événement `token_count`. Renvoie `None` si aucun
+/// `token_count` n'est présent (session avortée / sans échange).
 fn scan_rollout_file_cached(path: &Path, default_model: &str) -> Option<SessionUsage> {
     let metadata = fs::metadata(path).ok()?;
     let len = metadata.len();
@@ -1068,9 +1037,9 @@ fn scan_rollout_file(path: &Path, default_model: &str) -> Option<SessionUsage> {
 
     let mut model: Option<String> = None;
     let mut session_id: Option<String> = None;
-    let mut final_totals: Option<TokenTotals> = None;
+    let mut saw_totals = false;
     let mut final_ts: Option<i64> = None;
-    let mut previous_totals = TokenTotals::default();
+    let mut high_water = TokenTotals::default();
     let mut days = BTreeMap::<String, SessionDayUsage>::new();
     let fallback_day = day_from_rollout_name(path);
 
@@ -1115,7 +1084,12 @@ fn scan_rollout_file(path: &Path, default_model: &str) -> Option<SessionUsage> {
             if let Ok(value) = serde_json::from_str::<Value>(buffer.trim_end()) {
                 if let Some(usage) = value.pointer("/payload/info/total_token_usage") {
                     let totals = parse_totals(usage);
-                    let delta = totals.delta_since(&previous_totals);
+                    // Les notifications de plusieurs tours peuvent être
+                    // entrelacées dans un même rollout. Une valeur plus basse
+                    // est alors un snapshot ancien d'une autre branche, pas un
+                    // compteur remis à zéro. Seule la progression au-dessus du
+                    // plus haut cumul déjà observé constitue un nouvel usage.
+                    let delta = totals.delta_above(&high_water);
                     let parsed_ts = value
                         .get("timestamp")
                         .and_then(Value::as_str)
@@ -1124,18 +1098,28 @@ fn scan_rollout_file(path: &Path, default_model: &str) -> Option<SessionUsage> {
                         .map(local_day)
                         .or_else(|| fallback_day.clone())
                         .unwrap_or_else(|| "inconnu".to_string());
+                    let active_model = model.as_deref().unwrap_or(default_model);
                     let event_cost = metrics::cost_for_usage(
-                        model.as_deref().unwrap_or(default_model),
+                        active_model,
                         delta.input,
                         delta.cached,
                         delta.output,
                     );
+                    let long_context_requests =
+                        u64::from(metrics::usage_uses_long_context(active_model, delta.input));
                     let entry = days.entry(day).or_default();
                     entry.totals.add(&delta);
                     entry.cost += event_cost;
+                    add_model_usage(
+                        &mut entry.models,
+                        active_model,
+                        &delta,
+                        event_cost,
+                        long_context_requests,
+                    );
 
-                    previous_totals = totals;
-                    final_totals = Some(totals);
+                    high_water.include(&totals);
+                    saw_totals = true;
                     if parsed_ts.is_some() {
                         final_ts = parsed_ts;
                     }
@@ -1144,24 +1128,44 @@ fn scan_rollout_file(path: &Path, default_model: &str) -> Option<SessionUsage> {
         }
     }
 
-    let totals = final_totals?;
+    if !saw_totals {
+        return None;
+    }
+    let totals = high_water;
     let day = fallback_day
         .or_else(|| final_ts.map(local_day))
         .unwrap_or_else(|| "inconnu".to_string());
     if days.is_empty() {
-        let cost = metrics::cost_for_usage(
-            model.as_deref().unwrap_or(default_model),
-            totals.input,
-            totals.cached,
-            totals.output,
+        let active_model = model.as_deref().unwrap_or(default_model);
+        let cost =
+            metrics::cost_for_usage(active_model, totals.input, totals.cached, totals.output);
+        let mut models = BTreeMap::new();
+        add_model_usage(
+            &mut models,
+            active_model,
+            &totals,
+            cost,
+            u64::from(metrics::usage_uses_long_context(active_model, totals.input)),
         );
-        days.insert(day.clone(), SessionDayUsage { totals, cost });
+        days.insert(
+            day.clone(),
+            SessionDayUsage {
+                totals,
+                cost,
+                models,
+            },
+        );
     }
     let cost = days.values().map(|usage| usage.cost).sum();
+    let mut models = BTreeMap::new();
+    for usage in days.values() {
+        merge_model_usage(&mut models, &usage.models);
+    }
 
     Some(SessionUsage {
         session_id,
         days,
+        models,
         totals,
         cost,
         ts: final_ts,
@@ -1174,8 +1178,13 @@ fn parse_totals(value: &Value) -> TokenTotals {
     let output = u64_at(value, "output_tokens");
     let reasoning = u64_at(value, "reasoning_output_tokens");
     let total_raw = u64_at(value, "total_tokens");
-    let total = if total_raw == 0 {
-        input.saturating_add(output)
+    let derived_total = input.saturating_add(output);
+    // `cached_input_tokens` et `reasoning_output_tokens` sont déjà inclus dans
+    // entrée/sortie. Le total dérivé protège le dashboard d'un champ total
+    // corrompu tout en gardant la compatibilité avec les anciens événements qui
+    // ne fournissaient que `total_tokens`.
+    let total = if derived_total > 0 {
+        derived_total
     } else {
         total_raw
     };
@@ -1240,6 +1249,8 @@ fn local_day(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1260,33 +1271,6 @@ mod tests {
         .unwrap()
     }
 
-    fn usage_view(total_tokens: u64, days: Vec<AccountUsageDay>) -> AccountUsageView {
-        AccountUsageView {
-            id: "account".to_string(),
-            label: "Compte".to_string(),
-            profile_labels: vec!["Compte".to_string()],
-            codex_home: "test".to_string(),
-            has_tokens: true,
-            usage_source: "local-sessions".to_string(),
-            source_error: None,
-            session_count: 1,
-            input_tokens: total_tokens,
-            cached_input_tokens: 0,
-            output_tokens: 0,
-            reasoning_output_tokens: 0,
-            total_tokens,
-            cost_usd: 0.0,
-            today_tokens: total_tokens,
-            today_cost_usd: 0.0,
-            month_tokens: total_tokens,
-            month_cost_usd: 0.0,
-            first_activity: None,
-            last_activity: None,
-            days,
-            error: None,
-        }
-    }
-
     #[test]
     fn day_from_rollout_name_extracts_local_date() {
         assert_eq!(
@@ -1304,6 +1288,18 @@ mod tests {
         let totals = parse_totals(&value);
         assert_eq!(totals.input, 100);
         assert_eq!(totals.output, 10);
+        assert_eq!(totals.total, 110);
+    }
+
+    #[test]
+    fn parse_totals_rejects_an_inconsistent_reported_total() {
+        let value: Value = serde_json::from_str(
+            r#"{"input_tokens":100,"output_tokens":10,"total_tokens":2147483647}"#,
+        )
+        .unwrap();
+
+        let totals = parse_totals(&value);
+
         assert_eq!(totals.total, 110);
     }
 
@@ -1376,6 +1372,162 @@ mod tests {
         assert!(homes.contains(&matching_data.join(&relative_home)));
         assert!(!homes.contains(&foreign_data.join(&relative_home)));
         assert!(!homes.contains(&unrelated_data.join(&relative_home)));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_primary_home_uses_an_unambiguous_sibling_identity() {
+        let root = fresh_dir();
+        let primary_data = root.join("codex-switch-terminal-server-8081");
+        let sibling_data = root.join("codex-switch-terminal-server");
+        let relative_home = PathBuf::from("codex-homes/account");
+        let primary_home = primary_data.join(&relative_home);
+        let sibling_home = sibling_data.join(&relative_home);
+        fs::create_dir_all(&primary_data).unwrap();
+        fs::create_dir_all(&sibling_home).unwrap();
+        fs::write(
+            sibling_home.join("auth.json"),
+            r#"{"tokens":{"account_id":"same-account","access_token":"header.payload.signature"}}"#,
+        )
+        .unwrap();
+
+        assert!(!primary_home.exists());
+        assert_eq!(
+            account_usage_identity(&primary_data, &relative_home, &primary_home).as_deref(),
+            Some("same-account")
+        );
+        assert_eq!(
+            discover_matching_instance_homes(&primary_data, &relative_home, "same-account"),
+            vec![sibling_home.clone()]
+        );
+        assert_eq!(
+            resolve_data_dir_account_home(&primary_data, &relative_home, primary_home.clone(),),
+            sibling_home
+        );
+        assert!(seed_local_data_dir_account_auth(
+            &primary_data,
+            &relative_home,
+            &primary_home,
+        ));
+        assert!(Provider::Codex.has_auth(&primary_home, None));
+        assert_eq!(
+            account_identity_for_home(&primary_home).as_deref(),
+            Some("same-account")
+        );
+        assert_eq!(
+            resolve_data_dir_account_home(&primary_data, &relative_home, primary_home.clone(),),
+            primary_home
+        );
+        assert!(!seed_local_data_dir_account_auth(
+            &primary_data,
+            &relative_home,
+            &primary_home,
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn authenticated_primary_home_stays_prioritary() {
+        let root = fresh_dir();
+        let primary_data = root.join("codex-switch-terminal-server");
+        let sibling_data = root.join("codex-switch-terminal-server-8081");
+        let relative_home = PathBuf::from("codex-homes/account");
+        let primary_home = primary_data.join(&relative_home);
+        let sibling_home = sibling_data.join(&relative_home);
+        let auth =
+            r#"{"tokens":{"account_id":"same-account","access_token":"header.payload.signature"}}"#;
+        for home in [&primary_home, &sibling_home] {
+            fs::create_dir_all(home).unwrap();
+            fs::write(home.join("auth.json"), auth).unwrap();
+        }
+
+        assert_eq!(
+            resolve_data_dir_account_home(&primary_data, &relative_home, primary_home.clone(),),
+            primary_home
+        );
+        assert!(!seed_local_data_dir_account_auth(
+            &primary_data,
+            &relative_home,
+            &primary_home,
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_primary_home_rejects_ambiguous_sibling_identities() {
+        let root = fresh_dir();
+        let primary_data = root.join("codex-switch-terminal-server-8081");
+        let first_data = root.join("codex-switch-terminal-server");
+        let second_data = root.join("codex-switch-terminal-server-9090");
+        let relative_home = PathBuf::from("codex-homes/account");
+        let primary_home = primary_data.join(&relative_home);
+        fs::create_dir_all(&primary_data).unwrap();
+        for (data_dir, identity) in [(&first_data, "first"), (&second_data, "second")] {
+            let home = data_dir.join(&relative_home);
+            fs::create_dir_all(&home).unwrap();
+            fs::write(
+                home.join("auth.json"),
+                format!(r#"{{"tokens":{{"account_id":"{identity}"}}}}"#),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            account_usage_identity(&primary_data, &relative_home, &primary_home),
+            None
+        );
+        assert_eq!(
+            resolve_data_dir_account_home(&primary_data, &relative_home, primary_home.clone(),),
+            primary_home
+        );
+        assert!(!seed_local_data_dir_account_auth(
+            &primary_data,
+            &relative_home,
+            &primary_home,
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sibling_resolution_never_redirects_non_account_data_paths() {
+        let root = fresh_dir();
+        let primary_data = root.join("codex-switch-terminal-server");
+        let sibling_data = root.join("codex-switch-terminal-server-8081");
+        let relative_home = PathBuf::from("workspaces/account");
+        let primary_home = primary_data.join(&relative_home);
+        let sibling_home = sibling_data.join(&relative_home);
+        fs::create_dir_all(&sibling_home).unwrap();
+        fs::write(
+            sibling_home.join("auth.json"),
+            r#"{"tokens":{"account_id":"same-account","access_token":"header.payload.signature"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_data_dir_account_home(&primary_data, &relative_home, primary_home.clone(),),
+            primary_home
+        );
+        assert!(!seed_local_data_dir_account_auth(
+            &primary_data,
+            &relative_home,
+            &primary_home,
+        ));
+
+        let root_relative = PathBuf::from("codex-homes");
+        let root_home = primary_data.join(&root_relative);
+        assert_eq!(
+            resolve_data_dir_account_home(&primary_data, &root_relative, root_home.clone()),
+            root_home
+        );
+        assert!(!seed_local_data_dir_account_auth(
+            &primary_data,
+            &root_relative,
+            &root_home,
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1526,13 +1678,21 @@ mod tests {
         assert_eq!(dashboard.accounts.len(), 1);
         assert_eq!(dashboard.total_sessions, 2);
         assert_eq!(dashboard.total_tokens, 150);
+        assert_eq!(dashboard.models.len(), 1);
+        assert_eq!(dashboard.models[0].model, "gpt-5-codex");
+        assert_eq!(dashboard.models[0].total_tokens, 150);
+        assert!(dashboard.models[0].priced);
 
         let view = &dashboard.accounts[0];
         assert_eq!(view.session_count, 2);
         assert_eq!(view.total_tokens, 150);
+        assert_eq!(view.usage_source, "local-sessions");
+        assert_eq!(view.source_error, None);
         assert_eq!(view.days.len(), 1);
         assert_eq!(view.days[0].sessions, 2);
         assert_eq!(view.days[0].total_tokens, 150);
+        assert_eq!(view.days[0].models[0].total_tokens, 150);
+        assert_eq!(view.models[0].total_tokens, 150);
         assert_eq!(view.profile_labels, ["Principal", "Copie importee"]);
 
         let _ = fs::remove_dir_all(first_home);
@@ -1540,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_rollout_takes_last_cumulative_total_and_model() {
+    fn scan_rollout_uses_cumulative_high_water_and_latest_model() {
         let dir = fresh_dir();
         let file = dir.join("rollout-2026-07-08T21-19-10-test.jsonl");
         let content = [
@@ -1560,8 +1720,35 @@ mod tests {
         assert_eq!(session.days["2026-07-08"].totals.total, 340);
         assert!(session.ts.is_some());
         // Modèle lu dans turn_context (codex), pas le défaut passé "gpt-4" :
-        // (250*1.75 + 50*0.175 + 40*14)/1e6
-        assert!((session.cost - 0.00100625).abs() < 1e-9);
+        // (250*1.25 + 50*0.125 + 40*10)/1e6, aux tarifs publics.
+        assert!((session.cost - 0.00071875).abs() < 1e-9);
+        assert_eq!(session.models.len(), 1);
+        assert_eq!(session.models["gpt-5-codex"].totals.total, 340);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_rollout_splits_tokens_and_cost_when_the_model_changes() {
+        let dir = fresh_dir();
+        let file = dir.join("rollout-2026-07-08T21-19-10-model-switch.jsonl");
+        let content = [
+            r#"{"timestamp":"2026-07-08T19:19:59Z","type":"turn_context","payload":{"model":"gpt-5.6-luna"}}"#,
+            r#"{"timestamp":"2026-07-08T19:20:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":90,"output_tokens":10,"total_tokens":100}}}}"#,
+            r#"{"timestamp":"2026-07-08T19:20:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            r#"{"timestamp":"2026-07-08T19:20:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":225,"output_tokens":25,"total_tokens":250}}}}"#,
+        ]
+        .join("\n");
+        fs::write(&file, content).unwrap();
+
+        let session = scan_rollout_file(&file, "gpt-5.6-terra").expect("session");
+
+        assert_eq!(session.models.len(), 2);
+        assert_eq!(session.models["gpt-5.6-luna"].totals.total, 100);
+        assert_eq!(session.models["gpt-5.6-sol"].totals.total, 150);
+        assert!((session.models["gpt-5.6-luna"].cost - 0.00015).abs() < 1e-9);
+        assert!((session.models["gpt-5.6-sol"].cost - 0.001125).abs() < 1e-9);
+        assert!((session.cost - 0.001275).abs() < 1e-9);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1590,6 +1777,102 @@ mod tests {
                 .sum::<u64>(),
             session.totals.total
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interleaved_cumulative_snapshots_do_not_restart_the_counter() {
+        let dir = fresh_dir();
+        let file = dir.join("rollout-2026-07-14T10-00-00-interleaved.jsonl");
+        let content = [
+            r#"{"timestamp":"2026-07-14T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":90,"output_tokens":10,"total_tokens":100}}}}"#,
+            r#"{"timestamp":"2026-07-14T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":160,"output_tokens":20,"total_tokens":180}}}}"#,
+            r#"{"timestamp":"2026-07-14T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":115,"output_tokens":15,"total_tokens":130}}}}"#,
+            r#"{"timestamp":"2026-07-14T10:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":205,"output_tokens":25,"total_tokens":230}}}}"#,
+        ]
+        .join("\n");
+        fs::write(&file, content).unwrap();
+
+        let session = scan_rollout_file(&file, "gpt-5-codex").expect("session");
+        let daily_total = session
+            .days
+            .values()
+            .map(|usage| usage.totals.total)
+            .sum::<u64>();
+
+        assert_eq!(session.totals.total, 230);
+        assert_eq!(session.totals.input, 205);
+        assert_eq!(session.totals.output, 25);
+        assert_eq!(daily_total, 230);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_and_repeated_snapshots_keep_the_exact_high_water_under_stress() {
+        let dir = fresh_dir();
+
+        for seed in 1_u64..=64 {
+            let file = dir.join(format!("rollout-2026-07-14T10-00-00-stress-{seed}.jsonl"));
+            let mut state = seed;
+            let mut expected_high = 0_u64;
+            let mut previous_snapshot = 0_u64;
+            let mut lines = Vec::new();
+
+            for step in 0_u64..120 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let snapshot = if step % 11 == 0 {
+                    // Notification strictement repetee : elle doit etre idempotente.
+                    previous_snapshot
+                } else if step % 7 == 0 {
+                    // Ancienne branche livree en retard apres un cumul plus haut.
+                    expected_high.saturating_sub((state % 50_000).saturating_add(1))
+                } else {
+                    expected_high = expected_high.saturating_add((state % 20_000) + 1);
+                    expected_high
+                };
+                previous_snapshot = snapshot;
+                let input = snapshot.saturating_mul(9) / 10;
+                let output = snapshot.saturating_sub(input);
+                let minute = step / 60;
+                let second = step % 60;
+                lines.push(
+                    json!({
+                        "timestamp": format!("2026-07-14T10:{minute:02}:{second:02}Z"),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": input,
+                                    "output_tokens": output,
+                                    "total_tokens": snapshot
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            fs::write(&file, lines.join("\n")).unwrap();
+
+            let session = scan_rollout_file(&file, "gpt-5-codex").expect("session");
+            let daily_total = session
+                .days
+                .values()
+                .map(|usage| usage.totals.total)
+                .sum::<u64>();
+
+            assert_eq!(session.totals.total, expected_high, "seed {seed}");
+            assert_eq!(
+                session.totals.input + session.totals.output,
+                expected_high,
+                "seed {seed}"
+            );
+            assert_eq!(daily_total, expected_high, "seed {seed}");
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1678,195 +1961,5 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
         let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn server_usage_response_keeps_lifetime_and_daily_buckets() {
-        let usage: ServerTokenUsage = serde_json::from_value(json!({
-            "summary": { "lifetimeTokens": 1_250 },
-            "dailyUsageBuckets": [
-                { "startDate": "2026-07-12", "tokens": 450 },
-                { "startDate": "2026-07-13", "tokens": 800 }
-            ]
-        }))
-        .unwrap();
-
-        assert_eq!(usage.summary.lifetime_tokens, Some(1_250));
-        let buckets = usage.daily_usage_buckets.unwrap();
-        assert_eq!(buckets.len(), 2);
-        assert_eq!(buckets[1].tokens, 800);
-    }
-
-    #[test]
-    fn server_days_replace_local_totals_without_losing_local_details() {
-        let local = vec![AccountUsageDay {
-            date: "2026-07-13".to_string(),
-            sessions: 2,
-            input_tokens: 90,
-            cached_input_tokens: 20,
-            output_tokens: 10,
-            reasoning_output_tokens: 3,
-            total_tokens: 100,
-            cost_usd: 0.01,
-        }];
-        let days = merge_server_days(
-            vec![
-                ServerDailyUsageBucket {
-                    start_date: "2026-07-13".to_string(),
-                    tokens: 700,
-                },
-                ServerDailyUsageBucket {
-                    start_date: "2026-07-13".to_string(),
-                    tokens: 50,
-                },
-                ServerDailyUsageBucket {
-                    start_date: "not-a-date".to_string(),
-                    tokens: 999,
-                },
-            ],
-            &local,
-        );
-
-        assert_eq!(days.len(), 1);
-        assert_eq!(days[0].total_tokens, 750);
-        assert_eq!(days[0].sessions, 2);
-        assert_eq!(days[0].input_tokens, 90);
-    }
-
-    #[test]
-    fn closed_server_day_is_authoritative_even_when_local_total_is_higher() {
-        let yesterday = Local::now()
-            .date_naive()
-            .pred_opt()
-            .unwrap()
-            .format("%Y-%m-%d")
-            .to_string();
-        let local = vec![AccountUsageDay {
-            date: yesterday.clone(),
-            sessions: 2,
-            input_tokens: 140,
-            cached_input_tokens: 0,
-            output_tokens: 10,
-            reasoning_output_tokens: 0,
-            total_tokens: 150,
-            cost_usd: 0.01,
-        }];
-
-        let days = merge_server_days(
-            vec![ServerDailyUsageBucket {
-                start_date: yesterday,
-                tokens: 100,
-            }],
-            &local,
-        );
-
-        assert_eq!(days[0].total_tokens, 100);
-        assert_eq!(days[0].sessions, 2);
-    }
-
-    #[test]
-    fn official_lifetime_only_adds_local_usage_after_latest_server_day() {
-        let yesterday = Local::now()
-            .date_naive()
-            .pred_opt()
-            .unwrap()
-            .format("%Y-%m-%d")
-            .to_string();
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        let old_local = AccountUsageDay {
-            date: yesterday.clone(),
-            sessions: 1,
-            input_tokens: 140,
-            cached_input_tokens: 0,
-            output_tokens: 10,
-            reasoning_output_tokens: 0,
-            total_tokens: 150,
-            cost_usd: 0.01,
-        };
-        let realtime_local = AccountUsageDay {
-            date: today.clone(),
-            sessions: 1,
-            input_tokens: 45,
-            cached_input_tokens: 0,
-            output_tokens: 5,
-            reasoning_output_tokens: 0,
-            total_tokens: 50,
-            cost_usd: 0.01,
-        };
-        let mut view = usage_view(200, vec![old_local, realtime_local]);
-
-        apply_server_usage(
-            &mut view,
-            ServerTokenUsage {
-                summary: ServerTokenUsageSummary {
-                    lifetime_tokens: Some(100),
-                },
-                daily_usage_buckets: Some(vec![ServerDailyUsageBucket {
-                    start_date: yesterday,
-                    tokens: 100,
-                }]),
-            },
-        );
-
-        assert_eq!(view.total_tokens, 150);
-        assert_eq!(view.today_tokens, 50);
-        assert_eq!(
-            view.days
-                .iter()
-                .find(|day| day.date == today)
-                .unwrap()
-                .total_tokens,
-            50
-        );
-    }
-
-    #[test]
-    fn empty_server_days_do_not_delete_realtime_local_days() {
-        let local = vec![AccountUsageDay {
-            date: "2026-07-14".to_string(),
-            sessions: 1,
-            input_tokens: 900,
-            cached_input_tokens: 500,
-            output_tokens: 100,
-            reasoning_output_tokens: 10,
-            total_tokens: 1_000,
-            cost_usd: 0.01,
-        }];
-
-        let days = merge_server_days(Vec::new(), &local);
-
-        assert_eq!(days.len(), 1);
-        assert_eq!(days[0].total_tokens, 1_000);
-        assert_eq!(days[0].sessions, 1);
-    }
-
-    #[test]
-    fn zero_server_usage_does_not_erase_real_local_tokens() {
-        let day = AccountUsageDay {
-            date: Local::now().format("%Y-%m-%d").to_string(),
-            sessions: 1,
-            input_tokens: 140_000_000,
-            cached_input_tokens: 130_000_000,
-            output_tokens: 500_000,
-            reasoning_output_tokens: 25_000,
-            total_tokens: 140_500_000,
-            cost_usd: 1.0,
-        };
-        let mut view = usage_view(day.total_tokens, vec![day]);
-
-        apply_server_usage(
-            &mut view,
-            ServerTokenUsage {
-                summary: ServerTokenUsageSummary {
-                    lifetime_tokens: Some(0),
-                },
-                daily_usage_buckets: Some(Vec::new()),
-            },
-        );
-
-        assert_eq!(view.total_tokens, 140_500_000);
-        assert_eq!(view.today_tokens, 140_500_000);
-        assert_eq!(view.usage_source, "local-sessions");
-        assert!(view.source_error.as_deref().unwrap().contains("0 token"));
     }
 }

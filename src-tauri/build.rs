@@ -25,7 +25,11 @@ fn main() {
     // l'icône et (sur Windows) le manifeste Common-Controls v6 via resource.lib.
     // Indispensable : sans lui, event.listen est refuse ("Plugin not found") et
     // l'exe peut planter au lancement (TaskDialogIndirect v6 non resolu -> 0xC0000139).
-    tauri_build::build();
+    // Le runtime VPS n'embarque ni webview ni bundle desktop. La generation
+    // Tauri reste reservee aux builds qui activent explicitement `desktop`.
+    if std::env::var_os("CARGO_FEATURE_DESKTOP").is_some() {
+        tauri_build::build();
+    }
 }
 
 fn git_short_commit() -> Option<String> {

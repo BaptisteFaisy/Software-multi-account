@@ -11,6 +11,8 @@ export type ChatScrollState = {
   scrollTop: number;
 };
 
+export type ChatScrollUserIntent = "none" | "away" | "toward-latest";
+
 const finiteNumber = (value: number) => Number.isFinite(value) ? value : 0;
 
 export const chatMaxScrollTop = (metrics: ChatScrollMetrics): number =>
@@ -20,19 +22,22 @@ export const chatIsAtBottom = (metrics: ChatScrollMetrics): boolean =>
   chatMaxScrollTop(metrics) - finiteNumber(metrics.scrollTop) <= CHAT_SCROLL_BOTTOM_EPSILON;
 
 // Un scroll peut aussi etre declenche par un rendu ou un changement de taille.
-// Il ne suspend le suivi que lorsque l'appelant a detecte une remontee utilisateur.
+// L'intention de suivi ne change donc qu'apres un geste utilisateur explicite.
 export const updateChatScrollState = (
   state: ChatScrollState,
   metrics: ChatScrollMetrics,
-  userMovedAway = false,
+  userIntent: ChatScrollUserIntent = "none",
 ): void => {
-  state.scrollTop = Math.min(
+  const scrollTop = Math.min(
     Math.max(0, finiteNumber(metrics.scrollTop)),
     chatMaxScrollTop(metrics),
   );
-  if (chatIsAtBottom(metrics)) {
+  if (state.followLatest || userIntent !== "none") {
+    state.scrollTop = scrollTop;
+  }
+  if (userIntent === "toward-latest" && chatIsAtBottom(metrics)) {
     state.followLatest = true;
-  } else if (userMovedAway) {
+  } else if (userIntent === "away") {
     state.followLatest = false;
   }
 };
@@ -56,7 +61,6 @@ export const restoreChatScrollTop = (
   const target = state.followLatest
     ? maxScrollTop
     : Math.min(Math.max(0, finiteNumber(state.scrollTop)), maxScrollTop);
-  state.scrollTop = target;
-  if (maxScrollTop <= CHAT_SCROLL_BOTTOM_EPSILON) state.followLatest = true;
+  if (state.followLatest) state.scrollTop = target;
   return target;
 };

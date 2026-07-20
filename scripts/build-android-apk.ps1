@@ -76,12 +76,16 @@ Write-Host "JDK  : $Jbr"       -ForegroundColor Cyan
 Write-Host "SDK  : $Sdk"       -ForegroundColor Cyan
 Write-Host "Proj : $AndroidDir" -ForegroundColor Cyan
 
-$Task = if ($Release) { "assembleRelease" } else { "assembleDebug" }
+$Tasks = if ($Release) {
+  @("lintRelease", "assembleRelease")
+} else {
+  @("lintDebug", "assembleDebug")
+}
 
 Push-Location $AndroidDir
 try {
-  & (Join-Path $AndroidDir "gradlew.bat") $Task --console=plain
-  if ($LASTEXITCODE -ne 0) { throw "Echec du build Gradle ($Task)." }
+  & (Join-Path $AndroidDir "gradlew.bat") @Tasks --console=plain
+  if ($LASTEXITCODE -ne 0) { throw "Echec du build Gradle ($($Tasks -join ', '))." }
 }
 finally {
   Pop-Location
@@ -99,16 +103,34 @@ if (-not $ApkPath -or -not (Test-Path $ApkPath)) {
   throw "APK introuvable apres le build."
 }
 
+# Un APK debug doit etre signe et structurellement valide avant d'etre copie.
+if (-not $Release) {
+  $ApkSigner = Get-ChildItem -Path (Join-Path $Sdk "build-tools") -Directory -ErrorAction SilentlyContinue |
+    Sort-Object { try { [version]$_.Name } catch { [version]"0.0" } } -Descending |
+    ForEach-Object { Join-Path $_.FullName "apksigner.bat" } |
+    Where-Object { Test-Path $_ } |
+    Select-Object -First 1
+  if (-not $ApkSigner) {
+    throw "apksigner introuvable dans le SDK Android."
+  }
+  & $ApkSigner verify --verbose --print-certs $ApkPath
+  if ($LASTEXITCODE -ne 0) { throw "La signature de l'APK debug est invalide." }
+}
+
 $Dest1 = Join-Path $Root "CodexTerminal-$Variant.apk"
 $Dest2 = Join-Path $DesktopDir "CodexTerminal-$Variant.apk"
 Copy-Item $ApkPath $Dest1 -Force
 Copy-Item $ApkPath $Dest2 -Force
+$Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $Dest1).Hash
+$SizeMb = [Math]::Round((Get-Item -LiteralPath $Dest1).Length / 1MB, 2)
 
 Write-Host ""
 Write-Host "APK genere :" -ForegroundColor Green
 Write-Host "  $ApkPath"
 Write-Host "  -> $Dest1"
 Write-Host "  -> $Dest2"
+Write-Host "  Taille : $SizeMb Mo"
+Write-Host "  SHA-256: $Hash"
 Write-Host ""
 Write-Host "Installer par USB (debogage USB active sur le tel) :" -ForegroundColor Yellow
 Write-Host "  `"$Sdk\platform-tools\adb.exe`" install -r `"$Dest1`""

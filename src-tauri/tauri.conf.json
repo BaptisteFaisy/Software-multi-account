@@ -28,6 +28,9 @@
     "active": true,
     "targets": "all",
     "icon": ["icons/icon.ico"],
+    "resources": {
+      "../public/skills/dockerize-git": "skills/dockerize-git"
+    },
     "createUpdaterArtifacts": true
   },
   "plugins": {

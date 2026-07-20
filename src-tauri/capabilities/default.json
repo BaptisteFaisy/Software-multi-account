@@ -8,6 +8,14 @@
     "core:event:allow-listen",
     "core:window:allow-is-fullscreen",
     "core:window:allow-set-fullscreen",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://*"
+        }
+      ]
+    },
     "updater:default",
     "process:default"
   ]

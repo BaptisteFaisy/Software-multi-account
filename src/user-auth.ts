@@ -1,4 +1,4 @@
-import { remoteBaseUrl } from "./platform";
+import { remoteBaseUrl, repairRemoteConnection } from "./platform";
 
 export type AuthUser = {
   id: string;
@@ -15,6 +15,7 @@ type AuthConfig = {
   enabled: boolean;
   registrationEnabled: boolean;
   googleEnabled: boolean;
+  googleLoginUrl?: string | null;
 };
 
 type SessionResponse = { user: AuthUser };
@@ -38,6 +39,9 @@ let profileOpen = false;
 let profileError: string | null = null;
 let profileSuccess: string | null = null;
 
+const isRepairableConnectionError = (error: string | null) =>
+  Boolean(error && /failed to fetch|networkerror|network request failed|fetch failed|load failed/i.test(error));
+
 const escapeHtml = (value: string) =>
   value
     .replaceAll("&", "&amp;")
@@ -46,6 +50,27 @@ const escapeHtml = (value: string) =>
     .replaceAll('"', "&quot;");
 
 const escapeAttr = escapeHtml;
+
+const remoteHostLabel = () => {
+  try {
+    return new URL(remoteBaseUrl()).host;
+  } catch {
+    return remoteBaseUrl();
+  }
+};
+
+const googleLoginUrl = () => {
+  const configured = authConfig?.googleLoginUrl?.trim();
+  if (configured) {
+    try {
+      const url = new URL(configured);
+      if (url.protocol === "https:" || url.protocol === "http:") return url.href;
+    } catch {
+      // Une ancienne version du serveur peut ne pas fournir une URL exploitable.
+    }
+  }
+  return `${remoteBaseUrl()}/api/auth/google/start`;
+};
 
 const authApi = async <T>(
   path: string,
@@ -143,6 +168,12 @@ const authGateMarkup = () => {
         </div>` : ""}
 
         ${authGateError ? `<div class="account-auth-message error" role="alert">${escapeHtml(authGateError)}</div>` : ""}
+        ${isRepairableConnectionError(authGateError) ? `<div class="account-auth-repair">
+          <strong>La connexion au serveur a ete interrompue.</strong>
+          <p>Remettez automatiquement l'API sur cette adresse et nettoyez le cache obsolete.</p>
+          <button id="accountAuthRepairConnection" type="button">Reparer la connexion</button>
+          <small id="accountAuthRepairStatus" role="status" aria-live="polite"></small>
+        </div>` : ""}
 
         <form id="accountAuthForm" class="account-auth-form" data-mode="${authMode}">
           ${isRegister ? `<label>
@@ -172,14 +203,14 @@ const authGateMarkup = () => {
         </form>
 
         ${authConfig?.googleEnabled ? `<div class="account-auth-separator"><span>ou</span></div>
-          <a class="account-google-button" href="${escapeAttr(`${remoteBaseUrl()}/api/auth/google/start`)}">
+          <a class="account-google-button" href="${escapeAttr(googleLoginUrl())}">
             ${googleMark()}<span>Continuer avec Google</span>
           </a>` : ""}
 
         <footer class="account-auth-footer">
           <span>Connexion sécurisée</span>
           <span aria-hidden="true">•</span>
-          <span>${escapeHtml(new URL(remoteBaseUrl()).host)}</span>
+          <span>${escapeHtml(remoteHostLabel())}</span>
         </footer>
       </section>
     </main>`;
@@ -190,6 +221,30 @@ export const renderUserAuthGate = (
   onAuthenticated: () => void | Promise<void>,
 ) => {
   host.innerHTML = authGateMarkup();
+  host.querySelector<HTMLButtonElement>("#accountAuthRepairConnection")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const status = host.querySelector<HTMLElement>("#accountAuthRepairStatus");
+    button.disabled = true;
+    button.textContent = "Reparation en cours...";
+    if (status) status.textContent = "Verification du serveur et nettoyage du cache...";
+    try {
+      await repairRemoteConnection();
+      authGateError = null;
+      const state = await initializeUserAuth();
+      if (state === "authenticated") {
+        await onAuthenticated();
+        return;
+      }
+      if (state === "required") {
+        renderUserAuthGate(host, onAuthenticated);
+        return;
+      }
+      authGateError = "Le serveur ne propose pas la connexion utilisateur attendue.";
+    } catch (error) {
+      authGateError = error instanceof Error ? error.message : String(error);
+    }
+    renderUserAuthGate(host, onAuthenticated);
+  });
   host.querySelectorAll<HTMLButtonElement>("[data-auth-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       authMode = button.dataset.authMode === "register" ? "register" : "login";

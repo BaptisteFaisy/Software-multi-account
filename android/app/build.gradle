@@ -2,6 +2,16 @@ plugins {
     id 'com.android.application'
 }
 
+def googleServicesConfigured = [
+    'google-services.json',
+    'src/debug/google-services.json',
+    'src/release/google-services.json'
+].any { file(it).exists() }
+
+if (googleServicesConfigured) {
+    apply plugin: 'com.google.gms.google-services'
+}
+
 android {
     namespace 'com.codexswitch.terminal'
     compileSdk 36
@@ -12,9 +22,9 @@ android {
     defaultConfig {
         applicationId "com.codexswitch.terminal"
         minSdk 24
-        targetSdk 34
+        targetSdk 36
         versionCode 1
-        versionName "1.0"
+        versionName "0.1.0"
     }
 
     buildTypes {
@@ -32,4 +42,14 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+    implementation platform('com.google.firebase:firebase-bom:34.15.0')
+    implementation 'com.google.firebase:firebase-messaging'
+    implementation 'com.google.android.gms:play-services-wallet:20.0.0'
 }

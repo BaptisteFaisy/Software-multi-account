@@ -25,7 +25,7 @@ Le serveur par defaut est configure dans
 `CodexTerminal/Info.plist`, cle `CSTServerURL` :
 
 ```text
-https://pc-fixe-cst.tail3a8bdf.ts.net
+https://cst-google-trial.tail3a8bdf.ts.net
 ```
 
 ## Prerequis

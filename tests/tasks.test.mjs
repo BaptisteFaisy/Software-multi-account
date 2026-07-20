@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
+import { renderTasksPanel } from "../src/tasks-view.ts";
 import {
   TASKS_STORAGE_KEY,
+  TASKS_STORAGE_MIGRATION_KEY,
   addTaskItem,
   clearCompletedTaskItems,
   filterTaskItems,
@@ -13,11 +15,11 @@ import {
   persistTaskItems,
   removeTaskItem,
   renameTaskItem,
-  renderTasksPanel,
   searchTaskItems,
   setTaskCompleted,
   taskDueState,
   taskItemsForEnvironment,
+  taskStorageKeyForAccount,
   taskScheduleGroup,
   taskStats,
   updateTaskDetails,
@@ -157,6 +159,22 @@ test("persiste la liste et résiste à un stockage corrompu", () => {
   assert.deepEqual(loadTaskItems(storage), []);
 });
 
+test("isole le stockage des tâches par compte et migre l'ancienne liste une seule fois", () => {
+  const storage = memoryStorage();
+  const legacyTasks = addTaskItem([], "Ancienne tâche", 3_000, "legacy");
+  persistTaskItems(legacyTasks, storage);
+
+  assert.deepEqual(loadTaskItems(storage, "account-a"), legacyTasks);
+  assert.equal(storage.values.get(TASKS_STORAGE_MIGRATION_KEY), "account-a");
+  assert.ok(storage.values.has(taskStorageKeyForAccount("account-a")));
+  assert.deepEqual(loadTaskItems(storage, "account-b"), []);
+
+  const accountBTasks = addTaskItem([], "Tâche du compte B", 4_000, "account-b-task");
+  assert.equal(persistTaskItems(accountBTasks, storage, "account-b"), true);
+  assert.deepEqual(loadTaskItems(storage, "account-b"), accountBTasks);
+  assert.deepEqual(loadTaskItems(storage, "account-a"), legacyTasks);
+});
+
 test("échappe le contenu saisi dans le panneau", () => {
   const storage = memoryStorage();
   const personal = addTaskItem([], '<img src=x onerror="alert(1)">', 4_000, "unsafe");
@@ -185,15 +203,32 @@ test("échappe le contenu saisi dans le panneau", () => {
 test("la vue Tâches est reliée aux navigations desktop et mobile", () => {
   const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
   const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+  const taskModel = readFileSync(new URL("../src/tasks.ts", import.meta.url), "utf8");
+  const taskView = readFileSync(new URL("../src/tasks-view.ts", import.meta.url), "utf8");
+  const taskStyle = readFileSync(new URL("../src/tasks-view.css", import.meta.url), "utf8");
 
   assert.match(main, /\| "tasks"/);
   assert.match(main, /id="tasksToggle"/);
   assert.match(main, /role="menuitem" data-view="tasks"/);
-  assert.match(main, /case "tasks":\s*return renderTasksPanel\(undefined, currentTaskEnvironment\(\)\);/);
-  assert.match(main, /mountTasksPanel\(\{[\s\S]*?onExecuteTask:/);
+  assert.match(main, /import\("\.\/tasks-view"\)/);
+  assert.match(main, /import\("\.\/tasks-view\.css"\)/);
+  assert.match(main, /const currentTaskAccountId = \(\): string \| null =>\s*authenticatedUser\(\)\?\.id \?\? null;/);
+  assert.match(main, /case "tasks":\s*return tasksViewModule\?\.renderTasksPanel\([\s\S]*?currentTaskAccountId\(\),[\s\S]*?\) \?\? "";/);
+  assert.match(main, /tasksViewModule\?\.mountTasksPanel\(\{[\s\S]*?onExecuteTask:/);
   assert.match(main, /openNewChatModal\(\{ workspacePath: task\.environmentPath, task \}\)/);
   assert.match(main, /sendExpertChatMessage\(pane, root, prompt\)/);
   assert.match(main, /data-task-nav-count/);
-  assert.match(style, /\.tasks-panel/);
-  assert.match(style, /@media \(max-width: 560px\)[\s\S]*?\.task-create/);
+  assert.doesNotMatch(taskModel, /renderTasksPanel|mountTasksPanel|document\.querySelector/);
+  assert.match(taskView, /from "\.\/tasks\.ts"/);
+  assert.match(taskView, /renderTasksPanel/);
+  assert.doesNotMatch(style, /\.tasks-panel/);
+  assert.match(taskStyle, /@media \(max-width: 560px\)[\s\S]*?\.task-create/);
+  assert.match(
+    taskStyle,
+    /\.tasks-shell\s*\{[^}]*min-width:\s*0;[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s,
+  );
+  assert.match(
+    taskStyle,
+    /\.task-create-details\s*\{[^}]*min-width:\s*0;[^}]*flex-wrap:\s*wrap;/s,
+  );
 });

@@ -30,10 +30,12 @@ const BUILD_INPUTS = Object.freeze([
   "public",
   "scripts/clean-build-artifacts.mjs",
   "scripts/measure-frontend-baseline.mjs",
+  "scripts/precompress-frontend.mjs",
 ]);
 
 const VALIDATION_INPUTS = Object.freeze([
   ...BUILD_INPUTS,
+  "config",
   "tests",
   "scripts",
   "deploy",
@@ -383,12 +385,12 @@ const main = async () => {
   let tests = null;
   try {
     if (verify) {
-      const testRun = await runNpmScript("test:frontend", {
+      const testRun = await runNpmScript("test:frontend:baseline", {
         cwd: workingRoot,
         env: { FORCE_COLOR: "0", NO_COLOR: "1" },
       });
       tests = {
-        command: "npm run test:frontend",
+        command: "npm run test:frontend:baseline",
         ...parseTestSummary(`${testRun.stdout}\n${testRun.stderr}`),
       };
       if (
@@ -448,6 +450,7 @@ const main = async () => {
         "Une baseline est refusee si l'instantane change pendant les tests ou le build, ou si les entrees frontend reelles ne correspondent plus a la fin.",
         "Avec --allow-live-drift, un changement du depot vivant est signale sans invalider le snapshot controle; ce resultat ne doit pas etre presente comme l'etat courant.",
         "Le build verifie recoit un identifiant derive du fingerprint pour supprimer l'alea du cache PWA sans changer les builds ordinaires.",
+        "La suite de baseline limite la concurrence a deux fichiers afin de rester fiable sur une petite machine ou sous charge sans rendre le harnais interminable.",
         "Les tailles gzip utilisent le niveau 9; Brotli utilise la qualite 11. Les imports dynamiques restent classes comme differes.",
       ],
     };

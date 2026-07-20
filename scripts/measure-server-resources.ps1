@@ -198,11 +198,13 @@ function Get-TreeInventory {
 
   $ids = [System.Collections.Generic.List[int]]::new()
   $threadCountsByProcess = @{}
+  $parentProcessIdsByProcess = @{}
   foreach ($row in $ProcessRows) {
     $id = [int]$row.ProcessId
     if ($targetLookup.Contains($id) -and -not $samplerLookup.Contains($id)) {
       $ids.Add($id)
       $threadCountsByProcess[$id] = [int]$row.ThreadCount
+      $parentProcessIdsByProcess[$id] = [int]$row.ParentProcessId
     }
   }
 
@@ -210,12 +212,14 @@ function Get-TreeInventory {
     return [pscustomobject]@{
       ProcessIds = @()
       ThreadCountsByProcess = $threadCountsByProcess
+      ParentProcessIdsByProcess = $parentProcessIdsByProcess
     }
   }
 
   return [pscustomobject]@{
     ProcessIds = @($ids)
     ThreadCountsByProcess = $threadCountsByProcess
+    ParentProcessIdsByProcess = $parentProcessIdsByProcess
   }
 }
 
@@ -258,6 +262,7 @@ $samples = [System.Collections.Generic.List[object]]::new()
 $lastCpuByProcess = @{}
 $cpuSecondsByName = @{}
 $observedNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$observedRootChildNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $cpuSeconds = 0.0
 $endedEarly = $false
 $endReason = "duration-complete"
@@ -300,11 +305,13 @@ while ($true) {
     }
   )
   $threadCountsByProcess = $treeInventory.ThreadCountsByProcess
+  $parentProcessIdsByProcess = $treeInventory.ParentProcessIdsByProcess
   $workingSetBytes = [long]0
   $privateMemoryBytes = [long]0
   $threadCount = 0
   $handleCount = 0
   $sampleByProcessName = @{}
+  $sampleByRootChildName = @{}
 
   foreach ($process in $tree) {
     try {
@@ -370,6 +377,18 @@ while ($true) {
       $nameSample.privateMemoryMiB += [double]($processPrivateMemoryBytes / 1MB)
       $nameSample.threadCount += $processThreadCount
       $nameSample.handleCount += $processHandleCount
+
+      $processId = [int]$process.Id
+      if (
+        $parentProcessIdsByProcess.ContainsKey($processId) -and
+        [int]$parentProcessIdsByProcess[$processId] -eq $rootId
+      ) {
+        [void]$observedRootChildNames.Add($processName)
+        if (-not $sampleByRootChildName.ContainsKey($processName)) {
+          $sampleByRootChildName[$processName] = 0
+        }
+        $sampleByRootChildName[$processName] += 1
+      }
     }
     catch {
       # Un descendant court peut disparaitre entre l'inventaire CIM et la
@@ -388,6 +407,7 @@ while ($true) {
     threadCount = $threadCount
     handleCount = $handleCount
     byProcessName = $sampleByProcessName
+    byRootChildName = $sampleByRootChildName
   })
 
   if (
@@ -457,9 +477,19 @@ $byProcessName = @(
     }
   }
 )
+$rootChildrenByProcessName = @(
+  foreach ($name in @($observedRootChildNames | Sort-Object)) {
+    [ordered]@{
+      processName = $name
+      processCount = Get-Distribution -Values @($samples | ForEach-Object {
+        if ($_.byRootChildName.ContainsKey($name)) { [double]$_.byRootChildName[$name] } else { 0.0 }
+      }) -Decimals 2
+    }
+  }
+)
 
 $result = [ordered]@{
-  schemaVersion = 1
+  schemaVersion = 2
   label = $Label
   root = [ordered]@{
     processName = $root.ProcessName
@@ -491,6 +521,9 @@ $result = [ordered]@{
     handleCount = Get-Distribution -Values @($samples | ForEach-Object { [double]$_.handleCount }) -Decimals 2
   }
   byProcessName = $byProcessName
+  topology = [ordered]@{
+    rootChildrenByProcessName = $rootChildrenByProcessName
+  }
   observedProcessNames = @($observedNames | Sort-Object)
   methodology = @(
     "Windows parent-process tree and thread counts sampled through Toolhelp32 snapshots.",
@@ -498,6 +531,7 @@ $result = [ordered]@{
     "The sampler process and its descendants are excluded from every sample.",
     "CPU is the cumulative delta for observed processes; a process shorter than one sample interval can be missed.",
     "Per-name resource distributions include zero when that process name is absent from a sample.",
+    "Root-child distributions distinguish provider launchers from tool processes nested below a provider.",
     "Collection duration reports sampler cost without adding it to the measured process tree.",
     "100 cpuCorePercent means one logical processor was fully used; cpuMachinePercent is normalized by logical processor count."
   )

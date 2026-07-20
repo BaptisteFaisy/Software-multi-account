@@ -1,0 +1,180 @@
+/* Historique des demandes regroupe par chat / terminal ------------------ */
+#promptList {
+  gap: 8px;
+}
+
+.prompt-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+}
+
+.prompt-main {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.prompt-session-title {
+  color: var(--text);
+  font-family: var(--font-head);
+  font-size: 14px;
+  line-height: 1.35;
+}
+
+.prompt-session-messages {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.prompt-session-messages li {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  color: #cfc7b7;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.prompt-session-messages li > span:nth-child(2) {
+  display: -webkit-box;
+  overflow: hidden;
+  word-break: break-word;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.prompt-message-index {
+  display: inline-grid;
+  min-height: 20px;
+  place-items: center;
+  border: 1px solid #39362f;
+  border-radius: 999px;
+  color: #8f8878;
+  font-size: 10px;
+}
+
+.prompt-session-messages time {
+  color: #777164;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.prompt-session-title mark,
+.prompt-session-messages mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.prompt-text {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  word-break: break-word;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.prompt-text mark {
+  padding: 0 1px;
+  border-radius: 2px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.prompt-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.prompt-meta span {
+  display: inline-flex;
+  max-width: 320px;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-meta svg {
+  width: 13px;
+  height: 13px;
+}
+
+.prompt-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.prompt-more {
+  padding: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+@supports (content-visibility: auto) {
+  .prompt-row {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 76px;
+  }
+}
+
+@media (max-width: 700px) {
+  .prompt-session-messages li {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+
+  .prompt-session-messages time {
+    display: none;
+  }
+}
+
+:root[data-theme="light"] .prompt-row {
+  border-color: var(--line);
+  background: var(--panel);
+  box-shadow: none;
+}
+
+:root[data-theme="light"] .prompt-text mark {
+  color: var(--text);
+  background: #dde6d9;
+}
+
+:root[data-theme="light"] .prompt-session-messages li {
+  color: var(--text);
+}
+
+:root[data-theme="light"] .prompt-message-index {
+  border-color: var(--line);
+  color: var(--muted);
+  background: var(--panel-muted);
+}
+
+:root[data-theme="light"] .prompt-session-messages time {
+  color: var(--muted-2);
+}
+
+:root[data-theme="light"] :is(.prompt-session-title, .prompt-session-messages) mark {
+  color: var(--text);
+  background: #dce5da;
+}

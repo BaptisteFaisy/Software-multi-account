@@ -48,6 +48,21 @@
         "typography",
         "micro-interactions"
       ]
+    },
+    {
+      "id": "dockerize-git",
+      "file": "dockerize-git/SKILL.md",
+      "name": "dockerize-git",
+      "buttonLabel": "Docker Git",
+      "icon": "container",
+      "description": "Use when a user gives a Git URL and wants the project analyzed, packaged as an exportable Docker image, or deployed quickly to a Linux VPS.",
+      "tags": [
+        "docker",
+        "git",
+        "vps",
+        "deployment",
+        "portable"
+      ]
     }
   ]
 }

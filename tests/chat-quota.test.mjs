@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   bestQuotaAccount,
   bestQuotaAccountForNewChat,
+  combinedQuotaUsage,
   deduplicateQuotaAccountsForDisplay,
   isQuotaExhaustionError,
   OPEN_CHAT_QUOTA_RESERVATION_PERCENT,
@@ -15,6 +16,9 @@ import { readFileSync } from "node:fs";
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const chatView = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
+const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+const settingsBackend = readFileSync(new URL("../src-tauri/src/settings.rs", import.meta.url), "utf8");
+const platform = readFileSync(new URL("../src/platform.ts", import.meta.url), "utf8");
 
 test("reconnait les erreurs de quota sans confondre la fenetre de contexte", () => {
   assert.equal(isQuotaExhaustionError("You've hit your usage limit. Try again later."), true);
@@ -68,6 +72,49 @@ test("les limites visibles sont reactivees toutes les 30 secondes", () => {
   );
 });
 
+test("les limites s'affichent depuis un cache pendant le rafraichissement serveur", () => {
+  assert.match(settingsBackend, /const RATE_LIMIT_CACHE_TTL_SECS: u64 = 60/);
+  assert.match(settingsBackend, /fn account_limit_views_fast\(/);
+  assert.match(settingsBackend, /spawn_account_limit_refresh\(settings\.clone\(\), signature\)/);
+  assert.match(main, /const LIMIT_REFRESH_FOLLOWUP_MS = 750/);
+  assert.match(main, /limitStatus\.some\(\(row\) => row\.refreshing === true\)/);
+  assert.match(platform, /\/api\/limits\$\{args\.force \? "\?force=true" : ""\}/);
+});
+
+test("combine l'utilisation de tous les comptes ayant un quota lisible", () => {
+  assert.deepEqual(
+    combinedQuotaUsage([
+      { id: "leger", hasTokens: true, sessionUsedPercent: 20, weeklyUsedPercent: 10 },
+      { id: "charge", hasTokens: true, sessionUsedPercent: 80, weeklyUsedPercent: 50 },
+      { id: "inconnu", hasTokens: true },
+      { id: "deconnecte", hasTokens: false, sessionUsedPercent: 100 },
+    ]),
+    {
+      usedPercent: 50,
+      remainingPercent: 50,
+      measuredAccountCount: 2,
+    },
+  );
+  assert.deepEqual(combinedQuotaUsage([]), {
+    usedPercent: null,
+    remainingPercent: null,
+    measuredAccountCount: 0,
+  });
+});
+
+test("affiche la grosse barre d'utilisation globale au centre du bandeau des chats", () => {
+  assert.match(
+    main,
+    /<\/div>\s*\$\{renderExpertChatGlobalUsage\(\)\}\s*<div class="expert-chat-toolbar-actions">/,
+  );
+  assert.match(main, /if \(activeView === "chat"\) syncExpertChatGlobalUsageUi\(\)/);
+  assert.match(
+    style,
+    /\.expert-chat-global-usage \{[\s\S]*?flex: 1 1 420px;[\s\S]*?max-width: 620px;/,
+  );
+  assert.match(style, /\.expert-chat-global-usage-track \{[\s\S]*?height: 11px;/);
+});
+
 test("reserve 20 points de quota par chat deja ouvert", () => {
   assert.equal(OPEN_CHAT_QUOTA_RESERVATION_PERCENT, 20);
   assert.deepEqual(quotaAfterOpenChatReservations(86, 2), {
@@ -104,14 +151,23 @@ test("le nouveau chat choisit le plus gros quota apres reservation des chats ouv
   );
 });
 
-test("la modale peut ouvrir directement avec le compte le plus disponible", () => {
-  assert.match(main, /id="confirmBestQuotaNewChat"/);
+test("l'action principale route silencieusement vers le compte compatible le plus disponible", () => {
+  const routingStart = main.indexOf("const confirmNewChatWithBestQuota = async");
+  const routingEnd = main.indexOf("\nconst openNewChatModal =", routingStart);
+  const routing = main.slice(routingStart, routingEnd);
+
+  assert.match(main, /id="confirmNewChat"/);
+  assert.doesNotMatch(main, /id="confirmBestQuotaNewChat"/);
   assert.match(main, /const confirmNewChatWithBestQuota = async/);
   assert.match(
     main,
-    /bestQuotaAccountForNewChat\([\s\S]*?openChatAccountIdsForQuotaSelection\(\)/,
+    /compatibleAccountIds[\s\S]*?bestQuotaAccountForNewChat\([\s\S]*?openChatAccountIdsForQuotaSelection\(\)/,
   );
-  assert.match(main, /void confirmNewChatWithBestQuota\(\)/);
+  assert.match(
+    main,
+    /newChatRoutingMode === "automatic"[\s\S]*?void confirmNewChatWithBestQuota\(\)/,
+  );
+  assert.doesNotMatch(routing, /await refreshLimitStatus/);
 });
 
 test("n'affiche qu'une limite pour plusieurs profils partageant le meme home", () => {
@@ -206,13 +262,14 @@ test("un quota epuise transfere automatiquement la discussion sans bouton", () =
   assert.match(automaticTransfer, /quotaSuggestionFor\(currentTurn, currentDiscussion\)/);
   assert.match(
     automaticTransfer,
-    /await continueDiscussionWith\(currentDiscussion, suggestion\.accountId, pane\)/,
+    /await continueDiscussionWith\(currentDiscussion, suggestion\.accountId, pane, \{\s*preserveNavigation: true,\s*\}\)/,
   );
   assert.ok(
     (main.match(/automaticallyTransferQuotaExhaustedDiscussion\(/g) ?? []).length >= 5,
     "les echecs immediats et suivis des deux vues doivent lancer le transfert",
   );
-  assert.match(chatView, /Transfert automatique vers/);
+  assert.match(chatView, /Continuité automatique/);
+  assert.doesNotMatch(chatView, /Transfert automatique vers/);
   assert.doesNotMatch(chatView, /data-chat-action="quota-switch"/);
 });
 
@@ -233,8 +290,58 @@ test("le polling de quota arrete une commande bloquee avant le transfert", () =>
   assert.match(automaticTransfer, /"stop_chat_turn"/);
   assert.ok(
     automaticTransfer.indexOf('"stop_chat_turn"') <
-      automaticTransfer.indexOf("continueDiscussionWith(currentDiscussion, suggestion.accountId, pane)"),
+      automaticTransfer.indexOf("continueDiscussionWith(currentDiscussion, suggestion.accountId, pane, {"),
     "la commande source doit etre terminee avant de copier et reprendre la discussion",
+  );
+});
+
+test("une relance automatique conserve le chat et le workspace affiches", () => {
+  const automaticStart = main.indexOf("const automaticallyTransferQuotaExhaustedDiscussion =");
+  const automaticEnd = main.indexOf("\nconst readChatPreferences", automaticStart);
+  const continuationStart = main.indexOf("const continueDiscussionWith =");
+  const continuationEnd = main.indexOf("\nconst discussionHasRunningTurn", continuationStart);
+  const folderStart = main.indexOf("const preserveDiscussionFolder =");
+  const folderEnd = main.indexOf("\n// Quand un terminal se ferme", folderStart);
+  const resumeStart = main.indexOf("const resumeDiscussionInChat =");
+  const resumeEnd = main.indexOf("\nconst toggleExpertChatFullscreen", resumeStart);
+
+  for (const position of [
+    automaticStart,
+    automaticEnd,
+    continuationStart,
+    continuationEnd,
+    folderStart,
+    folderEnd,
+    resumeStart,
+    resumeEnd,
+  ]) {
+    assert.notEqual(position, -1);
+  }
+
+  const automaticTransfer = main.slice(automaticStart, automaticEnd);
+  const continuation = main.slice(continuationStart, continuationEnd);
+  const preservedFolder = main.slice(folderStart, folderEnd);
+  const resume = main.slice(resumeStart, resumeEnd);
+
+  assert.match(automaticTransfer, /preserveNavigation: true/);
+  assert.match(
+    continuation,
+    /options\.preserveNavigation\s*\? preserveDiscussionFolder\(discussion\)\s*: restoreDiscussionFolder\(discussion\)/,
+  );
+  assert.doesNotMatch(preservedFolder, /activateDiscussionFolder|setCurrentWorkspace|setChatWorkspaceFilter/);
+  assert.match(
+    resume,
+    /const activateReusePane = !!reusePane && !preserveNavigation && activeView !== "chat"/,
+  );
+  assert.match(resume, /const keepReusedPaneVisible = preserveNavigation/);
+  assert.match(resume, /automaticQuotaResumeVisibilityPins\.add\(pane\.key\)/);
+  assert.match(
+    main,
+    /const expertChatPaneIsAvailable = \(pane: ExpertChatPane\): boolean =>[\s\S]*?automaticQuotaResumeVisibilityPins\.has\(pane\.key\)/,
+  );
+  assert.match(
+    main,
+    /if \(!chatTurnIsBusy\(snapshot\.status\)\) \{\s*automaticQuotaResumeVisibilityPins\.delete\(pane\.key\)/,
   );
 });
 

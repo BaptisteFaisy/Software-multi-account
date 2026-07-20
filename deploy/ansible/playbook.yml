@@ -1,0 +1,317 @@
+---
+- name: Deployer le runtime Codex Switch Terminal
+  hosts: cst_nodes
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Valider la plateforme cible
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "Debian"
+          - ansible_architecture in ["x86_64", "aarch64"]
+          - cst_remote_port | int >= 1
+          - cst_remote_port | int <= 65535
+          - cst_capacity | int >= 1
+        fail_msg: >-
+          Le deploiement portable cible Ubuntu ou Debian en amd64/arm64 avec
+          un port et une capacite valides.
+
+    - name: Lire l'architecture des paquets Debian
+      ansible.builtin.command: dpkg --print-architecture
+      register: docker_dpkg_arch
+      changed_when: false
+
+  tasks:
+    - name: Installer les prerequis du depot Docker
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Creer le dossier des cles APT
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Installer la cle officielle Docker
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg"
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+
+    - name: Configurer le depot officiel Docker
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ docker_dpkg_arch.stdout }} signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/{{ ansible_distribution | lower }}
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Installer Docker Engine et Compose
+      ansible.builtin.apt:
+        name:
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-ce
+          - docker-ce-cli
+          - docker-compose-plugin
+        state: present
+
+    - name: Activer Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Creer les dossiers persistants
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /opt/codex-switch-terminal, owner: root, group: root, mode: "0755" }
+        - { path: /etc/codex-switch-terminal, owner: root, group: root, mode: "0700" }
+        - { path: /srv/cst, owner: "10001", group: "10001", mode: "0700" }
+        - { path: /srv/cst/workspaces, owner: "10001", group: "10001", mode: "0700" }
+
+    - name: Choisir l'image effective
+      ansible.builtin.set_fact:
+        cst_effective_image: >-
+          {{ cst_image if (cst_image | default('') | length > 0)
+             else 'codex-switch-terminal:' ~ cst_release }}
+
+    - name: Verifier si l'image construite existe deja
+      ansible.builtin.command:
+        argv: [docker, image, inspect, "{{ cst_effective_image }}"]
+      register: cst_local_image
+      changed_when: false
+      failed_when: false
+      when: cst_build_on_vps | bool
+
+    - name: Transferer le contexte de build
+      ansible.builtin.copy:
+        src: "{{ cst_build_context_archive }}"
+        dest: "/var/tmp/cst-build-{{ cst_release }}.tar.gz"
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - cst_build_on_vps | bool
+        - cst_local_image.rc | default(1) != 0
+
+    - name: Reinitialiser le contexte de build distant
+      ansible.builtin.file:
+        path: "/opt/codex-switch-terminal/build-{{ cst_release }}"
+        state: absent
+      when:
+        - cst_build_on_vps | bool
+        - cst_local_image.rc | default(1) != 0
+
+    - name: Creer le contexte de build distant
+      ansible.builtin.file:
+        path: "/opt/codex-switch-terminal/build-{{ cst_release }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - cst_build_on_vps | bool
+        - cst_local_image.rc | default(1) != 0
+
+    - name: Extraire le contexte de build distant
+      ansible.builtin.unarchive:
+        src: "/var/tmp/cst-build-{{ cst_release }}.tar.gz"
+        dest: "/opt/codex-switch-terminal/build-{{ cst_release }}"
+        remote_src: true
+      when:
+        - cst_build_on_vps | bool
+        - cst_local_image.rc | default(1) != 0
+
+    - name: Construire l'image sur le VPS pour le premier deploiement
+      ansible.builtin.command:
+        argv:
+          - docker
+          - build
+          - --pull
+          - --build-arg
+          - "CST_GIT_COMMIT={{ cst_commit }}"
+          - --tag
+          - "{{ cst_effective_image }}"
+          - "/opt/codex-switch-terminal/build-{{ cst_release }}"
+      when:
+        - cst_build_on_vps | bool
+        - cst_local_image.rc | default(1) != 0
+
+    - name: Se connecter au registre prive
+      ansible.builtin.command:
+        argv:
+          - docker
+          - login
+          - "{{ cst_registry }}"
+          - --username
+          - "{{ cst_registry_username }}"
+          - --password-stdin
+        stdin: "{{ cst_registry_token }}"
+        stdin_add_newline: true
+      no_log: true
+      when:
+        - not (cst_build_on_vps | bool)
+        - cst_registry_token | default('') | length > 0
+
+    - name: Recuperer l'image preconstruite
+      ansible.builtin.command:
+        argv: [docker, pull, "{{ cst_effective_image }}"]
+      register: cst_pull
+      changed_when: "'Downloaded newer image' in cst_pull.stdout"
+      when: not (cst_build_on_vps | bool)
+
+    - name: Verifier si les comptes sont deja initialises
+      ansible.builtin.stat:
+        path: /srv/cst/settings.json
+      register: cst_existing_settings
+
+    - name: Transferer le seed des comptes
+      ansible.builtin.copy:
+        src: "{{ cst_data_seed_archive }}"
+        dest: /var/tmp/cst-data-seed.tar.gz
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      when:
+        - cst_seed_accounts | bool
+        - not cst_existing_settings.stat.exists
+
+    - name: Initialiser les comptes sans remplacer l'etat existant
+      ansible.builtin.unarchive:
+        src: /var/tmp/cst-data-seed.tar.gz
+        dest: /srv/cst
+        remote_src: true
+      no_log: true
+      when:
+        - cst_seed_accounts | bool
+        - not cst_existing_settings.stat.exists
+
+    - name: Verifier si le workspace du projet existe
+      ansible.builtin.stat:
+        path: "/srv/cst/workspaces/{{ cst_workspace_name }}/.cst-workspace-seed"
+      register: cst_existing_workspace
+
+    - name: Creer le workspace du projet
+      ansible.builtin.file:
+        path: "/srv/cst/workspaces/{{ cst_workspace_name }}"
+        state: directory
+        # L'image execute le runtime avec l'utilisateur cst (UID/GID 10001).
+        # Conserver root:root en 0700 fait echouer Command::spawn avec EACCES.
+        owner: "10001"
+        group: "10001"
+        mode: "0700"
+      when: cst_seed_workspace | bool
+
+    - name: Transferer le workspace initial
+      ansible.builtin.copy:
+        src: "{{ cst_workspace_seed_archive }}"
+        dest: /var/tmp/cst-workspace-seed.tar.gz
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - cst_seed_workspace | bool
+        - not cst_existing_workspace.stat.exists
+
+    - name: Extraire le workspace initial sans ecraser les deploiements suivants
+      ansible.builtin.unarchive:
+        src: /var/tmp/cst-workspace-seed.tar.gz
+        dest: "/srv/cst/workspaces/{{ cst_workspace_name }}"
+        remote_src: true
+      when:
+        - cst_seed_workspace | bool
+        - not cst_existing_workspace.stat.exists
+
+    - name: Marquer le workspace initialise
+      ansible.builtin.file:
+        path: "/srv/cst/workspaces/{{ cst_workspace_name }}/.cst-workspace-seed"
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - cst_seed_workspace | bool
+        - not cst_existing_workspace.stat.exists
+
+    - name: Installer la configuration secrete du runtime
+      ansible.builtin.template:
+        src: templates/cst.env.j2
+        dest: /etc/codex-switch-terminal/cst.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Installer la pile Compose
+      ansible.builtin.template:
+        src: templates/compose.yaml.j2
+        dest: /opt/codex-switch-terminal/compose.yaml
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Demarrer ou mettre a jour le runtime
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - --file
+          - /opt/codex-switch-terminal/compose.yaml
+          - up
+          - --detach
+          - --remove-orphans
+          - --wait
+          - --wait-timeout
+          - "180"
+      register: cst_compose_up
+      changed_when: >-
+        'Created' in cst_compose_up.stderr or
+        'Recreated' in cst_compose_up.stderr or
+        'Started' in cst_compose_up.stderr
+
+    - name: Valider la sonde locale du runtime
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ cst_remote_port }}/healthz"
+        method: GET
+        status_code: 200
+        return_content: true
+      register: cst_health
+      retries: 20
+      delay: 3
+      until: cst_health.status == 200 and (cst_health.json.ok | default(false))
+
+    - name: Supprimer les archives temporaires sensibles
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/tmp/cst-data-seed.tar.gz
+        - /var/tmp/cst-workspace-seed.tar.gz
+        - "/var/tmp/cst-build-{{ cst_release }}.tar.gz"
+
+    - name: Afficher le resultat sans secret
+      ansible.builtin.debug:
+        msg: >-
+          {{ cst_node_label }} est operationnel sur 127.0.0.1:{{ cst_remote_port }}
+          avec l'image {{ cst_effective_image }}.

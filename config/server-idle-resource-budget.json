@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "id": "windows-idle-root-isolated-v1",
+  "reference": {
+    "label": "idle-root-isolated-20260715",
+    "evidence": "docs/server-idle-root-baseline-2026-07-15.md",
+    "binaryCommit": "3bce641",
+    "observedDurationSeconds": 30.05,
+    "aggregatePeak": {
+      "processCount": 2,
+      "workingSetMiB": 29.8,
+      "privateMemoryMiB": 3.59,
+      "threadCount": 22,
+      "handleCount": 232
+    },
+    "root": {
+      "cpuSeconds": 0,
+      "workingSetMiB": 20.16,
+      "privateMemoryMiB": 2.04,
+      "threadCount": 18,
+      "handleCount": 110
+    }
+  },
+  "scenario": {
+    "captureSchemaVersion": 2,
+    "labelPrefix": "idle-root-isolated-",
+    "rootProcessName": "cst-server",
+    "requestedDurationSeconds": 30,
+    "sampleIntervalMilliseconds": 1000,
+    "processTreeRefreshMilliseconds": 4000,
+    "minimumSampleCount": 25,
+    "forbiddenObservedProcessNames": [
+      "codex",
+      "codex-code-mode-host",
+      "node",
+      "cmd",
+      "powershell"
+    ],
+    "idle": {
+      "requireIsolated": true,
+      "maximumEstablishedClientConnectionsAtStart": 0,
+      "maximumActiveTerminals": 0,
+      "requireHealthyReadyServer": true
+    }
+  },
+  "resources": {
+    "aggregateCpuSecondsMaximum": 0.25,
+    "rootCpuSecondsMaximum": 0.25,
+    "aggregatePeak": {
+      "processCount": 2,
+      "workingSetMiB": 48,
+      "privateMemoryMiB": 12,
+      "threadCount": 32,
+      "handleCount": 320
+    },
+    "rootProcessPeak": {
+      "processCount": 1,
+      "workingSetMiB": 32,
+      "privateMemoryMiB": 8,
+      "threadCount": 24,
+      "handleCount": 160
+    },
+    "forbiddenRootChildProcessNames": [
+      "codex",
+      "codex-code-mode-host",
+      "node",
+      "cmd",
+      "powershell"
+    ]
+  }
+}

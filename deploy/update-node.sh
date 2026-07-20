@@ -23,18 +23,18 @@ set -euo pipefail
 #   # options communes : [--drain-timeout <sec>] [--drain-lease <sec>]
 #   #                    [--force] [--allow-unsigned]
 
-APP_DIR="/opt/codex-switch-terminal"
-SOURCE_DIR="/opt/codex-switch-terminal-src"
+APP_DIR="${CST_APP_DIR:-/opt/codex-switch-terminal}"
+SOURCE_DIR="${CST_SOURCE_DIR:-/opt/codex-switch-terminal-src}"
 SOURCE_ARCHIVE="/tmp/cst-source.tar.gz"
 RELEASES_DIR="$APP_DIR/releases"
 BUILD_CACHE="$APP_DIR/build-cache"
 CURRENT_LINK="$APP_DIR/current"
-ENV_FILE="/etc/codex-switch-terminal.env"
+ENV_FILE="${CST_ENV_FILE:-/etc/codex-switch-terminal.env}"
 SERVICE="codex-switch-terminal.service"
 CST_GIT_COMMIT="${CST_GIT_COMMIT:-}"
 DRAIN_TIMEOUT=300
 DRAIN_LEASE=20
-VERIFY_TIMEOUT=60
+VERIFY_TIMEOUT="${CST_VERIFY_TIMEOUT:-60}"
 FORCE=0
 DRAIN_ARMED=0
 DL=""
@@ -73,6 +73,10 @@ done
   echo "--drain-lease doit etre compris entre 5 et 60 secondes." >&2
   exit 2
 }
+[[ "$VERIFY_TIMEOUT" =~ ^[0-9]+$ && "$VERIFY_TIMEOUT" -ge 1 ]] || {
+  echo "CST_VERIFY_TIMEOUT doit etre un entier strictement positif." >&2
+  exit 2
+}
 
 [[ "$(id -u)" -eq 0 ]] || { echo "Lance ce script avec sudo." >&2; exit 1; }
 [[ -f "$ENV_FILE" ]] || { echo "$ENV_FILE introuvable : noeud non installe ?" >&2; exit 1; }
@@ -96,7 +100,39 @@ BASE="http://127.0.0.1:$PORT"
 
 log() { echo "[update-node] $*"; }
 healthz() { curl -fsS --max-time 3 "$BASE/healthz" 2>/dev/null || true; }
-hfield() { jq -r --arg k "$2" '.[$k] // empty' <<<"${1:-}" 2>/dev/null || true; }
+# `// empty` perdrait les booleens JSON valides a `false` (jq considere
+# `false` comme une valeur alternative). La verification doit distinguer un
+# champ absent de `draining: false`, sinon chaque mise a jour saine rollbacke.
+hfield() {
+  jq -r --arg k "$2" \
+    'if has($k) and .[$k] != null then .[$k] else empty end' \
+    <<<"${1:-}" 2>/dev/null || true
+}
+active_chat_turn_count() {
+  local payload count
+  if ! payload="$(curl -fsS --max-time 3 "$BASE/api/chat/turns/active" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" 2>/dev/null)"; then
+    echo "Impossible de verifier les tours de chat actifs ; mise a jour annulee sans redemarrage." >&2
+    return 1
+  fi
+  if ! count="$(jq -er 'if type == "array" then length else error("reponse invalide") end' \
+    <<<"$payload" 2>/dev/null)"; then
+    echo "Reponse invalide pour les tours de chat actifs ; mise a jour annulee sans redemarrage." >&2
+    return 1
+  fi
+  printf '%s\n' "$count"
+}
+active_workload_count() {
+  local hz="${1:-}" terminals chats
+  [[ -n "$hz" ]] || { printf '0\n'; return 0; }
+  terminals="$(hfield "$hz" activeTerminals)"; terminals="${terminals:-0}"
+  if [[ ! "$terminals" =~ ^[0-9]+$ ]]; then
+    echo "Compteur de terminaux actifs invalide ; mise a jour annulee sans redemarrage." >&2
+    return 1
+  fi
+  chats="$(active_chat_turn_count)" || return 1
+  printf '%s\n' "$((terminals + chats))"
+}
 set_drain() {
   local draining="$1"
   curl -fsS --max-time 5 -X POST "$BASE/api/admin/drain" \
@@ -210,8 +246,8 @@ else
     PATH=/home/cst/.cargo/bin:/usr/local/bin:/usr/bin:/bin \
     CARGO_TARGET_DIR="$BUILD_CACHE" \
     CST_GIT_COMMIT="$CST_GIT_COMMIT" \
-    bash -c "cd '$SOURCE_DIR' && cargo +1.88.0 build --manifest-path src-tauri/Cargo.toml --release --bin cst-server"
-  BUILT_BIN="$BUILD_CACHE/release/cst-server"
+    bash -c "cd '$SOURCE_DIR' && cargo +1.88.0 build --manifest-path src-tauri/Cargo.toml --profile server --bin cst-server"
+  BUILT_BIN="$BUILD_CACHE/server/cst-server"
   DIST_SRC="$SOURCE_DIR/dist"
 fi
 
@@ -223,6 +259,10 @@ COMMIT="$(sed -n 's/^cst-server [^ ]* (\(.*\))$/\1/p' <<<"$VLINE")"
   echo "Version/commit illisibles via 'cst-server --version': $VLINE" >&2
   exit 1
 }
+if [[ "$MODE" == "build" && -n "$CST_GIT_COMMIT" && "$COMMIT" != "$CST_GIT_COMMIT" ]]; then
+  echo "Incoherence: commit demande $CST_GIT_COMMIT mais binaire en $COMMIT." >&2
+  exit 1
+fi
 if [[ "$MODE" == "release" && "${RELEASE_TAG#v}" != "$VERSION" ]]; then
   echo "Incoherence: tag $RELEASE_TAG mais binaire en version $VERSION." >&2
   exit 1
@@ -263,7 +303,7 @@ while :; do
   if [[ -z "$hz" ]]; then
     active=0; draining=false; RUNNING=0
   else
-    active="$(hfield "$hz" activeTerminals)"; active="${active:-0}"
+    active="$(active_workload_count "$hz")" || exit 1
     draining="$(hfield "$hz" draining)"; draining="${draining:-false}"
     RUNNING=1
   fi
@@ -281,7 +321,7 @@ while :; do
       RUNNING=0; active=0; draining=false
     else
       RUNNING=1
-      active="$(hfield "$hz" activeTerminals)"; active="${active:-0}"
+      active="$(active_workload_count "$hz")" || exit 1
       draining="$(hfield "$hz" draining)"; draining="${draining:-false}"
     fi
     if [[ "$draining" != "true" && ( "$active" == "0" || "$FORCE" == "1" ) ]]; then
@@ -311,7 +351,8 @@ if [[ "$RUNNING" == "1" ]]; then
   set_drain true || { echo "Drain impossible (serveur injoignable ?)." >&2; exit 1; }
   DRAIN_ARMED=1
   sleep 0.25
-  active="$(hfield "$(healthz)" activeTerminals)"; active="${active:-0}"
+  hz="$(healthz)"
+  active="$(active_workload_count "$hz")" || exit 1
   if [[ "$active" != "0" && "$FORCE" != "1" ]]; then
     set_drain false || true
     DRAIN_ARMED=0

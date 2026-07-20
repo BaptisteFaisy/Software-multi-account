@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dockeriser un dépôt Git"
+  short_description: "Construire et déployer une image depuis Git"
+  default_prompt: "Use $dockerize-git to package and deploy this Git repository as a portable Docker image."

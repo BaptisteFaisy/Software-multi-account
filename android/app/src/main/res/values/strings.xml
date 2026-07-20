@@ -1,7 +1,79 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Codex Terminal</string>
-    <!-- Serveur par defaut (Tailscale Serve, HTTPS tailnet). Modifiable ensuite
+    <!-- VPS par defaut (Tailscale Serve, HTTPS tailnet). Modifiable ensuite
          via l'ecran de connexion web ou le pont CstAndroid.setConfig(). -->
-    <string name="server_url">https://pc-fixe-cst.tail3a8bdf.ts.net</string>
+    <string name="server_url">https://cst-google-trial.tail3a8bdf.ts.net</string>
+    <string name="connection_error_title">Serveur indisponible</string>
+    <string name="connection_error_hint">Vérifie Tailscale, l’adresse du serveur et ta connexion réseau.</string>
+    <string name="connection_error_details">%1$s\n\n%2$s</string>
+    <string name="retry">Réessayer</string>
+    <string name="configure">Configurer la connexion</string>
+    <string name="connection_settings_title">Connexion</string>
+    <string name="connection_settings_message">Le serveur doit être accessible en HTTPS. Le token reste chiffré par Android sur cet appareil.</string>
+    <string name="admin_token">Token admin</string>
+    <string name="save">Enregistrer</string>
+    <string name="https_required">Saisis une URL HTTPS valide.</string>
+    <string name="no_app_for_link">Aucune application ne peut ouvrir ce lien.</string>
+    <string name="no_file_picker">Aucun sélecteur de fichiers n’est disponible.</string>
+    <string name="download_blocked">Téléchargement bloqué : HTTPS est obligatoire.</string>
+    <string name="download_description">Téléchargement depuis Codex Terminal</string>
+    <string name="download_started">Téléchargement démarré.</string>
+    <string name="download_failed">Échec du téléchargement : %1$s</string>
+    <string name="save_in_progress">Termine d’abord l’enregistrement en cours.</string>
+    <string name="file_saved">%1$s a été enregistré.</string>
+    <string name="file_too_large">Ce fichier est trop volumineux pour être exporté depuis la WebView.</string>
+    <string name="http_error">Erreur serveur %1$d — %2$s</string>
+    <string name="ssl_error">Le certificat HTTPS du serveur n’est pas valide.</string>
+    <string name="webview_restarted">Le moteur d’affichage Android a redémarré. Appuie sur Réessayer.</string>
+    <string name="payment_notification_channel_id" translatable="false">payment_validations</string>
+    <string name="payment_notification_channel_name">Validations de paiement</string>
+    <string name="payment_notification_channel_description">Demandes d’intervention lorsque l’agent atteint Google Pay, 3D Secure ou une autre validation humaine.</string>
+    <string name="payment_notification_title">Validation de paiement requise</string>
+    <string name="payment_notification_public">Ouvre Codex Terminal pour examiner une demande.</string>
+    <string name="payment_notification_body">%1$s - %2$s - %3$s</string>
+    <string name="autonomous_notification_channel_id" translatable="false">autonomous_agents</string>
+    <string name="autonomous_notification_channel_name">Agents autonomes</string>
+    <string name="autonomous_notification_channel_description">Nouveaux comptes rendus et alertes importantes des agents autonomes.</string>
+    <string name="autonomous_notification_title">Agent autonome · %1$s</string>
+    <string name="autonomous_notification_alert_title">Intervention requise · %1$s</string>
+    <string name="autonomous_notification_public">Ouvre Codex Terminal pour consulter l’agent.</string>
+    <string name="payment_permission_title">Recevoir les notifications mobiles</string>
+    <string name="payment_permission_message">Codex Terminal peut te prévenir lorsqu’un agent publie un compte rendu, demande ton intervention ou prépare un checkout. Le contenu reste masqué sur l’écran verrouillé et les notifications de paiement n’affichent ni carte ni URL de checkout.</string>
+    <string name="payment_permission_enable">Activer</string>
+    <string name="payment_permission_later">Plus tard</string>
+    <string name="payment_config_title">Notifications mobiles</string>
+    <string name="payment_config_instructions">Dans Firebase, télécharge google-services.json pour cette app Android et une clé JSON de compte de service. Colle les deux fichiers ci-dessous pour recevoir les rapports d’agents, les alertes et les validations de paiement.</string>
+    <string name="payment_config_loading">Lecture de la configuration serveur…</string>
+    <string name="payment_config_google_services_hint">Colle ici le contenu de google-services.json</string>
+    <string name="payment_config_service_account_hint">Colle ici le JSON secret du compte de service</string>
+    <string name="payment_config_google_services_keep_hint">google-services.json — laisse vide pour conserver</string>
+    <string name="payment_config_service_account_keep_hint">Compte de service — laisse vide pour conserver</string>
+    <string name="payment_config_privacy">Le compte de service est envoyé directement au serveur en HTTPS, stocké dans un fichier privé et ne sera jamais réaffiché. Il ne transite pas dans la WebView.</string>
+    <string name="payment_config_save">Vérifier et enregistrer</string>
+    <string name="payment_config_test">Tester</string>
+    <string name="payment_config_testing">Envoi d’une notification de test…</string>
+    <string name="payment_config_test_sent">Test envoyé à %1$d appareil(s).</string>
+    <string name="payment_config_test_title">Test des notifications réussi</string>
+    <string name="payment_config_test_body">Firebase Cloud Messaging est correctement relié à Codex Terminal.</string>
+    <string name="payment_config_saving">Validation des deux configurations…</string>
+    <string name="payment_config_saved">Firebase est configuré. Les notifications mobiles vont être activées.</string>
+    <string name="payment_config_restart_required">Configuration enregistrée. Ferme puis rouvre l’app pour changer de projet Firebase.</string>
+    <string name="payment_config_connection_required">Enregistre d’abord l’URL HTTPS du serveur et le token admin.</string>
+    <string name="payment_config_unavailable">Configuration Firebase indisponible.</string>
+    <string name="payment_config_nothing_to_save">Colle au moins un des deux fichiers JSON.</string>
+    <string name="payment_config_ready">Prêt — projet %1$s — %2$d appareil(s)</string>
+    <string name="payment_config_partial">Configuration partielle — Android : %1$s — serveur : %2$s</string>
+    <string name="payment_config_open">Configurer les notifications</string>
+    <string name="google_pay_account_title">Compte Google Pay</string>
+    <string name="google_pay_account_explanation">Ton compte et tes cartes restent gérés par Google Wallet. Codex Terminal vérifie uniquement si un moyen de paiement Google Pay compatible est déjà disponible sur ce téléphone. Lors d’un achat, le marchand ouvrira la feuille Google Pay pour te laisser choisir le compte et la carte.</string>
+    <string name="google_pay_account_privacy">Aucun identifiant Google, numéro de carte, cryptogramme ou jeton de paiement n’est lu ni enregistré par Codex Terminal.</string>
+    <string name="google_pay_status_checking">Vérification de Google Pay…</string>
+    <string name="google_pay_status_ready">Prêt — un moyen de paiement Google Pay compatible est enregistré.</string>
+    <string name="google_pay_status_setup_required">Configuration requise — ouvre Google Wallet pour ajouter ou vérifier une carte.</string>
+    <string name="google_pay_status_error">Impossible de vérifier Google Pay. Vérifie Google Play Services et Google Wallet.</string>
+    <string name="google_pay_manage">Gérer dans Google Wallet</string>
+    <string name="google_pay_refresh">Actualiser</string>
+    <string name="yes">oui</string>
+    <string name="no">non</string>
 </resources>

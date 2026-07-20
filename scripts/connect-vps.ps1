@@ -55,6 +55,10 @@ if (-not (Test-Path -LiteralPath $profilePath)) {
 }
 $config = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
 
+if (-not $KnownHostsFile.Trim() -and [string]$config.knownHostsFile) {
+  $KnownHostsFile = [string]$config.knownHostsFile
+}
+
 $sshTarget = [string]$config.sshTarget
 $sshPort = [int]$config.sshPort
 $remotePort = [int]$config.remotePort
@@ -107,7 +111,11 @@ if (-not $CheckOnly) {
       (Join-Path $Root "Codex Switch Terminal Cloud.exe"),
       (Join-Path $Root "Codex Switch Terminal.exe"),
       (Join-Path $Root "src-tauri\target\release\codex-switch-terminal.exe")
-    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    ) |
+      Where-Object { Test-Path -LiteralPath $_ } |
+      ForEach-Object { Get-Item -LiteralPath $_ } |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 1 -ExpandProperty FullName
   }
   if (-not $resolvedClient) {
     throw "Client desktop introuvable; indique son chemin avec -ClientExe."
@@ -160,16 +168,24 @@ try {
   $previousRemote = $env:CST_CLIENT_REMOTE
   $previousBaseUrl = $env:CST_CLIENT_BASE_URL
   $previousToken = $env:CST_CLIENT_TOKEN
+  $previousNodes = $env:CST_CLIENT_NODES
   try {
+    $nodeLabel = ([string]$authenticatedHealth.nodeLabel).Trim().Replace('|', '/')
+    if (-not $nodeLabel) { $nodeLabel = [string]$config.label }
+    $nodeBaseUrl = "http://127.0.0.1:$LocalPort"
     $env:CST_CLIENT_REMOTE = "1"
-    $env:CST_CLIENT_BASE_URL = "http://127.0.0.1:$LocalPort"
+    $env:CST_CLIENT_BASE_URL = $nodeBaseUrl
     $env:CST_CLIENT_TOKEN = $adminToken
+    # Conserve le vrai libelle du profil dans le selecteur de cible des
+    # nouveaux chats, meme lorsqu'un seul tunnel est ouvert.
+    $env:CST_CLIENT_NODES = "$nodeLabel|$nodeBaseUrl|$adminToken|0"
     $client = Start-Process -FilePath $resolvedClient -WorkingDirectory (Split-Path -Parent $resolvedClient) -PassThru
   }
   finally {
     $env:CST_CLIENT_REMOTE = $previousRemote
     $env:CST_CLIENT_BASE_URL = $previousBaseUrl
     $env:CST_CLIENT_TOKEN = $previousToken
+    $env:CST_CLIENT_NODES = $previousNodes
   }
 
   Write-Host "Connecte a $($authenticatedHealth.nodeLabel) via SSH. Ferme le client pour couper le tunnel." -ForegroundColor Green

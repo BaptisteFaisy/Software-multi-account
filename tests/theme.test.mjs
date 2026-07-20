@@ -14,6 +14,9 @@ import {
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const themeCss = readFileSync(new URL("../src/theme.css", import.meta.url), "utf8");
+const deferredThemeCss = ["stats-view.css", "doctolib-lab.css", "tasks-view.css"]
+  .map((file) => readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"))
+  .join("\n");
 const index = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 
 test("le theme sauvegarde ne peut etre que clair ou sombre", () => {
@@ -103,6 +106,9 @@ test("la bascule est cablee avant le rendu et couvre les vues principales", () =
     ".orchestration-panel",
     ".tasks-panel",
   ]) {
-    assert.match(themeCss, new RegExp(`data-theme="light"[^{}]*\\${selector}`));
+    assert.match(
+      `${themeCss}\n${deferredThemeCss}`,
+      new RegExp(`data-theme="light"[^{}]*\\${selector}`),
+    );
   }
 });

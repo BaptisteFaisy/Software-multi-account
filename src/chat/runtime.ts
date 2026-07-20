@@ -23,6 +23,24 @@ export type RuntimeChatMessage = {
   parts?: RuntimeChatPart[];
 };
 
+// Les espaces, controles et caracteres Unicode explicitement invisibles ne
+// doivent pas suffire a reserver une bulle dans la timeline. Les caracteres
+// visibles (ponctuation et syntaxe Markdown comprises) restent intacts.
+const CHAT_NON_RENDERING_TEXT = /[\p{White_Space}\p{Default_Ignorable_Code_Point}\p{Control}\u2800]/gu;
+
+export const chatTextHasVisibleContent = (
+  value: string | null | undefined,
+): boolean => !!value && value.replace(CHAT_NON_RENDERING_TEXT, "").length > 0;
+
+export const chatPartHasVisibleContent = (part: RuntimeChatPart): boolean =>
+  part.kind === "tool" || chatTextHasVisibleContent(part.text);
+
+export const chatMessageHasVisibleContent = (message: RuntimeChatMessage): boolean =>
+  message.role === "user"
+    ? chatTextHasVisibleContent(message.text)
+    : chatTextHasVisibleContent(message.text)
+      || !!message.parts?.some(chatPartHasVisibleContent);
+
 /** Un tour reste verrouillé pendant la synchronisation qui suit la réponse finale. */
 export const chatTurnIsBusy = (status: string | null | undefined): boolean =>
   status === "running" || status === "finalizing";

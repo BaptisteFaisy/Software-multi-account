@@ -1,4 +1,5 @@
 import {
+  DEFAULT_KEYBOARD_SHORTCUTS,
   keyboardShortcutMatches,
   type KeyboardShortcutEvent,
 } from "../keyboard-shortcuts.ts";
@@ -37,10 +38,11 @@ export type ChatHoverShortcutAction = "close-chat" | "close-chat-and-discussion"
 
 export type ChatHoverShortcutBindings = Record<ChatHoverShortcutAction, string>;
 
-export const DEFAULT_CHAT_HOVER_SHORTCUT_BINDINGS: Readonly<ChatHoverShortcutBindings> = {
-  "close-chat": "Backspace",
-  "close-chat-and-discussion": "Delete",
-};
+export const DEFAULT_CHAT_HOVER_SHORTCUT_BINDINGS: Readonly<ChatHoverShortcutBindings> =
+  Object.freeze({
+    "close-chat": DEFAULT_KEYBOARD_SHORTCUTS["close-chat"],
+    "close-chat-and-discussion": DEFAULT_KEYBOARD_SHORTCUTS["close-chat-and-discussion"],
+  });
 
 export const chatShortcutTargetConsumesDeletion = (
   target: unknown,

@@ -4,6 +4,10 @@ param(
   # Delai TOTAL pour trouver un instant sans terminal. Le noeud reste ouvert
   # aux agents pendant cette attente ; le drain n'est active qu'a la bascule.
   [int]$DrainTimeoutSec = 300,
+  # Un noeud charge peut repondre lentement alors que ses chats continuent.
+  # La sonde reste fail-closed : si ce delai expire, la MAJ est annulee.
+  [ValidateRange(3, 60)]
+  [int]$ProbeTimeoutSec = 10,
   [ValidateRange(5, 60)]
   [int]$DrainLeaseSec = 20,
   [ValidateRange(1, 60)]
@@ -11,6 +15,8 @@ param(
   [int]$VerifyTimeoutSec = 60,
   [switch]$Force,
   [switch]$SkipBuild,
+  [string]$BuiltExePath = "",
+  [string]$BuiltDistPath = "",
   # --- Mode release (Phase 2 : artefacts CI signes) ---
   [string]$ReleaseTag = "",
   [string]$Repo = "BaptisteFaisy/Software-multi-account",
@@ -58,7 +64,31 @@ $base = "http://127.0.0.1:$Port"
 $authHeaders = @{ Authorization = "Bearer $env:CST_ADMIN_TOKEN" }
 
 function Get-Healthz {
-  try { return Invoke-RestMethod -Uri "$base/healthz" -TimeoutSec 3 } catch { return $null }
+  try {
+    return Invoke-RestMethod -Uri "$base/healthz" -TimeoutSec $ProbeTimeoutSec
+  }
+  catch {
+    return $null
+  }
+}
+
+function Get-ActiveWorkloadCount {
+  param([object]$Health)
+  if (-not $Health) { return 0 }
+
+  $activeTerminals = [int]$Health.activeTerminals
+  try {
+    $chatTurns = Invoke-RestMethod -Uri "$base/api/chat/turns/active" `
+      -Headers $authHeaders -TimeoutSec $ProbeTimeoutSec -ErrorAction Stop
+  }
+  catch {
+    throw "Impossible de verifier les tours de chat actifs ; mise a jour annulee sans redemarrage. $($_.Exception.Message)"
+  }
+  if ($chatTurns -isnot [Array]) {
+    throw "Reponse invalide pour les tours de chat actifs ; mise a jour annulee sans redemarrage."
+  }
+  $activeChatTurns = $chatTurns.Count
+  return $activeTerminals + $activeChatTurns
 }
 
 function Set-DrainState {
@@ -260,9 +290,20 @@ if ($IsReleaseMode) {
       npm run build:server;   if ($LASTEXITCODE -ne 0) { throw "Le build serveur a echoue." }
     } finally { Pop-Location }
   }
-  $builtExe = Join-Path $Root "src-tauri\target\release\cst-server.exe"
+  $builtExe = if ($BuiltExePath) {
+    [IO.Path]::GetFullPath($BuiltExePath)
+  } else {
+    Join-Path $Root "src-tauri\target\release\cst-server.exe"
+  }
   if (-not (Test-Path $builtExe)) { throw "Binaire introuvable: $builtExe (retire -SkipBuild ?)." }
-  $distSrc = Join-Path $Root "dist"
+  $distSrc = if ($BuiltDistPath) {
+    [IO.Path]::GetFullPath($BuiltDistPath)
+  } else {
+    Join-Path $Root "dist"
+  }
+  if (-not (Test-Path $distSrc -PathType Container)) {
+    throw "Frontend introuvable: $distSrc (retire -SkipBuild ?)."
+  }
 }
 
 # --- 2. Self-check version ---
@@ -320,7 +361,7 @@ try {
   while (-not $updateLockHeld) {
     $h = Get-Healthz
     $running = $null -ne $h
-    $active = if ($h) { [int]$h.activeTerminals } else { 0 }
+    $active = Get-ActiveWorkloadCount -Health $h
     $available = -not $h -or ($h.draining -eq $false -and $active -eq 0)
 
     if ($available -or ((Get-Date) -ge $deadline -and $Force)) {
@@ -340,7 +381,7 @@ try {
       # sans drainer le noeud.
       $h = Get-Healthz
       $running = $null -ne $h
-      $active = if ($h) { [int]$h.activeTerminals } else { 0 }
+      $active = Get-ActiveWorkloadCount -Health $h
       if ($h -and ($h.draining -eq $true -or ($active -gt 0 -and -not $Force))) {
         $updateMutex.ReleaseMutex()
         $updateLockHeld = $false
@@ -375,7 +416,7 @@ try {
     # -Force, on annule aussitot la fenetre plutot que bloquer les autres agents.
     Start-Sleep -Milliseconds 250
     $h = Get-Healthz
-    $active = if ($h) { [int]$h.activeTerminals } else { 0 }
+    $active = Get-ActiveWorkloadCount -Health $h
     if ($active -gt 0 -and -not $Force) {
       Set-DrainState -Draining $false
       $drainArmed = $false

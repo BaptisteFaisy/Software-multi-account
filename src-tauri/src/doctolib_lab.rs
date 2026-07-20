@@ -446,7 +446,7 @@ async fn blocking<T>(task: impl FnOnce() -> Result<T, String> + Send + 'static) 
 where
     T: Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(task)
+    tokio::task::spawn_blocking(task)
         .await
         .map_err(|error| format!("Tâche RDV Lab interrompue : {error}"))?
 }
@@ -718,21 +718,25 @@ pub async fn confirm(
     result
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn doctolib_lab_status() -> Result<DoctolibLabStatus, String> {
     status().await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn doctolib_lab_connect() -> Result<DoctolibLabConnectResponse, String> {
     connect().await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn doctolib_lab_google_calendar_connect() -> Result<DoctolibLabConnectResponse, String> {
     connect_google_calendar().await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn doctolib_lab_search(
     state: tauri::State<'_, DoctolibLabManager>,
@@ -741,6 +745,7 @@ pub async fn doctolib_lab_search(
     search(&state, request).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn doctolib_lab_confirm(
     state: tauri::State<'_, DoctolibLabManager>,

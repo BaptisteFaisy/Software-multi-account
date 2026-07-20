@@ -1,23 +1,34 @@
 param(
   [int]$Port = 8080,
   [string]$TargetDir = "",
+  [string]$SourceDir = "",
   [switch]$SkipBuild,
   [ValidateRange(1, 60)]
-  [int]$LockTimeoutSec = 10
+  [int]$LockTimeoutSec = 10,
+  [ValidateRange(1, 720)]
+  [int]$StaleAssetRetentionHours = 72
 )
 
 # Publication frontend multi-agents sur le noeud local, sans drain ni restart.
 # Vite produit des assets hashes : on les copie d'abord puis on remplace
-# index.html atomiquement en dernier. Une fois le nouvel index actif, les
-# fichiers absents du nouveau dist sont retires sous le meme mutex. Le mutex ne
-# couvre que cette publication, jamais le build.
+# index.html atomiquement en dernier. Les anciens chunks hashes restent servis
+# pendant une courte periode afin que les onglets deja ouverts puissent finir
+# leurs imports dynamiques. Le mutex ne couvre que cette publication, jamais le
+# build.
 
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $ScriptDir
-$SourceDir = Join-Path $Root "dist"
+$DefaultSourceDir = Join-Path $Root "dist"
 $LocalUrl = "http://127.0.0.1:$Port"
+
+if (-not $SourceDir) {
+  $SourceDir = $DefaultSourceDir
+}
+elseif (-not $SkipBuild) {
+  throw "-SourceDir exige -SkipBuild afin de ne jamais publier un build different de la source demandee."
+}
 
 if (-not $TargetDir) {
   $NodeHome = Join-Path $env:LOCALAPPDATA "codex-switch-terminal-node"
@@ -65,7 +76,8 @@ function Get-TreeRelativePath {
 function Remove-StaleTreeEntries {
   param(
     [Parameter(Mandatory = $true)][string]$SourceRoot,
-    [Parameter(Mandatory = $true)][string]$TargetRoot
+    [Parameter(Mandatory = $true)][string]$TargetRoot,
+    [Parameter(Mandatory = $true)][int]$RetainAssetHours
   )
 
   $sourceEntries = @{}
@@ -75,6 +87,8 @@ function Remove-StaleTreeEntries {
   }
 
   $removed = 0
+  $assetPrefix = "assets$([IO.Path]::DirectorySeparatorChar)"
+  $assetCutoff = [DateTime]::UtcNow.AddHours(-$RetainAssetHours)
   $targetEntries = @(
     Get-ChildItem -LiteralPath $TargetRoot -Recurse -Force |
       Sort-Object { $_.FullName.Length } -Descending
@@ -82,6 +96,13 @@ function Remove-StaleTreeEntries {
   foreach ($entry in $targetEntries) {
     $relative = Get-TreeRelativePath -Root $TargetRoot -FullName $entry.FullName
     if ($sourceEntries.ContainsKey($relative)) { continue }
+    if (
+      -not $entry.PSIsContainer -and
+      $relative.StartsWith($assetPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+      $entry.LastWriteTimeUtc -ge $assetCutoff
+    ) {
+      continue
+    }
     if (Test-Path -LiteralPath $entry.FullName) {
       Remove-Item -LiteralPath $entry.FullName -Recurse -Force
       $removed++
@@ -181,10 +202,13 @@ try {
     [IO.File]::Move($tempIndex, $targetIndex)
   }
 
-  # Le nouvel index ne reference plus les anciens assets hashes. Les retirer
-  # ici garantit que le dist actif est le miroir exact du dernier build, sans
-  # laisser une version precedente s'accumuler a chaque publication.
-  $staleCount = Remove-StaleTreeEntries -SourceRoot $SourceDir -TargetRoot $TargetDir
+  # Les fichiers ordinaires obsoletes partent immediatement. Les chunks hashes
+  # recents gardent une fenetre de grace pour les pages ouvertes avant la
+  # bascule ; le garde frontend recharge ensuite les onglets plus anciens.
+  $staleCount = Remove-StaleTreeEntries `
+    -SourceRoot $SourceDir `
+    -TargetRoot $TargetDir `
+    -RetainAssetHours $StaleAssetRetentionHours
 }
 finally {
   $timer.Stop()

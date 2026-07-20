@@ -4,6 +4,7 @@ param(
   [ValidatePattern('^[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+$')]
   [string]$SshTarget,
   [string]$IdentityFile = "",
+  [string]$KnownHostsFile = "",
   [ValidateRange(1, 65535)]
   [int]$SshPort = 22,
   [ValidateRange(1, 65535)]
@@ -99,6 +100,13 @@ $resolvedIdentity = ""
 if ($IdentityFile.Trim()) {
   $resolvedIdentity = (Resolve-Path -LiteralPath $IdentityFile).Path
 }
+$resolvedKnownHostsFile = ""
+if ($KnownHostsFile.Trim()) {
+  $resolvedKnownHostsFile = (Resolve-Path -LiteralPath $KnownHostsFile).Path
+}
+if ($resolvedKnownHostsFile -and $AcceptNewHostKey) {
+  throw "-KnownHostsFile et -AcceptNewHostKey sont mutuellement exclusifs."
+}
 
 $existingProfile = $null
 if (Test-Path -LiteralPath $ProfilePath) {
@@ -176,6 +184,16 @@ if ($resolvedIdentity) {
   $sshArgs += @("-i", $resolvedIdentity)
   $scpArgs += @("-i", $resolvedIdentity)
 }
+if ($resolvedKnownHostsFile) {
+  $sshArgs += @(
+    "-o", "UserKnownHostsFile=$resolvedKnownHostsFile",
+    "-o", "StrictHostKeyChecking=yes"
+  )
+  $scpArgs += @(
+    "-o", "UserKnownHostsFile=$resolvedKnownHostsFile",
+    "-o", "StrictHostKeyChecking=yes"
+  )
+}
 if ($AcceptNewHostKey) {
   $sshArgs += @("-o", "StrictHostKeyChecking=accept-new")
   $scpArgs += @("-o", "StrictHostKeyChecking=accept-new")
@@ -199,12 +217,12 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Le build frontend a echoue." }
 
     & tar @(
-      "--exclude=src-tauri/target",
-      "--exclude=src-tauri/target-alt",
+      "--exclude=src-tauri/target*",
       "-czf", $sourceArchive,
       "dist", "src-tauri", "rust-toolchain.toml"
     )
     if ($LASTEXITCODE -ne 0) { throw "La creation de l'archive source a echoue." }
+    $sourceDigest = (Get-FileHash -LiteralPath $sourceArchive -Algorithm SHA256).Hash.ToLowerInvariant()
   }
   finally {
     Pop-Location
@@ -241,6 +259,18 @@ try {
     'CST_NODE_LABEL=' + (Quote-SystemdEnvironment $NodeLabel)
     'CST_NODE_CAPACITY=' + (Quote-SystemdEnvironment ([string]$Capacity))
   )
+  foreach ($name in @(
+    'CST_ALLOW_REGISTRATION'
+    'CST_AUTH_SECURE_COOKIE'
+    'CST_GOOGLE_CLIENT_ID'
+    'CST_GOOGLE_CLIENT_SECRET'
+    'CST_GOOGLE_REDIRECT_URI'
+  )) {
+    $value = [Environment]::GetEnvironmentVariable($name)
+    if ($null -ne $value -and $value.Trim()) {
+      $environmentLines += $name + '=' + (Quote-SystemdEnvironment $value.Trim())
+    }
+  }
   [IO.File]::WriteAllText(
     $remoteEnv,
     (($environmentLines -join "`n") + "`n"),
@@ -260,9 +290,15 @@ try {
   & scp @scpArgs @transferFiles "${SshTarget}:$remoteDir/"
   if ($LASTEXITCODE -ne 0) { throw "Le transfert SCP a echoue." }
 
-  $commit = "unknown"
+  $commit = "archive-$($sourceDigest.Substring(0, 12))"
   $rev = & git -C $Root rev-parse --short HEAD 2>$null
-  if ($LASTEXITCODE -eq 0 -and $rev) { $commit = ([string]$rev).Trim() }
+  if ($LASTEXITCODE -eq 0 -and $rev) {
+    $commit = ([string]$rev).Trim()
+    $worktreeChanges = @(& git -C $Root status --porcelain --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $worktreeChanges.Count -gt 0) {
+      $commit = "$commit-dirty-$($sourceDigest.Substring(0, 12))"
+    }
+  }
   if ($commit -notmatch '^[A-Za-z0-9._-]+$') { $commit = "unknown" }
 
   $remoteDataPath = if ($hasDataArchive) { "$remoteDir/cst-data.tar.gz" } else { "$remoteDir/no-data.tar.gz" }
@@ -320,6 +356,7 @@ fi
     sshTarget = $SshTarget
     sshPort = $SshPort
     identityFile = $resolvedIdentity
+    knownHostsFile = $resolvedKnownHostsFile
     remotePort = $RemotePort
     defaultLocalPort = $LocalPort
     tokenProtected = (Protect-Secret $adminToken)
@@ -343,5 +380,7 @@ finally {
 }
 
 if ($Connect) {
-  & (Join-Path $ScriptDir "connect-vps.ps1") -Profile $NodeId -LocalPort $LocalPort
+  $connectArgs = @{ Profile = $NodeId; LocalPort = $LocalPort }
+  if ($resolvedKnownHostsFile) { $connectArgs.KnownHostsFile = $resolvedKnownHostsFile }
+  & (Join-Path $ScriptDir "connect-vps.ps1") @connectArgs
 }

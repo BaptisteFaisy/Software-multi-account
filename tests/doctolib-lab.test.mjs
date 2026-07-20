@@ -18,6 +18,9 @@ const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "u
 const server = readFileSync(new URL("../src-tauri/src/server.rs", import.meta.url), "utf8");
 const worker = readFileSync(new URL("../scripts/doctolib-lab-worker.mjs", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+const theme = readFileSync(new URL("../src/theme.css", import.meta.url), "utf8");
+const view = readFileSync(new URL("../src/doctolib-lab-view.ts", import.meta.url), "utf8");
+const viewStyle = readFileSync(new URL("../src/doctolib-lab.css", import.meta.url), "utf8");
 
 const proposal = {
   id: "proposal-1",
@@ -118,9 +121,18 @@ test("la vue est séparée des chats et raccordée aux cinq commandes desktop", 
   assert.match(main, /\| "doctolib-lab"/);
   assert.doesNotMatch(main, /doctolibLabToggle/);
   assert.doesNotMatch(main, /data-view="doctolib-lab"/);
+  assert.match(main, /type DoctolibLabModule = typeof import\("\.\/doctolib-lab-view"\)/);
+  assert.match(main, /doctolibLabModulePromise = import\("\.\/doctolib-lab-view"\)/);
+  assert.match(main, /if \(view === "doctolib-lab" && !doctolibLabModule\)/);
+  assert.match(main, /import type \{[\s\S]*?\} from "\.\/doctolib-lab";/);
+  assert.doesNotMatch(main, /import\s+\{[^}]*\}\s+from "\.\/doctolib-lab";/);
   assert.match(main, /renderDoctolibLabPanel/);
   assert.match(main, /handleDoctolibLabMessage/);
-  assert.match(style, /\.doctolib-lab\s*\{/);
+  assert.doesNotMatch(`${style}\n${theme}`, /\.doctolib-lab(?:[\s.:>]|$)/);
+  assert.match(view, /import "\.\/doctolib-lab\.css";/);
+  assert.match(view, /export \* from "\.\/doctolib-lab";/);
+  assert.match(viewStyle, /\.doctolib-lab\s*\{/);
+  assert.match(viewStyle, /:root\[data-theme="light"\] \.doctolib-lab/);
   for (const command of [
     "doctolib_lab_status",
     "doctolib_lab_connect",

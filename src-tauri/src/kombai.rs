@@ -16,6 +16,7 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(feature = "desktop")]
 use tauri::State;
 
 #[derive(Default)]
@@ -69,7 +70,7 @@ impl KombaiManager {
         let _start_guard = StartGuard(&self.starting);
 
         let cfg = config.clone();
-        let (child, message) = tauri::async_runtime::spawn_blocking(
+        let (child, message) = tokio::task::spawn_blocking(
             move || -> Result<(Child, Option<String>), String> {
                 if find_binary(&cfg.code_server_command).is_none() {
                     return Err(format!(
@@ -125,7 +126,7 @@ impl KombaiManager {
     pub async fn install_extension(&self) -> Result<KombaiStatus, String> {
         let config = load_settings_for_terminal()?.kombai;
         let cfg = config.clone();
-        let message = tauri::async_runtime::spawn_blocking(move || -> Option<String> {
+        let message = tokio::task::spawn_blocking(move || -> Option<String> {
             if find_binary(&cfg.code_server_command).is_none() {
                 return Some(format!(
                     "code-server introuvable ({}).",
@@ -352,11 +353,13 @@ fn status_snapshot(
     }
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn kombai_status(state: State<'_, KombaiManager>) -> Result<KombaiStatus, String> {
     state.status()
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn kombai_start(
     state: State<'_, KombaiManager>,
@@ -365,11 +368,13 @@ pub async fn kombai_start(
     state.start(project_dir).await
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn kombai_stop(state: State<'_, KombaiManager>) -> Result<KombaiStatus, String> {
     state.stop()
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn kombai_install_extension(
     state: State<'_, KombaiManager>,

@@ -1,7 +1,8 @@
 # Codex Switch Terminal
 
-Application Tauri + xterm.js pour utiliser plusieurs comptes Codex ou Claude,
-ouvrir des chats et lancer des terminaux dans un projet choisi.
+Application Tauri + xterm.js pour utiliser plusieurs comptes Codex, Claude ou
+des fournisseurs API pilotes par OpenCode, ouvrir des chats et lancer des
+terminaux dans un projet choisi.
 
 ## Principe
 
@@ -21,6 +22,8 @@ classique, sans protocole interne supplementaire.
 - Node.js 20+
 - Rust et Cargo via rustup
 - Codex CLI ou Claude CLI disponible dans le `PATH`
+- OpenCode dans le `PATH` pour Z.ai, MiniMax, DeepSeek et OpenRouter :
+  `npm install -g opencode-ai`
 
 ## Demarrage desktop
 
@@ -67,6 +70,10 @@ n'est necessaire.
 ## Comptes et environnements
 
 - Les comptes Codex sont des dossiers utilises comme `CODEX_HOME`.
+- Les comptes Claude Code utilisent un `CLAUDE_CONFIG_DIR` isole.
+- Z.ai, MiniMax, DeepSeek et OpenRouter passent par OpenCode. Chaque compte
+  recoit ses propres repertoires XDG : les cles API, la configuration, le cache
+  et les sessions ne sont pas partages entre comptes.
 - L'application detecte les dossiers `~\.codex*` contenant `auth.json` ou
   `config.toml`.
 - Les profils proxy sont lus depuis les fichiers `proxy.txt` de ces dossiers.
@@ -76,6 +83,34 @@ n'est necessaire.
   chat ou un terminal.
 - Les reglages de l'application sont stockes dans
   `%APPDATA%\codex-switch-terminal\settings.json`.
+
+## Studio IA : images et videos generatives
+
+L'onglet **Studio IA** genere des videos depuis un texte ou une image avec Wan
+2.6, Veo 3.1 Fast, Kling 3.0 ou Luma Ray 2. Il genere aussi des images avec FLUX
+2 Flash, Ideogram V3 ou Recraft V3. Les generations sont placees dans une file
+d'attente, restent suivies lorsque tu changes d'onglet et apparaissent dans des
+historiques locaux avec apercu et ouverture du resultat.
+
+Le studio utilise [fal.ai](https://fal.ai/) comme passerelle. Dans **Gerer les
+comptes**, ajoute une ou plusieurs cles fal personnelles ou d'equipe, choisis le
+compte actif et, si besoin, definis le compte par defaut. Les mots de passe
+Google, Kling, Luma ou Alibaba ne sont jamais demandes. Les cles sont validees
+par le backend, stockees dans `creative-accounts.json` cote application/serveur
+et ne sont jamais renvoyees au navigateur.
+
+Pour un deploiement administre, une cle d'environnement peut aussi servir de
+compte de secours :
+
+```powershell
+$env:CST_FAL_KEY = "identifiant:secret"
+npm run dev
+```
+
+Sur un serveur Linux, ajoute `CST_FAL_KEY` au fichier d'environnement du
+service. Chaque utilisateur web authentifie dispose de sa propre liste de
+comptes creatifs. Chaque generation est facturee par fal.ai selon le moteur et
+les options selectionnes.
 
 ### Memoire des chats
 
@@ -97,6 +132,11 @@ ouvre un terminal avec ce compte, puis lance :
 ```powershell
 codex login
 ```
+
+Pour un fournisseur annexe, choisis Z.ai, MiniMax, DeepSeek ou OpenRouter dans
+la page **Comptes**. L'application ouvre automatiquement la commande OpenCode
+`auth login --provider <fournisseur>` dans le home isole du nouveau compte ; la
+cle API n'est jamais copiee dans `settings.json`.
 
 ## Fonctionnalites principales
 
@@ -215,6 +255,31 @@ journal. L'agent peut proposer des souvenirs via `AUTONOMOUS_MEMORY:` ; ils sont
 dedupliques, limites et reinjectes dans les tours suivants. L'utilisateur peut
 aussi ajouter ou supprimer ces souvenirs depuis la carte de l'agent.
 
+Chaque compte rendu public devient aussi un resultat durable dans un historique
+borne aux 24 derniers tours : un nouveau passage ne peut donc plus ecraser une
+proposition que l'utilisateur n'a pas encore lue. Les resultats non lus sont
+prioritaires dans le moniteur, signales dans les navigations desktop et mobile,
+et regroupes dans une boite de reception sur la page **Agents autonomes**. Le
+bouton **Marquer comme lu** synchronise maintenant cet etat avec le moteur ; le
+rapport reste conserve dans l'historique de l'agent. Lors de la migration,
+l'ancien `lastSummary` est transforme en rapport afin de remettre en evidence
+les resultats deja manques.
+
+Ces comptes rendus sont rediges pour un lecteur humain : ils mettent en avant le
+resultat, les changements importants, les blocages, les decisions attendues et
+la prochaine action utile. Les identifiants internes, horodatages bruts et
+autres metadonnees de pilotage restent dans le moteur, sauf detail indispensable
+a une decision ou a une verification humaine.
+
+Un agent peut aussi remettre zero ou plusieurs actions structurees avec
+`AUTONOMOUS_PROPOSAL: titre | mission`. Elles sont dedupliquees et conservees
+dans le nouvel onglet **Propositions**. Le bouton **Executer** cree directement
+un agent dedie avec le meme compte et le meme projet ; la review humaine est
+activee pour que la proposition n'autorise jamais, a elle seule, une
+modification. Le lien avec l'agent lance est persistant et empeche une double
+execution depuis un autre client. Le modele **Radar projet** publie ses idees
+actionnables avec ce protocole, et ses anciennes lignes `IDEE:` sont migrees.
+
 Un chat ordinaire peut aussi servir de point de depart : le bouton
 **Autonomiser** de son bandeau ouvre une configuration pre-remplie avec le
 compte, l'environnement, le dernier objectif et un extrait borne du contexte
@@ -226,14 +291,41 @@ nom, son role, son objectif, sa frequence, ses garde-fous, ses connecteurs et sa
 commande de validation sans quitter le chat. Si un cycle est deja en cours,
 l'editeur propose d'abord une mise en pause explicite.
 
-Sur la version web, le chat dispose aussi nativement de l'outil MCP
-`create_autonomous_agent`. Une demande explicite comme « cree un agent autonome
-qui surveille les regressions toutes les heures » conduit donc le modele a
-appeler lui-meme l'outil, sans renvoyer vers le formulaire. Une capacite
-ephemere lie chaque appel au compte, au modele, au dossier et au chat courants ;
-le nouvel agent apparait ensuite automatiquement dans le bandeau de cette
-conversation. Les questions purement explicatives ne declenchent aucune
-creation.
+Sur la version web, le chat dispose aussi nativement des outils MCP
+`create_autonomous_agent`, `update_autonomous_agent`, `pause_autonomous_agent`,
+`activate_supervisor_general_report` et `apply_autonomous_agent_policy`. Une demande explicite
+comme « cree un agent autonome qui surveille les regressions toutes les heures »
+conduit donc le modele a creer lui-meme l'agent, sans renvoyer vers le formulaire.
+Dans le meme chat, « passe-le a un cycle toutes les deux heures et renomme-le
+Sentinelle » modifie directement l'agent lie. « Mets-le en pause » interrompt
+son cycle ou sa validation en cours et retire sa prochaine planification ;
+l'agent reste en pause jusqu'a sa reprise explicite depuis l'interface. Une
+demande repetee reussit sans modifier davantage son etat. Le modele ne recoit
+aucun champ permettant de choisir un identifiant arbitraire : une capacite ephemere lie
+chaque appel au compte, au dossier et au chat courants, puis le serveur retrouve
+l'agent concerne. Les champs non cites conservent leur valeur, et un agent actif
+est securise pendant l'ecriture avant de reprendre son activite. Le nouvel etat
+apparait automatiquement dans le bandeau de la conversation. Les questions
+purement explicatives ne declenchent aucune action.
+
+Depuis n'importe quel chat, « active le compte rendu general du superviseur »
+declenche directement le passage correspondant, sans identifiant d'agent. Le
+superviseur reserve un lot de comptes rendus non lus, en publie une synthese
+unique sous les priorites **critique**, **haute**, **moyenne** et **basse**, puis
+marque les sources comme traitees seulement si cette synthese a bien ete
+enregistree. L'accuse interne qui confirme les sources traitees est separe du
+texte public et n'affiche donc aucun identifiant dans le compte rendu. Un echec conserve le lot non lu pour la tentative suivante ; un
+retard superieur a la taille d'un lot est draine par des passages successifs.
+
+Une regle commune peut aussi etre ajoutee depuis n'importe quel chat aux agents
+deja actifs qui utilisent la review humaine, meme si ce chat n'a cree aucun
+agent. Par defaut, la commande cible uniquement les agents non systeme du meme
+compte et du projet courant ; la portee au compte entier doit etre demandee
+explicitement. La regle est ajoutee a leur memoire durable sans remplacer leurs
+objectifs, roles ou frequences, les anciennes autorisations sont invalidees et
+les cycles en cours sont interrompus puis relances proprement. Une politique
+visuelle peut ainsi imposer une capture ou maquette fidele avant autorisation,
+puis une capture du rendu reel et une comparaison explicite avant de conclure.
 
 Chaque boucle commence aussi par un cycle de pilotage : l'agent decide quelles
 informations meritent la memoire durable, segmente l'objectif en domaines et en
@@ -277,6 +369,13 @@ propre, que `origin/<branche>` ne pointe pas sur le commit local, ou que
 `dist/index.html` et ses assets ne sont pas ceux effectivement servis. La cible
 peut etre remplacee avec `CST_PUBLISH_SITE_URL`.
 
+Le publieur utilise une fenetre exclusive par projet : tant qu'un autre agent
+demarre un tour, travaille ou valide dans le meme dossier, son reveil et son
+demarrage restent en attente. Inversement, lorsqu'une publication est prete ou
+en cours, le moteur ne demarre pas un nouveau tour concurrent dans ce projet.
+Le modele attend aussi 120 secondes de stabilite des fichiers afin de ne pas
+publier une sauvegarde intermediaire.
+
 Pour eviter qu'un premier reveil publie des changements preexistants, cette
 permission ne peut etre armee que depuis une branche propre possedant un remote
 `origin`. La permission **Autoriser le push GitHub
@@ -289,10 +388,20 @@ evenementiels.
 
 Des qu'au moins un agent utilisateur est actif ou passe en **Attention
 requise**, le moteur cree aussi un **Superviseur des agents autonomes** gere par
-le systeme. Il recoit un etat borne de toute la flotte, lance un premier controle
-immediat puis revient toutes les heures. Il repare automatiquement les
-incoherences de planification, diagnostique les erreurs et validations echouees,
-et peut corriger dans le dossier projet les bugs logiciels confirmes. Il ne
+le systeme. Il recoit un etat borne de toute la flotte, lit la memoire durable,
+le carnet, les preuves, le journal et l'activite directe de chaque agent, lance
+un premier controle immediat puis revient toutes les heures. Il compile aussi
+tous les nouveaux comptes rendus non lus dans un **compte rendu general** classe
+par priorite, visible comme resultat propre du superviseur. Il repare
+automatiquement les incoherences de planification, diagnostique les erreurs et
+validations echouees, et peut corriger dans le dossier projet les bugs logiciels
+confirmes. Apres un redemarrage, le superviseur garde la priorite et les agents
+en retard sont repris avec un decalage de dix secondes entre eux, afin d'eviter
+une relance simultanee de toute la flotte. S'il prouve qu'un agent tarde a agir, repete le meme travail ou se
+perd dans un detail marginal, il inscrit une consigne **Superviseur** dans sa
+memoire et planifie une reprise alignee sur l'objectif principal. Une
+reorientation forte peut interrompre un tour enlise depuis au moins vingt
+minutes, mais jamais un test en cours. Il ne
 modifie jamais directement le fichier d'etat, ne contourne aucune review et ne
 reprend pas un agent volontairement mis en pause ou termine. Sa configuration
 est protegee dans l'interface ; il se met en veille quand aucun agent utilisateur
@@ -331,6 +440,62 @@ l'hote serveur dans le `CODEX_HOME` du compte selectionne, pas seulement dans
 le navigateur client. Les comptes Claude ne chargent pas ces connecteurs
 Codex.
 
+### Paiements confirmes par l'utilisateur
+
+Un agent autonome peut maintenant preparer une demande de paiement sans jamais
+recevoir de carte, de compte bancaire, de wallet ou de secret. Lorsqu'une
+depense est indispensable, il s'arrete et remet une ligne structuree :
+
+```text
+AUTONOMOUS_PAYMENT: order-42 | 1299 | EUR | Marchand | Abonnement mensuel | https://checkout.example/pay/order-42
+```
+
+Le montant est exprime dans la plus petite unite de la devise (`1299` =
+`12,99 EUR`). Le moteur accepte uniquement un checkout HTTPS public, sans
+identifiants dans l'URL, refuse les destinations locales ou privees et conserve
+un journal borne des demandes. Une reference deja confirmee ne peut pas etre
+representee comme un nouveau paiement avec des details differents.
+
+Dans le moniteur, l'utilisateur voit separement le montant, le marchand, la
+reference et le domaine, puis utilise un seul bouton **Payer**. L'action
+`authorizePayment` est auditee et liee a l'identifiant exact de la demande ;
+une vue perimee est refusee. Elle journalise seulement que le checkout a ete
+lance, ouvre le navigateur et planifie une verification autonome du recu apres
+90 secondes. Le clic n'est jamais transforme en preuve de debit, ne debloque
+ni les ecritures Gmail/Agenda ni une review de code et ne permet pas de relancer
+le meme paiement. Un refus reste disponible comme action de securite.
+
+Sur Android, chaque agent peut aussi activer **Notifications dans l'app mobile**.
+Firebase Cloud Messaging transmet alors ses nouveaux comptes rendus et ses
+alertes importantes ; un toucher recharge l'etat du serveur et ouvre directement
+le moniteur du bon agent. Le contenu reste masque sur l'ecran verrouille.
+
+Un blocage de paiement peut produire un **handoff mobile** via le meme canal.
+La notification affiche uniquement l'agent, le marchand et le
+montant ; elle ne contient ni URL de checkout, ni carte, ni secret. Un toucher
+ouvre l'app sur l'agent et l'identifiant exact de la demande est reverifie sur
+le serveur avant d'afficher le bouton unique **Payer**. Ce clic autorise et
+ouvre la page du marchand ; l'utilisateur choisit Google Pay si ce marchand le propose, puis termine
+Google Pay, 3D Secure ou toute autre verification dans l'interface du marchand.
+L'agent reprend ensuite pour verifier le recu sans supposer que le paiement a
+reussi. La notification ne contourne donc jamais le geste utilisateur exige
+par le wallet ou la banque. L'activation FCM est decrite dans `android/README.md`.
+Sur l'app Android, tout se configure depuis la carte **Notifications mobiles**
+des Parametres en collant les deux JSON Firebase ; aucun secret
+n'est ensuite reaffiche dans l'interface.
+La carte distincte **Compte Google Pay** verifie via l'API Google Pay si un
+moyen compatible est deja present sur le telephone et ouvre la gestion
+officielle Google Wallet. Codex Terminal ne collecte aucun compte Google ni
+aucune donnee de carte ; le compte et le moyen de paiement restent choisis dans
+la feuille securisee du marchand.
+
+Ce premier socle est volontairement independant du prestataire et ne declenche
+aucun debit cote serveur. Il pourra accueillir ensuite un adaptateur Agentic
+Commerce Protocol ou Universal Commerce Protocol avec un gestionnaire de
+paiement tokenise et borne, lorsqu'un marchand compatible sera configure, sans
+changer le contrat de confirmation humaine ni exposer les donnees de paiement
+au modele.
+
 Sur le site web `:8080`, ouvre **Agents autonomes**, puis **Creer un agent
 autonome** : les cases **Gmail** et **Google Agenda** sont affichees dans la
 section **Services Google**. Le navigateur envoie uniquement la liste des
@@ -343,7 +508,8 @@ l'hote `cst-server`.
   `deploy/codex-switch-terminal.service` (ou la tache planifiee Windows du
   noeud local).
 - Mettre un agent en pause arrete son tour courant. La reprise le replanifie
-  immediatement.
+  immediatement. Depuis la liste, **Tout mettre en pause** suspend en une fois
+  tous les agents utilisateur actifs, sans interrompre le superviseur systeme.
 - Le moteur n'autorise pas implicitement les actions externes irreversibles :
   l'agent doit demander une intervention humaine lorsqu'une autorisation, un
   secret ou une decision est indispensable.
@@ -357,6 +523,14 @@ l'hote `cst-server`.
 La vue **Chats orchestres** est separee des conversations ordinaires et des
 agents autonomes 24/7. Elle construit une feature avec une equipe de chats et
 un protocole de validation impose :
+
+Dans un chat ordinaire, l'interrupteur **Orchestration auto** du compositeur
+active un routage par demande. Le modele traite directement les questions et
+les travaux simples ; lorsqu'une realisation gagne vraiment a etre decomposee,
+il rend une decision structuree et l'application lance aussitot le chat
+orchestrateur et ses workers. Le choix est memorise separement pour chaque chat.
+La validation automatique reprend la commande configuree dans la vue orchestree
+ou, a defaut, `git diff --check`.
 
 1. un chat orchestrateur inspecte le projet et produit un plan structure ;
 2. chaque partie du plan devient un chat travailleur distinct ;
@@ -511,22 +685,39 @@ npm run clean
 
 ### VPS prive via SSH
 
-Le premier flux VPS automatise l'installation sur Ubuntu/Debian par SSH et SCP,
-laisse le runtime des chats lie a `127.0.0.1` sur le serveur, puis ouvre le
+Pour choisir une offre gratuite encore valable et creer la VM avec une taille
+realiste pour plusieurs chats, suis d'abord le guide
+[VPS gratuits](docs/free-vps.md). Il recommande actuellement une instance
+Oracle Cloud Ampere A1 Always Free de 2 OCPU et 12 Go, puis reutilise le flux
+SSH ci-dessous sans publier le port applicatif.
+
+Le flux recommande utilise Ansible et Docker Compose. Il copie le projet et les
+comptes au premier passage, laisse le runtime lie a `127.0.0.1`, puis ouvre le
 client desktop au travers d'un tunnel SSH :
 
 ```powershell
-npm run deploy:vps -- -SshTarget ubuntu@IP_DU_VPS -IdentityFile "$HOME\.ssh\id_ed25519" -NodeId vps-paris
+npm run deploy:vps:portable -- -SshTarget ubuntu@IP_DU_VPS -IdentityFile "$HOME\.ssh\id_ed25519" -NodeId vps-paris
+npm run deploy:vps:pool -- -Config config/oracle-vps-pool.json -PreflightOnly
 npm run connect:vps -- -Profile vps-paris
+npm run connect:vps:pool -- -Profiles vps-paris,vps-secondaire -PrimaryProfile vps-paris
 ```
+
+L'onglet web **VPS** propose aussi un assistant Google Cloud. Il ouvre la
+connexion et l'activation de l'essai sur les pages officielles Google, puis cree
+une VM europeenne et y deploie automatiquement la meme pile portable. CST ne
+recoit jamais le mot de passe, le MFA ni les informations bancaires.
 
 Le premier deploiement peut aussi enchainer directement la connexion avec
 `-Connect`. La cible SSH accepte `root`, ou un utilisateur avec `sudo` sans mot
 de passe. Les projets distants sont isoles dans `/srv/cst/workspaces`.
 
-Aucun port applicatif n'est publie sur Internet dans ce mode. Le guide
-[VPS via SSH](docs/vps-ssh.md) detaille les prerequis, la copie optionnelle des
-comptes, les mises a jour et le diagnostic.
+La modale **Nouveau chat** permet aussi d'imposer un noeud, par exemple
+**Oracle Free**, ou de garder le choix automatique du VPS sain le moins charge.
+La session reste ensuite sur ce VPS. Aucun port applicatif n'est publie sur
+Internet. Le guide [Ansible + Docker Compose](docs/portable-vps.md) couvre le
+chemin portable et l'image multi-architecture ; le guide
+[VPS via SSH](docs/vps-ssh.md) conserve le deploiement natif historique et le
+diagnostic du tunnel.
 
 ### Installation manuelle
 
@@ -536,6 +727,51 @@ Copie `deploy/cst-server.env.example` vers
 - `CST_PUBLIC_BASE_URL` ;
 - `CST_ADMIN_TOKEN` ;
 - `CST_GIT_PAT` si des depots prives doivent etre clones.
+
+### Comptes utilisateurs et connexion Google
+
+Le serveur web demande maintenant un compte utilisateur. Au premier lancement,
+cree le compte proprietaire depuis l'ecran d'inscription. Les mots de passe sont
+haches avec Argon2 et le fichier persistant `user-auth.json` ne contient que des
+hashes de mots de passe et de jetons de session. Le secret `CST_ADMIN_TOKEN`
+reste reserve aux scripts de maintenance et aux anciens clients techniques.
+
+Les inscriptions sont ouvertes par defaut. Le premier compte reste creatable
+meme si elles sont fermees, afin d'initialiser une nouvelle installation. Apres
+la creation du compte proprietaire, utilise :
+
+```bash
+CST_ALLOW_REGISTRATION=false
+```
+
+Cette option bloque aussi la creation d'un nouvel utilisateur via Google ; un
+compte Google deja lie continue de fonctionner.
+
+Pour activer Google, cree dans Google Cloud un client OAuth 2.0 de type
+**Application Web**, puis ajoute exactement cette URI aux URI de redirection
+autorisees :
+
+```text
+https://VOTRE_DOMAINE/api/auth/google/callback
+```
+
+Configure ensuite le serveur :
+
+```bash
+CST_GOOGLE_CLIENT_ID="...apps.googleusercontent.com"
+CST_GOOGLE_CLIENT_SECRET="GOCSPX-..."
+# Facultatif si CST_PUBLIC_BASE_URL est correcte :
+CST_GOOGLE_REDIRECT_URI="https://VOTRE_DOMAINE/api/auth/google/callback"
+```
+
+Le bouton Google apparait uniquement lorsque l'identifiant et le secret sont
+presents. Le serveur fournit aussi au frontend l'URL de demarrage OAuth associee
+a l'origine du callback : un acces direct par `127.0.0.1:8080` bascule ainsi
+proprement vers l'URL publique HTTPS avant de contacter Google. Le callback
+utilise le flux serveur avec `state`, PKCE et les scopes
+`openid email profile`; seules les adresses Google verifiees sont acceptees.
+Avec une URL publique HTTPS, les cookies de session recoivent automatiquement
+l'attribut `Secure`.
 
 Lancement manuel :
 
@@ -548,15 +784,44 @@ export CST_PUBLIC_BASE_URL="http://IP_DE_LA_VM:8080"
 
 Le frontend compile doit etre place dans `dist/` a cote du binaire serveur.
 
-## Mobile
+### Dockeriser n'importe quel dépôt Git
 
-Le client web est installable en PWA. Les projets Tauri mobiles peuvent etre
-initialises avec :
+Un lien Git suffit pour analyser un projet, réutiliser ou générer son
+`Dockerfile`, construire une image exportable et, si souhaité, la lancer par
+SSH sur un VPS `amd64` ou `arm64` :
 
 ```powershell
-npx tauri android init
-npx tauri ios init
+npm run dockerize:git -- https://github.com/organisation/projet.git
 ```
 
-Android necessite Android Studio et le SDK Android. iOS necessite macOS, Xcode
-et un compte Apple Developer pour une distribution signee.
+Le même flux est sélectionnable dans **Choisir un environnement → Depuis Git / Docker** pour créer et activer directement un nouvel environnement depuis l'URL.
+
+Le déploiement direct utilise `--deploy utilisateur@hote`. Le guide
+[Dockerize Git](docs/dockerize-git.md) décrit le paquet portable, les stacks
+détectées, les secrets, les monorepos et la construction native sur le VPS.
+
+## Mobile
+
+Le client web reste installable en PWA. Le depot contient aussi deux coques
+natives WebView qui se connectent au meme `cst-server` sans embarquer le moteur
+Rust sur le telephone :
+
+- `android/` : Android 7.0+ (API 24), cible Android 16/API 36 ;
+- `ios/` : iOS et iPadOS 15+.
+
+Sous Windows, Android Studio et son SDK suffisent pour produire un APK debug
+signe et directement installable :
+
+```powershell
+npm run test:android
+npm run build:android
+# -> CodexTerminal-debug.apk
+```
+
+Le build Android execute les tests frontend, le lint natif, Gradle et la
+verification de signature. La coque gere le clavier, les zones sures, les
+fichiers, le micro/camera, les telechargements et un ecran natif de reconnexion.
+Le token du pont natif est chiffre avec Android Keystore et les sauvegardes de
+l'application sont exclues. Voir [android/README.md](android/README.md).
+
+iOS necessite macOS et Xcode ; voir [ios/README.md](ios/README.md).

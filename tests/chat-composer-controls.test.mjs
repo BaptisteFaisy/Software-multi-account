@@ -5,14 +5,15 @@ import test from "node:test";
 const view = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
 const agentTools = readFileSync(new URL("../src/chat/agent-tools.ts", import.meta.url), "utf8");
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+const skillsView = readFileSync(new URL("../src/skills-view.ts", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 const platform = readFileSync(new URL("../src/platform.ts", import.meta.url), "utf8");
 const chatBackend = readFileSync(new URL("../src-tauri/src/chat.rs", import.meta.url), "utf8");
 const backendTools = readFileSync(new URL("../src-tauri/src/chat_tools.rs", import.meta.url), "utf8");
 
 test("le compositeur de chat n'affiche plus de selecteur de compte", () => {
-  // Le compte est fige par conversation : on le choisit dans la modale
-  // « Nouveau chat », plus dans la barre du compositeur.
+  // Le compte est route automatiquement pour la conversation ; une preference
+  // facultative existe dans la modale, jamais dans la barre du compositeur.
   assert.doesNotMatch(view, /chat-account-select/);
   assert.doesNotMatch(view, /data-chat-control="account"/);
   assert.doesNotMatch(view, /id="\$\{id\("chatAccount"\)\}"/);
@@ -47,6 +48,26 @@ test("les options d'intensite du chat derivent du catalogue du modele", () => {
   // qui privilegie les efforts annonces par le catalogue du modele.
   assert.match(main, /reasoningEffortOptions: chatReasoningEffortOptions\(account, selectedModel\)/);
   assert.match(main, /chatCatalogModel\(account, model\)\?\.supportedReasoningEfforts/);
+});
+
+test("les parametres peuvent verrouiller les trois selecteurs du chat", () => {
+  assert.match(main, /id="chatSelectorSettingsTitle">Sélecteurs dans les chats/);
+  assert.match(main, /data-chat-composer-selectors="enabled"/);
+  assert.match(main, /data-chat-composer-selectors="disabled"/);
+  assert.match(
+    main,
+    /localStorage\.setItem\(CHAT_COMPOSER_SELECTORS_STORAGE_KEY, String\(enabled\)\)/,
+  );
+  assert.match(main, /composerSelectorsEnabled: chatComposerSelectorsEnabled/);
+  assert.match(view, /busy \|\| !model\.composerSelectorsEnabled \? "disabled" : ""/);
+  assert.match(
+    view,
+    /!model\.selectedAccountId \|\| !model\.composerSelectorsEnabled \? "disabled" : ""/,
+  );
+  assert.match(
+    view,
+    /!model\.supportsReasoningEffort \|\| !model\.composerSelectorsEnabled \? "disabled" : ""/,
+  );
 });
 
 test("la saisie et l'envoi restent disponibles pendant que l'agent travaille", () => {
@@ -133,7 +154,8 @@ test("chaque message capture les outils actifs et les transmet au moteur", () =>
   assert.match(main, /enabledTools: \[\.\.\.chatEnabledTools\]/);
   assert.match(main, /enabledTools: \[\.\.\.pane\.enabledTools\]/);
   assert.match(main, /agentSkills: chatAgentSkillPrompts\(chatEnabledTools\)/);
-  assert.match(main, /agentSkills: chatAgentSkillPrompts\(pane\.enabledTools\)/);
+  assert.match(main, /\.\.\.chatAgentSkillPrompts\(pane\.enabledTools\)/);
+  assert.match(main, /\.\.\.\(automaticOrchestration \? \[automaticOrchestrationRoutingSkill\(pane\.mode\)\] : \[\]\)/);
   assert.match(main, /agentTools: submission\.enabledTools\.filter\(isChatAgentModeId\)/);
   assert.match(main, /agentSkills: submission\.agentSkills/);
   assert.match(main, /migratePersistedChatAgentTools\(persisted\)/);
@@ -158,9 +180,9 @@ test("les consignes des modes et des skills restent invisibles dans le message u
 
 test("la vue Skills permet d'ajouter et retirer chaque bouton de toutes les fenetres", () => {
   assert.match(main, /CHAT_SKILL_BUTTONS_STORAGE_KEY/);
-  assert.match(main, /data-skill-chat-button/);
+  assert.match(skillsView, /data-skill-chat-button/);
   assert.match(main, /toggleSkillChatButton/);
-  assert.match(main, /Ajouter aux chats/);
-  assert.match(main, /Retirer des chats/);
+  assert.match(skillsView, /Ajouter aux chats/);
+  assert.match(skillsView, /Retirer des chats/);
   assert.match(main, /persistChatSkillButtonIds/);
 });

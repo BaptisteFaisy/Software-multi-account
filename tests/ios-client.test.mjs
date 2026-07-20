@@ -31,6 +31,18 @@ test("the iOS native bridge matches the web platform contract", async () => {
   assert.match(platform, /nativeWindow\.CstIOS \?\? nativeWindow\.CstAndroid/);
 });
 
+test("iOS targets the VPS and migrates the former PC route once", async () => {
+  const [controller, info] = await Promise.all([
+    read("ios/CodexTerminal/WebViewController.swift"),
+    read("ios/CodexTerminal/Info.plist"),
+  ]);
+
+  assert.match(info, /https:\/\/cst-google-trial\.tail3a8bdf\.ts\.net/);
+  assert.match(controller, /fallbackBaseURL = "https:\/\/cst-google-trial\.tail3a8bdf\.ts\.net"/);
+  assert.match(controller, /legacyPCBaseURL = "https:\/\/pc-fixe-cst\.tail3a8bdf\.ts\.net"/);
+  assert.match(controller, /vpsRouteMigrationKey/);
+});
+
 test("iOS keeps the admin token in Keychain and limits insecure networking", async () => {
   const [keychain, info, privacy, controller] = await Promise.all([
     read("ios/CodexTerminal/KeychainTokenStore.swift"),

@@ -32,7 +32,7 @@ test("le backend purge a l'ouverture comme a la sauvegarde sans toucher aux anci
 test("un home expire ne reapparait pas par auto-detection et ses fichiers sont conserves", () => {
   assert.match(settingsBackend, /pub expired_unconnected_account_homes: Vec<String>,/);
   assert.match(settingsBackend, /if expired_homes\.contains\(&normalized\)/);
-  assert.match(settingsBackend, /if Provider::Codex\.has_auth\(&path\)/);
+  assert.match(settingsBackend, /if Provider::Codex\.has_auth\(&path, None\)/);
   const cleanupStart = settingsBackend.indexOf("fn remove_expired_unconnected_accounts");
   const cleanupEnd = settingsBackend.indexOf(
     "fn clear_expired_home_tombstones_for_registered_accounts",

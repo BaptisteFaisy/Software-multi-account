@@ -6,6 +6,9 @@ final class WebViewController: UIViewController {
     private enum NativeConfig {
         static let baseURLKey = "codex-switch-terminal.remote.base-url"
         static let bundledBaseURLKey = "CSTServerURL"
+        static let vpsRouteMigrationKey = "codex-switch-terminal.vps-route-migrated-20260720"
+        static let legacyPCBaseURL = "https://pc-fixe-cst.tail3a8bdf.ts.net"
+        static let fallbackBaseURL = "https://cst-google-trial.tail3a8bdf.ts.net"
         static let configMessage = "cstConfig"
         static let settingsMessage = "cstSettings"
     }
@@ -176,9 +179,23 @@ final class WebViewController: UIViewController {
 
     private func configuredServerURL() -> URL? {
         let defaults = UserDefaults.standard
-        let saved = defaults.string(forKey: NativeConfig.baseURLKey)
         let bundled = Bundle.main.object(forInfoDictionaryKey: NativeConfig.bundledBaseURLKey) as? String
-        return normalizedServerURL(saved ?? bundled ?? "https://pc-fixe-cst.tail3a8bdf.ts.net")
+        let bundledURL = normalizedServerURL(bundled ?? NativeConfig.fallbackBaseURL)
+
+        if !defaults.bool(forKey: NativeConfig.vpsRouteMigrationKey) {
+            let savedURL = defaults.string(forKey: NativeConfig.baseURLKey)
+                .flatMap(normalizedServerURL)
+            if savedURL?.absoluteString == NativeConfig.legacyPCBaseURL,
+               let bundledURL
+            {
+                defaults.set(bundledURL.absoluteString, forKey: NativeConfig.baseURLKey)
+            }
+            defaults.set(true, forKey: NativeConfig.vpsRouteMigrationKey)
+        }
+
+        let savedURL = defaults.string(forKey: NativeConfig.baseURLKey)
+            .flatMap(normalizedServerURL)
+        return savedURL ?? bundledURL
     }
 
     private func normalizedServerURL(_ rawValue: String) -> URL? {

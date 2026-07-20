@@ -1,0 +1,23 @@
+name: codex-switch-terminal
+
+services:
+  cst:
+    image: {{ cst_effective_image | to_json }}
+    container_name: codex-switch-terminal
+    restart: unless-stopped
+    init: true
+    env_file:
+      - /etc/codex-switch-terminal/cst.env
+    ports:
+      - "127.0.0.1:{{ cst_remote_port }}:8080"
+    volumes:
+      - /srv/cst:/srv/cst
+    stop_grace_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 4s
+      start_period: 20s
+      retries: 8

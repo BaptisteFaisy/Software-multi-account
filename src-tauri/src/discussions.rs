@@ -40,14 +40,15 @@
 use crate::account_usage::collect_rollouts;
 use crate::metrics;
 use crate::settings::{self, expand_home, AccountProfile, AppSettings};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Mutex, OnceLock},
     thread,
     time::UNIX_EPOCH,
@@ -55,6 +56,12 @@ use std::{
 
 const TITLE_MAX_CHARS: usize = 80;
 const PREVIEW_MAX_CHARS: usize = 200;
+const CUSTOM_TITLES_FILE: &str = ".cst-discussion-titles.json";
+const DISCUSSION_COPY_BUFFER_BYTES: usize = 256 * 1024;
+// Meme reserve fixe que Codex pour son indicateur de contexte : instructions,
+// outils et marge necessaire a une compaction ne sont pas controlables par
+// l'utilisateur et sont donc retires du pourcentage de pression affiche.
+const CODEX_CONTEXT_BASELINE_TOKENS: u64 = 12_000;
 
 /// Construit un titre a partir du sens de la demande. Les agents Codex et
 /// Claude reformulent generalement la tache dans leur premier message de
@@ -131,6 +138,7 @@ struct CachedDashboard {
 
 static SUMMARY_CACHE: OnceLock<Mutex<HashMap<SummaryCacheKey, CachedSummary>>> = OnceLock::new();
 static DASHBOARD_CACHE: OnceLock<Mutex<Option<CachedDashboard>>> = OnceLock::new();
+static CUSTOM_TITLES_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn summary_cache() -> &'static Mutex<HashMap<SummaryCacheKey, CachedSummary>> {
     SUMMARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -138,6 +146,10 @@ fn summary_cache() -> &'static Mutex<HashMap<SummaryCacheKey, CachedSummary>> {
 
 fn dashboard_cache() -> &'static Mutex<Option<CachedDashboard>> {
     DASHBOARD_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn custom_titles_write_lock() -> &'static Mutex<()> {
+    CUSTOM_TITLES_WRITE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +204,44 @@ pub struct DiscussionSummary {
     pub cli_version: Option<String>,
 }
 
+/// Mesure de la fenetre de contexte courante, distincte du cumul de tokens
+/// factures sur toute la discussion (`DiscussionSummary::total_tokens`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscussionContextUsage {
+    pub used_tokens: u64,
+    pub context_window: u64,
+    pub remaining_tokens: u64,
+    pub used_percent: u8,
+}
+
+impl DiscussionContextUsage {
+    pub(crate) fn from_counts(used_tokens: u64, context_window: u64) -> Option<Self> {
+        if context_window == 0 {
+            return None;
+        }
+        let used_percent = if context_window <= CODEX_CONTEXT_BASELINE_TOKENS {
+            100
+        } else {
+            let effective_window = context_window - CODEX_CONTEXT_BASELINE_TOKENS;
+            let effective_used = used_tokens
+                .saturating_sub(CODEX_CONTEXT_BASELINE_TOKENS)
+                .min(effective_window);
+            let remaining = effective_window - effective_used;
+            let remaining_percent = (((remaining as u128) * 100 + (effective_window as u128 / 2))
+                / effective_window as u128)
+                .min(100) as u8;
+            100_u8.saturating_sub(remaining_percent)
+        };
+        Some(Self {
+            used_tokens,
+            context_window,
+            remaining_tokens: context_window.saturating_sub(used_tokens),
+            used_percent,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteDiscussionResult {
@@ -207,9 +257,9 @@ pub struct DeleteDiscussionResult {
 // (a) list_discussions
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn list_discussions() -> Result<DiscussionsDashboard, String> {
-    tauri::async_runtime::spawn_blocking(list_discussions_dashboard)
+    tokio::task::spawn_blocking(list_discussions_dashboard)
         .await
         .map_err(|error| error.to_string())?
 }
@@ -285,6 +335,7 @@ fn discussions_revision_for_settings(settings: &AppSettings) -> u64 {
         for file in files {
             hash_file_revision(&file, &mut hasher);
         }
+        hash_file_revision(&home.join(CUSTOM_TITLES_FILE), &mut hasher);
     }
 
     hasher.finish()
@@ -324,6 +375,14 @@ fn discussion_files(home: &Path, provider: settings::Provider) -> Vec<PathBuf> {
                 }));
             }
             files
+        }
+        settings::Provider::OpenCode => {
+            let root = home.join("data").join("opencode");
+            ["opencode.db", "opencode.db-wal", "opencode.db-shm"]
+                .into_iter()
+                .map(|name| root.join(name))
+                .filter(|path| path.is_file())
+                .collect()
         }
     }
 }
@@ -398,6 +457,33 @@ fn cached_file_summary(
     summary
 }
 
+fn cached_rollout_path_for_id(account: &AccountProfile, id: &str) -> Option<PathBuf> {
+    let candidate = {
+        let cache = summary_cache().lock().ok()?;
+        cache
+            .iter()
+            .filter(|(key, _)| {
+                key.account_id == account.id
+                    && key.account_label == account.label
+                    && key.codex_home == account.codex_home
+                    && key.provider == account.provider.as_str()
+            })
+            .filter_map(|(key, cached)| {
+                let summary = cached.summary.as_ref()?;
+                (summary.rollout_id == id || summary.session_id == id).then_some((
+                    summary.started_at,
+                    summary.last_activity,
+                    key.path.clone(),
+                ))
+            })
+            // Un session_id logique peut designer plusieurs forks : reprendre
+            // le HEAD, comme le tableau de bord, plutot qu'un fichier arbitraire.
+            .max_by_key(|(started_at, last_activity, _)| (*started_at, *last_activity))
+            .map(|(_, _, path)| path)
+    };
+    candidate.filter(|path| path.is_file())
+}
+
 fn prune_summary_cache(settings: &AppSettings) {
     let Ok(mut cache) = summary_cache().lock() else {
         return;
@@ -424,7 +510,10 @@ fn build(settings: &AppSettings) -> DiscussionsDashboard {
         .accounts
         .iter()
         .cloned()
-        .map(|account| thread::spawn(move || scan_account(&account)))
+        .map(|account| {
+            let command = settings::command_for_provider(settings, account.provider);
+            thread::spawn(move || scan_account(&account, &command))
+        })
         .collect::<Vec<_>>();
 
     let accounts = handles
@@ -441,7 +530,7 @@ fn build(settings: &AppSettings) -> DiscussionsDashboard {
     }
 }
 
-fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
+fn scan_account(account: &AccountProfile, provider_command: &str) -> DiscussionAccountGroup {
     let has_tokens = settings::account_has_auth_tokens(account);
 
     let home = match expand_home(&account.codex_home) {
@@ -460,11 +549,18 @@ fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
         }
     };
 
-    let mut discussions = match account.provider {
-        settings::Provider::Codex => scan_codex_discussions(&home, account),
-        settings::Provider::Claude => scan_claude_discussions(&home, account),
+    let (mut discussions, error) = match account.provider {
+        settings::Provider::Codex => (scan_codex_discussions(&home, account), None),
+        settings::Provider::Claude => (scan_claude_discussions(&home, account), None),
+        settings::Provider::OpenCode => {
+            match scan_opencode_discussions(&home, account, provider_command) {
+                Ok(discussions) => (discussions, None),
+                Err(error) => (Vec::new(), Some(error)),
+            }
+        }
     };
     discussions.retain(|discussion| !discussion_summary_is_autonomous(discussion));
+    apply_custom_titles(&home, &mut discussions);
 
     // Les plus recemment actives d'abord (le HEAD porte le dernier `mtime`).
     discussions.sort_by(|a, b| {
@@ -482,8 +578,127 @@ fn scan_account(account: &AccountProfile) -> DiscussionAccountGroup {
         has_tokens,
         discussion_count,
         discussions,
-        error: None,
+        error,
     }
+}
+
+fn custom_titles_path(home: &Path) -> PathBuf {
+    home.join(CUSTOM_TITLES_FILE)
+}
+
+fn load_custom_titles(home: &Path) -> HashMap<String, String> {
+    fs::read_to_string(custom_titles_path(home))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn apply_custom_titles(home: &Path, discussions: &mut [DiscussionSummary]) {
+    let titles = load_custom_titles(home);
+    if titles.is_empty() {
+        return;
+    }
+    for discussion in discussions {
+        if let Some(title) = titles.get(&discussion.session_id) {
+            discussion.title = Some(title.clone());
+        }
+    }
+}
+
+fn normalized_custom_title(title: &str) -> Result<Option<String>, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.chars().count() > TITLE_MAX_CHARS {
+        return Err(format!(
+            "Le titre ne peut pas depasser {TITLE_MAX_CHARS} caracteres"
+        ));
+    }
+    if title.chars().any(char::is_control) {
+        return Err("Le titre contient des caracteres non autorises".to_string());
+    }
+    Ok(Some(title.to_string()))
+}
+
+/// Enregistre un titre d'affichage sans modifier le transcript du fournisseur.
+/// Une valeur vide retire le titre personnalise et restaure le titre genere.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn rename_discussion(
+    account_id: String,
+    session_id: String,
+    title: String,
+) -> Result<DiscussionSummary, String> {
+    tokio::task::spawn_blocking(move || {
+        rename_discussion_for_account(account_id, session_id, title)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+pub fn rename_discussion_for_account(
+    account_id: String,
+    session_id: String,
+    title: String,
+) -> Result<DiscussionSummary, String> {
+    let settings = settings::load_settings_for_terminal()?;
+    let account = settings
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .cloned()
+        .ok_or_else(|| "Compte introuvable".to_string())?;
+    let valid_id = match account.provider {
+        settings::Provider::OpenCode => valid_opencode_session_id(&session_id),
+        settings::Provider::Codex | settings::Provider::Claude => is_uuid_shaped(&session_id),
+    };
+    if !valid_id {
+        return Err("Identifiant de session invalide".to_string());
+    }
+    let custom_title = normalized_custom_title(&title)?;
+    let home = expand_home(&account.codex_home)?;
+    let provider_command = settings::command_for_provider(&settings, account.provider);
+
+    // Valide l'existence avant d'ecrire, et conserve cette verification sous le
+    // verrou afin que deux renommages simultanes ne perdent pas une entree.
+    let _guard = custom_titles_write_lock()
+        .lock()
+        .map_err(|_| "Stockage des titres indisponible".to_string())?;
+    let existing = scan_account(&account, &provider_command)
+        .discussions
+        .into_iter()
+        .find(|discussion| discussion.session_id == session_id)
+        .ok_or_else(|| "Discussion introuvable".to_string())?;
+    let mut titles = load_custom_titles(&home);
+    match custom_title {
+        Some(title) => {
+            titles.insert(session_id.clone(), title);
+        }
+        None => {
+            titles.remove(&session_id);
+        }
+    }
+    let mut serialized = serde_json::to_string_pretty(&titles)
+        .map_err(|error| format!("Titres non serialisables : {error}"))?;
+    serialized.push('\n');
+    crate::fs_util::atomic_write(&custom_titles_path(&home), serialized)
+        .map_err(|error| error.to_string())?;
+    if let Ok(mut cache) = dashboard_cache().lock() {
+        *cache = None;
+    }
+
+    let mut refreshed = existing;
+    if let Some(title) = titles.get(&session_id) {
+        refreshed.title = Some(title.clone());
+    } else {
+        // Re-scan sans l'override pour retrouver le titre semantique d'origine.
+        refreshed = scan_account(&account, &provider_command)
+            .discussions
+            .into_iter()
+            .find(|discussion| discussion.session_id == session_id)
+            .ok_or_else(|| "Discussion introuvable".to_string())?;
+    }
+    Ok(refreshed)
 }
 
 /// Scan **Codex** : `<home>/sessions/AAAA/MM/JJ/rollout-*.jsonl`, puis
@@ -536,6 +751,157 @@ fn scan_claude_discussions(home: &Path, account: &AccountProfile) -> Vec<Discuss
     }
     discussions
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenCodeSessionRow {
+    id: String,
+    title: String,
+    updated: i64,
+    created: i64,
+    directory: String,
+}
+
+/// OpenCode fournit volontairement un index stable via sa CLI. L'utiliser ici
+/// evite de coupler l'application au schema SQLite interne, tout en conservant
+/// l'isolation XDG du compte.
+fn scan_opencode_discussions(
+    home: &Path,
+    account: &AccountProfile,
+    provider_command: &str,
+) -> Result<Vec<DiscussionSummary>, String> {
+    let value = run_opencode_json(
+        home,
+        provider_command,
+        &["session", "list", "--format", "json"],
+    )?;
+    opencode_summaries_from_value(&value, home, account)
+}
+
+fn opencode_summaries_from_value(
+    value: &Value,
+    home: &Path,
+    account: &AccountProfile,
+) -> Result<Vec<DiscussionSummary>, String> {
+    let rows = serde_json::from_value::<Vec<OpenCodeSessionRow>>(value.clone())
+        .map_err(|error| format!("Index de sessions OpenCode illisible : {error}"))?;
+    let database = home.join("data").join("opencode").join("opencode.db");
+    Ok(rows
+        .into_iter()
+        .filter(|row| valid_opencode_session_id(&row.id))
+        .map(|row| {
+            let title = {
+                let value = row.title.trim();
+                (!value.is_empty()).then(|| value.to_string())
+            };
+            DiscussionSummary {
+                session_id: row.id.clone(),
+                rollout_id: row.id,
+                fork_count: 1,
+                provider: settings::Provider::OpenCode,
+                account_id: account.id.clone(),
+                account_label: account.label.clone(),
+                codex_home: account.codex_home.clone(),
+                file_path: database.to_string_lossy().to_string(),
+                cwd: (!row.directory.trim().is_empty()).then_some(row.directory),
+                started_at: opencode_timestamp_seconds(row.created),
+                last_activity: opencode_timestamp_seconds(row.updated),
+                title,
+                preview: None,
+                // `session list` ne force pas l'export de tous les messages :
+                // l'ouverture du transcript reste donc une operation a la demande.
+                message_count: 0,
+                total_tokens: None,
+                cli_version: None,
+            }
+        })
+        .collect())
+}
+
+fn opencode_timestamp_seconds(value: i64) -> i64 {
+    if value.unsigned_abs() >= 100_000_000_000 {
+        value / 1_000
+    } else {
+        value
+    }
+}
+
+fn valid_opencode_session_id(value: &str) -> bool {
+    let len = value.chars().count();
+    (1..=160).contains(&len)
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+}
+
+fn run_opencode_json(home: &Path, provider_command: &str, args: &[&str]) -> Result<Value, String> {
+    let stdout = run_opencode_command(home, provider_command, args)?;
+    let trimmed = stdout.trim().trim_start_matches('\u{feff}');
+    if trimmed.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    serde_json::from_str(trimmed).map_err(|error| format!("JSON OpenCode illisible : {error}"))
+}
+
+fn run_opencode_command(
+    home: &Path,
+    provider_command: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    let mut command =
+        crate::chat::resolved_provider_command(provider_command, settings::Provider::OpenCode)?;
+    for (key, value) in settings::Provider::OpenCode.home_env(home) {
+        command.env(key, value);
+    }
+    command
+        .env("NO_COLOR", "1")
+        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_opencode_process_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("OpenCode ne peut pas etre lance : {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("OpenCode a quitte avec le statut {}", output.status)
+        } else {
+            format!("OpenCode : {detail}")
+        });
+    }
+    String::from_utf8(output.stdout).map_err(|error| format!("Sortie OpenCode non UTF-8 : {error}"))
+}
+
+fn load_opencode_export(account_id: &str, session_id: &str) -> Result<Value, String> {
+    if !valid_opencode_session_id(session_id) {
+        return Err("Identifiant de session OpenCode invalide".to_string());
+    }
+    let app_settings = settings::load_settings_for_terminal()?;
+    let account = app_settings
+        .accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| "Compte introuvable".to_string())?;
+    if account.provider != settings::Provider::OpenCode {
+        return Err("Ce compte n'utilise pas OpenCode".to_string());
+    }
+    let home = expand_home(&account.codex_home)?;
+    let provider_command =
+        settings::command_for_provider(&app_settings, settings::Provider::OpenCode);
+    run_opencode_json(&home, &provider_command, &["export", session_id])
+}
+
+#[cfg(windows)]
+fn hide_opencode_process_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000);
+}
+
+#[cfg(not(windows))]
+fn hide_opencode_process_window(_command: &mut std::process::Command) {}
 
 /// Parse un fichier de session Claude Code en `DiscussionSummary`. Schema (verifie
 /// sur disque) : chaque ligne est un objet portant `type` (user/assistant/...),
@@ -967,14 +1333,14 @@ fn merge_fork_group(group: Vec<DiscussionSummary>) -> Option<DiscussionSummary> 
 // (b) claim_session_for_terminal
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn claim_session_for_terminal(
     account_id: String,
     after_unix: i64,
     exclude_session_ids: Vec<String>,
     match_session_id: Option<String>,
 ) -> Result<Option<String>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         claim_session_for_account(
             account_id,
             after_unix,
@@ -1066,13 +1432,13 @@ fn claim_session(
 // (c) copy_discussion_to_account
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn copy_discussion_to_account(
     session_id: String,
     source_account_id: String,
     target_account_id: String,
 ) -> Result<DiscussionSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         copy_discussion_between(session_id, source_account_id, target_account_id)
     })
     .await
@@ -1127,23 +1493,35 @@ fn copy_discussion(
     let source_home = expand_home(&source.codex_home)?;
     let target_home = expand_home(&target.codex_home)?;
 
-    let src = find_rollout_by_id(&source_home.join("sessions"), &session_id)
+    let source_sessions = source_home.join("sessions");
+    let src = cached_rollout_path_for_id(&source, &session_id)
+        .or_else(|| find_rollout_by_id(&source_sessions, &session_id))
         .ok_or_else(|| "Discussion introuvable".to_string())?;
 
-    // La source est ouverte en LECTURE SEULE et doit rester octet-pour-octet
-    // identique.
-    let content = fs::read_to_string(&src).map_err(|error| error.to_string())?;
-    let new_id = uuid::Uuid::new_v4().to_string();
+    // La liste des discussions a normalement deja rempli ce cache. Reutiliser
+    // son resume evite de reparcourir tout le JSONL cible apres la copie, ce qui
+    // dominait le temps de bascule pour les longues conversations.
+    let source_summary = cached_file_summary(&src, &source, scan_discussion_file);
 
-    // Decoupe a la PREMIERE '\n'. Tout ce qui suit est recopie verbatim.
-    let (line0_raw, rest) = match content.find('\n') {
-        Some(index) => (&content[..index], Some(&content[index + 1..])),
-        None => (content.as_str(), None),
-    };
+    // La source est ouverte en LECTURE SEULE et doit rester octet-pour-octet
+    // identique. Seule la premiere ligne est chargee : le transcript peut etre
+    // copie en flux, sans allocation proportionnelle a sa taille.
+    let source_file = fs::File::open(&src).map_err(|error| error.to_string())?;
+    let mut reader = BufReader::with_capacity(DISCUSSION_COPY_BUFFER_BYTES, source_file);
+    let mut line0_raw = String::new();
+    if reader
+        .read_line(&mut line0_raw)
+        .map_err(|error| error.to_string())?
+        == 0
+    {
+        return Err("Discussion vide".to_string());
+    }
+    let new_id = uuid::Uuid::new_v4().to_string();
 
     // Parse la ligne 0 (retire un eventuel '\r' de fin), verifie le type et
     // reecrit l'uuid.
-    let line0_trimmed = line0_raw.trim_end_matches('\r');
+    let line0_had_newline = line0_raw.ends_with('\n');
+    let line0_trimmed = line0_raw.trim_end_matches('\n').trim_end_matches('\r');
     let mut meta: Value = serde_json::from_str(line0_trimmed)
         .map_err(|error| format!("ligne meta illisible: {error}"))?;
     if meta.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -1154,11 +1532,6 @@ fn copy_discussion(
         payload.insert("id".to_string(), Value::String(new_id.clone()));
     }
     let new_line0 = serde_json::to_string(&meta).map_err(|error| error.to_string())?;
-
-    let output = match rest {
-        Some(rest) => format!("{new_line0}\n{rest}"),
-        None => new_line0,
-    };
 
     // Nom + emplacement de la destination : date issue du nom SOURCE.
     let src_name = src
@@ -1184,14 +1557,61 @@ fn copy_discussion(
 
     let dest_name = src_name.replace(&session_id, &new_id);
     let dest = dest_dir.join(&dest_name);
-    fs::write(&dest, output).map_err(|error| error.to_string())?;
+    let temp_dest = dest.with_extension(format!("jsonl.tmp-{new_id}"));
+    let write_result = (|| -> std::io::Result<()> {
+        let destination = fs::File::create(&temp_dest)?;
+        let mut writer = BufWriter::with_capacity(DISCUSSION_COPY_BUFFER_BYTES, destination);
+        writer.write_all(new_line0.as_bytes())?;
+        if line0_had_newline {
+            writer.write_all(b"\n")?;
+        }
+        std::io::copy(&mut reader, &mut writer)?;
+        writer.flush()
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_dest);
+        return Err(error.to_string());
+    }
+    if let Err(error) = fs::rename(&temp_dest, &dest) {
+        let _ = fs::remove_file(&temp_dest);
+        return Err(error.to_string());
+    }
 
-    // Resume coherent : on re-scanne la copie (meme logique que la liste).
-    if let Some(summary) = scan_discussion_file(&dest, &target) {
+    // Tous les champs semantiques sont identiques a la source ; seuls
+    // l'identite, le compte, le chemin et l'activite changent. Enregistrer ce
+    // resume sous l'empreinte de destination rend aussi le rafraichissement qui
+    // suit la bascule quasi gratuit.
+    if let Some(mut summary) = source_summary {
+        summary.session_id = new_id.clone();
+        summary.rollout_id = new_id.clone();
+        summary.fork_count = 1;
+        summary.provider = settings::Provider::Codex;
+        summary.account_id = target.id.clone();
+        summary.account_label = target.label.clone();
+        summary.codex_home = target.codex_home.clone();
+        summary.file_path = dest.to_string_lossy().to_string();
+        summary.last_activity = fs::metadata(&dest)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or_else(metrics::now_ts);
+        if let Some(fingerprint) = file_fingerprint(&dest) {
+            if let Ok(mut cache) = summary_cache().lock() {
+                cache.insert(
+                    summary_cache_key(&dest, &target),
+                    CachedSummary {
+                        fingerprint,
+                        summary: Some(summary.clone()),
+                    },
+                );
+            }
+        }
         return Ok(summary);
     }
 
-    // Filet de securite si le re-scan ne renvoie rien (session sans message).
+    // Filet de securite si aucun resume exploitable n'etait en cache
+    // (session vide, avortee ou speciale).
     let cwd = meta
         .pointer("/payload/cwd")
         .and_then(Value::as_str)
@@ -1236,13 +1656,13 @@ fn copy_discussion(
 /// Rattache une conversation existante a un autre workspace. Le `cwd` du
 /// resume est modifie de facon persistante ; l'identite et le transcript de la
 /// discussion restent inchanges.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn move_discussion(
     account_id: String,
     session_id: String,
     workspace_path: String,
 ) -> Result<DiscussionSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         move_discussion_for_account(account_id, session_id, workspace_path)
     })
     .await
@@ -1288,6 +1708,9 @@ pub fn move_discussion_for_account(
         }
         settings::Provider::Claude => {
             move_claude_discussion_impl(&account, &session_id, workspace_path)
+        }
+        settings::Provider::OpenCode => {
+            Err("Le deplacement des sessions OpenCode n'est pas encore pris en charge".to_string())
         }
     }
 }
@@ -1494,13 +1917,13 @@ fn rewrite_claude_session_cwd(content: &str, workspace_path: &str) -> Result<Str
 // (e) delete_discussion
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn delete_discussion(
     account_id: String,
     session_id: String,
     archive: bool,
 ) -> Result<DeleteDiscussionResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         delete_discussion_for_account(account_id, session_id, archive)
     })
     .await
@@ -1513,10 +1936,6 @@ pub fn delete_discussion_for_account(
     session_id: String,
     archive: bool,
 ) -> Result<DeleteDiscussionResult, String> {
-    if !is_uuid_shaped(&session_id) {
-        return Err("Identifiant de session invalide".to_string());
-    }
-
     let settings = settings::load_settings_for_terminal()?;
     let account = settings
         .accounts
@@ -1525,6 +1944,14 @@ pub fn delete_discussion_for_account(
         .cloned()
         .ok_or_else(|| "Compte introuvable".to_string())?;
 
+    let valid_id = match account.provider {
+        settings::Provider::OpenCode => valid_opencode_session_id(&session_id),
+        settings::Provider::Codex | settings::Provider::Claude => is_uuid_shaped(&session_id),
+    };
+    if !valid_id {
+        return Err("Identifiant de session invalide".to_string());
+    }
+
     match account.provider {
         settings::Provider::Codex => {
             delete_discussion_impl(account.codex_home, session_id, archive)
@@ -1532,7 +1959,46 @@ pub fn delete_discussion_for_account(
         settings::Provider::Claude => {
             delete_claude_discussion_impl(account.codex_home, session_id, archive)
         }
+        settings::Provider::OpenCode => {
+            delete_opencode_discussion_impl(&settings, &account, &session_id, archive)
+        }
     }
+}
+
+/// OpenCode sait supprimer une session mais ne fournit pas d'archive native.
+/// Avant la suppression demandee par l'UI, on exporte donc le JSON officiel
+/// dans le home isole ; il reste reimportable avec `opencode import`.
+fn delete_opencode_discussion_impl(
+    app_settings: &AppSettings,
+    account: &AccountProfile,
+    session_id: &str,
+    archive: bool,
+) -> Result<DeleteDiscussionResult, String> {
+    let home = expand_home(&account.codex_home)?;
+    let provider_command =
+        settings::command_for_provider(app_settings, settings::Provider::OpenCode);
+    let database = home.join("data").join("opencode").join("opencode.db");
+    let final_path = if archive {
+        let export = run_opencode_json(&home, &provider_command, &["export", session_id])?;
+        let archive_dir = home.join("data").join("opencode").join("archive");
+        fs::create_dir_all(&archive_dir).map_err(|error| error.to_string())?;
+        let destination = archive_dir.join(format!("{session_id}.json"));
+        let mut serialized = serde_json::to_string_pretty(&export)
+            .map_err(|error| format!("Archive OpenCode non serialisable : {error}"))?;
+        serialized.push('\n');
+        crate::fs_util::atomic_write(&destination, serialized)
+            .map_err(|error| error.to_string())?;
+        destination
+    } else {
+        database
+    };
+
+    run_opencode_command(&home, &provider_command, &["session", "delete", session_id])?;
+    Ok(DeleteDiscussionResult {
+        archived: archive,
+        count: 1,
+        path: final_path.to_string_lossy().to_string(),
+    })
 }
 
 /// Suppression/archivage d'une session Claude : un fichier unique
@@ -1748,16 +2214,14 @@ pub struct TranscriptPart {
     pub output: Option<String>,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn export_discussion_transcript(
     account_id: String,
     session_id: String,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        export_transcript_for_account(account_id, session_id)
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    tokio::task::spawn_blocking(move || export_transcript_for_account(account_id, session_id))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Variante synchrone reutilisable hors du runtime Tauri (serveur SaaS).
@@ -1783,6 +2247,9 @@ fn collect_transcript_turns(
     Ok(match provider {
         settings::Provider::Codex => extract_codex_transcript(&file),
         settings::Provider::Claude => extract_claude_transcript(&file),
+        settings::Provider::OpenCode => {
+            extract_opencode_semantic_transcript(&load_opencode_export(account_id, session_id)?)
+        }
     })
 }
 
@@ -1793,9 +2260,6 @@ fn discussion_source_for_account(
     account_id: &str,
     session_id: &str,
 ) -> Result<(settings::Provider, PathBuf), String> {
-    if !is_uuid_shaped(session_id) {
-        return Err("Identifiant de session invalide".to_string());
-    }
     let settings = settings::load_settings_for_terminal()?;
     let account = settings
         .accounts
@@ -1806,10 +2270,30 @@ fn discussion_source_for_account(
     let home = expand_home(&account.codex_home)?;
 
     let file = match account.provider {
-        settings::Provider::Codex => find_rollout_by_id(&home.join("sessions"), session_id)
-            .ok_or_else(|| "Discussion introuvable".to_string())?,
-        settings::Provider::Claude => find_claude_session_file(&home.join("projects"), session_id)
-            .ok_or_else(|| "Discussion introuvable".to_string())?,
+        settings::Provider::Codex => {
+            if !is_uuid_shaped(session_id) {
+                return Err("Identifiant de session invalide".to_string());
+            }
+            find_rollout_by_id(&home.join("sessions"), session_id)
+                .ok_or_else(|| "Discussion introuvable".to_string())?
+        }
+        settings::Provider::Claude => {
+            if !is_uuid_shaped(session_id) {
+                return Err("Identifiant de session invalide".to_string());
+            }
+            find_claude_session_file(&home.join("projects"), session_id)
+                .ok_or_else(|| "Discussion introuvable".to_string())?
+        }
+        settings::Provider::OpenCode => {
+            if !valid_opencode_session_id(session_id) {
+                return Err("Identifiant de session OpenCode invalide".to_string());
+            }
+            let database = home.join("data").join("opencode").join("opencode.db");
+            if !database.is_file() {
+                return Err("Base de sessions OpenCode introuvable".to_string());
+            }
+            database
+        }
     };
     Ok((account.provider, file))
 }
@@ -1900,6 +2384,67 @@ fn extract_claude_transcript(path: &Path) -> Vec<TranscriptMessage> {
     turns
 }
 
+fn extract_opencode_semantic_transcript(export: &Value) -> Vec<TranscriptMessage> {
+    let mut turns = Vec::new();
+    for message in export
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = match message.pointer("/info/role").and_then(Value::as_str) {
+            Some("user") => TranscriptRole::User,
+            Some("assistant") => TranscriptRole::Assistant,
+            _ => continue,
+        };
+        let text = message
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let text = if role == TranscriptRole::User {
+            opencode_user_text(&text)
+        } else {
+            text
+        };
+        if text.trim().is_empty()
+            || (role == TranscriptRole::User && is_synthetic_prompt(text.trim()))
+        {
+            continue;
+        }
+        turns.push(TranscriptMessage {
+            role,
+            text,
+            timestamp: opencode_message_timestamp(message),
+            parts: Vec::new(),
+        });
+    }
+    turns
+}
+
+fn opencode_user_text(text: &str) -> String {
+    const MARKER: &str = "\n\nDemande utilisateur :\n";
+    text.strip_prefix("Instructions de ce tour :\n")
+        .and_then(|value| value.split_once(MARKER).map(|(_, prompt)| prompt))
+        .unwrap_or(text)
+        .trim()
+        .to_string()
+}
+
+fn opencode_message_timestamp(message: &Value) -> i64 {
+    message
+        .pointer("/info/time/created")
+        .and_then(Value::as_i64)
+        .map(opencode_timestamp_seconds)
+        .unwrap_or(0)
+}
+
 /// Formate les tours en une amorce injectable, tronquee a `TRANSCRIPT_MAX_CHARS`
 /// en conservant la FIN de la conversation (la plus pertinente pour continuer).
 fn format_transcript(turns: &[TranscriptMessage]) -> String {
@@ -1933,24 +2478,21 @@ fn format_transcript(turns: &[TranscriptMessage]) -> String {
 // conversation (bulles user/assistant), tous providers.
 // ---------------------------------------------------------------------------
 
-/// Nombre maximal de messages renvoyes a la vue conversation. Au-dela on garde
-/// la FIN de la discussion (la plus pertinente) et on signale la troncature.
-const TRANSCRIPT_MAX_MESSAGES: usize = 2000;
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussionTranscript {
     pub session_id: String,
     pub messages: Vec<TranscriptMessage>,
     pub truncated: bool,
+    pub context_usage: Option<DiscussionContextUsage>,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn get_discussion_transcript(
     account_id: String,
     session_id: String,
 ) -> Result<DiscussionTranscript, String> {
-    tauri::async_runtime::spawn_blocking(move || transcript_for_account(account_id, session_id))
+    tokio::task::spawn_blocking(move || transcript_for_account(account_id, session_id))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -1961,20 +2503,54 @@ pub fn transcript_for_account(
     session_id: String,
 ) -> Result<DiscussionTranscript, String> {
     let (provider, file) = discussion_source_for_account(&account_id, &session_id)?;
-    let mut messages = match provider {
-        settings::Provider::Codex => extract_codex_display_transcript(&file),
-        settings::Provider::Claude => extract_claude_display_transcript(&file),
+    let (messages, context_usage) = match provider {
+        settings::Provider::Codex => extract_codex_display_transcript_with_context(&file),
+        settings::Provider::Claude => (extract_claude_display_transcript(&file), None),
+        settings::Provider::OpenCode => (
+            extract_opencode_display_transcript(&load_opencode_export(&account_id, &session_id)?),
+            None,
+        ),
     };
-    let truncated = messages.len() > TRANSCRIPT_MAX_MESSAGES;
-    if truncated {
-        let skip = messages.len() - TRANSCRIPT_MAX_MESSAGES;
-        messages.drain(..skip);
-    }
     Ok(DiscussionTranscript {
         session_id,
         messages,
-        truncated,
+        // Le fichier de session est la source durable de l'historique. Ne jamais
+        // supprimer son debut lors d'un rechargement ou d'un changement de chat ;
+        // la fenetre de rendu du frontend limite seule le cout d'affichage.
+        truncated: false,
+        context_usage,
     })
+}
+
+/// Relit uniquement les petites lignes `token_count` du rollout. Cette voie
+/// sert de repli immediat apres `/compact`, sans reconstruire le transcript.
+pub(crate) fn context_usage_for_account(
+    account_id: &str,
+    session_id: &str,
+) -> Result<Option<DiscussionContextUsage>, String> {
+    let (provider, file) = discussion_source_for_account(account_id, session_id)?;
+    if provider != settings::Provider::Codex {
+        return Ok(None);
+    }
+    let file = fs::File::open(file).map_err(|error| error.to_string())?;
+    let mut latest = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("\"type\":\"token_count\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let payload = if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+            value.get("payload").unwrap_or(&Value::Null)
+        } else {
+            &value
+        };
+        if let Some(usage) = context_usage_from_rollout_payload(payload) {
+            latest = Some(usage);
+        }
+    }
+    Ok(latest)
 }
 
 /// Parse le JSONL Codex au niveau `response_item` pour reconstruire la timeline
@@ -1982,11 +2558,19 @@ pub fn transcript_for_account(
 /// outils restent dans leur ordre d'emission. Les `event_msg.agent_message`
 /// servent de repli pour les anciens rollouts qui ne contiennent pas de
 /// `response_item`, mais ne sont jamais dupliques.
+#[cfg(test)]
 fn extract_codex_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
+    extract_codex_display_transcript_with_context(path).0
+}
+
+fn extract_codex_display_transcript_with_context(
+    path: &Path,
+) -> (Vec<TranscriptMessage>, Option<DiscussionContextUsage>) {
     let mut messages = Vec::new();
     let Ok(file) = fs::File::open(path) else {
-        return messages;
+        return (messages, None);
     };
+    let mut context_usage = None;
     let mut parts = Vec::<TranscriptPart>::new();
     let mut fallback_texts = Vec::<(String, i64)>::new();
     let mut final_text: Option<String> = None;
@@ -2057,6 +2641,13 @@ fn extract_codex_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
         } else {
             outer_type
         };
+
+        if event_type == "token_count" {
+            if let Some(next_usage) = context_usage_from_rollout_payload(payload) {
+                context_usage = Some(next_usage);
+            }
+            continue;
+        }
 
         if event_type == "user_message" {
             flush_assistant(
@@ -2189,7 +2780,17 @@ fn extract_codex_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
         &mut last_timestamp,
         &mut part_sequence,
     );
-    messages
+    (messages, context_usage)
+}
+
+fn context_usage_from_rollout_payload(payload: &Value) -> Option<DiscussionContextUsage> {
+    let used_tokens = payload
+        .pointer("/info/last_token_usage/total_tokens")
+        .and_then(json_u64)?;
+    let context_window = payload
+        .pointer("/info/model_context_window")
+        .and_then(json_u64)?;
+    DiscussionContextUsage::from_counts(used_tokens, context_window)
 }
 
 fn extract_claude_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
@@ -2328,6 +2929,131 @@ fn extract_claude_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
         if !parts.is_empty() {
             messages.push(TranscriptMessage {
                 role: TranscriptRole::Assistant,
+                text: visible.join("\n\n"),
+                timestamp,
+                parts,
+            });
+        }
+    }
+    messages
+}
+
+fn extract_opencode_display_transcript(export: &Value) -> Vec<TranscriptMessage> {
+    let mut messages = Vec::new();
+    let mut sequence = 0_u64;
+    for message in export
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = match message.pointer("/info/role").and_then(Value::as_str) {
+            Some("user") => TranscriptRole::User,
+            Some("assistant") => TranscriptRole::Assistant,
+            _ => continue,
+        };
+        let timestamp = opencode_message_timestamp(message);
+        let parts_source = message.get("parts").and_then(Value::as_array);
+
+        if role == TranscriptRole::User {
+            let text = parts_source
+                .into_iter()
+                .flatten()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let text = opencode_user_text(&text);
+            if !text.is_empty() && !is_synthetic_prompt(&text) {
+                messages.push(TranscriptMessage {
+                    role,
+                    text,
+                    timestamp,
+                    parts: Vec::new(),
+                });
+            }
+            continue;
+        }
+
+        let mut parts = Vec::new();
+        let mut visible = Vec::new();
+        for part in parts_source.into_iter().flatten() {
+            sequence += 1;
+            let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+            match kind {
+                "reasoning" => {
+                    let Some(text) = part.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    parts.push(TranscriptPart {
+                        id: transcript_item_id(part, "reasoning", sequence),
+                        kind: "reasoning".to_string(),
+                        status: "complete".to_string(),
+                        text: Some(text.to_string()),
+                        tool: None,
+                        title: None,
+                        subtitle: None,
+                        detail: None,
+                        output: None,
+                    });
+                }
+                "text" => {
+                    let Some(text) = part.get("text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    visible.push(text.to_string());
+                    parts.push(transcript_text_part(
+                        transcript_item_id(part, "message", sequence),
+                        text.to_string(),
+                    ));
+                }
+                "tool" => {
+                    let state = part.get("state").unwrap_or(&Value::Null);
+                    let raw_status = state
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pending");
+                    let status = match raw_status {
+                        "completed" => "complete",
+                        "error" | "failed" => "error",
+                        _ => "running",
+                    };
+                    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("outil");
+                    let input = state.get("input").and_then(transcript_json_text);
+                    let output = state
+                        .get("output")
+                        .and_then(transcript_json_text)
+                        .or_else(|| state.get("error").and_then(transcript_json_text));
+                    parts.push(TranscriptPart {
+                        id: transcript_item_id(part, "tool", sequence),
+                        kind: "tool".to_string(),
+                        status: status.to_string(),
+                        text: None,
+                        tool: Some(transcript_tool_kind(tool).to_string()),
+                        title: state
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                            .or_else(|| Some(transcript_tool_title(tool))),
+                        subtitle: input.as_deref().map(transcript_short),
+                        detail: input.map(|text| transcript_clip(&text)),
+                        output: output.map(|text| transcript_clip(&text)),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if !parts.is_empty() {
+            messages.push(TranscriptMessage {
+                role,
                 text: visible.join("\n\n"),
                 timestamp,
                 parts,
@@ -2482,10 +3208,10 @@ pub struct PromptHistory {
     pub prompts: Vec<PromptEntry>,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn list_prompt_history(limit: Option<usize>) -> Result<PromptHistory, String> {
     let settings = settings::load_settings_for_terminal()?;
-    tauri::async_runtime::spawn_blocking(move || build_prompt_history(&settings, limit))
+    tokio::task::spawn_blocking(move || build_prompt_history(&settings, limit))
         .await
         .map_err(|error| error.to_string())
 }
@@ -2569,7 +3295,7 @@ fn is_synthetic_prompt(msg: &str) -> bool {
     msg.starts_with("<environment_context>") || msg.starts_with("<user_instructions>")
 }
 
-fn is_autonomous_prompt(msg: &str) -> bool {
+pub(crate) fn is_autonomous_prompt(msg: &str) -> bool {
     msg.contains("CST_AUTONOMOUS_AGENT_SESSION: true")
         || msg.contains("chat de type agent autonome")
         || msg.contains("Poursuis de maniere autonome l'objectif durable")
@@ -3100,6 +3826,49 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn context_usage_uses_codex_baseline_and_caps_pressure() {
+        let safe = DiscussionContextUsage::from_counts(12_000, 100_000).unwrap();
+        assert_eq!(safe.used_percent, 0);
+        assert_eq!(safe.remaining_tokens, 88_000);
+
+        let warning = DiscussionContextUsage::from_counts(64_800, 100_000).unwrap();
+        assert_eq!(warning.used_percent, 60);
+
+        let danger = DiscussionContextUsage::from_counts(82_400, 100_000).unwrap();
+        assert_eq!(danger.used_percent, 80);
+
+        let overflow = DiscussionContextUsage::from_counts(120_000, 100_000).unwrap();
+        assert_eq!(overflow.used_percent, 100);
+        assert_eq!(overflow.remaining_tokens, 0);
+    }
+
+    #[test]
+    fn codex_display_transcript_exposes_latest_context_window_usage() {
+        let dir = fresh_dir();
+        let path = dir.join("rollout-context.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"2026-07-15T10:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"Bonjour"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-15T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":60000},"model_context_window":100000}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-15T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":82400},"model_context_window":100000}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let (messages, usage) = extract_codex_display_transcript_with_context(&path);
+        assert_eq!(messages.len(), 1);
+        let usage = usage.expect("context usage");
+        assert_eq!(usage.used_tokens, 82_400);
+        assert_eq!(usage.context_window, 100_000);
+        assert_eq!(usage.used_percent, 80);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn local_secs(ts: &str) -> i64 {
         chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H-%M-%S")
             .unwrap()
@@ -3115,6 +3884,7 @@ mod tests {
             label: format!("Compte {id}"),
             created_at: None,
             provider: settings::Provider::Codex,
+            inference_provider: None,
             codex_home: home.to_string_lossy().to_string(),
             project_dir: None,
             proxy_id: None,
@@ -3134,6 +3904,77 @@ mod tests {
         );
         fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn opencode_session_index_maps_to_dashboard_summaries() {
+        let home = fresh_dir();
+        let mut account = test_account("deepseek", &home);
+        account.provider = settings::Provider::OpenCode;
+        account.inference_provider = Some("deepseek".to_string());
+        let value = serde_json::json!([{
+            "id": "ses_abc123",
+            "title": "Corriger le client API",
+            "updated": 1_784_112_345_000_i64,
+            "created": 1_784_110_000_000_i64,
+            "projectId": "project",
+            "directory": "C:\\projet"
+        }]);
+
+        let summaries = opencode_summaries_from_value(&value, &home, &account).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, "ses_abc123");
+        assert_eq!(summaries[0].provider, settings::Provider::OpenCode);
+        assert_eq!(summaries[0].started_at, 1_784_110_000);
+        assert_eq!(summaries[0].last_activity, 1_784_112_345);
+        assert_eq!(summaries[0].cwd.as_deref(), Some("C:\\projet"));
+        assert_eq!(
+            summaries[0].title.as_deref(),
+            Some("Corriger le client API")
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_export_restores_user_text_and_ordered_assistant_parts() {
+        let export = serde_json::json!({
+            "info": {"id": "ses_test"},
+            "messages": [
+                {
+                    "info": {"role": "user", "time": {"created": 1_784_110_000_000_i64}},
+                    "parts": [{
+                        "id": "user_1",
+                        "type": "text",
+                        "text": "Instructions de ce tour :\nContexte\n\nDemande utilisateur :\nAnalyse ce depot"
+                    }]
+                },
+                {
+                    "info": {"role": "assistant", "time": {"created": 1_784_110_001_000_i64}},
+                    "parts": [
+                        {"id": "reason_1", "type": "reasoning", "text": "Je verifie."},
+                        {"id": "tool_1", "type": "tool", "tool": "bash", "state": {
+                            "status": "completed", "title": "Tests", "input": {"command": "npm test"}, "output": "ok"
+                        }},
+                        {"id": "text_1", "type": "text", "text": "Tout est valide."}
+                    ]
+                }
+            ]
+        });
+
+        let semantic = extract_opencode_semantic_transcript(&export);
+        assert_eq!(semantic.len(), 2);
+        assert_eq!(semantic[0].text, "Analyse ce depot");
+        assert_eq!(semantic[1].text, "Tout est valide.");
+
+        let display = extract_opencode_display_transcript(&export);
+        assert_eq!(display.len(), 2);
+        assert_eq!(display[0].text, "Analyse ce depot");
+        assert_eq!(display[1].parts.len(), 3);
+        assert_eq!(display[1].parts[0].kind, "reasoning");
+        assert_eq!(display[1].parts[1].kind, "tool");
+        assert_eq!(display[1].parts[1].status, "complete");
+        assert_eq!(display[1].parts[2].kind, "text");
     }
 
     #[test]
@@ -3263,6 +4104,47 @@ mod tests {
         assert_eq!(missing, None);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_rollout_path_resolves_exact_id_and_latest_logical_fork() {
+        let home = fresh_dir();
+        let sessions = home.join("sessions").join("2026").join("07").join("07");
+        fs::create_dir_all(&sessions).unwrap();
+
+        let logical_id = "019f0000-0000-7000-8000-000000000020";
+        let first_id = "019f0000-0000-7000-8000-000000000021";
+        let latest_id = "019f0000-0000-7000-8000-000000000022";
+        let first = sessions.join(format!("rollout-2026-07-07T10-00-00-{first_id}.jsonl"));
+        let latest = sessions.join(format!("rollout-2026-07-07T11-00-00-{latest_id}.jsonl"));
+        for (path, rollout_id, timestamp) in [
+            (&first, first_id, "2026-07-07T10:00:00Z"),
+            (&latest, latest_id, "2026-07-07T11:00:00Z"),
+        ] {
+            let meta = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{logical_id}\",\"id\":\"{rollout_id}\",\"timestamp\":\"{timestamp}\",\"cwd\":\"C:\\\\projet\"}}}}"
+            );
+            fs::write(
+                path,
+                format!(
+                    "{meta}\n{{\"type\":\"user_message\",\"payload\":{{\"message\":\"test\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let account = test_account("cached-path", &home);
+        assert_eq!(scan_codex_discussions(&home, &account).len(), 1);
+        assert_eq!(
+            cached_rollout_path_for_id(&account, first_id).as_deref(),
+            Some(first.as_path())
+        );
+        assert_eq!(
+            cached_rollout_path_for_id(&account, logical_id).as_deref(),
+            Some(latest.as_path())
+        );
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -3557,7 +4439,7 @@ mod tests {
         );
 
         let account = test_account("acc", &home);
-        let group = scan_account(&account);
+        let group = scan_account(&account, "codex");
 
         assert_eq!(group.discussion_count, 1, "une seule conversation attendue");
         let head = &group.discussions[0];
@@ -3660,9 +4542,10 @@ mod tests {
         assert_eq!(out[0].text, "premiere demande");
         assert_eq!(out[1].text, "seconde demande");
 
-        // Le titre de session (1re demande reelle) est propage a chaque entree.
-        assert_eq!(out[0].session_title.as_deref(), Some("premiere demande"));
-        assert_eq!(out[1].session_title.as_deref(), Some("premiere demande"));
+        // Le titre semantique normalise (1re demande reelle) est propage a
+        // chaque entree.
+        assert_eq!(out[0].session_title.as_deref(), Some("Premiere demande"));
+        assert_eq!(out[1].session_title.as_deref(), Some("Premiere demande"));
 
         assert_eq!(out[0].session_id, uuid);
         assert_eq!(out[0].account_id, "acc");

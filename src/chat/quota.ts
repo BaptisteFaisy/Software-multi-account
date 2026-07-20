@@ -104,9 +104,9 @@ const quotaDisplayQuality = (account: QuotaDisplayAccount): number => {
 };
 
 /**
- * Plusieurs profils peuvent pointer vers le même CODEX_HOME. Ils restent
- * disponibles pour le routage des chats, mais une seule ligne doit représenter
- * leur quota commun dans la vue Limites.
+ * Plusieurs profils peuvent pointer vers le même CODEX_HOME. Pour les totaux
+ * agrégés du bandeau de chat, leur quota commun ne doit être compté qu'une
+ * fois. La vue Limites, elle, affiche volontairement chaque profil.
  */
 export const deduplicateQuotaAccountsForDisplay = <T extends QuotaDisplayAccount>(
   accounts: T[],
@@ -152,6 +152,40 @@ export const remainingQuotaPercent = (account: ChatAccountQuota): number | null 
   ].filter(validPercent);
   if (!used.length) return null;
   return Math.max(0, Math.min(100, 100 - Math.max(...used)));
+};
+
+export type CombinedQuotaUsage = {
+  usedPercent: number | null;
+  remainingPercent: number | null;
+  measuredAccountCount: number;
+};
+
+/**
+ * Combine la capacite de plusieurs comptes en donnant le meme poids a chacun.
+ * Les comptes sans quota lisible sont signales par le compteur, mais ne
+ * faussent pas la moyenne affichee.
+ */
+export const combinedQuotaUsage = (
+  accounts: readonly ChatAccountQuota[],
+): CombinedQuotaUsage => {
+  const remaining = accounts
+    .map(remainingQuotaPercent)
+    .filter((value): value is number => value !== null);
+  if (remaining.length === 0) {
+    return {
+      usedPercent: null,
+      remainingPercent: null,
+      measuredAccountCount: 0,
+    };
+  }
+
+  const remainingPercent = remaining.reduce((total, value) => total + value, 0)
+    / remaining.length;
+  return {
+    usedPercent: Math.max(0, Math.min(100, 100 - remainingPercent)),
+    remainingPercent,
+    measuredAccountCount: remaining.length,
+  };
 };
 
 const normalizedOpenChatCount = (value: number): number =>

@@ -12,6 +12,18 @@ const localServerStarter = readFileSync(
   new URL("../scripts/start-local-server.ps1", import.meta.url),
   "utf8",
 );
+const updateRuntimeHarness = readFileSync(
+  new URL("../scripts/test-update-node-runtime.mjs", import.meta.url),
+  "utf8",
+);
+const linuxConcurrencyHarness = readFileSync(
+  new URL("../scripts/test-update-node-linux-concurrency-runtime.sh", import.meta.url),
+  "utf8",
+);
+const linuxRuntimeHarness = readFileSync(
+  new URL("../scripts/test-update-node-linux-runtime.sh", import.meta.url),
+  "utf8",
+);
 
 test("l'updater Windows annule le drain si le redemarrage n'a pas eu lieu", () => {
   const drainOn = windowsUpdater.indexOf("Set-DrainState -Draining $true");
@@ -63,11 +75,53 @@ test("les updaters attendent sans drain puis utilisent une lease bornee", () => 
   assert.match(linuxUpdater, /sans avoir draine ni bloque le noeud/);
 });
 
+test("l'updater Windows attend aussi les tours de chat actifs", () => {
+  assert.match(windowsUpdater, /function Get-ActiveWorkloadCount/);
+  assert.match(windowsUpdater, /\/api\/chat\/turns\/active/);
+  assert.match(windowsUpdater, /Get-ActiveWorkloadCount -Health \$h/g);
+  assert.match(windowsUpdater, /mise a jour annulee sans redemarrage/);
+  assert.match(updateRuntimeHarness, /wait-active-chat-turn/);
+  assert.match(updateRuntimeHarness, /active-chat-drain/);
+});
+
+test("l'updater Windows echoue ferme si l'API des tours de chat est degradee", () => {
+  assert.match(windowsUpdater, /\$chatTurns -isnot \[Array\]/);
+  assert.match(windowsUpdater, /Reponse invalide pour les tours de chat actifs/);
+  assert.match(updateRuntimeHarness, /chat-api-unavailable/);
+  assert.match(updateRuntimeHarness, /chat-api-malformed/);
+  assert.match(updateRuntimeHarness, /aucun drain ne doit etre arme/);
+  assert.match(updateRuntimeHarness, /aucun redemarrage ne doit etre demande/);
+  assert.match(updateRuntimeHarness, /current ne doit pas basculer/);
+});
+
+test("l'updater Linux attend aussi les tours de chat actifs", () => {
+  assert.match(linuxUpdater, /active_chat_turn_count/);
+  assert.match(linuxUpdater, /\/api\/chat\/turns\/active/);
+  assert.match(linuxUpdater, /Authorization: Bearer \$ADMIN_TOKEN/);
+  assert.equal(linuxUpdater.match(/active_workload_count "\$hz"/g)?.length, 3);
+  assert.match(linuxUpdater, /tours de chat actifs ; mise a jour annulee sans redemarrage/);
+  assert.match(linuxRuntimeHarness, /"busy_chat_checks": 4/);
+  assert.match(linuxRuntimeHarness, /aucun tour de chat actif n'a ete observe apres la fin des terminaux/);
+  assert.match(linuxRuntimeHarness, /le drain a commence avant la fin du tour de chat actif/);
+  assert.match(linuxRuntimeHarness, /chat-api-unavailable/);
+  assert.match(linuxRuntimeHarness, /chat-api-malformed/);
+  assert.match(linuxRuntimeHarness, /un drain a ete arme malgre l'echec de l'API chat/);
+  assert.match(linuxRuntimeHarness, /un redemarrage a eu lieu malgre l'echec de l'API chat/);
+  assert.match(linuxConcurrencyHarness, /\/api\/chat\/turns\/active/);
+});
+
 test("les releases de developpement sont immuables et verifiees par commit", () => {
   assert.match(windowsUpdater, /\$releaseId = "\$version-\$safeCommit"/);
   assert.match(windowsUpdater, /-WantCommit \$commit/);
   assert.match(linuxUpdater, /RELEASE_ID="\$VERSION-\$SAFE_COMMIT"/);
   assert.match(linuxUpdater, /verify "\$VERSION" "\$COMMIT"/);
+  assert.match(linuxUpdater, /CST_GIT_COMMIT="\$CST_GIT_COMMIT"/);
+  assert.match(linuxUpdater, /commit demande \$CST_GIT_COMMIT mais binaire en \$COMMIT/);
+});
+
+test("la verification Linux conserve les booleens JSON a false", () => {
+  assert.match(linuxUpdater, /has\(\$k\) and \.\[\$k\] != null/);
+  assert.doesNotMatch(linuxUpdater, /'\.\[\$k\] \/\/ empty'/);
 });
 
 test("la publication frontend ne bloque jamais le serveur 8080", () => {
@@ -84,6 +138,11 @@ test("la publication frontend ne bloque jamais le serveur 8080", () => {
   assert.ok(prune > replace && unlock > prune, "les anciens assets doivent etre retires avant le deverrouillage");
   assert.ok(verify > unlock, "la verification HTTP doit etre hors mutex");
   assert.doesNotMatch(frontendPublisher, /Set-DrainState|Stop-ScheduledTask|Stop-Process/);
+  assert.match(frontendPublisher, /\[string\]\$SourceDir\s*=\s*""/);
+  assert.match(frontendPublisher, /-SourceDir exige -SkipBuild/);
+  assert.match(frontendPublisher, /StaleAssetRetentionHours\s*=\s*72/);
+  assert.match(frontendPublisher, /LastWriteTimeUtc\s+-ge\s+\$assetCutoff/);
+  assert.match(frontendPublisher, /-RetainAssetHours \$StaleAssetRetentionHours/);
 });
 
 test("les anciennes releases web/app sont purgees seulement apres verification", () => {
@@ -98,6 +157,49 @@ test("les anciennes releases web/app sont purgees seulement apres verification",
   assert.match(windowsUpdater, /Test-ReleaseUpdateInProgress/);
   assert.match(linuxUpdater, /\.update-in-progress/);
   assert.match(linuxUpdater, /release_update_in_progress/);
+});
+
+test("le harnais Linux exerce deux updaters, le mutex et les marqueurs de release", () => {
+  assert.match(linuxConcurrencyHarness, /run_updater winner/);
+  assert.match(linuxConcurrencyHarness, /run_updater contender/);
+  assert.match(linuxConcurrencyHarness, /winner-locked/);
+  assert.match(linuxConcurrencyHarness, /contender-cleanup-paused/);
+  assert.match(linuxConcurrencyHarness, /99999999\|1/);
+  assert.match(linuxConcurrencyHarness, /Release conservee car une mise a jour l'utilise/);
+  assert.match(linuxConcurrencyHarness, /test "\$contender_status" -eq 4/);
+  assert.match(linuxConcurrencyHarness, /flock -n "\$app\/\.update\.lock"/);
+});
+
+test("le harnais Windows exerce deux updaters, le mutex et les marqueurs de release", () => {
+  assert.match(updateRuntimeHarness, /--concurrency-only/);
+  assert.match(updateRuntimeHarness, /startPowerShell\(updaterArgs\(winnerCandidate, "winner"\)/);
+  assert.match(updateRuntimeHarness, /updaterArgs\(contenderCandidate, "contender"\)/);
+  assert.match(updateRuntimeHarness, /winner-locked/);
+  assert.match(updateRuntimeHarness, /health-paused/);
+  assert.match(updateRuntimeHarness, /99999999\|1/);
+  assert.match(updateRuntimeHarness, /getProcessStartTicks\(contenderRun\.child\.pid\)/);
+  assert.match(updateRuntimeHarness, /Une autre mise a jour effectue deja la bascule/);
+  assert.match(updateRuntimeHarness, /Release conservee car une mise a jour l'utilise/);
+  assert.match(updateRuntimeHarness, /concurrency-mutex-reuse/);
+});
+
+test("le harnais Windows reprend une bascule apres abandon du mutex", () => {
+  assert.match(windowsUpdater, /catch \[Threading\.AbandonedMutexException\]/);
+  assert.match(updateRuntimeHarness, /updaterArgs\(crashCandidate, "crash-holder"\)/);
+  assert.match(updateRuntimeHarness, /child\.kill\("SIGKILL"\)/);
+  assert.match(updateRuntimeHarness, /le crash doit laisser un marqueur perime/);
+  assert.match(updateRuntimeHarness, /abandoned-mutex-recovery/);
+  assert.match(updateRuntimeHarness, /crash-window-service-restoration/);
+});
+
+test("le harnais runtime isole la bascule, le rollback et la purge Windows", () => {
+  assert.match(updateRuntimeHarness, /mkdtemp\(path\.join\(os\.tmpdir\(\), "cst-update-runtime-"\)\)/);
+  assert.match(updateRuntimeHarness, /\$env:APPDATA = \$AppData/);
+  assert.match(updateRuntimeHarness, /\$env:LOCALAPPDATA = \$LocalAppData/);
+  assert.match(updateRuntimeHarness, /function Stop-ScheduledTask/);
+  assert.match(updateRuntimeHarness, /function Start-ScheduledTask/);
+  assert.match(updateRuntimeHarness, /post-switch-verification-failure/);
+  assert.match(updateRuntimeHarness, /failed-release-cleanup/);
 });
 
 test("le serveur local refuse de republier un checkout connu comme obsolete", () => {

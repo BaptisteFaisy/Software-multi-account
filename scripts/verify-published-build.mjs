@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
@@ -14,6 +14,11 @@ const boundedTimeout = (value) => {
 };
 
 export const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+
+export const redactGitDiagnostic = (value) => String(value ?? "")
+  .replace(/(https?:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/gi, "$1[identifiants masques]@")
+  .replace(/\b(?:gh[pousr]_|github_pat_)[a-z0-9_]+/gi, "[secret masque]")
+  .replace(/((?:token|password|secret|api[_-]?key)\s*[=:]\s*)\S+/gi, "$1[secret masque]");
 
 export const extractLocalAssetUrls = (html, indexUrl) => {
   const origin = new URL(indexUrl).origin;
@@ -45,13 +50,14 @@ const git = (...args) => {
       ...process.env,
       GIT_TERMINAL_PROMPT: "0",
       GCM_INTERACTIVE: "Never",
+      GIT_OPTIONAL_LOCKS: "0",
     },
   });
   if (result.error) {
     throw new Error(`git ${args[0]} impossible: ${result.error.message}`);
   }
   if (result.status !== 0) {
-    const detail = String(result.stderr || result.stdout || "").trim().slice(0, 500);
+    const detail = redactGitDiagnostic(result.stderr || result.stdout).trim().slice(0, 500);
     throw new Error(`git ${args[0]} a echoue${detail ? `: ${detail}` : ""}`);
   }
   return String(result.stdout || "").trim();
@@ -105,7 +111,8 @@ export const verifyPublishedBuild = async ({
     throw new Error("Le noeud web repond mais n'est pas pret a servir le frontend.");
   }
 
-  const localIndex = await readFile(resolve(projectRoot, "dist", "index.html"));
+  const distDir = resolve(projectRoot, "dist");
+  const localIndex = await readFile(resolve(distDir, "index.html"));
   const indexUrl = new URL("/", baseUrl);
   indexUrl.searchParams.set("cst-publish-verify", localCommit.slice(0, 12));
   const { bytes: servedIndex } = await fetchBytes(indexUrl, timeoutMs, "index.html actif");
@@ -117,8 +124,26 @@ export const verifyPublishedBuild = async ({
 
   const assetUrls = extractLocalAssetUrls(localIndex.toString("utf8"), indexUrl);
   for (const assetUrl of assetUrls) {
+    let relativePath;
+    try {
+      relativePath = decodeURIComponent(assetUrl.pathname).replace(/^\/+/, "");
+    } catch {
+      throw new Error(`Chemin d'asset invalide: ${assetUrl.pathname}`);
+    }
+    const localAssetPath = resolve(distDir, relativePath);
+    if (!localAssetPath.startsWith(`${distDir}${sep}`)) {
+      throw new Error(`Asset hors du dist refuse: ${assetUrl.pathname}`);
+    }
+    const localAsset = await readFile(localAssetPath);
     assetUrl.searchParams.set("cst-publish-verify", localCommit.slice(0, 12));
-    await fetchBytes(assetUrl, timeoutMs, `asset ${assetUrl.pathname}`);
+    const { bytes: servedAsset } = await fetchBytes(
+      assetUrl,
+      timeoutMs,
+      `asset ${assetUrl.pathname}`,
+    );
+    if (sha256(localAsset) !== sha256(servedAsset)) {
+      throw new Error(`Le contenu de l'asset actif differe du build: ${assetUrl.pathname}`);
+    }
   }
 
   return {

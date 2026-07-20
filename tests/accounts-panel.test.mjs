@@ -33,19 +33,38 @@ test("renderAccountsPanel n'est plus du code mort", () => {
   );
 });
 
-test("le formulaire minimal ajoute un compte Codex ou Claude", () => {
+test("le formulaire minimal ajoute un compte natif ou un fournisseur OpenCode", () => {
   assert.match(accountsPanel, /id="addAccountForm"/);
   assert.match(accountsPanel, /id="newAccountLabel"/);
   assert.match(accountsPanel, /name="newAccountProvider" value="codex"/);
   assert.match(accountsPanel, /name="newAccountProvider" value="claude"/);
+  assert.match(accountsPanel, /OPENCODE_PROVIDER_OPTIONS\.map/);
+  assert.match(main, /id: "zai"/);
+  assert.match(main, /id: "minimax"/);
+  assert.match(main, /id: "deepseek"/);
+  assert.match(main, /id: "openrouter"/);
   assert.match(accountsPanel, /Ajouter et se connecter/);
   assert.match(
     main,
     /querySelector<HTMLFormElement>\("#addAccountForm"\)\?\.addEventListener\("submit"/,
   );
-  assert.match(main, /providerValue === "claude" \? "claude" : "codex"/);
+  assert.match(main, /const \{ provider, inferenceProvider \} = parseProviderChoice\(providerValue\)/);
   assert.match(main, /uniqueCodexHomeForLabel\(label, provider\)/);
-  assert.match(main, /\{ provider \}/);
+  assert.match(main, /\{ provider, inferenceProvider \}/);
+  assert.match(accountsPanel, /npm install -g opencode-ai/);
+});
+
+test("la connexion API annexe passe par OpenCode et cible le bon provider", () => {
+  assert.match(main, /provider === "opencode"/);
+  assert.match(main, /auth login --provider \$\{inferenceProvider\}/);
+  assert.match(main, /agentProvider\(agent\) === "opencode"/);
+});
+
+test("le terminal OpenCode reprend le modele du compte", () => {
+  assert.match(main, /if \(agentProvider\(agent\) === "opencode"\)/);
+  assert.match(main, /safeCliModel\(accountModel\(account\)\)/);
+  assert.match(main, /command \+= ` --model \$\{model\}`/);
+  assert.match(main, /command \+= " --auto"/);
 });
 
 test("chaque compte expose seulement connexion et suppression", () => {
@@ -80,19 +99,21 @@ test("reconnecter Codex supprime l'ancienne session avant le nouveau login", () 
   assert.match(main, /reconnectCommand,/);
 });
 
-test("la reconnexion Codex utilise la connexion classique (sans codes/device flow)", () => {
-  // Retour a la connexion classique : plus d'injection --device-auth ni de
-  // branche effectiveLoginSub, meme en mode remote. On ouvre le login OAuth
-  // standard directement a partir de loginSub.
-  assert.doesNotMatch(main, /--device-auth/);
-  assert.doesNotMatch(main, /effectiveLoginSub/);
-  assert.match(main, /const loginCommand = agentSubcommand\(agent, loginSub\);/);
+test("la reconnexion Codex utilise le device flow uniquement sur un serveur distant", () => {
+  assert.match(
+    main,
+    /provider === "codex" && isRemoteMode\(\) && loginSub === "login"/,
+  );
+  assert.match(main, /\? "login --device-auth"\s*:\s*loginSub/);
+  assert.match(main, /const loginCommand = agentSubcommand\(agent, effectiveLoginSub\);/);
 });
 
 test("la reconnexion utilise un terminal strictement reserve au login", () => {
-  assert.match(main, /const environmentPath = userEnvironmentPath\(account\.codexHome\);/);
-  assert.match(main, /environmentPath,\s*\n\s*true,\s*\n\s*\);/);
-  assert.match(main, /loginOnly,\s*\n\s*\}\);/);
+  assert.match(main, /if \(!account\.codexHome\.trim\(\)\)/);
+  assert.match(main, /reconnectCommand,\s*\n\s*agentId,\s*\n\s*null,\s*\n\s*null,\s*\n\s*true/);
+  assert.match(main, /loginOnly\s*\? userEnvironmentPath\(startedAccount\?\.codexHome\)/);
+  assert.match(main, /workspacePath: isRemoteMode\(\) && !loginOnly/);
+  assert.match(main, /loginOnly,\s*\n/);
   assert.match(main, /!loginOnly && settings\.autoRunCodex/);
   assert.match(main, /!loginOnly &&\s*\n\s*\(session\.resumeSessionId/);
 });
@@ -104,7 +125,7 @@ test("une reconnexion ne peut ouvrir qu'un terminal temporaire a la fois", () =>
     main,
     /if \(!loginOnly \|\| terminalRestoreAttempted\) \{\s*await ensureTerminalsRestored\(\);/,
   );
-  assert.match(main, /session\.loginOnly = loginOnly;/);
+  assert.match(main, /loginOnly,\s*\n\s*folderPath: loginOnly \? null : capturedEnvironment/);
   assert.match(
     main,
     /\.filter\(\(session\) => session\.status !== "Ferme" && !session\.loginOnly\)/,
@@ -121,6 +142,21 @@ test("une reconnexion ne peut ouvrir qu'un terminal temporaire a la fois", () =>
   assert.match(main, /if \(inFlightLogin\) \{[\s\S]*?return inFlightLogin;/);
   assert.match(main, /loginTerminalCreations\.set\(accountId, creation\);/);
   assert.match(main, /loginTerminalCreations\.delete\(accountId\);/);
+
+  // Une fois le PTY cree, recliquer doit refocaliser ce terminal au lieu d'en
+  // creer un deuxieme qui consommerait un slot VPS.
+  assert.match(main, /const existingLogin = terminalSessions\.find\(/);
+  assert.match(main, /session\.loginOnly &&[\s\S]*?session\.accountId === accountId/);
+  assert.match(main, /activateTerminalSession\(existingLogin\);/);
+  assert.match(main, /return existingLogin;/);
+});
+
+test("le terminal de connexion sans workspace reste visible", () => {
+  assert.match(main, /const activeLoginTerminal = \(\) =>/);
+  assert.match(main, /if \(loginSession\) return \[loginSession\];/);
+  assert.match(main, /if \(!folderPath && !loginSession\)/);
+  assert.match(main, /Aucun dossier projet requis/);
+  assert.match(main, /Terminal temporaire/);
 });
 
 test("le login depuis Nouveau terminal persiste aussi dans le home du compte", () => {
@@ -137,12 +173,16 @@ test("le login depuis Nouveau terminal persiste aussi dans le home du compte", (
   // Le meme logout + login est utilise, et loginOnly=true empeche le lancement
   // automatique de la commande de travail du compte.
   assert.match(handler, /reconnectCommandForAccount\(account, agent\)/);
-  assert.match(handler, /newTerminalWorkspacePath,\s*\n\s*true,\s*\n\s*\);/);
+  assert.match(handler, /null,\s*\n\s*true,\s*\n\s*\);/);
+  assert.doesNotMatch(handler, /upsertWorkspaceRegistry/);
 });
 
 test("une erreur d'auth reste prioritaire sur les limites locales en cache", () => {
   assert.match(main, /account\.error && AUTH_LIMIT_ERROR\.test\(account\.error\)/);
-  assert.match(main, /return "session expiree"/);
+  assert.match(
+    main,
+    /if \(account\.error && AUTH_LIMIT_ERROR\.test\(account\.error\)\) return "error";/,
+  );
 });
 
 test("la connexion cible directement le compte de la carte", () => {

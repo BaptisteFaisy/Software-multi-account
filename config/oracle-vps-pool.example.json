@@ -1,0 +1,30 @@
+{
+  "nodes": [
+    {
+      "id": "oracle-a",
+      "label": "Oracle A",
+      "sshTarget": "ubuntu@203.0.113.10",
+      "identityFile": "%USERPROFILE%\\.ssh\\oracle-a",
+      "knownHostsFile": "%USERPROFILE%\\.ssh\\known_hosts",
+      "sshPort": 22,
+      "remotePort": 8080,
+      "localPort": 18080,
+      "capacity": 2,
+      "seedAccounts": true,
+      "acceptNewHostKey": false
+    },
+    {
+      "id": "oracle-b",
+      "label": "Oracle B",
+      "sshTarget": "ubuntu@203.0.113.11",
+      "identityFile": "%USERPROFILE%\\.ssh\\oracle-b",
+      "knownHostsFile": "%USERPROFILE%\\.ssh\\known_hosts",
+      "sshPort": 22,
+      "remotePort": 8080,
+      "localPort": 18081,
+      "capacity": 2,
+      "seedAccounts": true,
+      "acceptNewHostKey": false
+    }
+  ]
+}

@@ -1,20 +1,38 @@
 import {
   appWindow,
   hasRemoteAuth,
+  hasMobileGooglePaySettings,
+  hasMobileSettings,
+  hasMobilePaymentSettings,
   initializePlatform,
+  installMobileAutonomousAgentHandoffListener,
+  installMobilePaymentHandoffListener,
   invoke,
   isRemoteMode,
+  isTauriRuntime,
   listen,
+  openExternalHttpsUrl,
+  openMobileGooglePaySettings,
+  openMobilePaymentSettings,
+  openMobileSettings,
   remoteBaseUrl,
+  remoteChatExecutionTargets,
   remoteNodesText,
+  repairRemoteConnection,
   saveRemoteConfig,
   subscribeDiscussionUpdates,
+  subscribeRuntimeUpdates,
   type DiscussionStreamMessage,
+  type MobileAutonomousAgentHandoff,
+  type MobilePaymentHandoff,
   type RealtimeConnectionState,
+  type RuntimeSyncMessage,
+  type RuntimeSyncTopic,
   type UnlistenFn,
 } from "./platform";
 import { initPwaSupport } from "./pwa";
 import {
+  authenticatedUser,
   bindUserAccountUi,
   initializeUserAuth,
   renderUserAccountButton,
@@ -54,9 +72,19 @@ import {
 } from "./chat/agent-tools";
 import { bindVoiceComposer } from "./chat/voice";
 import {
+  chatImageAttachmentPayloads,
+  clipboardChatImageFiles,
+  disposeChatImagePreviews,
+  readChatImageAttachments,
+  type ChatImageAttachment,
+} from "./chat/image-attachments";
+import {
   chatSyncLabel,
   renderChatFeedInner,
+  renderChatHistory,
+  renderChatLatestTurn,
   renderChatPanel,
+  renderChatTokenUsage,
   renderChatRuntimeStatus,
   renderChatTurnParts,
   renderChatTurnStatus,
@@ -70,13 +98,26 @@ import {
   type ChatQuotaStatus,
   type ChatSyncState,
   type ChatTurnStatus,
+  type ChatTurnStatusDisplayMode,
 } from "./chat/view";
+import {
+  chatTokenUsagePresentation,
+  isCompactSlashCommand,
+  normalizeChatContextUsage,
+  type ChatContextWindowUsage,
+} from "./chat/token-usage";
+import {
+  DEFAULT_CHAT_TURN_STATUS_DISPLAY_MODE,
+  loadChatTurnStatusDisplayMode,
+  normalizeChatTurnStatusDisplayMode,
+  persistChatTurnStatusDisplayMode,
+} from "./chat/status-display";
 import {
   bestQuotaAccount,
   bestQuotaAccountForNewChat,
+  combinedQuotaUsage,
   deduplicateQuotaAccountsForDisplay,
   isQuotaExhaustionError,
-  OPEN_CHAT_QUOTA_RESERVATION_PERCENT,
   quotaAfterOpenChatReservations,
   remainingQuotaPercent,
   shouldRecoverRunningQuotaTurn,
@@ -87,16 +128,27 @@ import {
   modelCapacityRetryDelayMs,
   modelCapacityRetryPrompt,
 } from "./chat/capacity";
-import { accountCatalogMatchesLimitRows } from "./chat/accounts";
+import {
+  accountCatalogMatchesLimitRows,
+  accountLimitRowsForDisplay,
+} from "./chat/accounts";
 import {
   AUTONOMOUS_AGENT_TEMPLATES,
   AUTONOMOUS_CONNECTORS,
   AUTONOMOUS_INTERVAL_OPTIONS,
+  autonomousAgentIsProjectRadar,
   autonomousAgentIsRunning,
+  autonomousAgentsToPause,
+  autonomousAgentProposals,
+  autonomousAgentReports,
   autonomousAgentTemplateById,
+  autonomousAgentUnreadReports,
+  autonomousConversationEntries,
   autonomousConnectorLabel,
   autonomousInitialMemoryFromChat,
   autonomousMemoryKindLabel,
+  autonomousPaymentCheckoutUrl,
+  autonomousPaymentStatusLabel,
   autonomousReviewKindLabel,
   autonomousStatusLabel,
   autonomousStatusTone,
@@ -105,13 +157,23 @@ import {
   autonomousWorkItemStatusLabel,
   autonomousWorkPlanProgress,
   formatAutonomousInterval,
+  formatAutonomousPaymentAmount,
   formatAutonomousSchedule,
   isAutonomousConnectorId,
   isAutonomousTriggerKind,
   normalizeAutonomousConnectors,
   parseAutonomousWatchPaths,
+  autonomousRadarIdeaProposal,
+  autonomousRadarImplementationAgent,
+  autonomousRadarReportIdeas,
+  autonomousProposalExecutionAgent,
   toggleAutonomousConnector,
   type AutonomousAgentAction,
+  type AutonomousAgentMessageMode,
+  type AutonomousAgentProposal,
+  type AutonomousPaymentRequest,
+  type AutonomousAgentReport,
+  type AutonomousReviewEvidence,
   type AutonomousAgentSnapshot,
   type AutonomousAgentTemplateId,
   type AutonomousConnectorId,
@@ -119,6 +181,8 @@ import {
   type AutonomousTriggerKind,
 } from "./chat/autonomous";
 import {
+  AUTOMATIC_ORCHESTRATION_MARKER,
+  automaticOrchestrationNotice,
   orchestrationIsRunning,
   orchestrationOrchestratorAccountId,
   orchestrationPhaseLabel,
@@ -126,12 +190,15 @@ import {
   orchestrationStatusLabel,
   orchestrationTaskStatusLabel,
   orchestrationWorkerAccountId,
+  parseAutomaticOrchestrationDecision,
+  type AutomaticOrchestrationDecision,
   type OrchestrationAction,
   type OrchestrationAccountRole,
   type OrchestrationSnapshot,
   type OrchestrationTask,
 } from "./chat/orchestration";
 import {
+  chatMessageHasVisibleContent,
   chatMessagesEqual,
   chatTurnIsBusy,
   conversationWaitsForUser,
@@ -144,36 +211,57 @@ import {
   shouldAdoptActiveChatTurn,
 } from "./chat/runtime";
 import {
+  chatIsAtBottom,
   pauseChatScrollFollow,
   restoreChatScrollTop,
   updateChatScrollState,
   type ChatScrollState,
+  type ChatScrollUserIntent,
 } from "./chat/scroll";
 import {
   CHAT_SIDEBAR_DEFAULT_WIDTH,
   CHAT_SIDEBAR_MAX_WIDTH,
   CHAT_SIDEBAR_MIN_WIDTH,
+  DEFAULT_CHAT_SIDEBAR_PRIORITY_MODE,
   activeChatTurnForDiscussion,
+  arrangeChatSidebarItems,
   chatSidebarStatus,
   chatSidebarStatusLabel,
   chatSidebarMaxWidth,
   clampChatSidebarWidth,
   defaultChatSidebarWidth,
   discussionForSession,
+  normalizeChatSidebarPriorityMode,
   orderChatSidebarDiscussions,
+  type ChatSidebarPriorityMode,
+  type ChatSidebarStatus,
 } from "./chat/sidebar";
+import {
+  CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH,
+  CHAT_CONTEXT_SIDEBAR_MAX_WIDTH,
+  CHAT_CONTEXT_SIDEBAR_MIN_WIDTH,
+  CHAT_CONTEXT_SIDEBAR_MOBILE_BREAKPOINT,
+  chatContextSidebarIsCompact,
+  chatContextSidebarMaxWidth,
+  clampChatContextSidebarWidth,
+  defaultChatContextSidebarWidth,
+} from "./chat/context-sidebar";
 import {
   DEFAULT_EXPERT_CHAT_DISPLAY_MODE,
   DEFAULT_EXPERT_CHAT_PAGE_SIZE_MODE,
   clampExpertChatPage,
-  expertChatGridDimensions,
   expertChatPageCount,
   expertChatPageForIndex,
+  expertChatHistoryOpenAfterFullscreenChange,
+  expertChatResponsiveCapacity,
+  expertChatResponsiveGridDimensions,
   expertChatsForDisplay,
   expertChatsOnPage,
   normalizeExpertChatDisplayMode,
   normalizeExpertChatPageSizeMode,
   resolveExpertChatPageSize,
+  shouldMinimizeActiveBusyExpertChat,
+  shouldPinActiveExpertChatDuringTurn,
   type ExpertChatDisplayMode,
   type ExpertChatPageSizeMode,
   type ExpertGridLayout,
@@ -183,11 +271,15 @@ import {
   draftEnvironmentChatPanes,
   mergeClosedWorkspaceIds,
   mergeWorkspaceProfiles,
+  normalizeWorkspaceExecutionTargetId,
   normalizeWorkspacePath,
   openWorkspaceRegistry,
+  remoteEnvironmentPath,
+  setWorkspaceExecutionTarget,
   setWorkspaceMemory,
   terminalsForFolder,
   userEnvironmentPath,
+  userEnvironmentPathExcluding,
   workspaceBaseName,
   workspaceIdForPath,
   workspacePathBreadcrumbs,
@@ -196,52 +288,53 @@ import {
 import {
   STATS_RANGE_OPTIONS,
   WORK_TIME_GRANULARITY_OPTIONS,
+  aggregateApiModelUsage,
   accountTokenUsageForDate,
   buildAccountTokenSeries,
   buildWorkTimeBuckets,
   deduplicateAccountTokenAccounts,
   sumTokenUsage,
+  type ApiModelTokenUsage,
   type DailyTokenUsage,
   type StatsRangeDays,
   type WorkTimeBucket,
   type WorkTimeDay,
   type WorkTimeGranularity,
 } from "./stats";
-import {
-  appendDoctolibLabMessage,
-  createDoctolibLabState,
-  interpretDoctolibLabMessage,
-  renderDoctolibLabPanel,
-  selectedDoctolibLabProposal,
-  type DoctolibLabConfirmation,
-  type DoctolibLabSearchResponse,
-  type DoctolibLabStatus,
+import type {
+  DoctolibLabConfirmation,
+  DoctolibLabSearchResponse,
+  DoctolibLabStatus,
+  DoctolibLabViewState,
 } from "./doctolib-lab";
 import {
   loadTaskItems,
-  mountTasksPanel,
-  renderTasksPanel,
+  persistTaskItems,
+  setTaskCompleted,
   taskItemsForEnvironment,
   taskStats,
   type TaskEnvironment,
   type TaskItem,
 } from "./tasks";
+import type { PromptLibraryItem } from "./prompts";
 import {
-  mountPromptLibraryPanel,
-  renderPromptLibraryPanel,
-  type PromptLibraryItem,
-} from "./prompts";
+  loadFavoritePromptShortcuts,
+  type FavoritePromptShortcut,
+} from "./prompt-shortcuts";
+import {
+  loadCustomSkills,
+  persistCustomSkills,
+  removeCustomSkill,
+} from "./skills";
 import {
   claimScheduledChatItem,
   dueScheduledChatItems,
   loadScheduledChatItems,
   markScheduledChatFailed,
   markScheduledChatLaunched,
-  mountScheduledChatsPanel,
   nextScheduledChatAt,
   persistScheduledChatItems,
   recoverInterruptedScheduledChats,
-  renderScheduledChatsPanel,
   scheduledChatPendingCount,
   scheduledChatTitle,
   syncScheduledChatNavigationBadges,
@@ -257,6 +350,17 @@ import {
   type ThemeMode,
 } from "./theme";
 import {
+  BUG_REPORT_SEVERITIES,
+  bugReportSeverityLabel,
+  bugReportTitleFromAgent,
+  buildBugReportObjective,
+  createBugReportSourceKey,
+  emptyBugReportDraft,
+  isBugReportAgent,
+  type BugReportDraft,
+  type BugReportSeverity,
+} from "./bug-report";
+import {
   chatBecameAvailable,
   loadChatReadySoundPreferences,
   persistChatReadySoundPreferences,
@@ -269,61 +373,107 @@ import type { FitAddon } from "@xterm/addon-fit";
 import type { Terminal } from "@xterm/xterm";
 import {
   Activity,
+  Badge,
+  Calculator,
+  ChartNoAxesColumn,
+  ExternalLink,
+  LayoutTemplate,
   AppWindow,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
   ArrowUpRight,
   BadgeCheck,
+  Ban,
   BarChart3,
   BellOff,
   BellRing,
   Bot,
+  Bug,
   BrainCircuit,
   CalendarClock,
+  Clapperboard,
   Check,
+  CheckCheck,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
+  Circle,
   CircleAlert,
+  CircleCheck,
   CircleDollarSign,
+  CircleX,
+  Coins,
+  ClipboardCheck,
   Clock3,
   CopyCheck,
+  CreditCard,
+  Compass,
+  Container,
+  Download,
+  Eye,
+  EyeOff,
+  Film,
+  Flag,
   FlaskConical,
   FolderOpen,
+  FolderGit2,
   GitBranch,
   History,
   Info,
+  Inbox,
+  Image as ImageIcon,
+  ImageOff,
   Keyboard,
+  KeyRound,
   LayoutGrid,
+  Lightbulb,
   List,
+  ListFilter,
   ListPlus,
   ListTree,
+  Link,
   LoaderCircle,
+  Lock,
+  LockOpen,
   LockKeyhole,
   LogIn,
+  Mail,
   Maximize2,
   Minimize2,
+  MousePointer2,
   Play,
   PlugZap,
   Plus,
   Power,
+  Orbit,
   Radar,
   Radio,
+  Ratio,
   RefreshCcw,
+  Rocket,
+  Route,
   Save,
+  ScanLine,
   Server,
   Shuffle,
   SquareTerminal,
+  Smartphone,
   Stethoscope,
   Star,
   Sun,
   Tag,
   Target,
   Trash2,
+  Trophy,
+  Type,
   Upload,
   Unplug,
   Users,
+  Volume2,
+  WandSparkles,
+  WifiOff,
   X,
   Copy,
   Cpu,
@@ -333,15 +483,18 @@ import {
   Search,
   Send,
   ShieldCheck,
+  ShieldAlert,
   Sparkles,
   ScanEye,
   FolderX,
   Library,
   ListChecks,
   MessageCircleQuestion,
+  MessageCircle,
   MessageSquare,
   MessageSquarePlus,
   MessageSquareText,
+  MessageSquareWarning,
   Mic,
   Square,
   Reply,
@@ -349,29 +502,372 @@ import {
   Wrench,
   Settings,
   Settings2,
+  SlidersHorizontal,
   Folder,
   FolderPlus,
   Folders,
   ChevronsUpDown,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRightClose,
   PanelRightOpen,
   Pause,
   Pencil,
   ShieldQuestion,
   TriangleAlert,
+  WalletCards,
+  MousePointerClick,
   Moon,
+  UserCheck,
   UserPlus,
+  UserX,
   createElement as createLucideElement,
   type IconNode,
 } from "lucide";
 import "./style.css";
 import "./theme.css";
 
+type TutorialModule = typeof import("./tutorial");
+
+const TUTORIAL_PROGRESS_STORAGE_KEY = "codex-switch-terminal.tutorial-progress.v1";
+
+const tutorialHasStarted = (): boolean => {
+  try {
+    const progress = JSON.parse(localStorage.getItem(TUTORIAL_PROGRESS_STORAGE_KEY) ?? "null") as {
+      visited?: unknown;
+      completed?: unknown;
+    } | null;
+    return progress?.completed === true
+      || (Array.isArray(progress?.visited) && progress.visited.length > 0);
+  } catch {
+    return false;
+  }
+};
+
+let tutorialModule: TutorialModule | null = null;
+let tutorialModulePromise: Promise<TutorialModule> | null = null;
+
+const loadTutorialModule = (): Promise<TutorialModule> => {
+  if (tutorialModule) return Promise.resolve(tutorialModule);
+  if (!tutorialModulePromise) {
+    tutorialModulePromise = import("./tutorial")
+      .then((module) => {
+        tutorialModule = module;
+        return module;
+      })
+      .catch((error) => {
+        tutorialModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return tutorialModulePromise;
+};
+
+type TasksViewModule = typeof import("./tasks-view");
+
+let tasksViewModule: TasksViewModule | null = null;
+let tasksViewModulePromise: Promise<TasksViewModule> | null = null;
+
+const loadTasksViewModule = (): Promise<TasksViewModule> => {
+  if (tasksViewModule) return Promise.resolve(tasksViewModule);
+  if (!tasksViewModulePromise) {
+    tasksViewModulePromise = Promise.all([
+      import("./tasks-view"),
+      import("./tasks-view.css"),
+    ]).then(([module]) => {
+        tasksViewModule = module;
+        return module;
+      })
+      .catch((error) => {
+        tasksViewModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return tasksViewModulePromise;
+};
+
+type PromptLibraryModule = typeof import("./prompts-view");
+
+let promptLibraryModule: PromptLibraryModule | null = null;
+let promptLibraryModulePromise: Promise<PromptLibraryModule> | null = null;
+
+const loadPromptLibraryModule = (): Promise<PromptLibraryModule> => {
+  if (promptLibraryModule) return Promise.resolve(promptLibraryModule);
+  if (!promptLibraryModulePromise) {
+    promptLibraryModulePromise = import("./prompts-view")
+      .then((module) => {
+        promptLibraryModule = module;
+        return module;
+      })
+      .catch((error) => {
+        promptLibraryModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return promptLibraryModulePromise;
+};
+
+type PromptHistoryViewModule = typeof import("./prompt-history-view");
+type PromptHistoryView = import("./prompt-history-view").PromptHistoryView;
+
+let promptHistoryViewModule: PromptHistoryViewModule | null = null;
+let promptHistoryViewModulePromise: Promise<PromptHistoryViewModule> | null = null;
+
+const loadPromptHistoryViewModule = (): Promise<PromptHistoryViewModule> => {
+  if (promptHistoryViewModule) return Promise.resolve(promptHistoryViewModule);
+  if (!promptHistoryViewModulePromise) {
+    promptHistoryViewModulePromise = import("./prompt-history-view")
+      .then((module) => {
+        promptHistoryViewModule = module;
+        return module;
+      })
+      .catch((error) => {
+        promptHistoryViewModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return promptHistoryViewModulePromise;
+};
+
+type ScheduledChatsViewModule = typeof import("./scheduled-chats-view");
+
+let scheduledChatsViewModule: ScheduledChatsViewModule | null = null;
+let scheduledChatsViewModulePromise: Promise<ScheduledChatsViewModule> | null = null;
+
+const loadScheduledChatsViewModule = (): Promise<ScheduledChatsViewModule> => {
+  if (scheduledChatsViewModule) return Promise.resolve(scheduledChatsViewModule);
+  if (!scheduledChatsViewModulePromise) {
+    scheduledChatsViewModulePromise = import("./scheduled-chats-view")
+      .then((module) => {
+        scheduledChatsViewModule = module;
+        return module;
+      })
+      .catch((error) => {
+        scheduledChatsViewModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return scheduledChatsViewModulePromise;
+};
+
+type SkillsViewModule = typeof import("./skills-view");
+
+let skillsViewModule: SkillsViewModule | null = null;
+let skillsViewModulePromise: Promise<SkillsViewModule> | null = null;
+
+const loadSkillsViewModule = (): Promise<SkillsViewModule> => {
+  if (skillsViewModule) return Promise.resolve(skillsViewModule);
+  if (!skillsViewModulePromise) {
+    skillsViewModulePromise = import("./skills-view")
+      .then((module) => {
+        skillsViewModule = module;
+        return module;
+      })
+      .catch((error) => {
+        skillsViewModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return skillsViewModulePromise;
+};
+
+type ForumModule = typeof import("./forum");
+
+let forumModule: ForumModule | null = null;
+let forumModulePromise: Promise<ForumModule> | null = null;
+
+const loadForumModule = (): Promise<ForumModule> => {
+  if (forumModule) return Promise.resolve(forumModule);
+  if (!forumModulePromise) {
+    forumModulePromise = import("./forum")
+      .then((module) => {
+        forumModule = module;
+        return module;
+      })
+      .catch((error) => {
+        forumModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return forumModulePromise;
+};
+
+type MessagingModule = typeof import("./messaging");
+
+let messagingModule: MessagingModule | null = null;
+let messagingModulePromise: Promise<MessagingModule> | null = null;
+
+const loadMessagingModule = (): Promise<MessagingModule> => {
+  if (messagingModule) return Promise.resolve(messagingModule);
+  if (!messagingModulePromise) {
+    messagingModulePromise = import("./messaging")
+      .then((module) => {
+        messagingModule = module;
+        module.setMessagingRealtimeAvailable(runtimeSyncState === "live");
+        return module;
+      })
+      .catch((error) => {
+        messagingModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return messagingModulePromise;
+};
+
+type StatsViewModule = typeof import("./stats-view");
+
+let statsViewModule: StatsViewModule | null = null;
+let statsViewModulePromise: Promise<StatsViewModule> | null = null;
+
+const loadStatsViewModule = (): Promise<StatsViewModule> => {
+  if (statsViewModule) return Promise.resolve(statsViewModule);
+  if (!statsViewModulePromise) {
+    statsViewModulePromise = import("./stats-view")
+      .then((module) => {
+        statsViewModule = module;
+        return module;
+      })
+      .catch((error) => {
+        statsViewModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return statsViewModulePromise;
+};
+
+type VpsModule = typeof import("./vps");
+
+let vpsModule: VpsModule | null = null;
+let vpsModulePromise: Promise<VpsModule> | null = null;
+
+const loadVpsModule = (): Promise<VpsModule> => {
+  if (vpsModule) return Promise.resolve(vpsModule);
+  if (!vpsModulePromise) {
+    vpsModulePromise = import("./vps")
+      .then((module) => {
+        vpsModule = module;
+        return module;
+      })
+      .catch((error) => {
+        vpsModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return vpsModulePromise;
+};
+
+type VideoModule = typeof import("./video");
+
+let videoModule: VideoModule | null = null;
+let videoModulePromise: Promise<VideoModule> | null = null;
+
+const loadVideoModule = (): Promise<VideoModule> => {
+  if (videoModule) return Promise.resolve(videoModule);
+  if (!videoModulePromise) {
+    videoModulePromise = import("./video")
+      .then((module) => {
+        videoModule = module;
+        return module;
+      })
+      .catch((error) => {
+        videoModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return videoModulePromise;
+};
+
+type DesignModule = typeof import("./design");
+type DesignTool = import("./design").DesignTool;
+type ClaudeDesignMode = import("./design").ClaudeDesignMode;
+type ClaudeDesignStudioModel = import("./design").ClaudeDesignStudioModel;
+
+let designModule: DesignModule | null = null;
+let designModulePromise: Promise<DesignModule> | null = null;
+
+const loadDesignModule = (): Promise<DesignModule> => {
+  if (designModule) return Promise.resolve(designModule);
+  if (!designModulePromise) {
+    designModulePromise = import("./design")
+      .then((module) => {
+        designModule = module;
+        return module;
+      })
+      .catch((error) => {
+        designModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return designModulePromise;
+};
+
+type DoctolibLabModule = typeof import("./doctolib-lab-view");
+
+let doctolibLabModule: DoctolibLabModule | null = null;
+let doctolibLabModulePromise: Promise<DoctolibLabModule> | null = null;
+
+const loadDoctolibLabModule = (): Promise<DoctolibLabModule> => {
+  if (doctolibLabModule) return Promise.resolve(doctolibLabModule);
+  if (!doctolibLabModulePromise) {
+    doctolibLabModulePromise = import("./doctolib-lab-view")
+      .then((module) => {
+        doctolibLabModule = module;
+        if (!doctolibLab) doctolibLab = module.createDoctolibLabState();
+        return module;
+      })
+      .catch((error) => {
+        doctolibLabModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return doctolibLabModulePromise;
+};
+
+const appendDoctolibLabMessage = (
+  ...args: Parameters<DoctolibLabModule["appendDoctolibLabMessage"]>
+): ReturnType<DoctolibLabModule["appendDoctolibLabMessage"]> =>
+  doctolibLabModule!.appendDoctolibLabMessage(...args);
+
+const interpretDoctolibLabMessage = (
+  ...args: Parameters<DoctolibLabModule["interpretDoctolibLabMessage"]>
+): ReturnType<DoctolibLabModule["interpretDoctolibLabMessage"]> =>
+  doctolibLabModule!.interpretDoctolibLabMessage(...args);
+
+const selectedDoctolibLabProposal = (
+  ...args: Parameters<DoctolibLabModule["selectedDoctolibLabProposal"]>
+): ReturnType<DoctolibLabModule["selectedDoctolibLabProposal"]> =>
+  doctolibLabModule!.selectedDoctolibLabProposal(...args);
+
+const renderDoctolibLabPanel = (
+  ...args: Parameters<DoctolibLabModule["renderDoctolibLabPanel"]>
+): ReturnType<DoctolibLabModule["renderDoctolibLabPanel"]> =>
+  doctolibLabModule!.renderDoctolibLabPanel(...args);
+
 type CodexReasoningEffort = string;
 
-// Fournisseur CLI d'un compte / agent. Absent des configs anterieures => Codex.
-type Provider = "codex" | "claude";
+// Runtime CLI d'un compte / agent. Les fournisseurs API annexes sont tous
+// executes par OpenCode ; Codex et Claude Code conservent leur CLI natif.
+type Provider = "codex" | "claude" | "opencode";
+type OpenCodeInferenceProvider =
+  | "zai"
+  | "zai-coding-plan"
+  | "minimax"
+  | "minimax-coding-plan"
+  | "deepseek"
+  | "openrouter";
 
 type AccountProfile = {
   id: string;
@@ -381,6 +877,8 @@ type AccountProfile = {
   createdAt?: number | null;
   // Fournisseur CLI de ce compte. Optionnel pour la retro-compat (defaut Codex).
   provider?: Provider;
+  // Fournisseur de modele authentifie dans le store isole OpenCode.
+  inferenceProvider?: string | null;
   codexHome: string;
   projectDir?: string | null;
   proxyId?: string | null;
@@ -513,6 +1011,88 @@ type VoiceRuntimeStatus = {
   warning?: string | null;
 };
 
+type WhatsAppConnectionView = {
+  connected: boolean;
+  channelId?: string | null;
+  phoneNumberId?: string | null;
+  displayPhoneNumber?: string | null;
+  verifiedName?: string | null;
+  qualityRating?: string | null;
+  recipientHint?: string | null;
+  conversationEnabled: boolean;
+  webhookCallbackUrl?: string | null;
+  webhookVerifyToken?: string | null;
+  templateName?: string | null;
+  templateLanguage?: string | null;
+  deliveryMode: "disabled" | "template" | "session_text";
+  graphApiVersion: string;
+  connectedAt?: number | null;
+  dashboardUrl: string;
+  note: string;
+};
+
+type WhatsAppSendResult = {
+  messageId: string;
+  sentAt: number;
+};
+
+type WhatsAppConnectionDraft = {
+  accessToken: string;
+  appSecret: string;
+  phoneNumberId: string;
+  recipientPhoneNumber: string;
+  templateName: string;
+  templateLanguage: string;
+};
+
+type TelegramConnectionView = {
+  connected: boolean;
+  paired: boolean;
+  channelId?: string | null;
+  botUsername?: string | null;
+  botName?: string | null;
+  userHint?: string | null;
+  pairingUrl?: string | null;
+  pairingExpiresAt?: number | null;
+  connectedAt?: number | null;
+  pairedAt?: number | null;
+  botfatherUrl: string;
+  free: boolean;
+  note: string;
+};
+
+type TelegramSendResult = {
+  messageId: number;
+  sentAt: number;
+};
+
+type TelegramManagerView = {
+  connected: boolean;
+  managementEnabled: boolean;
+  botUsername?: string | null;
+  botName?: string | null;
+  pendingBotUsername?: string | null;
+  pendingBotName?: string | null;
+  creationUrl?: string | null;
+  pendingExpiresAt?: number | null;
+  lastCreatedBotUsername?: string | null;
+  lastCreatedAt?: number | null;
+  lastError?: string | null;
+  connectedAt?: number | null;
+  botfatherUrl: string;
+  note: string;
+};
+
+type TelegramConnectionDraft = {
+  botToken: string;
+};
+
+type TelegramManagerDraft = {
+  botToken: string;
+  managedBotUsername: string;
+  managedBotName: string;
+};
+
 // Entree/reponse du navigateur de dossiers du serveur (mode web). En desktop on
 // utilise le dialogue natif (`pick_project_dir`), pas cette API.
 type FsEntry = { name: string; path: string; isDir: boolean };
@@ -521,6 +1101,50 @@ type FsListResponse = {
   path: string;
   parent: string | null;
   entries: FsEntry[];
+};
+
+type WorkspaceAccessPerson = {
+  userId: string;
+  username: string;
+  createdAt: number;
+};
+
+type WorkspaceAccessView = {
+  id: string;
+  label: string;
+  path: string;
+  ownerId: string;
+  ownerUsername: string;
+  role: "owner" | "member";
+  shareCode?: string | null;
+  members: WorkspaceAccessPerson[];
+  requests: WorkspaceAccessPerson[];
+  createdAt: number;
+  updatedAt: number;
+};
+
+type GitDockerEnvironmentMode = "analyze" | "build" | "deploy";
+type GitDockerEnvironmentDraft = {
+  repositoryUrl: string;
+  refName: string;
+  mode: GitDockerEnvironmentMode;
+  deployTarget: string;
+  sshKey: string;
+  sshPort: string;
+  installDocker: boolean;
+  acceptNewHostKey: boolean;
+  containerPort: string;
+  hostPort: string;
+};
+type GitDockerEnvironmentResult = {
+  repositoryUrl: string;
+  workspacePath: string;
+  bundlePath: string | null;
+  commit: string;
+  mode: GitDockerEnvironmentMode;
+  dockerStatus: "analyzed" | "built" | "deployed" | "failed";
+  message: string;
+  log: string;
 };
 
 type AppSettings = {
@@ -629,6 +1253,7 @@ type AccountUsageDay = {
   reasoningOutputTokens: number;
   totalTokens: number;
   costUsd: number;
+  models: ApiModelTokenUsage[];
 };
 
 type AccountUsageView = {
@@ -652,6 +1277,7 @@ type AccountUsageView = {
   monthCostUsd: number;
   firstActivity?: number | null;
   lastActivity?: number | null;
+  models: ApiModelTokenUsage[];
   days: AccountUsageDay[];
   error?: string | null;
 };
@@ -662,6 +1288,9 @@ type AccountUsageDashboard = {
   totalTokens: number;
   totalCostUsd: number;
   totalSessions: number;
+  pricingSourceUrl?: string;
+  pricingAsOf?: string;
+  models?: ApiModelTokenUsage[];
   accounts: AccountUsageView[];
 };
 
@@ -691,6 +1320,7 @@ type AccountLimitView = {
   buckets: AccountRateLimitBucketView[];
   refreshedAt?: number | null;
   source: string;
+  refreshing?: boolean;
   error?: string | null;
 };
 
@@ -764,22 +1394,100 @@ type PersistedTerminalState = {
 
 type AppView =
   | "terminal"
+  | "tutorial"
   | "tasks"
   | "prompts"
   | "scheduled-chat"
   | "pool"
   | "limits"
   | "dashboard"
-  | "kombai"
+  | "video"
+  | "vps"
+  | "design"
   | "doctolib-lab"
   | "autonomous"
+  | "bug-report"
   | "orchestration"
+  | "forum"
+  | "messaging"
   | "discussions"
   | "history"
   | "audit"
   | "skills"
   | "settings"
   | "chat";
+
+const chatSideMoreViews = new Set<AppView>([
+  "video",
+  "bug-report",
+  "forum",
+  "audit",
+  "pool",
+  "skills",
+  "vps",
+]);
+let chatSideMoreMenuOpen = false;
+
+const lazyModuleViews = new Set<AppView>([
+  "tutorial",
+  "tasks",
+  "prompts",
+  "history",
+  "scheduled-chat",
+  "skills",
+  "forum",
+  "messaging",
+  "dashboard",
+  "vps",
+  "video",
+  "design",
+  "doctolib-lab",
+]);
+const STALE_CHUNK_BUILD_PARAM = "cst-chunk-build";
+const STALE_CHUNK_VIEW_PARAM = "cst-chunk-view";
+let lazyChunkTargetView: AppView | null = null;
+let lazyChunkReloadScheduled = false;
+
+const staleChunkError = (error: unknown): boolean =>
+  /failed to fetch dynamically imported module|importing a module script failed|error loading dynamically imported module|unable to preload css/i
+    .test(String(error));
+
+function scheduleStaleChunkRecovery(error?: unknown): boolean {
+  if (error !== undefined && !staleChunkError(error)) return false;
+  if (lazyChunkReloadScheduled) return true;
+  const recoveryUrl = new URL(window.location.href);
+  if (recoveryUrl.searchParams.get(STALE_CHUNK_BUILD_PARAM) === __CST_BUILD_ID__) {
+    return false;
+  }
+  lazyChunkReloadScheduled = true;
+  recoveryUrl.searchParams.set(STALE_CHUNK_BUILD_PARAM, __CST_BUILD_ID__);
+  if (lazyChunkTargetView) {
+    recoveryUrl.searchParams.set(STALE_CHUNK_VIEW_PARAM, lazyChunkTargetView);
+  }
+  const target = recoveryUrl.toString();
+  window.setTimeout(() => window.location.replace(target), 0);
+  return true;
+}
+
+// Un onglet web peut conserver le bundle principal d'un build pendant qu'une
+// publication remplace les chunks hashes. Vite signale alors le 404 avant de
+// rejeter import(). Recharge une seule fois sur le nouveau point d'entree et
+// restaure la vue que l'utilisateur venait d'ouvrir.
+window.addEventListener("vite:preloadError", (event) => {
+  void event;
+  // Laisser Vite rejeter import() : le masquer ferait resoudre le loader avec
+  // `undefined` et pourrait creer une boucle de microtaches avant la navigation.
+  scheduleStaleChunkRecovery();
+});
+
+const consumeRecoveredLazyView = (): AppView | null => {
+  const recoveryUrl = new URL(window.location.href);
+  const candidate = recoveryUrl.searchParams.get(STALE_CHUNK_VIEW_PARAM);
+  if (!candidate) return null;
+  recoveryUrl.searchParams.delete(STALE_CHUNK_VIEW_PARAM);
+  window.history.replaceState(window.history.state, "", recoveryUrl.toString());
+  return lazyModuleViews.has(candidate as AppView) ? candidate as AppView : null;
+};
 
 type DiscussionSummary = {
   // Identite LOGIQUE de la conversation (stable a travers les reprises/forks).
@@ -806,6 +1514,8 @@ type DiscussionSummary = {
   messageCount: number;
   totalTokens: number | null;
   cliVersion: string | null;
+  nodeId?: string | null;
+  nodeLabel?: string | null;
 };
 
 type DiscussionAccountGroup = {
@@ -830,6 +1540,11 @@ type DiscussionTranscriptView = {
   sessionId: string;
   messages: ChatMessage[];
   truncated: boolean;
+  contextUsage?: ChatContextWindowUsage | null;
+};
+
+type CompactChatSessionResult = {
+  contextUsage?: ChatContextWindowUsage | null;
 };
 
 type ChatTurnSnapshot = {
@@ -843,6 +1558,8 @@ type ChatTurnSnapshot = {
   activities: ChatActivity[];
   thoughts: ChatThought[];
   parts: ChatPart[];
+  nodeId?: string | null;
+  nodeLabel?: string | null;
 };
 
 type ActiveChatTurnSummary = {
@@ -852,18 +1569,35 @@ type ActiveChatTurnSummary = {
   status: Exclude<ChatTurnStatus, "idle">;
   startedAt: number;
   waitingForUser: boolean;
+  nodeId?: string | null;
+  nodeLabel?: string | null;
+};
+
+type ChatOpenRequest = {
+  id: string;
+  accountId: string;
+  sourceChatKey?: string | null;
+  projectDir?: string | null;
+  mode: ChatMode;
+  prompt: string;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  createdAt: number;
 };
 
 type ChatSubmitIntent = "message" | "goal";
 
 type QueuedChatSubmission = {
   prompt: string;
+  imageAttachments: ChatImageAttachment[];
   accountId: string;
   mode: ChatMode;
   model: string;
   reasoningEffort: string | null;
   enabledTools: ChatAgentToolId[];
   agentSkills: ChatAgentSkillPrompt[];
+  /** Ce message doit d'abord etre route par le mode d'orchestration automatique. */
+  automaticOrchestration?: boolean;
   /** Reprise interne d'une saturation : conserve strictement modele et effort. */
   automaticCapacityRetry?: boolean;
   /** Session a reprendre meme si son resume n'est pas encore charge dans l'UI. */
@@ -877,6 +1611,8 @@ type ExpertChatPane = {
   loading: boolean;
   error: string | null;
   truncated: boolean;
+  contextUsage: ChatContextWindowUsage | null;
+  contextCompacting: boolean;
   syncState: ChatSyncState;
   liveUnlisten: UnlistenFn | null;
   fallbackPoll: number | null;
@@ -885,6 +1621,7 @@ type ExpertChatPane = {
   turnPoll: number | null;
   turnPollInFlight: boolean;
   draft: string;
+  imageAttachments: ChatImageAttachment[];
   queuedSubmissions: QueuedChatSubmission[];
   queueDrainInFlight: boolean;
   activeSubmission: QueuedChatSubmission | null;
@@ -893,20 +1630,26 @@ type ExpertChatPane = {
   mode: ChatMode;
   enabledTools: ChatAgentToolId[];
   accountId: string | null;
+  /** Cible imposee uniquement lors de la creation de la session distante. */
+  executionTargetId: string | null;
   historyOpen: boolean;
   pendingWorkspace: string | null;
   autonomousAgentId: string | null;
+  automaticOrchestrationEnabled: boolean;
+  automaticOrchestrationLaunching: boolean;
   orchestrationId: string | null;
   orchestrationRole: "orchestrator" | "worker" | null;
   orchestrationTaskId: string | null;
   followLatest: boolean;
   scrollTop: number;
+  visibleTurnLimit: number | null;
 };
 
 type PersistedExpertChatPane = {
   key: string;
   sessionId: string | null;
   accountId: string | null;
+  executionTargetId?: string | null;
   draft: string;
   mode: ChatMode;
   enabledTools?: ChatAgentToolId[];
@@ -915,6 +1658,7 @@ type PersistedExpertChatPane = {
   proofToolEnabled?: boolean;
   pendingWorkspace: string | null;
   autonomousAgentId?: string | null;
+  automaticOrchestrationEnabled?: boolean;
   orchestrationId?: string | null;
   orchestrationRole?: "orchestrator" | "worker" | null;
   orchestrationTaskId?: string | null;
@@ -969,38 +1713,6 @@ type PersistedExpertChats = {
   v: 1;
   activeKey: string | null;
   panes: PersistedExpertChatPane[];
-};
-
-type PromptEntry = {
-  sessionId: string;
-  accountId: string;
-  accountLabel: string;
-  codexHome: string;
-  filePath: string;
-  cwd: string | null;
-  timestamp: number;
-  sessionTitle: string | null;
-  text: string;
-};
-
-type PromptHistoryView = {
-  generatedAt: number;
-  totalPrompts: number;
-  returned: number;
-  truncated: boolean;
-  prompts: PromptEntry[];
-};
-
-type PromptSessionHistory = {
-  key: string;
-  sessionId: string;
-  accountId: string;
-  accountLabel: string;
-  cwd: string | null;
-  sessionTitle: string | null;
-  firstTimestamp: number;
-  lastTimestamp: number;
-  prompts: PromptEntry[];
 };
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -1098,17 +1810,39 @@ let requestTerminalFocusKey: string | null = null;
 let globalMobileListenersBound = false;
 let mobileRefitTimer = 0;
 let unlistenData: UnlistenFn | null = null;
+let unlistenMobileAutonomousAgentHandoff: UnlistenFn | null = null;
+let unlistenMobilePaymentHandoff: UnlistenFn | null = null;
 let unlistenExit: UnlistenFn | null = null;
 let activeView: AppView = "chat";
+const MOBILE_CHAT_TURN_BATCH = 24;
+const DESKTOP_CHAT_TURN_BATCH = 200;
+const chatTurnBatchForViewport = (): number =>
+  window.matchMedia("(max-width: 860px)").matches
+    ? MOBILE_CHAT_TURN_BATCH
+    : DESKTOP_CHAT_TURN_BATCH;
+const initialVisibleChatTurnLimit = (): number | null =>
+  chatTurnBatchForViewport();
+let chatVisibleTurnLimit: number | null = initialVisibleChatTurnLimit();
 let scheduledChatTimer: number | null = null;
 let scheduledChatDispatchInFlight = false;
 let scheduledChatSchedulerStarted = false;
-const doctolibLab = createDoctolibLabState();
+let doctolibLab: DoctolibLabViewState;
 let expertGridLayout: ExpertGridLayout = "auto";
 let expertChatPageSizeMode: ExpertChatPageSizeMode = DEFAULT_EXPERT_CHAT_PAGE_SIZE_MODE;
 let expertChatDisplayMode: ExpertChatDisplayMode = DEFAULT_EXPERT_CHAT_DISPLAY_MODE;
+let chatComposerSelectorsEnabled = true;
+let chatTurnStatusDisplayMode: ChatTurnStatusDisplayMode =
+  DEFAULT_CHAT_TURN_STATUS_DISPLAY_MODE;
+let chatSidebarPriorityMode: ChatSidebarPriorityMode =
+  DEFAULT_CHAT_SIDEBAR_PRIORITY_MODE;
+let chatSidebarHideRunning = false;
+let chatContextTasksVisible = false;
+let expertChatHistoryOpenOnFullscreen = false;
+let expertChatHistoryCloseOnCompact = false;
 let expertChatPage = 0;
 let expertChatToolbarHidden = false;
+let expertChatResponsiveRenderFrame = 0;
+let renderedExpertChatLayoutSignature = "";
 let terminalRestoreAttempted = false;
 let terminalRestorePromise: Promise<void> | null = null;
 let poolStatus: PoolStatus | null = null;
@@ -1119,6 +1853,35 @@ let voiceRuntimeStatus: VoiceRuntimeStatus | null = null;
 let voiceRuntimeError: string | null = null;
 let voiceRuntimeInFlight = false;
 let voiceRuntimePoll: number | null = null;
+let whatsappConnection: WhatsAppConnectionView | null = null;
+let whatsappConnectionLoaded = false;
+let whatsappConnectionInFlight = false;
+let whatsappConnectionAction: "connect" | "test" | "disconnect" | null = null;
+let whatsappConnectionEditing = false;
+let whatsappDisconnectPending = false;
+let whatsappConnectionFeedback: { tone: "success" | "error"; message: string } | null = null;
+let whatsappConnectionDraft: WhatsAppConnectionDraft = {
+  accessToken: "",
+  appSecret: "",
+  phoneNumberId: "",
+  recipientPhoneNumber: "",
+  templateName: "",
+  templateLanguage: "fr",
+};
+let telegramConnection: TelegramConnectionView | null = null;
+let telegramConnectionLoaded = false;
+let telegramConnectionInFlight = false;
+let telegramConnectionAction: "connect" | "pairing" | "test" | "disconnect" | null = null;
+let telegramDisconnectPending = false;
+let telegramConnectionFeedback: { tone: "success" | "error"; message: string } | null = null;
+let telegramConnectionDraft: TelegramConnectionDraft = { botToken: "" };
+let telegramManager: TelegramManagerView | null = null;
+let telegramManagerAction: "connect" | "prepare" | "disconnect" | null = null;
+let telegramManagerDraft: TelegramManagerDraft = {
+  botToken: "",
+  managedBotUsername: "",
+  managedBotName: "Agent Codex",
+};
 let poolImportPaths = "";
 let poolNewAccountLabel = "";
 let poolNewAccountProxyId = "";
@@ -1133,6 +1896,7 @@ let unconnectedAccountCleanupTimer: number | null = null;
 let unconnectedAccountCleanupInFlight = false;
 let limitStatusInFlight = false;
 let limitStatusRefreshPromise: Promise<void> | null = null;
+let limitRefreshFollowupTimer: number | null = null;
 let limitStatusSignature = "";
 let usageDashboard: UsageDashboard | null = null;
 let usagePoll: number | null = null;
@@ -1156,6 +1920,36 @@ let kombaiLoaded = false;
 let kombaiPoll: number | null = null;
 let kombaiStatusError = false;
 let kombaiStatusInFlight = false;
+const DESIGN_TOOL_STORAGE_KEY = "codex-switch-terminal.design-tool";
+const DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY = "codex-switch-terminal.design-claude-account";
+const DESIGN_CLAUDE_MODE_STORAGE_KEY = "codex-switch-terminal.design-claude-mode";
+const DESIGN_CLAUDE_SESSIONS_STORAGE_KEY = "codex-switch-terminal.design-claude-sessions";
+const normalizeDesignToolPreference = (value: unknown): DesignTool =>
+  value === "kombai" ? "kombai" : "claude";
+const normalizeClaudeDesignModePreference = (value: unknown): ClaudeDesignMode =>
+  value === "wireframe" || value === "presentation" || value === "system"
+    ? value
+    : "prototype";
+let activeDesignTool: DesignTool = normalizeDesignToolPreference(
+  localStorage.getItem(DESIGN_TOOL_STORAGE_KEY),
+);
+let designClaudeAccountId: string | null = localStorage.getItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY);
+let designClaudeMode: ClaudeDesignMode = normalizeClaudeDesignModePreference(
+  localStorage.getItem(DESIGN_CLAUDE_MODE_STORAGE_KEY),
+);
+let designClaudeContextKey: string | null = null;
+let designClaudeProjectDir: string | null = null;
+let designClaudeSessionId: string | null = null;
+let designClaudeMessages: ChatMessage[] = [];
+let designClaudeTurn: ChatTurnSnapshot | null = null;
+let designClaudeDraft = "";
+let designClaudeError: string | null = null;
+let designClaudeLoading = false;
+let designClaudeTranscriptLoaded = false;
+let designClaudeTranscriptInFlight = false;
+let designClaudeTranscriptRequestId = 0;
+let designClaudePoll: number | null = null;
+let designClaudePollInFlight = false;
 let isFullscreen = false;
 let newTerminalModalOpen = false;
 let newTerminalAccountId: string | null = null;
@@ -1163,15 +1957,20 @@ let newTerminalAgentId: string | null = null;
 let newTerminalWorkspacePath: string | null = null;
 let newTerminalAccountLabel = "";
 let newTerminalAccountProvider: Provider = "codex";
+let newTerminalInferenceProvider: OpenCodeInferenceProvider | null = null;
 let newTerminalAccountBypass = true;
 let newTerminalAccountModel = DEFAULT_CODEX_MODEL;
 let newTerminalAccountReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
-// Fenetre "nouveau chat" : on choisit le compte, le modele et le mode avant
-// d'ouvrir reellement le pane (tous les points d'entree "nouveau chat" y passent).
+// Fenetre "nouveau chat" : le routage choisit un compte compatible en arriere-plan.
+// Un choix manuel reste disponible dans les reglages avances, sans devenir une
+// etape obligatoire du parcours principal.
+type NewChatRoutingMode = "automatic" | "manual";
 let newChatModalOpen = false;
 let newChatAccountId: string | null = null;
+let newChatRoutingMode: NewChatRoutingMode = "automatic";
 let newChatMode: ChatMode = "build";
 let newChatModel = "";
+let newChatExecutionTargetId: string | null = null;
 const newChatModelDrafts = new Map<string, string>();
 let newChatPendingWorkspace: string | null = null;
 let newChatPendingTaskTitle: string | null = null;
@@ -1184,12 +1983,18 @@ let autonomousAgents: AutonomousAgentSnapshot[] = [];
 let autonomousAgentsLoaded = false;
 let autonomousAgentsInFlight = false;
 let autonomousAgentsPoll: number | null = null;
+let autonomousAgentsTracking = false;
 let autonomousAgentsSignature = "";
 let autonomousNameDraft = "";
 let autonomousObjectiveDraft = "";
 let autonomousRoleDraft = "";
 let autonomousInitialMemoryDraft = "";
 let autonomousTemplateId: AutonomousAgentTemplateId | null = null;
+let autonomousRadarSourceDraft: {
+  reportId: string;
+  ideaIndex: number;
+  proposalId: string | null;
+} | null = null;
 let autonomousAccountId: string | null = null;
 let autonomousProjectDir = "";
 let autonomousEnvironmentCustom = false;
@@ -1205,10 +2010,25 @@ let autonomousLaunchWorkerCount = 3;
 let autonomousLaunchWorkerAccountIds: string[] = [];
 let autonomousRequireUserReview = true;
 let autonomousConnectors: AutonomousConnectorId[] = [];
+let autonomousMobileNotifications = false;
+let autonomousTelegramNotifications = false;
+let autonomousWhatsAppNotifications = false;
 let autonomousTestCommandDraft = "";
 let autonomousTestTimeoutSeconds = 5 * 60;
 let autonomousCreateOpen = false;
 let autonomousCreatePreferenceSet = false;
+let autonomousCreateOptionsOpen = false;
+let autonomousOverviewOpen = false;
+let autonomousTemplatesOpen = false;
+type AutonomousPanelTab = "agents" | "proposals";
+let autonomousPanelTab: AutonomousPanelTab = "agents";
+const autonomousExpandedAgentIds = new Set<string>();
+const autonomousCollapsedAgentCards = new Map<string, boolean>();
+const autonomousExpandedAgentSectionKeys = new Set<string>();
+let bugReportDraft: BugReportDraft = emptyBugReportDraft();
+let bugReportBusy = false;
+let bugReportFeedback: { tone: "success" | "error"; message: string } | null = null;
+let lastCreatedBugReportAgentId: string | null = null;
 type AutonomousAgentEditDraft = {
   name: string;
   objective: string;
@@ -1219,6 +2039,9 @@ type AutonomousAgentEditDraft = {
   model: string;
   reasoningEffort: string;
   connectors: AutonomousConnectorId[];
+  mobileNotificationsEnabled: boolean;
+  telegramNotificationChannelId: string | null;
+  whatsappNotificationChannelId: string | null;
   intervalSeconds: number;
   triggerKind: AutonomousTriggerKind;
   watchPaths: string;
@@ -1232,8 +2055,63 @@ type AutonomousAgentEditDraft = {
 let autonomousEditingId: string | null = null;
 let autonomousEditDraft: AutonomousAgentEditDraft | null = null;
 const AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY = "codex-switch-terminal.autonomous-monitor-compact.v1";
+const AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY = "codex-switch-terminal.autonomous-monitor-position.v1";
+const AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY = "codex-switch-terminal.autonomous-monitor-size.v1";
+const AUTONOMOUS_SEEN_REPORTS_STORAGE_KEY = "codex-switch-terminal.autonomous-seen-reports.v1";
+type AutonomousMonitorPosition = { x: number; y: number };
+type AutonomousMonitorSize = { width: number; height: number };
+const loadAutonomousMonitorPosition = (): AutonomousMonitorPosition | null => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY) ?? "null");
+    if (
+      stored
+      && typeof stored === "object"
+      && Number.isFinite(stored.x)
+      && Number.isFinite(stored.y)
+    ) {
+      return { x: Number(stored.x), y: Number(stored.y) };
+    }
+  } catch {
+    // Une valeur locale invalide ne doit jamais empêcher l'ouverture du moniteur.
+  }
+  return null;
+};
+const loadAutonomousMonitorSize = (): AutonomousMonitorSize | null => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY) ?? "null");
+    if (
+      stored
+      && typeof stored === "object"
+      && Number.isFinite(stored.width)
+      && Number.isFinite(stored.height)
+      && stored.width > 0
+      && stored.height > 0
+    ) {
+      return { width: Number(stored.width), height: Number(stored.height) };
+    }
+  } catch {
+    // Une taille locale invalide ne doit jamais empêcher l'ouverture du moniteur.
+  }
+  return null;
+};
+const loadSeenAutonomousReportIds = (): Set<string> => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(AUTONOMOUS_SEEN_REPORTS_STORAGE_KEY) ?? "[]");
+    return new Set(Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : []);
+  } catch {
+    return new Set();
+  }
+};
+let autonomousSeenReportIds = loadSeenAutonomousReportIds();
 let autonomousMonitorOpen = false;
 let autonomousMonitorCompact = localStorage.getItem(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY) === "1";
+let autonomousMonitorPosition = loadAutonomousMonitorPosition();
+let autonomousMonitorSize = loadAutonomousMonitorSize();
+const autonomousMonitorDisclosureState = new Map<string, boolean>();
+const autonomousMonitorDisclosureAttribute = (
+  key: string,
+  defaultOpen = false,
+): string => (autonomousMonitorDisclosureState.get(key) ?? defaultOpen) ? " open" : "";
 let autonomousMonitorAgentId: string | null = null;
 let autonomousMonitorInstructionDraft = "";
 let autonomousMonitorTurn: ChatTurnSnapshot | null = null;
@@ -1242,8 +2120,14 @@ let autonomousMonitorTurnSignature = "";
 let autonomousMonitorTurnInFlight = false;
 let autonomousMonitorTurnPoll: number | null = null;
 let autonomousMonitorError = "";
+const autonomousReviewEvidenceCache = new Map<string, AutonomousReviewEvidence>();
+const autonomousReviewEvidenceErrors = new Map<string, string>();
+const autonomousReviewEvidenceInFlight = new Set<string>();
 const autonomousMemoryDrafts = new Map<string, string>();
+const autonomousMessageDrafts = new Map<string, string>();
+const autonomousMessageModes = new Map<string, AutonomousAgentMessageMode>();
 let autonomousBusyId: string | null = null;
+const AUTONOMOUS_PAUSE_ALL_BUSY_ID = "pause-all";
 let autonomousDeletePendingId: string | null = null;
 let autonomousScheduleEditingId: string | null = null;
 const autonomousScheduleDrafts = new Map<string, string>();
@@ -1263,6 +2147,7 @@ let orchestrationWorkerCount = 3;
 let orchestrationWorkerAccountIds: string[] = [];
 let orchestrationCreateOpen = false;
 let orchestrationCreatePreferenceSet = false;
+let orchestrationCreateAdvancedOpen = false;
 let orchestrationBusyId: string | null = null;
 let orchestrationAssignmentBusy: string | null = null;
 let orchestrationDeletePendingId: string | null = null;
@@ -1274,12 +2159,13 @@ let discussions: DiscussionsView | null = null;
 let discussionsLoaded = false;
 let discussionsPoll: number | null = null;
 let discussionsLiveUnlisten: UnlistenFn | null = null;
-let discussionsSyncState: RealtimeConnectionState = "closed";
+let discussionsSyncState: RealtimeConnectionState | "polling" = "closed";
 let discussionsRenderSignature = "";
 let discussionsRefreshPromise: Promise<void> | null = null;
 let discussionSearch = "";
 let chatSidebarSearch = "";
 let chatSidebarWidth = CHAT_SIDEBAR_DEFAULT_WIDTH;
+let chatContextSidebarWidthPreference: number | null = null;
 // Compte cible choisi par discussion (sessionId -> accountId). Defaut : le
 // compte d'origine. Persiste entre les re-rendus (poll 60s) pour ne pas perdre
 // le choix en cours.
@@ -1293,14 +2179,25 @@ type ChatAccountTransition = {
 // Etat purement visuel et ephemere : une bascule conserve le panneau existant
 // pendant que son contexte passe au compte cible. Rien n'est persiste ici.
 const expertChatAccountTransitions = new Map<string, ChatAccountTransition>();
+// En mode « chats disponibles », un panneau visible ne doit pas disparaitre
+// lorsqu'une reprise automatique le remet en cours d'execution. L'epingle est
+// retiree des que ce nouveau tour se termine.
+const automaticQuotaResumeVisibilityPins = new Set<string>();
+// Un chat en cours suivi volontairement (ouvert depuis la liste ou actif au
+// moment de l'envoi) reste visible en mode « Disponibles ». Cette exception
+// est ephemere et expire a la fin du tour.
+const explicitlyOpenedBusyChatVisibilityPins = new Set<string>();
 const CHAT_DRAG_MIME = "application/x-cst-chat";
 let draggedChatSessionId: string | null = null;
+let chatSidebarRefreshPending = false;
 // Vue conversation : discussion ouverte en bulles + son transcript charge.
 let chatDiscussion: DiscussionSummary | null = null;
 let chatMessages: ChatMessage[] = [];
 let chatLoading = false;
 let chatError: string | null = null;
 let chatTruncated = false;
+let chatContextUsage: ChatContextWindowUsage | null = null;
+let chatContextCompacting = false;
 let chatSyncState: ChatSyncState = "closed";
 let chatLiveUnlisten: UnlistenFn | null = null;
 let chatFallbackPoll: number | null = null;
@@ -1310,10 +2207,19 @@ let chatTurnPoll: number | null = null;
 let chatTurnPollInFlight = false;
 let activeChatTurns: ActiveChatTurnSummary[] = [];
 let activeChatTurnsPoll: number | null = null;
+let activeChatTurnsTracking = false;
 let activeChatTurnsInFlight = false;
 let activeChatTurnsSidebarSignature = "";
+let runtimeSyncState: RealtimeConnectionState = "closed";
+let runtimeSyncUnlisten: UnlistenFn | null = null;
+let runtimeSyncRefreshTimer: number | null = null;
+const runtimeSyncPendingTopics = new Set<RuntimeSyncTopic>();
+const runtimeSyncRetryTimers = new Map<RuntimeSyncTopic, number>();
+let privateMessagesSyncInFlight = false;
+let chatOpenRequestsInFlight = false;
 let chatRuntimeClock: number | null = null;
 let chatDraft = "";
+let chatImageAttachments: ChatImageAttachment[] = [];
 let chatQueuedSubmissions: QueuedChatSubmission[] = [];
 let chatQueueDrainInFlight = false;
 let chatActiveSubmission: QueuedChatSubmission | null = null;
@@ -1340,7 +2246,7 @@ let expertChatFullscreenKey: string | null = null;
 let expertChatsRestored = false;
 let promptHistory: PromptHistoryView | null = null;
 let promptHistoryLoaded = false;
-let promptSearch = "";
+let promptHistoryRefreshPromise: Promise<void> | null = null;
 // Selecteur de workspace (mode web) : modale de navigation de dossiers serveur.
 type WorkspacePickerTarget = "active" | "new-terminal";
 let workspaceModalOpen = false;
@@ -1349,10 +2255,32 @@ let workspaceBrowse: FsListResponse | null = null;
 let workspaceBrowseLoading = false;
 let workspaceBrowseError = "";
 let terminalEnvironmentMenuOpen = false;
+let gitDockerEnvironmentModalOpen = false;
+let gitDockerEnvironmentSubmitting = false;
+let gitDockerEnvironmentError = "";
+let gitDockerEnvironmentDraft: GitDockerEnvironmentDraft = {
+  repositoryUrl: "",
+  refName: "",
+  mode: "analyze",
+  deployTarget: "",
+  sshKey: "",
+  sshPort: "22",
+  installDocker: false,
+  acceptNewHostKey: false,
+  containerPort: "",
+  hostPort: "",
+};
 let environmentMemoryTargetId: string | null = null;
 let environmentMemoryDraftId: string | null = null;
 let environmentMemoryDraft = "";
 let environmentMemorySaving = false;
+let environmentExecutionTargetSavingId: string | null = null;
+let workspaceAccess: WorkspaceAccessView[] = [];
+let workspaceAccessLoaded = false;
+let workspaceAccessLoading = false;
+let workspaceAccessError = "";
+let workspaceAccessTargetId: string | null = null;
+let workspaceAccessBusyKey: string | null = null;
 
 type ManagedDialog =
   | "agents"
@@ -1560,6 +2488,7 @@ type SkillEntry = {
   buttonLabel: string;
   icon: string;
   content: string;
+  custom: boolean;
 };
 type ChatAgentSkillPrompt = Pick<SkillEntry, "id" | "name" | "content">;
 let skillsList: SkillEntry[] | null = null;
@@ -1569,63 +2498,108 @@ let chatSkillButtonIds: string[] | null = null;
 
 const lucideIcons = {
   Activity,
+  Badge,
+  Calculator,
+  ChartNoAxesColumn,
+  ExternalLink,
+  LayoutTemplate,
   ArrowUpRight,
   ArrowRight,
   Check,
+  CheckCheck,
   LayoutGrid,
+  Lightbulb,
   List,
+  ListFilter,
   ListPlus,
   ListTree,
   LoaderCircle,
+  Lock,
+  LockOpen,
   LogIn,
+  Mail,
   MessageSquare,
   MessageSquarePlus,
   AppWindow,
   ArrowLeft,
   ArrowUp,
   BadgeCheck,
+  Ban,
   BarChart3,
   BellOff,
   BellRing,
   Bot,
+  Bug,
   BrainCircuit,
   CalendarClock,
+  Clapperboard,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
+  Circle,
   CircleAlert,
+  CircleCheck,
   CircleDollarSign,
+  CircleX,
+  Coins,
+  ClipboardCheck,
   Clock3,
   CopyCheck,
+  CreditCard,
+  Compass,
+  Container,
+  Download,
+  Eye,
+  EyeOff,
+  Film,
+  Flag,
   FlaskConical,
   FolderOpen,
+  FolderGit2,
   GitBranch,
   History,
   Info,
+  Inbox,
+  Image: ImageIcon,
+  ImageOff,
   Keyboard,
+  KeyRound,
   Maximize2,
   Minimize2,
+  MousePointer2,
   Play,
   PlugZap,
   Plus,
   Power,
+  Orbit,
   Radar,
   Radio,
+  Ratio,
   RefreshCcw,
+  Rocket,
+  Route,
   Save,
+  ScanLine,
   Server,
   Shuffle,
   SquareTerminal,
+  Smartphone,
   Stethoscope,
   Star,
   Sun,
   Tag,
   Target,
   Trash2,
+  Trophy,
+  Type,
   Upload,
   Unplug,
   UserPlus,
   Users,
+  Volume2,
+  WandSparkles,
+  WifiOff,
   X,
   Copy,
   Cpu,
@@ -1634,15 +2608,19 @@ const lucideIcons = {
   Music2,
   Search,
   Send,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   ScanEye,
   FolderX,
   Library,
   ListChecks,
+  Link,
   LockKeyhole,
+  MessageCircle,
   MessageCircleQuestion,
   MessageSquareText,
+  MessageSquareWarning,
   Mic,
   Square,
   Reply,
@@ -1650,18 +2628,24 @@ const lucideIcons = {
   Wrench,
   Settings,
   Settings2,
+  SlidersHorizontal,
   Folder,
   FolderPlus,
   Folders,
   ChevronsUpDown,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRightClose,
   PanelRightOpen,
   Pause,
   Pencil,
   ShieldQuestion,
   TriangleAlert,
+  WalletCards,
+  MousePointerClick,
   Moon,
+  UserCheck,
+  UserX,
 };
 
 // `lucide.createIcons()` reparcourt puis remplace toutes les icones du document
@@ -1695,25 +2679,121 @@ const renderIcons = (root: ParentNode = document) => {
   });
 };
 
-const chatFeedSignatures = new WeakMap<HTMLElement, string>();
 const chatRuntimeSignatures = new WeakMap<object, string>();
+const chatSidebarPaneStatuses = new WeakMap<ExpertChatPane, ChatSidebarStatus>();
 
-const chatFeedRenderSignature = (model: ChatPanelModel) => JSON.stringify([
-  model.providerLabel,
-  model.loading,
-  model.error,
-  model.truncated,
-  model.messages,
-  model.activities,
-  model.thoughts,
-  model.parts,
-  model.turnStatus,
-  model.turnStartedAt,
-  model.turnFinishedAt,
-  model.turnError,
-  model.waitingForUser,
-  model.quotaSuggestion,
-]);
+type ChatFeedSnapshot = {
+  messages: ChatMessage[];
+  latestTurnStart: number;
+  frameSignature: string;
+  latestSignature: string;
+};
+
+const chatFeedSnapshots = new WeakMap<HTMLElement, ChatFeedSnapshot>();
+
+const latestVisibleChatTurnStart = (messages: ChatMessage[]): number => {
+  let start = messages.findIndex(chatMessageHasVisibleContent);
+  if (start < 0) start = messages.length;
+  for (let index = messages.length - 1; index >= start; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "user" && chatMessageHasVisibleContent(message)) return index;
+  }
+  return start;
+};
+
+const chatPartStable = (left: ChatPart, right: ChatPart): boolean =>
+  left.id === right.id
+  && left.kind === right.kind
+  && left.status === right.status
+  && left.tool === right.tool
+  && left.title === right.title
+  && left.subtitle === right.subtitle
+  && left.text === right.text
+  && left.detail === right.detail
+  && left.output === right.output;
+
+const historicalChatMessageStable = (left: ChatMessage, right: ChatMessage): boolean => {
+  if (
+    left.role !== right.role
+    || left.text !== right.text
+    || left.timestamp !== right.timestamp
+    || left.deliveryState !== right.deliveryState
+  ) return false;
+  const leftParts = left.parts ?? [];
+  const rightParts = right.parts ?? [];
+  return leftParts.length === rightParts.length
+    && leftParts.every((part, index) => chatPartStable(part, rightParts[index]));
+};
+
+const chatHistoryPrefixStable = (
+  previous: ChatFeedSnapshot,
+  messages: ChatMessage[],
+  latestTurnStart: number,
+): boolean => {
+  if (previous.latestTurnStart !== latestTurnStart) return false;
+  for (let index = 0; index < latestTurnStart; index += 1) {
+    const before = previous.messages[index];
+    const after = messages[index];
+    if (!before || !after || !historicalChatMessageStable(before, after)) return false;
+  }
+  return true;
+};
+
+const chatFeedSnapshot = (model: ChatPanelModel): ChatFeedSnapshot => {
+  const latestTurnStart = latestVisibleChatTurnStart(model.messages);
+  return {
+    messages: model.messages,
+    latestTurnStart,
+    frameSignature: JSON.stringify([
+      model.providerLabel,
+      model.loading,
+      model.error,
+      model.truncated,
+      model.turnError,
+      model.quotaSuggestion,
+      model.visibleTurnLimit,
+    ]),
+    // Seul le tour courant varie pendant le streaming. Les longs tours restent
+    // serialises, mais tout l'historique stable ne l'est plus a chaque trame.
+    latestSignature: JSON.stringify([
+      model.messages.slice(latestTurnStart),
+      model.parts,
+      model.turnStatus,
+      model.turnStartedAt,
+      model.turnFinishedAt,
+    ]),
+  };
+};
+
+const patchChatFeedContent = (
+  feed: HTMLElement,
+  model: ChatPanelModel,
+  instanceId = "",
+): ParentNode | null => {
+  const previous = chatFeedSnapshots.get(feed);
+  const next = chatFeedSnapshot(model);
+  if (
+    previous
+    && previous.frameSignature === next.frameSignature
+    && chatHistoryPrefixStable(previous, model.messages, next.latestTurnStart)
+  ) {
+    if (previous.latestSignature === next.latestSignature) {
+      chatFeedSnapshots.set(feed, next);
+      return null;
+    }
+    const latest = feed.querySelector<HTMLElement>(".chat-turn.is-latest");
+    const latestHtml = renderChatLatestTurn(model, instanceId);
+    if (latest && latestHtml) {
+      latest.outerHTML = latestHtml;
+      chatFeedSnapshots.set(feed, next);
+      return feed.querySelector<HTMLElement>(".chat-turn.is-latest") ?? feed;
+    }
+  }
+
+  feed.innerHTML = renderChatFeedInner(model, instanceId);
+  chatFeedSnapshots.set(feed, next);
+  return feed;
+};
 
 const chatRuntimeRenderSignature = (model: ChatPanelModel) => JSON.stringify([
   model.turnStatus,
@@ -1724,6 +2804,12 @@ const chatRuntimeRenderSignature = (model: ChatPanelModel) => JSON.stringify([
   model.parts.at(-1),
   model.turnError,
   model.quotaStatus,
+  model.turnStatusDisplayMode,
+  model.totalTokens,
+  model.contextUsage,
+  model.contextCompacting,
+  model.supportsCompact,
+  model.hasCompactableSession,
 ]);
 
 const OPEN_TERMINALS_STORAGE_KEY = "codex-switch-terminal.open-terminals.v4";
@@ -1735,6 +2821,8 @@ const EXPERT_GRID_LAYOUT_STORAGE_KEY = "codex-switch-terminal.expert-grid-layout
 const EXPERT_CHATS_PER_PAGE_STORAGE_KEY = "codex-switch-terminal.expert-chats-per-page.v1";
 const EXPERT_CHAT_DISPLAY_MODE_STORAGE_KEY =
   "codex-switch-terminal.expert-chat-display-mode.v1";
+const CHAT_COMPOSER_SELECTORS_STORAGE_KEY =
+  "codex-switch-terminal.chat-composer-selectors-enabled.v1";
 const EXPERT_CHAT_TOOLBAR_HIDDEN_STORAGE_KEY =
   "codex-switch-terminal.expert-chat-toolbar-hidden.v1";
 const EXPERT_MAX_TERMINALS = 16;
@@ -1743,8 +2831,23 @@ const EXPERT_OPEN_CHATS_STORAGE_KEY = "codex-switch-terminal.expert-open-chats.v
 // v2 applique la largeur plus lisible de la nouvelle coque sans conserver une
 // ancienne valeur par defaut trop etroite comme preference utilisateur.
 const CHAT_SIDEBAR_WIDTH_STORAGE_KEY = "codex-switch-terminal.chat-sidebar-width.v2";
+const CHAT_CONTEXT_SIDEBAR_WIDTH_STORAGE_KEY =
+  "codex-switch-terminal.chat-context-sidebar-width.v1";
+const CHAT_SIDEBAR_PRIORITY_STORAGE_KEY =
+  "codex-switch-terminal.chat-sidebar-priority.v1";
+const CHAT_SIDEBAR_HIDE_RUNNING_STORAGE_KEY =
+  "codex-switch-terminal.chat-sidebar-hide-running.v1";
+const CHAT_CONTEXT_TASKS_VISIBLE_STORAGE_KEY =
+  "codex-switch-terminal.chat-context-tasks-visible.v1";
+const CHAT_CONTEXT_TASKS_MIN_WIDTH = 200;
+const CHAT_CONTEXT_SIDEBAR_SNAP_CLOSED_WIDTH = 64;
+const EXPERT_CHAT_HISTORY_OPEN_FULLSCREEN_STORAGE_KEY =
+  "codex-switch-terminal.expert-chat-history-open-fullscreen.v1";
+const EXPERT_CHAT_HISTORY_CLOSE_COMPACT_STORAGE_KEY =
+  "codex-switch-terminal.expert-chat-history-close-compact.v1";
 const CHAT_SIDEBAR_SNAP_CLOSED_WIDTH = 48;
 const LIMIT_POLL_INTERVAL_MS = 30_000;
+const LIMIT_REFRESH_FOLLOWUP_MS = 750;
 const UNCONNECTED_ACCOUNT_EXPIRY_MS = 10 * 60 * 1_000;
 const UNCONNECTED_ACCOUNT_CLEANUP_RETRY_MS = 30_000;
 const LOCAL_TRANSCRIPT_POLL_INTERVAL_MS = 2_000;
@@ -1768,15 +2871,116 @@ const loadExpertChatPageSizeMode = (): ExpertChatPageSizeMode =>
 const loadExpertChatDisplayMode = (): ExpertChatDisplayMode =>
   normalizeExpertChatDisplayMode(localStorage.getItem(EXPERT_CHAT_DISPLAY_MODE_STORAGE_KEY));
 
+const loadChatComposerSelectorsEnabled = (): boolean =>
+  localStorage.getItem(CHAT_COMPOSER_SELECTORS_STORAGE_KEY) !== "false";
+
+const loadChatSidebarPriorityMode = (): ChatSidebarPriorityMode =>
+  normalizeChatSidebarPriorityMode(
+    localStorage.getItem(CHAT_SIDEBAR_PRIORITY_STORAGE_KEY),
+  );
+
+const loadChatSidebarHideRunning = (): boolean =>
+  localStorage.getItem(CHAT_SIDEBAR_HIDE_RUNNING_STORAGE_KEY) === "true";
+
+const loadChatContextTasksVisible = (): boolean =>
+  localStorage.getItem(CHAT_CONTEXT_TASKS_VISIBLE_STORAGE_KEY) !== "false";
+
+const loadExpertChatHistoryOpenOnFullscreen = (): boolean =>
+  localStorage.getItem(EXPERT_CHAT_HISTORY_OPEN_FULLSCREEN_STORAGE_KEY) === "true";
+
+const loadExpertChatHistoryCloseOnCompact = (): boolean =>
+  localStorage.getItem(EXPERT_CHAT_HISTORY_CLOSE_COMPACT_STORAGE_KEY) === "true";
+
+const setChatComposerSelectorsEnabled = (enabled: boolean): void => {
+  if (enabled === chatComposerSelectorsEnabled) return;
+  chatComposerSelectorsEnabled = enabled;
+  localStorage.setItem(CHAT_COMPOSER_SELECTORS_STORAGE_KEY, String(enabled));
+  statusText = enabled
+    ? "Les sélecteurs du chat sont modifiables"
+    : "Le modèle, l’intensité et le mode du chat sont verrouillés";
+  render();
+};
+
+const setChatTurnStatusDisplayMode = (mode: ChatTurnStatusDisplayMode): void => {
+  const nextMode = normalizeChatTurnStatusDisplayMode(mode);
+  if (nextMode === chatTurnStatusDisplayMode) return;
+  chatTurnStatusDisplayMode = nextMode;
+  persistChatTurnStatusDisplayMode(nextMode);
+  statusText = nextMode === "dot"
+    ? "Le bandeau affiche uniquement le point d'état coloré"
+    : "Le bandeau affiche le texte de l'état du chat";
+  render();
+};
+
+const setChatSidebarPriorityMode = (mode: ChatSidebarPriorityMode): void => {
+  const nextMode = normalizeChatSidebarPriorityMode(mode);
+  if (nextMode === chatSidebarPriorityMode) return;
+  chatSidebarPriorityMode = nextMode;
+  localStorage.setItem(CHAT_SIDEBAR_PRIORITY_STORAGE_KEY, nextMode);
+  statusText = nextMode === "question"
+    ? "Les chats avec une question passent en tête de la liste"
+    : nextMode === "available"
+      ? "Les chats verts passent en tête de la liste"
+      : "Les chats gardent leur ordre récent";
+  render();
+};
+
+const setChatSidebarHideRunning = (hidden: boolean): void => {
+  if (hidden === chatSidebarHideRunning) return;
+  chatSidebarHideRunning = hidden;
+  localStorage.setItem(CHAT_SIDEBAR_HIDE_RUNNING_STORAGE_KEY, String(hidden));
+  statusText = hidden
+    ? "Les chats orange sont masqués dans la liste de l’environnement"
+    : "Les chats orange sont affichés dans la liste de l’environnement";
+  render();
+};
+
+const setChatContextTasksVisible = (visible: boolean): void => {
+  if (visible === chatContextTasksVisible) return;
+  chatContextTasksVisible = visible;
+  localStorage.setItem(CHAT_CONTEXT_TASKS_VISIBLE_STORAGE_KEY, String(visible));
+  statusText = visible
+    ? "Les tâches à faire sont affichées dans la colonne de droite"
+    : "Les tâches à faire sont masquées dans la colonne de droite";
+  render();
+};
+
+const setExpertChatHistoryOpenOnFullscreen = (enabled: boolean): void => {
+  if (enabled === expertChatHistoryOpenOnFullscreen) return;
+  expertChatHistoryOpenOnFullscreen = enabled;
+  localStorage.setItem(
+    EXPERT_CHAT_HISTORY_OPEN_FULLSCREEN_STORAGE_KEY,
+    String(enabled),
+  );
+  statusText = enabled
+    ? "L’historique s’ouvrira automatiquement en plein écran"
+    : "Le passage en plein écran conservera l’état de l’historique";
+  render();
+};
+
+const setExpertChatHistoryCloseOnCompact = (enabled: boolean): void => {
+  if (enabled === expertChatHistoryCloseOnCompact) return;
+  expertChatHistoryCloseOnCompact = enabled;
+  localStorage.setItem(
+    EXPERT_CHAT_HISTORY_CLOSE_COMPACT_STORAGE_KEY,
+    String(enabled),
+  );
+  statusText = enabled
+    ? "L’historique se fermera automatiquement en vue réduite"
+    : "Le retour en vue réduite conservera l’état de l’historique";
+  render();
+};
+
 const setExpertChatDisplayMode = (mode: ExpertChatDisplayMode): void => {
   const nextMode = normalizeExpertChatDisplayMode(mode);
   if (nextMode === expertChatDisplayMode) return;
   expertChatDisplayMode = nextMode;
+  if (nextMode !== "available") explicitlyOpenedBusyChatVisibilityPins.clear();
   localStorage.setItem(EXPERT_CHAT_DISPLAY_MODE_STORAGE_KEY, nextMode);
   expertChatPage = 0;
   reconcileExpertChatPage();
   statusText = nextMode === "available"
-    ? "La fenêtre principale n'affiche que les chats disponibles"
+    ? "Les chats disponibles sont affichés ; un chat en cours reste accessible depuis la liste"
     : "La fenêtre principale affiche tous les chats";
   render();
   if (activeView === "chat") startAllExpertChatWork();
@@ -1801,6 +3005,7 @@ const setExpertChatToolbarHidden = (hidden: boolean) => {
   expertChatToolbarHidden = hidden;
   localStorage.setItem(EXPERT_CHAT_TOOLBAR_HIDDEN_STORAGE_KEY, String(hidden));
   syncExpertChatToolbarDom();
+  scheduleExpertChatResponsiveRender();
   const focusTarget = document.querySelector<HTMLButtonElement>(
     hidden ? "#expertChatToolbarShow" : "#expertChatToolbarHide",
   );
@@ -1818,8 +3023,89 @@ const loadChatSidebarWidth = (): number => {
   );
 };
 
+const loadChatContextSidebarWidthPreference = (): number | null => {
+  const stored = localStorage.getItem(CHAT_CONTEXT_SIDEBAR_WIDTH_STORAGE_KEY);
+  if (stored === null) return null;
+  const parsed = Number(stored);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed <= CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH) {
+    return CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH;
+  }
+  return Math.max(
+    CHAT_CONTEXT_SIDEBAR_MIN_WIDTH,
+    Math.min(CHAT_CONTEXT_SIDEBAR_MAX_WIDTH, Math.round(parsed)),
+  );
+};
+
+const leftSidebarWidthReservedForContext = (viewportWidth: number): number =>
+  clampChatSidebarWidth(chatSidebarWidth, viewportWidth);
+
+const chatContextSidebarWidth = (viewportWidth: number): number => {
+  const preferredWidth = chatContextSidebarWidthPreference
+    ?? defaultChatContextSidebarWidth(viewportWidth);
+  if (preferredWidth === CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH) {
+    return CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH;
+  }
+  const requestedWidth = chatContextTasksVisible
+    && viewportWidth > CHAT_CONTEXT_SIDEBAR_MOBILE_BREAKPOINT
+    ? Math.max(CHAT_CONTEXT_TASKS_MIN_WIDTH, preferredWidth)
+    : preferredWidth;
+  return clampChatContextSidebarWidth(
+    requestedWidth,
+    viewportWidth,
+    leftSidebarWidthReservedForContext(viewportWidth),
+  );
+};
+
+const chatSidebarAvailableViewportWidth = (): number =>
+  Math.max(1, window.innerWidth - chatContextSidebarWidth(window.innerWidth));
+
 const displayedChatSidebarWidth = (): number =>
-  clampChatSidebarWidth(chatSidebarWidth, window.innerWidth);
+  clampChatSidebarWidth(chatSidebarWidth, chatSidebarAvailableViewportWidth());
+
+const displayedChatContextSidebarWidth = (): number =>
+  chatContextSidebarWidth(window.innerWidth);
+
+const syncChatContextSidebarWidthDom = () => {
+  const layout = document.querySelector<HTMLElement>(".chat-app-layout");
+  const resizer = document.querySelector<HTMLElement>("#chatContextSidebarResizer");
+  if (!layout) return;
+  const width = displayedChatContextSidebarWidth();
+  const mobile = window.innerWidth <= CHAT_CONTEXT_SIDEBAR_MOBILE_BREAKPOINT;
+  const maxWidth = chatContextSidebarMaxWidth(
+    window.innerWidth,
+    leftSidebarWidthReservedForContext(window.innerWidth),
+  );
+  layout.style.setProperty("--chat-context-sidebar-width", `${width}px`);
+  layout.classList.toggle(
+    "is-context-sidebar-collapsed",
+    width === CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH,
+  );
+  layout.classList.toggle(
+    "is-context-sidebar-compact",
+    chatContextSidebarIsCompact(width),
+  );
+  if (resizer) {
+    resizer.setAttribute("aria-valuemin", String(
+      mobile
+        ? 0
+        : CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH,
+    ));
+    resizer.setAttribute("aria-valuemax", String(maxWidth));
+    resizer.setAttribute("aria-valuenow", String(width));
+    resizer.setAttribute(
+      "aria-valuetext",
+      mobile
+        ? "Menu masqué sur mobile"
+        : width === CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH
+          ? "Barre de droite masquée"
+          : `${width} pixels`,
+    );
+  }
+  document
+    .querySelector<HTMLElement>("#autonomousMonitorHost")
+    ?.style.setProperty("--chat-context-sidebar-offset", `${width}px`);
+};
 
 const syncChatSidebarWidthDom = () => {
   const layout = document.querySelector<HTMLElement>(".chat-app-layout");
@@ -1829,16 +3115,76 @@ const syncChatSidebarWidthDom = () => {
   layout.style.setProperty("--chat-sidebar-width", `${width}px`);
   layout.classList.toggle("is-sidebar-collapsed", width === 0);
   resizer.setAttribute("aria-valuenow", String(width));
-  resizer.setAttribute("aria-valuemax", String(chatSidebarMaxWidth(window.innerWidth)));
+  resizer.setAttribute("aria-valuemax", String(chatSidebarMaxWidth(chatSidebarAvailableViewportWidth())));
   resizer.setAttribute("aria-valuetext", width === 0 ? "Colonne masquée" : `${width} pixels`);
 };
 
 const setChatSidebarWidth = (width: number, persist = true) => {
-  chatSidebarWidth = clampChatSidebarWidth(width, window.innerWidth);
+  chatSidebarWidth = clampChatSidebarWidth(width, chatSidebarAvailableViewportWidth());
+  syncChatContextSidebarWidthDom();
   syncChatSidebarWidthDom();
   if (persist) {
     localStorage.setItem(CHAT_SIDEBAR_WIDTH_STORAGE_KEY, String(chatSidebarWidth));
   }
+};
+
+const setChatContextSidebarWidth = (width: number, persist = true) => {
+  const requestedWidth = width <= CHAT_CONTEXT_SIDEBAR_SNAP_CLOSED_WIDTH
+    ? CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH
+    : chatContextTasksVisible
+      ? Math.max(CHAT_CONTEXT_TASKS_MIN_WIDTH, width)
+      : width;
+  chatContextSidebarWidthPreference = clampChatContextSidebarWidth(
+    requestedWidth,
+    window.innerWidth,
+    leftSidebarWidthReservedForContext(window.innerWidth),
+  );
+  syncChatContextSidebarWidthDom();
+  syncChatSidebarWidthDom();
+  if (persist) {
+    localStorage.setItem(
+      CHAT_CONTEXT_SIDEBAR_WIDTH_STORAGE_KEY,
+      String(chatContextSidebarWidthPreference),
+    );
+  }
+  syncAutonomousMonitorPositionUi(persist);
+};
+
+const resetChatContextSidebarWidth = () => {
+  chatContextSidebarWidthPreference = null;
+  localStorage.removeItem(CHAT_CONTEXT_SIDEBAR_WIDTH_STORAGE_KEY);
+  syncChatContextSidebarWidthDom();
+  syncChatSidebarWidthDom();
+  syncAutonomousMonitorPositionUi(true);
+};
+
+const toggleChatSidebar = (): void => {
+  if (window.matchMedia("(max-width: 860px)").matches) {
+    if (document.body.classList.contains("chat-sidebar-open")) {
+      closeMobileOverlays();
+    } else {
+      document.body.classList.remove("m-drawer-open", "m-sheet-open");
+      document.body.classList.add("chat-sidebar-open");
+      syncMobileSheetAccessibility(false);
+      syncMobileDrawerAccessibility(true, true);
+    }
+  } else if (displayedChatSidebarWidth() === 0) {
+    setChatSidebarWidth(defaultChatSidebarWidth(window.innerWidth));
+  } else {
+    setChatSidebarWidth(0);
+  }
+  fitAndResizeVisibleTerminals();
+  scheduleExpertChatResponsiveRender();
+};
+
+const toggleChatContextSidebar = (): void => {
+  if (displayedChatContextSidebarWidth() === CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH) {
+    setChatContextSidebarWidth(defaultChatContextSidebarWidth(window.innerWidth));
+  } else {
+    setChatContextSidebarWidth(CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH);
+  }
+  fitAndResizeVisibleTerminals();
+  scheduleExpertChatResponsiveRender();
 };
 
 const bindChatSidebarResizer = () => {
@@ -1863,6 +3209,7 @@ const bindChatSidebarResizer = () => {
       resizer.releasePointerCapture(capturedPointerId);
     }
     fitAndResizeVisibleTerminals();
+    scheduleExpertChatResponsiveRender();
   };
 
   resizer.addEventListener("pointerdown", (event) => {
@@ -1884,6 +3231,7 @@ const bindChatSidebarResizer = () => {
   resizer.addEventListener("dblclick", () => {
     setChatSidebarWidth(defaultChatSidebarWidth(window.innerWidth));
     fitAndResizeVisibleTerminals();
+    scheduleExpertChatResponsiveRender();
   });
   resizer.addEventListener("keydown", (event) => {
     const step = event.shiftKey ? 32 : 16;
@@ -1891,11 +3239,78 @@ const bindChatSidebarResizer = () => {
     if (event.key === "ArrowLeft") nextWidth = displayedChatSidebarWidth() - step;
     if (event.key === "ArrowRight") nextWidth = displayedChatSidebarWidth() + step;
     if (event.key === "Home") nextWidth = CHAT_SIDEBAR_MIN_WIDTH;
-    if (event.key === "End") nextWidth = chatSidebarMaxWidth(window.innerWidth);
+    if (event.key === "End") nextWidth = chatSidebarMaxWidth(chatSidebarAvailableViewportWidth());
     if (nextWidth === null) return;
     event.preventDefault();
     setChatSidebarWidth(nextWidth);
     fitAndResizeVisibleTerminals();
+    scheduleExpertChatResponsiveRender();
+  });
+};
+
+const bindChatContextSidebarResizer = () => {
+  const resizer = document.querySelector<HTMLElement>("#chatContextSidebarResizer");
+  if (!resizer) return;
+
+  let pointerId: number | null = null;
+  let pointerStartX = 0;
+  let widthAtPointerStart = 0;
+
+  const finishResize = (event: PointerEvent) => {
+    if (pointerId !== event.pointerId) return;
+    const capturedPointerId = pointerId;
+    pointerId = null;
+    document.body.classList.remove("chat-context-sidebar-resizing");
+    setChatContextSidebarWidth(displayedChatContextSidebarWidth());
+    if (resizer.hasPointerCapture(capturedPointerId)) {
+      resizer.releasePointerCapture(capturedPointerId);
+    }
+    fitAndResizeVisibleTerminals();
+    scheduleExpertChatResponsiveRender();
+  };
+
+  resizer.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    event.preventDefault();
+    pointerId = event.pointerId;
+    pointerStartX = event.clientX;
+    widthAtPointerStart = displayedChatContextSidebarWidth();
+    resizer.setPointerCapture(event.pointerId);
+    document.body.classList.add("chat-context-sidebar-resizing");
+  });
+  resizer.addEventListener("pointermove", (event) => {
+    if (pointerId !== event.pointerId) return;
+    setChatContextSidebarWidth(
+      widthAtPointerStart + pointerStartX - event.clientX,
+      false,
+    );
+  });
+  resizer.addEventListener("pointerup", finishResize);
+  resizer.addEventListener("pointercancel", finishResize);
+  resizer.addEventListener("lostpointercapture", finishResize);
+  resizer.addEventListener("dblclick", () => {
+    resetChatContextSidebarWidth();
+    fitAndResizeVisibleTerminals();
+    scheduleExpertChatResponsiveRender();
+  });
+  resizer.addEventListener("keydown", (event) => {
+    const step = event.shiftKey ? 32 : 16;
+    const currentWidth = displayedChatContextSidebarWidth();
+    let nextWidth: number | null = null;
+    if (event.key === "ArrowLeft") nextWidth = currentWidth + step;
+    if (event.key === "ArrowRight") nextWidth = currentWidth - step;
+    if (event.key === "Home") nextWidth = CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH;
+    if (event.key === "End") {
+      nextWidth = chatContextSidebarMaxWidth(
+        window.innerWidth,
+        leftSidebarWidthReservedForContext(window.innerWidth),
+      );
+    }
+    if (nextWidth === null) return;
+    event.preventDefault();
+    setChatContextSidebarWidth(nextWidth);
+    fitAndResizeVisibleTerminals();
+    scheduleExpertChatResponsiveRender();
   });
 };
 
@@ -1906,6 +3321,17 @@ const WORKSPACE_STORAGE_KEY = "codex-switch-terminal.workspace.path";
 const WORKSPACES_STORAGE_KEY = "codex-switch-terminal.workspaces.v1";
 const MAX_ENVIRONMENT_MEMORY_CHARS = 8_000;
 
+// Les homes de comptes servent uniquement a stocker credentials et sessions.
+// Ils ne doivent jamais etre proposes comme dossiers projet ni persistes dans
+// le registre des workspaces.
+const userWorkspacePath = (path: string | null | undefined): string | null => {
+  const environment = userEnvironmentPathExcluding(
+    path,
+    (settings?.accounts ?? []).map((account) => account.codexHome),
+  );
+  return isRemoteMode() ? remoteEnvironmentPath(environment) : environment;
+};
+
 const loadWorkspacePaths = (): string[] => {
   try {
     const parsed = JSON.parse(localStorage.getItem(WORKSPACES_STORAGE_KEY) ?? "[]");
@@ -1913,7 +3339,7 @@ const loadWorkspacePaths = (): string[] => {
     const seen = new Set<string>();
     const sanitized = parsed
       .filter((path): path is string => typeof path === "string" && path.trim().length > 0)
-      .map((path) => userEnvironmentPath(path))
+      .map((path) => userWorkspacePath(path))
       .filter((path): path is string => !!path)
       .filter((path) => {
         const key = normalizeWorkspacePath(path);
@@ -1935,7 +3361,7 @@ const storeWorkspacePaths = (paths: readonly string[]) => {
 };
 
 const rememberWorkspace = (path: string) => {
-  const trimmed = userEnvironmentPath(path);
+  const trimmed = userWorkspacePath(path);
   if (!trimmed) return;
   const key = normalizeWorkspacePath(trimmed);
   const paths = loadWorkspacePaths().filter((item) => normalizeWorkspacePath(item) !== key);
@@ -1951,13 +3377,13 @@ const forgetWorkspace = (path: string) => {
 
 const currentWorkspace = (): string | null => {
   const stored = localStorage.getItem(WORKSPACE_STORAGE_KEY);
-  const environment = userEnvironmentPath(stored);
+  const environment = userWorkspacePath(stored);
   if (stored?.trim() && !environment) localStorage.removeItem(WORKSPACE_STORAGE_KEY);
   return environment;
 };
 
 const setCurrentWorkspace = (path: string | null) => {
-  const trimmed = userEnvironmentPath(path);
+  const trimmed = userWorkspacePath(path);
   if (trimmed) {
     rememberWorkspace(trimmed);
     localStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
@@ -2035,7 +3461,7 @@ const knownWorkspaces = (): WorkspaceProfile[] => {
   const byId = new Map<string, WorkspaceProfile>();
   const closedIds = closedWorkspaceIds();
   const add = (rawPath: string | null | undefined) => {
-    const path = userEnvironmentPath(rawPath);
+    const path = userWorkspacePath(rawPath);
     if (!path) return;
     const id = workspaceIdForPath(path);
     if (closedIds.has(id)) return;
@@ -2045,6 +3471,7 @@ const knownWorkspaces = (): WorkspaceProfile[] => {
   };
 
   mergeWorkspaceProfiles(settings?.workspaces ?? []).workspaces.forEach((ws) => {
+    if (!userWorkspacePath(ws.path)) return;
     if (closedIds.has(ws.id)) return;
     if (!byId.has(ws.id)) byId.set(ws.id, ws);
   });
@@ -2075,11 +3502,16 @@ const knownWorkspaces = (): WorkspaceProfile[] => {
 const workspaceProfileForPath = (
   path: string | null | undefined,
 ): WorkspaceProfile | null => {
-  const environmentPath = userEnvironmentPath(path);
+  const environmentPath = userWorkspacePath(path);
   if (!environmentPath) return null;
   const id = workspaceIdForPath(environmentPath);
   return knownWorkspaces().find((workspace) => workspace.id === id) ?? null;
 };
+
+const workspaceExecutionTargetIdForPath = (
+  path: string | null | undefined,
+): string | null =>
+  normalizeWorkspaceExecutionTargetId(workspaceProfileForPath(path)?.executionTargetId);
 
 const openEnvironmentMemory = (workspace: WorkspaceProfile) => {
   environmentMemoryTargetId = workspace.id;
@@ -2149,10 +3581,49 @@ const saveEnvironmentMemory = async (): Promise<void> => {
   }
 };
 
+const saveEnvironmentExecutionTarget = async (
+  workspaceId: string,
+  requestedTargetId: string | null,
+): Promise<void> => {
+  if (!settings || environmentExecutionTargetSavingId) return;
+  const workspace = knownWorkspaces().find((candidate) => candidate.id === workspaceId) ?? null;
+  const environmentPath = userEnvironmentPath(workspace?.path);
+  if (!workspace || !environmentPath) return;
+
+  const targetId = normalizeWorkspaceExecutionTargetId(requestedTargetId);
+  const targets = remoteChatExecutionTargets();
+  if (targetId && !targets.some((target) => target.id === targetId)) {
+    statusText = "Ce VPS n'est plus configure dans le pool";
+    render();
+    return;
+  }
+
+  const previousWorkspaces = settings.workspaces ?? [];
+  const update = setWorkspaceExecutionTarget(previousWorkspaces, environmentPath, targetId);
+  if (!update.changed) return;
+
+  environmentExecutionTargetSavingId = workspaceId;
+  settings.workspaces = update.workspaces;
+  render();
+  try {
+    settings = await invoke<AppSettings>("save_settings", { settings });
+    const targetLabel = targetId
+      ? targets.find((target) => target.id === targetId)?.label ?? "VPS choisi"
+      : "Automatique";
+    statusText = `${workspace.label} executera ses nouveaux chats et terminaux sur : ${targetLabel}`;
+  } catch (error) {
+    settings.workspaces = previousWorkspaces;
+    statusText = String(error);
+  } finally {
+    environmentExecutionTargetSavingId = null;
+    render();
+  }
+};
+
 // Ajoute un dossier au registre synchronise s'il en est absent, puis persiste.
 const upsertWorkspaceRegistry = async (path: string): Promise<void> => {
   if (!settings) return;
-  const trimmed = userEnvironmentPath(path);
+  const trimmed = userWorkspacePath(path);
   if (!trimmed) return;
   rememberWorkspace(trimmed);
   const update = openWorkspaceRegistry(
@@ -2179,12 +3650,14 @@ const syncWorkspaceRegistry = async (): Promise<void> => {
   const normalizedClosedIds = mergeClosedWorkspaceIds(storedClosedIds);
   const closedIds = new Set(normalizedClosedIds);
   const merged = mergeWorkspaceProfiles(settings.workspaces ?? []);
-  const openProfiles = merged.workspaces.filter((workspace) => !closedIds.has(workspace.id));
+  const validProfiles = merged.workspaces.filter((workspace) => !!userWorkspacePath(workspace.path));
+  const openProfiles = validProfiles.filter((workspace) => !closedIds.has(workspace.id));
   const byId = new Map<string, WorkspaceProfile>(
     openProfiles.map((ws) => [ws.id, ws]),
   );
   let changed =
     merged.changed ||
+    validProfiles.length !== merged.workspaces.length ||
     openProfiles.length !== merged.workspaces.length ||
     normalizedClosedIds.length !== storedClosedIds.length ||
     normalizedClosedIds.some(
@@ -2207,7 +3680,7 @@ const syncWorkspaceRegistry = async (): Promise<void> => {
   }
 
   const seed = (rawPath: string | null | undefined) => {
-    const path = rawPath?.trim();
+    const path = userWorkspacePath(rawPath);
     if (!path) return;
     const id = workspaceIdForPath(path);
     if (closedIds.has(id)) return;
@@ -2334,7 +3807,9 @@ const persistTerminalSessions = () => {
 // Un rollout Codex = une discussion (rollout-<ts>-<uuid>.jsonl). On garde
 // l'uuid (session id) pour relancer `codex resume <uuid>` a la reouverture.
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-const isPlausibleSessionId = (id: string | null | undefined): id is string => !!id && UUID_RE.test(id);
+const OPENCODE_SESSION_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,159}$/;
+const isPlausibleSessionId = (id: string | null | undefined): id is string =>
+  !!id && (UUID_RE.test(id) || OPENCODE_SESSION_RE.test(id));
 
 // Commande de reprise d'une discussion, selon le provider du compte cible :
 // Codex -> `codex … resume <id>` ; Claude -> `claude … --resume <id>`. Le flag
@@ -2342,7 +3817,11 @@ const isPlausibleSessionId = (id: string | null | undefined): id is string => !!
 const buildResumeCommand = (id: string, account: AccountProfile | null | undefined = null) => {
   const provider = accountProvider(account);
   const base = agentRunCommand(agentById(providerAgentId(provider)), account);
-  return provider === "claude" ? `${base} --resume ${id}` : `${base} resume ${id}`;
+  return provider === "claude"
+    ? `${base} --resume ${id}`
+    : provider === "opencode"
+      ? `${base} --session ${id}`
+      : `${base} resume ${id}`;
 };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -2372,6 +3851,7 @@ const claimSessionForTerminal = (session: TerminalSession): Promise<string | nul
     );
     const id = await invoke<string | null>("claim_session_for_terminal", {
       accountId: session.accountId,
+      terminalId: session.ptyId,
       afterUnix,
       excludeSessionIds: exclude,
       matchSessionId: session.resumeSessionId,
@@ -2428,6 +3908,15 @@ const waitForFrame = () => new Promise<void>((resolve) => requestAnimationFrame(
 const selectedAccount = () =>
   settings?.accounts.find((account) => account.id === selectedAccountId) ?? null;
 
+const ensureSelectedAccount = () => {
+  const account = selectedAccount()
+    ?? accountById(settings?.defaultAccountId)
+    ?? settings?.accounts[0]
+    ?? null;
+  selectedAccountId = account?.id ?? null;
+  return account;
+};
+
 const newTerminalAccount = () =>
   settings?.accounts.find((account) => account.id === newTerminalAccountId) ?? null;
 
@@ -2448,13 +3937,47 @@ const codexAgentId = () =>
   settings?.agents.find((agent) => agent.builtin)?.id ??
   "codex";
 
-// --- Multi-provider (Codex / Claude Code) --------------------------------
+// --- Multi-provider (Codex / Claude Code / OpenCode) ----------------------
 // Provider d'un compte / d'un agent (defaut Codex pour les configs anterieures).
 const accountProvider = (account: AccountProfile | null | undefined): Provider =>
   account?.provider ?? "codex";
 const agentProvider = (agent: AgentProfile | null | undefined): Provider =>
-  agent?.provider ?? (agent?.id === "claude" ? "claude" : "codex");
-const providerLabel = (provider: Provider) => (provider === "claude" ? "Claude" : "Codex");
+  agent?.provider ??
+  (agent?.id === "claude" ? "claude" : agent?.id === "opencode" ? "opencode" : "codex");
+const providerLabel = (provider: Provider) =>
+  provider === "claude" ? "Claude" : provider === "opencode" ? "OpenCode" : "Codex";
+
+const openCodeProviderOption = (id: string | null | undefined) =>
+  OPENCODE_PROVIDER_OPTIONS.find((item) => item.id === id) ?? null;
+const accountInferenceProvider = (
+  account: AccountProfile | null | undefined,
+): string | null =>
+  accountProvider(account) === "opencode" ? account?.inferenceProvider?.trim() || null : null;
+const safeOpenCodeProviderId = (value: string | null | undefined): string | null =>
+  value && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value) ? value : null;
+const safeCliModel = (value: string | null | undefined): string | null =>
+  value && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/.test(value) ? value : null;
+const accountProviderLabel = (account: AccountProfile | null | undefined) => {
+  if (accountProvider(account) !== "opencode") return providerLabel(accountProvider(account));
+  const inference = accountInferenceProvider(account);
+  return openCodeProviderOption(inference)?.label ?? (inference ? `${inference} via OpenCode` : "OpenCode");
+};
+const parseProviderChoice = (value: string | null | undefined): {
+  provider: Provider;
+  inferenceProvider: OpenCodeInferenceProvider | null;
+} => {
+  if (value?.startsWith("opencode:")) {
+    const inferenceProvider = value.slice("opencode:".length);
+    const option = openCodeProviderOption(inferenceProvider);
+    if (option) return { provider: "opencode", inferenceProvider: option.id };
+  }
+  if (value === "claude") return { provider: "claude", inferenceProvider: null };
+  return { provider: "codex", inferenceProvider: null };
+};
+const providerChoiceValue = (
+  provider: Provider,
+  inferenceProvider: string | null | undefined,
+) => provider === "opencode" ? `opencode:${inferenceProvider ?? "zai"}` : provider;
 
 // Id de l'agent integre correspondant a un provider : sert a lancer un compte
 // Claude avec l'agent Claude, un compte Codex avec l'agent Codex.
@@ -2477,7 +4000,11 @@ const isCodexAgent = (agent: AgentProfile | null | undefined) => agentProvider(a
 const CODEX_BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const CLAUDE_BYPASS_FLAG = "--dangerously-skip-permissions";
 const providerBypassFlag = (provider: Provider) =>
-  provider === "claude" ? CLAUDE_BYPASS_FLAG : CODEX_BYPASS_FLAG;
+  provider === "claude"
+    ? CLAUDE_BYPASS_FLAG
+    : provider === "opencode"
+      ? "--auto"
+      : CODEX_BYPASS_FLAG;
 
 // Le bypass est un reglage PAR COMPTE (defaut ON). Un compte sans champ `bypass`
 // (config anterieure) retombe sur le defaut global `codexBypass`, puis `true`.
@@ -2492,11 +4019,33 @@ const normalizeCodexReasoningEffort = (
 ): CodexReasoningEffort =>
   isCodexReasoningEffort(value) ? value : DEFAULT_CODEX_REASONING_EFFORT;
 
-const providerDefaultModel = (provider: Provider) =>
-  provider === "claude" ? DEFAULT_CLAUDE_MODEL : DEFAULT_CODEX_MODEL;
+const providerDefaultModel = (
+  provider: Provider,
+  inferenceProvider: string | null = null,
+) =>
+  provider === "claude"
+    ? DEFAULT_CLAUDE_MODEL
+    : provider === "opencode"
+      ? openCodeProviderOption(inferenceProvider)?.defaultModel ?? OPENCODE_PROVIDER_OPTIONS[0].defaultModel
+      : DEFAULT_CODEX_MODEL;
 
 const accountModel = (account: AccountProfile | null | undefined) =>
-  account?.model?.trim() || providerDefaultModel(accountProvider(account));
+  account?.model?.trim() ||
+  providerDefaultModel(accountProvider(account), accountInferenceProvider(account));
+
+const modelSuggestionsForAccount = (
+  account: AccountProfile | null | undefined,
+  codexCatalog: AccountModelView[] | undefined = undefined,
+): string[] => {
+  const provider = accountProvider(account);
+  if (provider === "claude") return [...CLAUDE_MODEL_SUGGESTIONS];
+  if (provider === "opencode") {
+    return [
+      ...(openCodeProviderOption(accountInferenceProvider(account))?.models ?? OPENCODE_MODEL_SUGGESTIONS),
+    ];
+  }
+  return codexCatalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS;
+};
 
 const accountReasoningEffort = (account: AccountProfile | null | undefined) =>
   normalizeCodexReasoningEffort(account?.reasoningEffort);
@@ -2594,7 +4143,7 @@ const reasoningEffortOptions = (selected: string | null | undefined) => {
 
 const renderCodexModelSuggestions = () => `
   <datalist id="codexModelSuggestions">
-    ${[...CODEX_MODEL_SUGGESTIONS, ...CLAUDE_MODEL_SUGGESTIONS]
+    ${[...CODEX_MODEL_SUGGESTIONS, ...CLAUDE_MODEL_SUGGESTIONS, ...OPENCODE_MODEL_SUGGESTIONS]
       .map((model) => `<option value="${escapeAttr(model)}"></option>`)
       .join("")}
   </datalist>
@@ -2617,6 +4166,17 @@ const agentRunCommand = (
   account: AccountProfile | null | undefined = null,
 ) => {
   const base = agentCommand(agent);
+  if (agentProvider(agent) === "opencode") {
+    let command = base;
+    if (accountBypassEnabled(account) && !command.includes("--auto")) {
+      command += " --auto";
+    }
+    const model = account ? safeCliModel(accountModel(account)) : null;
+    if (model && !/(?:^|\s)(?:--model|-m)(?:\s|=)/.test(command)) {
+      command += ` --model ${model}`;
+    }
+    return command;
+  }
   if (isFirstPartyAgent(agent) && accountBypassEnabled(account)) {
     const flag = providerBypassFlag(agentProvider(agent));
     if (!base.includes(flag)) return `${base} ${flag}`;
@@ -2667,11 +4227,23 @@ const reconnectCommandForAccount = (
   agent: AgentProfile | null | undefined,
 ) => {
   const provider = accountProvider(account);
+  if (provider === "opencode") {
+    const inferenceProvider = safeOpenCodeProviderId(accountInferenceProvider(account));
+    if (!inferenceProvider) return agentSubcommand(agent, "auth login");
+    return agentSubcommand(agent, `auth login --provider ${inferenceProvider}`);
+  }
   const loginSub =
     agent?.loginCommand?.trim() || (provider === "claude" ? "auth login" : "login");
-  // Connexion classique : on ouvre le flux OAuth standard (callback navigateur),
-  // sans passer par les codes du device flow, y compris en mode remote/Tailscale.
-  const loginCommand = agentSubcommand(agent, loginSub);
+  // Sur un serveur distant, le callback localhost du login OAuth classique
+  // revient sur le navigateur de l'utilisateur et ne peut pas joindre le
+  // conteneur. Le device flow Codex est explicitement prevu pour ce cas. Les
+  // commandes personnalisees restent intactes ; seule la commande integree
+  // `login` est adaptee en mode remote.
+  const effectiveLoginSub =
+    provider === "codex" && isRemoteMode() && loginSub === "login"
+      ? "login --device-auth"
+      : loginSub;
+  const loginCommand = agentSubcommand(agent, effectiveLoginSub);
   return provider === "codex"
     ? `${agentSubcommand(agent, "logout")}${shellCommandSeparator()}${loginCommand}`
     : loginCommand;
@@ -2697,13 +4269,24 @@ const selectedProxy = () => proxyForAccount(selectedAccount());
 const activeTerminal = () =>
   terminalSessions.find((session) => session.key === activeTerminalKey) ?? null;
 
+// Le terminal de connexion est volontairement detache des workspaces. Il doit
+// toutefois rester visible, y compris apres la fin du CLI, afin que
+// l'utilisateur puisse lire le code ou la confirmation avant de le fermer.
+const activeLoginTerminal = () => {
+  const session = activeTerminal();
+  return session?.loginOnly ? session : null;
+};
+
 const terminalSessionsForFolder = (folderPath: string | null | undefined) =>
   terminalsForFolder(terminalSessions, folderPath);
 
-const expertTerminalSessions = () =>
-  terminalFolderFilter === null
+const expertTerminalSessions = () => {
+  const loginSession = activeLoginTerminal();
+  if (loginSession) return [loginSession];
+  return terminalFolderFilter === null
     ? []
     : terminalSessionsForFolder(terminalFolderFilter).slice(0, EXPERT_MAX_TERMINALS);
+};
 
 const expertGridSlotCount = () => Math.max(2, expertTerminalSessions().length);
 
@@ -2818,7 +4401,7 @@ type TerminalEnvironmentGroup = TerminalWorkspaceGroup & { path: string };
 
 const terminalEnvironmentGroups = (): TerminalEnvironmentGroup[] =>
   terminalWorkspaceGroups().filter((group): group is TerminalEnvironmentGroup => {
-    const path = userEnvironmentPath(group.path);
+    const path = userWorkspacePath(group.path);
     return !!path && !workspaceIsClosed(path);
   }).sort(
     (left, right) =>
@@ -2826,10 +4409,90 @@ const terminalEnvironmentGroups = (): TerminalEnvironmentGroup[] =>
       normalizeWorkspacePath(left.path).localeCompare(normalizeWorkspacePath(right.path)),
   );
 
+const workspaceAccessForPath = (path: string | null | undefined): WorkspaceAccessView | null => {
+  const environmentPath = userEnvironmentPath(path);
+  if (!environmentPath) return null;
+  const id = workspaceIdForPath(environmentPath);
+  return workspaceAccess.find((environment) => workspaceIdForPath(environment.path) === id) ?? null;
+};
+
+const refreshWorkspaceAccess = async (): Promise<void> => {
+  if (!isRemoteMode() || workspaceAccessLoading) return;
+  workspaceAccessLoading = true;
+  workspaceAccessError = "";
+  if (terminalEnvironmentMenuOpen) render();
+  try {
+    workspaceAccess = await invoke<WorkspaceAccessView[]>("workspace_access");
+    workspaceAccessLoaded = true;
+    const knownIds = new Set(knownWorkspaces().map((workspace) => workspace.id));
+    const receivedNewEnvironment = workspaceAccess.some(
+      (environment) => !knownIds.has(workspaceIdForPath(environment.path)),
+    );
+    if (receivedNewEnvironment) {
+      settings = await invoke<AppSettings>("load_settings");
+      reconcileAccountSelections();
+    }
+  } catch (error) {
+    workspaceAccessError = String(error);
+  } finally {
+    workspaceAccessLoading = false;
+    if (terminalEnvironmentMenuOpen) render();
+  }
+};
+
+const submitWorkspaceAccessRequest = async (form: HTMLFormElement): Promise<void> => {
+  if (workspaceAccessBusyKey || !form.reportValidity()) return;
+  const shareCode = form.querySelector<HTMLInputElement>("#workspaceShareCode")?.value.trim() ?? "";
+  workspaceAccessBusyKey = "request";
+  workspaceAccessError = "";
+  render();
+  try {
+    await invoke<{ requested: boolean }>("request_workspace_access", { shareCode });
+    statusText = "Demande d'accès envoyée au propriétaire";
+    await refreshWorkspaceAccess();
+  } catch (error) {
+    workspaceAccessError = String(error);
+  } finally {
+    workspaceAccessBusyKey = null;
+    render();
+  }
+};
+
+const updateWorkspaceAccessDecision = async (
+  action: "accept" | "reject" | "revoke",
+  environmentId: string,
+  userId: string,
+): Promise<void> => {
+  if (workspaceAccessBusyKey) return;
+  workspaceAccessBusyKey = `${action}:${environmentId}:${userId}`;
+  workspaceAccessError = "";
+  render();
+  try {
+    if (action === "accept") {
+      await invoke<WorkspaceAccessView>("accept_workspace_access", { environmentId, userId });
+    } else if (action === "reject") {
+      await invoke<WorkspaceAccessView>("reject_workspace_access", { environmentId, userId });
+    } else {
+      await invoke<WorkspaceAccessView>("revoke_workspace_access", { environmentId, userId });
+    }
+    statusText = action === "accept"
+      ? "Accès à l'environnement autorisé"
+      : action === "reject"
+        ? "Demande d'accès refusée"
+        : "Accès à l'environnement révoqué";
+    await refreshWorkspaceAccess();
+  } catch (error) {
+    workspaceAccessError = String(error);
+  } finally {
+    workspaceAccessBusyKey = null;
+    render();
+  }
+};
+
 // L'environnement est le contexte global de travail des conversations et terminaux.
 const selectEnvironment = (path: string): void => {
   const returnFocus = takeDialogTrigger("environment");
-  const environmentPath = userEnvironmentPath(path);
+  const environmentPath = userWorkspacePath(path);
   if (!environmentPath) {
     statusText = "Les workspaces techniques des agents ne peuvent pas devenir des environnements";
     terminalEnvironmentMenuOpen = false;
@@ -2860,6 +4523,7 @@ const openTerminalEnvironmentMenu = () => {
   terminalEnvironmentMenuOpen = true;
   statusText = "Menu des environnements";
   render();
+  if (isRemoteMode()) void refreshWorkspaceAccess();
 };
 
 const closeTerminalEnvironmentMenu = () => {
@@ -2869,6 +4533,107 @@ const closeTerminalEnvironmentMenu = () => {
   clearEnvironmentMemoryDraft();
   render();
   restoreDialogTrigger(returnFocus);
+};
+
+const emptyGitDockerEnvironmentDraft = (): GitDockerEnvironmentDraft => ({
+  repositoryUrl: "",
+  refName: "",
+  mode: "analyze",
+  deployTarget: "",
+  sshKey: "",
+  sshPort: "22",
+  installDocker: false,
+  acceptNewHostKey: false,
+  containerPort: "",
+  hostPort: "",
+});
+
+const openGitDockerEnvironmentModal = () => {
+  terminalEnvironmentMenuOpen = false;
+  clearEnvironmentMemoryDraft();
+  gitDockerEnvironmentDraft = emptyGitDockerEnvironmentDraft();
+  gitDockerEnvironmentError = "";
+  gitDockerEnvironmentSubmitting = false;
+  gitDockerEnvironmentModalOpen = true;
+  statusText = "Nouvel environnement depuis Git";
+  render();
+  requestAnimationFrame(() => {
+    document.querySelector<HTMLInputElement>("#gitDockerRepositoryUrl")?.focus();
+  });
+};
+
+const closeGitDockerEnvironmentModal = () => {
+  if (!gitDockerEnvironmentModalOpen || gitDockerEnvironmentSubmitting) return;
+  gitDockerEnvironmentModalOpen = false;
+  gitDockerEnvironmentError = "";
+  terminalEnvironmentMenuOpen = true;
+  statusText = "Menu des environnements";
+  render();
+};
+
+const readGitDockerEnvironmentForm = () => {
+  const mode = document.querySelector<HTMLSelectElement>("#gitDockerMode")?.value;
+  gitDockerEnvironmentDraft = {
+    repositoryUrl:
+      document.querySelector<HTMLInputElement>("#gitDockerRepositoryUrl")?.value ?? "",
+    refName: document.querySelector<HTMLInputElement>("#gitDockerRef")?.value ?? "",
+    mode: mode === "build" || mode === "deploy" ? mode : "analyze",
+    deployTarget:
+      document.querySelector<HTMLInputElement>("#gitDockerDeployTarget")?.value ?? "",
+    sshKey: document.querySelector<HTMLInputElement>("#gitDockerSshKey")?.value ?? "",
+    sshPort: document.querySelector<HTMLInputElement>("#gitDockerSshPort")?.value ?? "22",
+    installDocker:
+      document.querySelector<HTMLInputElement>("#gitDockerInstallDocker")?.checked ?? false,
+    acceptNewHostKey:
+      document.querySelector<HTMLInputElement>("#gitDockerAcceptHostKey")?.checked ?? false,
+    containerPort:
+      document.querySelector<HTMLInputElement>("#gitDockerContainerPort")?.value ?? "",
+    hostPort: document.querySelector<HTMLInputElement>("#gitDockerHostPort")?.value ?? "",
+  };
+};
+
+const optionalGitDockerPort = (value: string): number | undefined => {
+  const trimmed = value.trim();
+  return trimmed ? Number(trimmed) : undefined;
+};
+
+const submitGitDockerEnvironment = async (form: HTMLFormElement) => {
+  if (gitDockerEnvironmentSubmitting || !form.reportValidity()) return;
+  readGitDockerEnvironmentForm();
+  gitDockerEnvironmentSubmitting = true;
+  gitDockerEnvironmentError = "";
+  statusText = "Clonage du depot et preparation Docker...";
+  render();
+
+  try {
+    const draft = gitDockerEnvironmentDraft;
+    const result = await invoke<GitDockerEnvironmentResult>("create_git_docker_environment", {
+      request: {
+        repositoryUrl: draft.repositoryUrl.trim(),
+        refName: draft.refName.trim(),
+        mode: draft.mode,
+        deployTarget: draft.deployTarget.trim(),
+        sshKey: draft.sshKey.trim(),
+        sshPort: Number(draft.sshPort || "22"),
+        installDocker: draft.installDocker,
+        acceptNewHostKey: draft.acceptNewHostKey,
+        containerPort: optionalGitDockerPort(draft.containerPort),
+        hostPort: optionalGitDockerPort(draft.hostPort),
+      },
+    });
+    gitDockerEnvironmentSubmitting = false;
+    gitDockerEnvironmentModalOpen = false;
+    terminalEnvironmentMenuOpen = false;
+    statusText = result.bundlePath
+      ? `${result.message} · paquet: ${result.bundlePath}`
+      : result.message;
+    selectEnvironment(result.workspacePath);
+  } catch (error) {
+    gitDockerEnvironmentSubmitting = false;
+    gitDockerEnvironmentError = String(error);
+    statusText = "Creation de l'environnement Git impossible";
+    render();
+  }
 };
 
 const toggleTerminalEnvironmentMenu = () => {
@@ -2882,10 +4647,12 @@ const activateTerminalSession = (session: TerminalSession) => {
   // Un terminal deja ouvert reste utilisable apres fermeture de son dossier,
   // sans le rouvrir implicitement. Seule une action explicite sur le groupe ou
   // le selecteur retire le tombstone synchronise.
-  if (!session.folderPath || !workspaceIsClosed(session.folderPath)) {
-    setCurrentWorkspace(session.folderPath);
+  if (!session.loginOnly) {
+    if (!session.folderPath || !workspaceIsClosed(session.folderPath)) {
+      setCurrentWorkspace(session.folderPath);
+    }
+    terminalFolderFilter = session.folderPath;
   }
-  terminalFolderFilter = session.folderPath;
   if (settings && session.agentId && settings.agents.some((agent) => agent.id === session.agentId)) {
     settings.activeAgentId = session.agentId;
   }
@@ -3177,10 +4944,12 @@ const auditViewLabelFor = (view: AppView): string => {
       return "vue Limites";
     case "dashboard":
       return "vue Stats";
-    case "kombai":
-      return "vue Kombai";
+    case "video":
+      return "studio vidéo";
+    case "design":
+      return "espace Design";
     case "discussions":
-      return "vue Discussions";
+      return "vue Historique";
     case "history":
       return "vue Historique";
     case "prompts":
@@ -3401,8 +5170,8 @@ const renderAuditPanel = (): string => {
 // Source indépendante du backend : fichiers statiques
 // embarqués sous public/skills/ (copiés dans dist/ au build, servis à /skills/…).
 // On lit le manifeste index.json puis le contenu .md de chaque skill par fetch —
-// identique en desktop (webview), web et mobile, sans backend. Ajouter un skill =
-// déposer un .md dans public/skills/ et l'ajouter à index.json.
+// identique en desktop (webview), web et mobile, sans backend. Les skills créés
+// depuis l'interface sont fusionnés depuis le stockage local de l'appareil.
 const SKILLS_INDEX_URL = "/skills/index.json";
 const CHAT_SKILL_BUTTONS_STORAGE_KEY = "codex-switch-terminal.chat-skill-buttons.v1";
 
@@ -3442,6 +5211,27 @@ const chatAgentSkillPrompts = (
   (skillsList ?? [])
     .filter((skill) => enabledTools.includes(skill.id) && skill.content.trim())
     .map(({ id, name, content }) => ({ id, name, content }));
+
+const automaticOrchestrationRoutingSkill = (mode: ChatMode): ChatAgentSkillPrompt => ({
+  id: "automatic-orchestration-router",
+  name: "Routage automatique vers une équipe",
+  content: `# Routage obligatoire avant action
+
+Le mode d'orchestration automatique est explicitement actif pour ce tour (mode courant : ${mode}). Avant toute modification ou réponse de fond, évalue si la demande bénéficie réellement d'un orchestrateur et de chats workers isolés.
+
+Choisis l'orchestration seulement pour une réalisation dans un dépôt Git qui est assez complexe pour être décomposée en plusieurs missions cohérentes, lorsque le parallélisme, les revues croisées et une validation d'intégration apportent un gain net. Une demande explicite d'équipe multi-agent est un signal fort.
+
+N'oriente pas vers l'orchestration une question, une explication, une demande de statut, une revue seule, une petite correction locale, une tâche essentiellement séquentielle, une demande ambiguë qui exige d'abord une réponse utilisateur, ni un tour en mode Planifier ou Question. Dans ces cas, traite normalement la demande sans parler de ce routage.
+
+Si l'orchestration est justifiée :
+- ne commence pas le travail et ne modifie aucun fichier ;
+- n'utilise pas toi-même de sous-agents : l'application va créer l'équipe ;
+- réponds uniquement par une ligne JSON compacte, sans Markdown ni texte autour, sous cette forme exacte :
+${AUTOMATIC_ORCHESTRATION_MARKER} {"decision":"orchestrate","workerCount":3,"reason":"raison courte"}
+- choisis entre 1 et 12 workers, généralement 2 à 4, selon le nombre réel de missions utiles.
+
+Sinon, accomplis directement la demande comme dans un chat normal et n'émets jamais le marqueur ${AUTOMATIC_ORCHESTRATION_MARKER}`,
+});
 
 const enabledToolsVisibleInChat = (
   enabledTools: readonly ChatAgentToolId[],
@@ -3494,12 +5284,16 @@ const toggleSkillChatButton = (id: string) => {
 };
 
 const refreshSkills = async (): Promise<void> => {
+  // Une panne réseau ponctuelle ne doit ni faire disparaître les cartes déjà
+  // chargées, ni désépingler leurs boutons persistés dans les chats.
+  let bundledSkills: SkillEntry[] = (skillsList ?? []).filter((skill) => !skill.custom);
+  let bundledError: string | null = null;
   try {
     const indexResponse = await fetch(SKILLS_INDEX_URL, { cache: "no-cache" });
     if (!indexResponse.ok) throw new Error(`index.json: HTTP ${indexResponse.status}`);
     const index = (await indexResponse.json()) as { skills?: unknown };
     const entries = Array.isArray(index.skills) ? index.skills : [];
-    skillsList = await Promise.all(
+    bundledSkills = await Promise.all(
       entries.map(async (raw): Promise<SkillEntry> => {
         const entry = (raw ?? {}) as Record<string, unknown>;
         const file = String(entry.file ?? "");
@@ -3518,16 +5312,68 @@ const refreshSkills = async (): Promise<void> => {
           buttonLabel: String(entry.buttonLabel ?? entry.name ?? entry.id ?? "Skill"),
           icon: String(entry.icon ?? "sparkles"),
           content,
+          custom: false,
         };
       }),
     );
-    reconcileChatSkillButtons();
-    skillsError = null;
   } catch (error) {
-    skillsError = String((error as Error)?.message ?? error);
+    bundledError = String((error as Error)?.message ?? error);
   }
+  const bundledIds = new Set(bundledSkills.map((skill) => skill.id));
+  const customSkills = loadCustomSkills()
+    .filter((skill) => !bundledIds.has(skill.id));
+  skillsList = [...customSkills, ...bundledSkills];
+  skillsError = bundledError;
+  reconcileChatSkillButtons();
   skillsLoaded = true;
   if (activeView === "skills" || activeView === "chat") render();
+};
+
+const openSkillEditor = (id: string | null = null): void => {
+  const customSkill = id
+    ? loadCustomSkills().find((skill) => skill.id === id) ?? null
+    : null;
+  if (id && !customSkill) {
+    statusText = "Seuls les skills personnels peuvent être modifiés";
+    render();
+    return;
+  }
+  void loadSkillsViewModule()
+    .then((module) => module.openCustomSkillEditor({
+      skill: customSkill,
+      reservedIds: (skillsList ?? []).map((skill) => skill.id),
+      renderIcons,
+      onSaved: async (skill, created) => {
+        await refreshSkills();
+        if (created && isChatAgentToolId(skill.id) && !isChatAgentModeId(skill.id)) {
+          chatSkillButtonIds = [...new Set([...(chatSkillButtonIds ?? []), skill.id])];
+          persistChatSkillButtonIds();
+        }
+        statusText = created
+          ? `Skill « ${skill.name} » ajouté et disponible dans les chats`
+          : `Skill « ${skill.name} » modifié`;
+        render();
+      },
+    }))
+    .catch((error) => {
+      statusText = `Éditeur de skill indisponible : ${String(error)}`;
+      render();
+    });
+};
+
+const deleteCustomSkill = async (id: string): Promise<void> => {
+  const customSkills = loadCustomSkills();
+  const skill = customSkills.find((candidate) => candidate.id === id);
+  if (!skill) return;
+  if (!window.confirm(`Supprimer définitivement le skill « ${skill.name} » ?`)) return;
+  if (!persistCustomSkills(removeCustomSkill(customSkills, id))) {
+    statusText = "Impossible de supprimer ce skill sur cet appareil";
+    render();
+    return;
+  }
+  await refreshSkills();
+  statusText = `Skill « ${skill.name} » supprimé`;
+  render();
 };
 
 // Colle du texte (potentiellement multi-lignes) dans la session Codex active via
@@ -3604,6 +5450,161 @@ const useLibraryPromptInChat = async (prompt: PromptLibraryItem): Promise<void> 
   window.setTimeout(() => focusExpertChatPrompt(pane), 0);
 };
 
+type PromptComposerSelection = {
+  start: number;
+  end: number;
+};
+
+const promptComposerSelection = (
+  input: HTMLTextAreaElement | null,
+  fallback: number,
+): PromptComposerSelection => ({
+  start: input?.selectionStart ?? fallback,
+  end: input?.selectionEnd ?? fallback,
+});
+
+const insertPromptAtComposerSelection = (
+  draft: string,
+  content: string,
+  selection: PromptComposerSelection,
+): { value: string; caret: number } => {
+  const start = Math.max(0, Math.min(selection.start, draft.length));
+  const end = Math.max(start, Math.min(selection.end, draft.length));
+  const before = draft.slice(0, start);
+  const after = draft.slice(end);
+  const prefix = before.length === 0 || before.endsWith("\n\n")
+    ? ""
+    : before.endsWith("\n") ? "\n" : "\n\n";
+  const suffix = after.length === 0 || after.startsWith("\n\n")
+    ? ""
+    : after.startsWith("\n") ? "\n" : "\n\n";
+  const inserted = `${prefix}${content.trim()}${suffix}`;
+  return {
+    value: `${before}${inserted}${after}`,
+    caret: before.length + prefix.length + content.trim().length,
+  };
+};
+
+const openChatPromptQuickPicker = (
+  onUsePrompt: (prompt: PromptLibraryItem) => void | Promise<void>,
+): void => {
+  void loadPromptLibraryModule()
+    .then((module) => module.openPromptQuickPicker({
+      renderIcons,
+      onUsePrompt,
+      onManagePrompts: () => setActiveView("prompts"),
+    }))
+    .catch((error) => {
+      statusText = `Sélecteur de prompts indisponible : ${String(error)}`;
+      render();
+    });
+};
+
+type InsertablePrompt = Pick<FavoritePromptShortcut, "title" | "content">;
+
+const insertPromptInMainChat = (
+  prompt: InsertablePrompt,
+  selection?: PromptComposerSelection,
+): void => {
+  const input = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+  const insertion = insertPromptAtComposerSelection(
+    input?.value ?? chatDraft,
+    prompt.content,
+    selection ?? promptComposerSelection(input, chatDraft.length),
+  );
+  chatDraft = insertion.value;
+  if (input) {
+    input.value = chatDraft;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    window.requestAnimationFrame(() => {
+      input.focus();
+      input.setSelectionRange(insertion.caret, insertion.caret);
+    });
+  }
+  statusText = `Prompt « ${prompt.title} » inséré dans le chat`;
+};
+
+const insertPromptInExpertChat = (
+  pane: ExpertChatPane,
+  root: HTMLElement,
+  prompt: InsertablePrompt,
+  selection?: PromptComposerSelection,
+): void => {
+  const input = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
+  const insertion = insertPromptAtComposerSelection(
+    input?.value ?? pane.draft,
+    prompt.content,
+    selection ?? promptComposerSelection(input, pane.draft.length),
+  );
+  pane.draft = insertion.value;
+  persistExpertChats();
+  const currentInput = expertChatPaneRoot(pane)
+    ?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
+  if (currentInput) {
+    currentInput.value = pane.draft;
+    currentInput.dispatchEvent(new Event("input", { bubbles: true }));
+    window.requestAnimationFrame(() => {
+      currentInput.focus();
+      currentInput.setSelectionRange(insertion.caret, insertion.caret);
+    });
+  }
+  statusText = `Prompt « ${prompt.title} » inséré dans le chat`;
+};
+
+const recordPromptShortcutUse = (id: string): void => {
+  void loadPromptLibraryModule()
+    .then((module) => module.recordPromptUse(id))
+    .catch(() => undefined);
+};
+
+const favoritePromptShortcutById = (id: string): FavoritePromptShortcut | null =>
+  loadFavoritePromptShortcuts().find((prompt) => prompt.id === id) ?? null;
+
+const insertFavoritePromptInMainChat = (id: string): void => {
+  const prompt = favoritePromptShortcutById(id);
+  if (!prompt) {
+    statusText = "Ce prompt n’est plus dans vos favoris";
+    render();
+    return;
+  }
+  insertPromptInMainChat(prompt);
+  recordPromptShortcutUse(prompt.id);
+};
+
+const insertFavoritePromptInExpertChat = (
+  pane: ExpertChatPane,
+  root: HTMLElement,
+  id: string,
+): void => {
+  const prompt = favoritePromptShortcutById(id);
+  if (!prompt) {
+    statusText = "Ce prompt n’est plus dans vos favoris";
+    render();
+    return;
+  }
+  insertPromptInExpertChat(pane, root, prompt);
+  recordPromptShortcutUse(prompt.id);
+};
+
+const openMainChatPromptQuickPicker = (): void => {
+  const input = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+  const selection = promptComposerSelection(input, chatDraft.length);
+  openChatPromptQuickPicker((prompt) => {
+    insertPromptInMainChat(prompt, selection);
+  });
+};
+
+const openExpertChatPromptQuickPicker = (
+  pane: ExpertChatPane,
+  root: HTMLElement,
+): void => {
+  const input = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
+  const selection = promptComposerSelection(input, pane.draft.length);
+  openChatPromptQuickPicker((prompt) => {
+    insertPromptInExpertChat(pane, root, prompt, selection);
+  });
+};
+
 const copySkill = async (id: string): Promise<void> => {
   const skill = (skillsList ?? []).find((entry) => entry.id === id);
   if (!skill) return;
@@ -3616,83 +5617,15 @@ const copySkill = async (id: string): Promise<void> => {
   render();
 };
 
-const renderSkillCard = (
-  skill: SkillEntry,
-  applyTarget: "chat" | "terminal",
-  hasActiveSession: boolean,
-): string => {
-  const tags = skill.tags
-    .slice(0, 6)
-    .map((tag) => `<span class="skill-tag">${escapeHtml(tag)}</span>`)
-    .join("");
-  const applyToChat = applyTarget === "chat";
-  const buttonAdded = (chatSkillButtonIds ?? []).includes(skill.id);
-  const hasContent = skill.content.trim().length > 0;
-  const canApply = hasContent && (applyToChat || hasActiveSession);
-  const applyLabel = applyToChat ? "Ajouter au chat" : "Injecter dans Codex";
-  const applyTitle = !hasContent
-    ? "Contenu du skill indisponible"
-    : applyToChat
-      ? "Ajouter le skill au brouillon du chat"
-      : hasActiveSession
-        ? "Coller le skill dans la session Codex active (relis puis Entrée)"
-        : "Aucune session Codex active";
-  return `
-    <div class="skill-card">
-      <div class="skill-card-head">
-        <strong>${escapeHtml(skill.name)}</strong>
-      </div>
-      ${skill.description ? `<p class="skill-desc">${escapeHtml(skill.description)}</p>` : ""}
-      ${tags ? `<div class="skill-tags">${tags}</div>` : ""}
-      <div class="skill-actions">
-        <button class="tool-button ${buttonAdded ? "skill-chat-button-active" : "primary"}" data-skill-chat-button="${escapeAttr(skill.id)}" aria-pressed="${buttonAdded}" title="${buttonAdded ? "Retirer ce bouton de toutes les fenêtres de chat" : "Ajouter ce bouton à toutes les fenêtres de chat"}">
-          <i data-lucide="${buttonAdded ? "x" : "plus"}"></i><span>${buttonAdded ? "Retirer des chats" : "Ajouter aux chats"}</span>
-        </button>
-        <button class="tool-button" data-skill-apply="${escapeAttr(skill.id)}" ${canApply ? "" : "disabled"} title="${escapeAttr(applyTitle)}">
-          <i data-lucide="send"></i><span>${applyLabel === "Ajouter au chat" ? "Ajouter au message" : applyLabel}</span>
-        </button>
-        <button class="tool-button" data-skill-copy="${escapeAttr(skill.id)}" title="Copier le contenu du skill dans le presse-papiers">
-          <i data-lucide="copy"></i><span>Copier</span>
-        </button>
-      </div>
-      <details class="skill-details">
-        <summary>Voir le contenu</summary>
-        <pre class="skill-content">${escapeHtml(skill.content)}</pre>
-      </details>
-    </div>`;
-};
-
 const renderSkillsPanel = (): string => {
-  const skills = skillsList ?? [];
-  const applyTarget = "chat" as const;
-  const hasActiveSession = activeTerminal()?.running ?? false;
-  const sub = !skillsLoaded
-    ? "Chargement…"
-    : applyTarget === "chat"
-      ? `${skills.length} skill(s) disponible(s) · choisis les boutons affichés dans toutes les fenêtres de chat`
-      : `${skills.length} skill(s) disponible(s)${hasActiveSession ? "" : " · démarre un terminal Codex pour pouvoir les injecter"}`;
-
-  const body = skillsError
-    ? `<div class="empty audit-error">${escapeHtml(skillsError)}</div>`
-    : !skillsLoaded
-      ? `<div class="empty">Chargement des skills…</div>`
-      : skills.length === 0
-        ? `<div class="empty">Aucun skill trouvé (<code>public/skills/index.json</code>).</div>`
-        : `<div id="skillsList" class="skills-list">${skills.map((skill) => renderSkillCard(skill, applyTarget, hasActiveSession)).join("")}</div>`;
-
-  return `
-    <div class="panel audit-panel skills-panel">
-      <div class="panel-head">
-        <div>
-          <h2>Skills</h2>
-          <p class="panel-sub">${escapeHtml(sub)}</p>
-        </div>
-        <div class="panel-actions">
-          <button id="skillsRefresh" class="icon-button wide" title="Rafraîchir la bibliothèque"><i data-lucide="refresh-ccw"></i></button>
-        </div>
-      </div>
-      ${body}
-    </div>`;
+  return skillsViewModule?.renderSkillsPanel({
+    skills: skillsList ?? [],
+    loaded: skillsLoaded,
+    error: skillsError,
+    chatButtonIds: chatSkillButtonIds ?? [],
+    applyTarget: "chat",
+    hasActiveSession: activeTerminal()?.running ?? false,
+  }) ?? "";
 };
 
 
@@ -3737,17 +5670,27 @@ const ensureTerminalsRestored = async () => {
   }
 };
 
-const stopAutonomousAgentsPoll = () => {
+const clearAutonomousAgentsPoll = () => {
   if (autonomousAgentsPoll !== null) {
     clearInterval(autonomousAgentsPoll);
     autonomousAgentsPoll = null;
   }
 };
 
+const stopAutonomousAgentsPoll = () => {
+  autonomousAgentsTracking = false;
+  clearAutonomousAgentsPoll();
+};
+
 const refreshAutonomousScheduleLabels = () => {
   const now = Date.now() / 1000;
   document.querySelectorAll<HTMLElement>("[data-autonomous-schedule]").forEach((element) => {
     const id = element.dataset.autonomousSchedule;
+    const agent = autonomousAgents.find((candidate) => candidate.id === id);
+    if (agent) element.textContent = formatAutonomousSchedule(agent, now);
+  });
+  document.querySelectorAll<HTMLElement>("[data-bug-report-schedule]").forEach((element) => {
+    const id = element.dataset.bugReportSchedule;
     const agent = autonomousAgents.find((candidate) => candidate.id === id);
     if (agent) element.textContent = formatAutonomousSchedule(agent, now);
   });
@@ -3788,23 +5731,53 @@ const syncAutonomousChatPanes = (): ExpertChatPane[] => {
   return changed;
 };
 
-const refreshAutonomousAgents = async (announce = false) => {
-  if (autonomousAgentsInFlight) return;
+const refreshAutonomousAgents = async (announce = false): Promise<boolean> => {
+  if (autonomousAgentsInFlight) return false;
   autonomousAgentsInFlight = true;
-  if (announce && activeView === "autonomous") statusText = "Actualisation des agents autonomes";
+  if (announce && (activeView === "autonomous" || activeView === "bug-report")) {
+    statusText = activeView === "bug-report"
+      ? "Actualisation des signalements"
+      : "Actualisation des agents autonomes";
+  }
   try {
+    const knownReportIds = new Set(
+      autonomousAgents.flatMap((agent) => autonomousAgentReports(agent).map((report) => report.id)),
+    );
     const next = await invoke<AutonomousAgentSnapshot[]>("list_autonomous_agents");
+    const newlyDelivered = next
+      .flatMap((agent) => autonomousAgentReports(agent).map((report) => ({ agent, report })))
+      .filter(({ report }) =>
+        report.readAt == null
+        && !knownReportIds.has(report.id)
+        && !autonomousSeenReportIds.has(report.id),
+      )
+      .sort((left, right) => right.report.createdAt - left.report.createdAt);
     const signature = JSON.stringify(next);
     const changed = signature !== autonomousAgentsSignature;
     autonomousAgents = next;
     autonomousAgentsSignature = signature;
     autonomousAgentsLoaded = true;
+    syncAutonomousUnreadBadges();
     if (autonomousEditingId && !next.some((agent) => agent.id === autonomousEditingId)) {
       closeAutonomousAgentEditor();
     }
     const unlinkedPanes = syncAutonomousChatPanes();
-    if (announce && activeView === "autonomous") statusText = "Agents autonomes actualises";
-    if (changed && activeView === "autonomous") render();
+    if (announce && (activeView === "autonomous" || activeView === "bug-report")) {
+      statusText = activeView === "bug-report"
+        ? "Signalements actualisés"
+        : "Agents autonomes actualises";
+    }
+    if (newlyDelivered.length) {
+      const latest = newlyDelivered[0];
+      statusText = newlyDelivered.length === 1
+        ? `${latest.agent.name || latest.agent.objective} a remis un nouveau compte rendu`
+        : `${newlyDelivered.length} nouveaux comptes rendus autonomes sont à consulter`;
+      const toast = document.querySelector<HTMLElement>(".chat-status-toast");
+      if (toast) toast.textContent = statusText;
+    }
+    if (changed) syncBugReportPanelUi();
+    if (changed && (activeView === "autonomous" || activeView === "dashboard")) render();
+    else if (changed && activeView === "bug-report") syncAutonomousMonitorUi();
     else if (changed) {
       syncAutonomousMonitorUi();
       if (activeView === "chat") {
@@ -3816,23 +5789,26 @@ const refreshAutonomousAgents = async (announce = false) => {
       }
     }
     else refreshAutonomousScheduleLabels();
+    return true;
   } catch (error) {
     autonomousAgentsLoaded = true;
-    if (activeView === "autonomous") {
+    if (activeView === "autonomous" || activeView === "bug-report") {
       statusText = String(error);
-      if (announce) render();
+      if (activeView === "bug-report") {
+        bugReportFeedback = { tone: "error", message: String(error) };
+        syncBugReportPanelUi();
+      } else if (announce) render();
     }
+    return false;
   } finally {
     autonomousAgentsInFlight = false;
+    scheduleRuntimeSyncFlush();
   }
 };
 
 const startAutonomousAgentsPoll = () => {
-  if (autonomousAgentsPoll !== null) return;
-  autonomousAgentsPoll = window.setInterval(
-    () => runWhenPageVisible(() => void refreshAutonomousAgents()),
-    2_000,
-  );
+  autonomousAgentsTracking = true;
+  syncRuntimeFallbackPolling();
 };
 
 const stopOrchestrationsPoll = () => {
@@ -3947,6 +5923,129 @@ const startAutonomousMonitorTurnPoll = () => {
 };
 
 const setActiveView = (view: AppView) => {
+  lazyChunkTargetView = view;
+  if (view === "tutorial" && !tutorialModule) {
+    void loadTutorialModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Tutoriel indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "tasks" && !tasksViewModule) {
+    void loadTasksViewModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Vue tâches indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "prompts" && !promptLibraryModule) {
+    void loadPromptLibraryModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Bibliothèque de prompts indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "history" && !promptHistoryViewModule) {
+    if (!promptHistoryLoaded) void refreshPromptHistory();
+    void loadPromptHistoryViewModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Historique des prompts indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "scheduled-chat" && !scheduledChatsViewModule) {
+    void loadScheduledChatsViewModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Chat planifié indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "skills" && !skillsViewModule) {
+    void loadSkillsViewModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Bibliothèque de skills indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "forum" && !forumModule) {
+    void loadForumModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Forum communautaire indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "messaging" && !messagingModule) {
+    void loadMessagingModule()
+      .then((module) => {
+        module.startMessagingPolling(render);
+        setActiveView(view);
+      })
+      .catch((error) => {
+        statusText = `Messagerie indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "dashboard" && !statsViewModule) {
+    void loadStatsViewModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Statistiques indisponibles : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "vps" && !vpsModule) {
+    void loadVpsModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Déploiement VPS indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "video" && !videoModule) {
+    void loadVideoModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Studio IA indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "design" && !designModule) {
+    void loadDesignModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Espace Design indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  if (view === "doctolib-lab" && !doctolibLabModule) {
+    void loadDoctolibLabModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `RDV Lab indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
+  lazyChunkTargetView = null;
   document.body.classList.remove("chat-sidebar-open", "m-drawer-open", "m-sheet-open");
   if (view !== "settings") keyboardShortcutCaptureId = null;
   if (view === "terminal" && !userEnvironmentPath(terminalFolderFilter)) {
@@ -3954,17 +6053,23 @@ const setActiveView = (view: AppView) => {
   }
   activeView = view;
   const viewStatus: Partial<Record<AppView, string>> = {
+    tutorial: "Parcours de découverte",
     tasks: "Vue tâches",
     prompts: "Bibliothèque de prompts",
     "scheduled-chat": "Chat planifié",
     pool: "Vue pool",
     limits: "Vue limites",
     dashboard: "Vue dashboard",
+    video: "Studio IA génératif",
+    vps: "Déploiement VPS",
     "doctolib-lab": "RDV Lab expérimental",
     autonomous: "Agents autonomes",
+    "bug-report": "Signaler un bug",
     orchestration: "Chats orchestrés",
-    kombai: "Vue Kombai",
-    discussions: "Vue discussions",
+    forum: "Forum communautaire",
+    messaging: "Messagerie privée",
+    design: "Espace Design",
+    discussions: "Vue historique",
     history: "Vue historique",
     audit: "Audit design",
     skills: "Skills",
@@ -3992,7 +6097,7 @@ const setActiveView = (view: AppView) => {
     stopUsagePoll();
   }
 
-  if (activeView === "kombai") {
+  if (activeView === "design" && activeDesignTool === "kombai") {
     startKombaiPoll();
   } else {
     stopKombaiPoll();
@@ -4009,6 +6114,12 @@ const setActiveView = (view: AppView) => {
       autonomousAccountId = selectedAccountId ?? settings?.defaultAccountId ?? null;
     }
     if (!autonomousProjectDir) autonomousProjectDir = currentWorkspace() ?? "";
+  }
+  if (activeView === "bug-report") {
+    if (!accountById(bugReportDraft.accountId)) {
+      bugReportDraft.accountId = selectedAccountId ?? settings?.defaultAccountId ?? settings?.accounts[0]?.id ?? "";
+    }
+    if (!bugReportDraft.projectDir) bugReportDraft.projectDir = currentWorkspace() ?? "";
   }
   startAutonomousAgentsPoll();
 
@@ -4032,6 +6143,15 @@ const setActiveView = (view: AppView) => {
     stopDiscussionsPoll();
   }
 
+  if (activeView === "forum") forumModule?.startForumPolling(render);
+  else forumModule?.stopForumPolling();
+
+  messagingModule?.setMessagingVisible(activeView === "messaging");
+  messagingModule?.startMessagingPolling(render);
+
+  if (activeView !== "vps") vpsModule?.deactivateVpsPanel();
+  if (activeView !== "video") videoModule?.deactivateVideoPanel();
+
   if (activeView === "chat") startAllExpertChatWork();
   else stopAllExpertChatWork();
 
@@ -4045,8 +6165,13 @@ const setActiveView = (view: AppView) => {
     void refreshAccountUsage();
     void refreshWorkTimeDashboard();
   }
-  if (activeView === "kombai") void refreshKombaiStatus();
-  if (activeView === "autonomous") void refreshAutonomousAgents(!autonomousAgentsLoaded);
+  if (activeView === "design" && activeDesignTool === "kombai") void refreshKombaiStatus();
+  if (activeView === "design" && activeDesignTool === "claude") {
+    void loadClaudeDesignTranscriptIfNeeded();
+  }
+  if (activeView === "autonomous" || activeView === "bug-report") {
+    void refreshAutonomousAgents(!autonomousAgentsLoaded);
+  }
   if (
     activeView === "orchestration"
     || (activeView === "chat" && expertChatPanes.some((pane) => !!pane.orchestrationId))
@@ -4054,26 +6179,58 @@ const setActiveView = (view: AppView) => {
     void refreshOrchestrations(!orchestrationsLoaded);
   }
   if (activeView === "discussions") void refreshDiscussions();
+  if (activeView === "forum") void forumModule?.refreshForum(render);
+  if (activeView === "messaging") void messagingModule?.refreshMessaging(render);
+  if (activeView === "vps") vpsModule?.activateVpsPanel(render);
+  if (activeView === "video") videoModule?.activateVideoPanel(render);
   if (activeView === "history" && !promptHistoryLoaded) void refreshPromptHistory();
   if (activeView === "skills") void refreshSkills();
-  if (activeView === "settings") void refreshVoiceRuntimeStatus();
+  if (activeView === "settings") {
+    void refreshVoiceRuntimeStatus();
+    if (!telegramConnectionLoaded) void refreshTelegramConnection(true);
+    if (!whatsappConnectionLoaded) void refreshWhatsAppConnection(true);
+  }
+  if (activeView === "autonomous" && !telegramConnectionLoaded) {
+    void refreshTelegramConnection();
+  }
+  if (activeView === "autonomous" && !whatsappConnectionLoaded) {
+    void refreshWhatsAppConnection();
+  }
   if (activeView === "doctolib-lab" && !doctolibLab.status) {
     void refreshDoctolibLabStatus();
   }
 };
 
-const refreshLimitStatus = (silent = false): Promise<void> => {
+const stopLimitRefreshFollowup = () => {
+  if (limitRefreshFollowupTimer !== null) {
+    window.clearTimeout(limitRefreshFollowupTimer);
+    limitRefreshFollowupTimer = null;
+  }
+};
+
+const scheduleLimitRefreshFollowup = () => {
+  if (limitRefreshFollowupTimer !== null) return;
+  limitRefreshFollowupTimer = window.setTimeout(() => {
+    limitRefreshFollowupTimer = null;
+    runWhenPageVisible(() => void refreshLimitStatus(true));
+  }, LIMIT_REFRESH_FOLLOWUP_MS);
+};
+
+const refreshLimitStatus = (silent = false, force = false): Promise<void> => {
   if (limitStatusRefreshPromise) return limitStatusRefreshPromise;
   const pending = (async () => {
     limitStatusInFlight = true;
     const announceInLimitsView = !silent && activeView === "limits";
+    const wasBackgroundRefreshing = limitStatus.some((row) => row.refreshing === true);
     if (announceInLimitsView) {
       statusText = "Lecture des limites serveur";
     }
     let statusChanged = false;
     let accountSettingsChanged = false;
+    let backgroundRefreshing = false;
     try {
-      limitStatus = await invoke<AccountLimitView[]>("account_limit_status");
+      limitStatus = await invoke<AccountLimitView[]>("account_limit_status", { force });
+      backgroundRefreshing = limitStatus.some((row) => row.refreshing === true);
       if (
         settings &&
         !accountCatalogMatchesLimitRows(settings.accounts, limitStatus)
@@ -4098,16 +6255,27 @@ const refreshLimitStatus = (silent = false): Promise<void> => {
       statusChanged = nextSignature !== limitStatusSignature;
       limitStatusSignature = nextSignature;
       limitStatusLoaded = true;
-      if (announceInLimitsView) statusText = "Limites serveur actualisees";
+      if (announceInLimitsView) {
+        statusText = backgroundRefreshing
+          ? "Limites affichees, actualisation en arriere-plan"
+          : "Limites serveur actualisees";
+      } else if (wasBackgroundRefreshing && !backgroundRefreshing && activeView === "limits") {
+        statusText = "Limites serveur actualisees";
+      }
       recoverQuotaExhaustedChatTurns();
     } catch (error) {
       if (announceInLimitsView) statusText = String(error);
       limitStatusLoaded = true;
+      backgroundRefreshing = limitStatus.some((row) => row.refreshing === true);
     } finally {
       limitStatusInFlight = false;
     }
 
+    if (backgroundRefreshing) scheduleLimitRefreshFollowup();
+    else stopLimitRefreshFollowup();
+
     if (newChatModalOpen) syncNewChatAccountUsageUi();
+    if (activeView === "chat") syncExpertChatGlobalUsageUi();
 
     if (
       activeView === "limits" &&
@@ -4154,20 +6322,19 @@ const reloginAccount = async (accountId: string) => {
   // Un login n'a besoin d'aucun projet : son terminal temporaire travaille dans
   // le home isole du compte. Le backend reserve toujours l'exigence d'un vrai
   // environnement aux terminaux de travail.
-  const environmentPath = userEnvironmentPath(account.codexHome);
-  if (!environmentPath) {
+  if (!account.codexHome.trim()) {
     statusText = "Dossier du compte introuvable";
     render();
     return;
   }
-  statusText = `Ouverture de la connexion ${providerLabel(provider)} pour ${account.label}…`;
+  statusText = `Ouverture de la connexion ${accountProviderLabel(account)} pour ${account.label}…`;
   await createNewTerminal(
     accountId,
     true,
     reconnectCommand,
     agentId,
     null,
-    environmentPath,
+    null,
     true,
   );
 };
@@ -4300,9 +6467,49 @@ const refreshUsageDashboard = async () => {
   }
 };
 
-// Le backend met en cache les rollouts inchangés et la lecture distante du
-// compte. Le poll peut donc suivre les sessions actives sans reparcourir tout
-// l'historique toutes les cinq secondes.
+// Le backend met en cache les rollouts inchangés. Le poll peut donc suivre les
+// sessions actives sans reparcourir tout l'historique toutes les cinq secondes.
+const optionalPositiveNumber = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+
+const normalizeApiModelUsages = (value: unknown): ApiModelTokenUsage[] => {
+  if (!Array.isArray(value)) return [];
+  return aggregateApiModelUsage(
+    value.flatMap((raw): ApiModelTokenUsage[] => {
+      if (!raw || typeof raw !== "object") return [];
+      const usage = raw as Partial<ApiModelTokenUsage>;
+      const model = typeof usage.model === "string" ? usage.model.trim() : "";
+      if (!model) return [];
+      return [
+        {
+          model,
+          pricingModel:
+            typeof usage.pricingModel === "string" && usage.pricingModel.trim()
+              ? usage.pricingModel.trim()
+              : null,
+          priced: usage.priced === true,
+          inputTokens: optionalPositiveNumber(usage.inputTokens) ?? 0,
+          cachedInputTokens: optionalPositiveNumber(usage.cachedInputTokens) ?? 0,
+          outputTokens: optionalPositiveNumber(usage.outputTokens) ?? 0,
+          reasoningOutputTokens: optionalPositiveNumber(usage.reasoningOutputTokens) ?? 0,
+          totalTokens: optionalPositiveNumber(usage.totalTokens) ?? 0,
+          apiEquivalentUsd: optionalPositiveNumber(usage.apiEquivalentUsd) ?? 0,
+          inputPricePerMillion: optionalPositiveNumber(usage.inputPricePerMillion),
+          cachedInputPricePerMillion: optionalPositiveNumber(usage.cachedInputPricePerMillion),
+          outputPricePerMillion: optionalPositiveNumber(usage.outputPricePerMillion),
+          longContextThresholdTokens: optionalPositiveNumber(usage.longContextThresholdTokens),
+          longInputPricePerMillion: optionalPositiveNumber(usage.longInputPricePerMillion),
+          longCachedInputPricePerMillion: optionalPositiveNumber(
+            usage.longCachedInputPricePerMillion,
+          ),
+          longOutputPricePerMillion: optionalPositiveNumber(usage.longOutputPricePerMillion),
+          longContextRequests: optionalPositiveNumber(usage.longContextRequests) ?? 0,
+        },
+      ];
+    }),
+  );
+};
+
 const normalizeAccountUsageDashboard = (
   dashboard: AccountUsageDashboard,
 ): AccountUsageDashboard => {
@@ -4319,13 +6526,24 @@ const normalizeAccountUsageDashboard = (
         account.usageSource === "unavailable"
           ? account.usageSource
           : "local-sessions";
-      return {
+      const normalized: AccountUsageView = {
         ...account,
         profileLabels: profileLabels.length ? profileLabels : [account.label],
         usageSource,
         sourceError: account.sourceError ?? account.error ?? null,
         days: Array.isArray(account.days) ? account.days : [],
+        models: normalizeApiModelUsages(account.models),
       };
+      normalized.days = normalized.days.map((day) => ({
+        ...day,
+        models: normalizeApiModelUsages(day.models),
+      }));
+      if (normalized.models.length === 0) {
+        normalized.models = aggregateApiModelUsage(
+          normalized.days.flatMap((day) => day.models),
+        );
+      }
+      return normalized;
     },
   );
   const fallbackProfileCount = normalizedAccounts.reduce(
@@ -4333,9 +6551,15 @@ const normalizeAccountUsageDashboard = (
     0,
   );
   const accounts = deduplicateAccountTokenAccounts(normalizedAccounts);
+  const dashboardModels = normalizeApiModelUsages(dashboard.models);
+  const models =
+    dashboardModels.length > 0
+      ? dashboardModels
+      : aggregateApiModelUsage(accounts.flatMap((account) => account.models));
   return {
     ...dashboard,
     accounts,
+    models,
     totalTokens: accounts.reduce((total, account) => total + (account.totalTokens || 0), 0),
     totalCostUsd: accounts.reduce((total, account) => total + (account.costUsd || 0), 0),
     totalSessions: accounts.reduce((total, account) => total + (account.sessionCount || 0), 0),
@@ -4458,7 +6682,7 @@ const refreshKombaiStatus = async () => {
       const recoveredFromError = kombaiStatusError;
       const runningChanged = kombaiStatus.running !== wasRunning;
       kombaiStatusError = false;
-      if (activeView === "kombai") {
+      if (activeView === "design" && activeDesignTool === "kombai") {
         if (recoveredFromError || runningChanged) {
           statusText = kombaiStatusSummary(kombaiStatus);
         }
@@ -4472,7 +6696,7 @@ const refreshKombaiStatus = async () => {
       kombaiStatusError = true;
       statusText = String(error);
       kombaiLoaded = true;
-      if (activeView === "kombai") render();
+      if (activeView === "design" && activeDesignTool === "kombai") render();
     }
   } finally {
     kombaiStatusInFlight = false;
@@ -4510,11 +6734,31 @@ const applyDiscussionsSnapshot = (snapshot: DiscussionsView) => {
     element.textContent = title;
     element.title = title;
   };
+  const syncPanelTokenUsage = (
+    root: ParentNode | null,
+    model: ChatPanelModel,
+    blocked = false,
+  ) => {
+    const current = root?.querySelector<HTMLElement>("[data-chat-control='tokens']");
+    if (!current) return;
+    const signature = chatTokenUsagePresentation(
+      model.totalTokens,
+      model.contextUsage,
+    ).signature;
+    if (
+      current.dataset.chatTokenSignature === signature
+      && current.classList.contains("is-compacting") === model.contextCompacting
+    ) return;
+    current.outerHTML = renderChatTokenUsage(model, blocked || chatTurnIsBusy(model.turnStatus));
+    const next = root?.querySelector<HTMLElement>("[data-chat-control='tokens']");
+    if (next) renderIcons(next);
+  };
   if (chatDiscussion) {
     const latest = latestBySession.get(chatDiscussion.sessionId);
     if (latest) {
       Object.assign(chatDiscussion, latest);
       syncPanelTitle(document.querySelector<HTMLElement>("#chatPanel"), chatDiscussion);
+      syncPanelTokenUsage(document.querySelector<HTMLElement>("#chatPanel"), chatPanelModel());
     }
   }
   expertChatPanes.forEach((pane) => {
@@ -4523,6 +6767,11 @@ const applyDiscussionsSnapshot = (snapshot: DiscussionsView) => {
     if (latest) {
       Object.assign(pane.discussion, latest);
       syncPanelTitle(expertChatPaneRoot(pane), pane.discussion);
+      syncPanelTokenUsage(
+        expertChatPaneRoot(pane),
+        expertChatPanelModel(pane),
+        expertChatAccountTransitions.has(pane.key),
+      );
     }
   });
   if (activeView === "discussions") {
@@ -4537,10 +6786,13 @@ const applyDiscussionsSnapshot = (snapshot: DiscussionsView) => {
     // Ne remplace jamais le DOM sous le pointeur pendant un drag natif : sinon
     // le navigateur annule le geste avant que le drop atteigne son workspace.
     if (host && !draggedChatSessionId) {
+      chatSidebarRefreshPending = false;
       host.innerHTML = renderChatSidebarConversations();
       renderIcons(host);
       bindDiscussionRowUi();
       bindWorkspaceSwitcherUi(host);
+    } else if (host) {
+      chatSidebarRefreshPending = true;
     }
     // Garde le compteur global des workspaces et conversations a jour.
     refreshWorkspaceSwitcher();
@@ -4567,7 +6819,16 @@ const refreshDiscussions = (): Promise<void> => {
 
 const startDiscussionsPoll = () => {
   stopDiscussionsPoll();
-  if (isRemoteMode()) {
+  if (isRemoteMode() && remoteNodesText().trim()) {
+    // Un seul WebSocket ne represente qu'un VPS. En mode multi-noeuds, le
+    // snapshot REST agrege maintient l'index complet et actualise les routes
+    // collantes des sessions.
+    discussionsSyncState = "polling";
+    discussionsPoll = window.setInterval(
+      () => runWhenPageVisible(() => void refreshDiscussions()),
+      2000,
+    );
+  } else if (isRemoteMode()) {
     discussionsSyncState = "connecting";
     discussionsLiveUnlisten = subscribeDiscussionUpdates(
       {},
@@ -4613,8 +6874,45 @@ const stopDiscussionsPoll = () => {
 const allDiscussions = (): DiscussionSummary[] =>
   discussions?.accounts.flatMap((group) => group.discussions) ?? [];
 
-const findDiscussion = (id: string | null | undefined) =>
-  (id && allDiscussions().find((discussion) => discussion.sessionId === id)) || null;
+const findDiscussion = (id: string | null | undefined, accountId?: string | null) =>
+  (id && allDiscussions().find((discussion) =>
+    discussion.sessionId === id && (!accountId || discussion.accountId === accountId)
+  )) || null;
+
+const renameDiscussion = async (discussion: DiscussionSummary): Promise<void> => {
+  if (discussionBusyId) return;
+  const currentTitle = discussion.title?.trim() ?? "";
+  const requested = window.prompt(
+    "Nouveau nom du chat (laissez vide pour restaurer le titre automatique)",
+    currentTitle,
+  );
+  if (requested === null || requested.trim() === currentTitle) return;
+  if (requested.trim().length > 80) {
+    statusText = "Le nom du chat ne peut pas dépasser 80 caractères";
+    render();
+    return;
+  }
+
+  discussionBusyId = discussion.sessionId;
+  if (activeView === "discussions") refreshDiscussionList();
+  else refreshChatSidebarConversations();
+  try {
+    const renamed = await invoke<DiscussionSummary>("rename_discussion", {
+      accountId: discussion.accountId,
+      sessionId: discussion.sessionId,
+      title: requested,
+    });
+    Object.assign(discussion, renamed);
+    statusText = requested.trim()
+      ? `Chat renommé « ${renamed.title ?? requested.trim()} »`
+      : "Titre automatique restauré";
+  } catch (error) {
+    statusText = `Renommage impossible : ${String(error)}`;
+  }
+  discussionBusyId = null;
+  await refreshDiscussions();
+  render();
+};
 
 const discussionMatches = (discussion: DiscussionSummary, label: string) => {
   const query = discussionSearch.trim().toLowerCase();
@@ -4649,6 +6947,20 @@ const restoreDiscussionFolder = async (
 ): Promise<string | null> => {
   const folderPath = activateDiscussionFolder(discussion);
   if (!folderPath) return null;
+  await persistDiscussionFolder(discussion, folderPath);
+  return folderPath;
+};
+
+// Une reprise automatique (quota epuise, chat suivi en arriere-plan) doit
+// conserver l'environnement actuellement affiche. Elle resout et persiste le
+// dossier du chat concerne sans toucher au workspace, au filtre ou au terminal
+// actifs de l'utilisateur.
+const preserveDiscussionFolder = async (
+  discussion: DiscussionSummary,
+): Promise<string | null> => {
+  const folderPath = discussionFolderPath(discussion);
+  if (!folderPath) return null;
+  discussion.folderPath = folderPath;
   await persistDiscussionFolder(discussion, folderPath);
   return folderPath;
 };
@@ -4730,6 +7042,8 @@ const closeTransferredDiscussionSource = (discussion: DiscussionSummary) => {
     stopExpertChatTurnPoll(pane);
     resetExpertModelCapacityRetry(pane);
     expertChatAccountTransitions.delete(pane.key);
+    automaticQuotaResumeVisibilityPins.delete(pane.key);
+    explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
   });
   expertChatPanes = expertChatPanes.filter((pane) => !isSourceDiscussion(pane.discussion));
   if (closedPanes.some((pane) => pane.key === activeExpertChatKey)) {
@@ -4755,6 +7069,8 @@ const closeTransferredDiscussionSource = (discussion: DiscussionSummary) => {
     chatError = null;
     chatLoading = false;
     chatTruncated = false;
+    chatContextUsage = null;
+    chatContextCompacting = false;
     chatHistoryOpen = false;
   }
 };
@@ -4772,12 +7088,12 @@ const archiveTransferredDiscussion = async (discussion: DiscussionSummary): Prom
 };
 
 const transferredDiscussionStatus = (
-  target: AccountProfile,
-  archivedCount: number,
-) => {
-  const forkNote = archivedCount > 1 ? ` (${archivedCount} anciennes reprises archivees)` : "";
-  return `Discussion deplacee vers « ${target.label} »${forkNote} et reprise automatiquement`;
-};
+  _target: AccountProfile,
+  _archivedCount: number,
+) => "Conversation poursuivie sans interruption";
+
+const transferredDiscussionPendingStatus = (_target: AccountProfile) =>
+  "Conversation prête";
 
 const syncStatusTextDom = () => {
   document.querySelectorAll<HTMLElement>(".chat-status-toast").forEach((element) => {
@@ -4815,6 +7131,46 @@ const setExpertChatAccountTransition = (
   refreshAccountTransitionUi(pane);
 };
 
+// Le compte cible est utilisable des que start_chat_turn a confirme son
+// demarrage. L'archivage de la source et le rescannage de l'index restent
+// necessaires, mais ne doivent plus bloquer le compositeur pendant plusieurs
+// secondes sur une longue conversation.
+const finalizeTransferredDiscussion = async (
+  discussion: DiscussionSummary,
+  target: AccountProfile,
+  pendingStatus: string,
+) => {
+  let finalStatus: string;
+  try {
+    const archivedCount = await archiveTransferredDiscussion(discussion);
+    finalStatus = transferredDiscussionStatus(target, archivedCount);
+  } catch (error) {
+    finalStatus = `Conversation poursuivie, mais l’ancienne version reste disponible : ${String(error)}`;
+  }
+
+  // Le verrou protege uniquement la source contre une seconde mutation. Le
+  // chat cible, lui, est deja interactif depuis releaseTransferredDiscussion.
+  if (discussionBusyId === discussion.sessionId) discussionBusyId = null;
+  await refreshDiscussions();
+  // Ne pas ecraser une action plus recente de l'utilisateur avec la fin d'une
+  // tache d'arriere-plan devenue stale.
+  if (statusText === pendingStatus) {
+    statusText = finalStatus;
+    syncStatusTextDom();
+  }
+};
+
+const releaseTransferredDiscussion = (
+  discussion: DiscussionSummary,
+  target: AccountProfile,
+  transferPane: ExpertChatPane | null,
+) => {
+  const pendingStatus = transferredDiscussionPendingStatus(target);
+  statusText = pendingStatus;
+  setExpertChatAccountTransition(transferPane, null);
+  void finalizeTransferredDiscussion(discussion, target, pendingStatus);
+};
+
 const expertPaneForDiscussion = (
   discussion: DiscussionSummary,
   preferred: ExpertChatPane | null = null,
@@ -4836,30 +7192,38 @@ const expertPaneForDiscussion = (
 //
 // Dans les deux cas, la source n'est archivee qu'une fois le tour du chat cible
 // demarre. Un echec conserve donc l'ancienne discussion dans la liste.
+type DiscussionContinuationOptions = {
+  preserveNavigation?: boolean;
+};
+
 const continueDiscussionWith = async (
   discussion: DiscussionSummary,
   targetAccountId: string,
   preferredPane: ExpertChatPane | null = null,
+  options: DiscussionContinuationOptions = {},
 ) => {
   if (discussionBusyId) return;
   if (!settings || !targetAccountId || targetAccountId === discussion.accountId) return;
   const target = accountById(targetAccountId);
   if (!target) return;
-  const sourceLabel = accountById(discussion.accountId)?.label ?? discussion.accountLabel;
   const transferPane = expertPaneForDiscussion(discussion, preferredPane);
   const sourceProvider = discussion.provider ?? accountProvider(accountById(discussion.accountId));
   const targetProvider = accountProvider(target);
   discussionBusyId = discussion.sessionId;
   if (transferPane) {
     setExpertChatAccountTransition(transferPane, {
-      label: "Changement de compte",
-      detail: `${sourceLabel} → ${target.label} · préparation du contexte`,
+      label: "Continuité automatique",
+      detail: "Préparation de la suite de la conversation",
     });
   } else {
     render();
   }
   try {
-    const folderPath = userEnvironmentPath(await restoreDiscussionFolder(discussion));
+    const folderPath = userEnvironmentPath(await (
+      options.preserveNavigation
+        ? preserveDiscussionFolder(discussion)
+        : restoreDiscussionFolder(discussion)
+    ));
     if (!folderPath) {
       throw new Error("la discussion n'a pas d'environnement associe");
     }
@@ -4872,7 +7236,7 @@ const continueDiscussionWith = async (
       const resumeId = copied.rolloutId || copied.sessionId;
       if (!isPlausibleSessionId(resumeId)) {
         discussionBusyId = null;
-        statusText = "Copie effectuee mais identifiant invalide";
+        statusText = "La conversation n’a pas pu être reprise. La version précédente a été conservée.";
         setExpertChatAccountTransition(transferPane, null);
         await refreshDiscussions();
         return;
@@ -4884,23 +7248,16 @@ const continueDiscussionWith = async (
         folderPath,
         "continue",
         transferPane,
+        { preserveNavigation: options.preserveNavigation },
       );
       if (!resumed) {
         discussionBusyId = null;
-        statusText = `La nouvelle discussion est disponible dans « ${target.label} », mais le chat n'a pas demarre. L'ancienne a ete conservee.`;
+        statusText = "La reprise n’a pas démarré. La conversation précédente a été conservée.";
         setExpertChatAccountTransition(transferPane, null);
         await refreshDiscussions();
         return;
       }
-      setExpertChatAccountTransition(transferPane, {
-        label: "Compte remplacé",
-        detail: `${target.label} a repris la conversation · finalisation`,
-      });
-      const archivedCount = await archiveTransferredDiscussion(discussion);
-      discussionBusyId = null;
-      statusText = transferredDiscussionStatus(target, archivedCount);
-      setExpertChatAccountTransition(transferPane, null);
-      await refreshDiscussions();
+      releaseTransferredDiscussion(discussion, target, transferPane);
       return;
     }
 
@@ -4915,25 +7272,18 @@ const continueDiscussionWith = async (
       folderPath,
       transcript,
       transferPane,
+      { preserveNavigation: options.preserveNavigation },
     );
     if (!resumed) {
       discussionBusyId = null;
-      statusText = "Le chat cible n'a pas demarre. L'ancienne discussion a ete conservee.";
+      statusText = "La reprise n’a pas démarré. La conversation précédente a été conservée.";
       setExpertChatAccountTransition(transferPane, null);
       return;
     }
-    setExpertChatAccountTransition(transferPane, {
-      label: "Compte remplacé",
-      detail: `${target.label} a repris la conversation · finalisation`,
-    });
-    const archivedCount = await archiveTransferredDiscussion(discussion);
-    discussionBusyId = null;
-    statusText = transferredDiscussionStatus(target, archivedCount);
-    setExpertChatAccountTransition(transferPane, null);
-    await refreshDiscussions();
+    releaseTransferredDiscussion(discussion, target, transferPane);
   } catch (error) {
     discussionBusyId = null;
-    statusText = `Deplacement incomplet : ${String(error)}. L'ancienne discussion a ete conservee si son archivage n'avait pas commence.`;
+    statusText = `Reprise incomplète : ${String(error)}. La conversation précédente a été conservée.`;
     setExpertChatAccountTransition(transferPane, null);
   }
 };
@@ -5012,6 +7362,7 @@ const removeArchivedDiscussionFromUi = (ids: ReadonlySet<string>) => {
     stopExpertChatSync(pane);
     stopExpertChatTurnPoll(pane);
     resetExpertModelCapacityRetry(pane);
+    explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
   });
   expertChatPanes = expertChatPanes.filter(
     (pane) => !discussionMatchesAnyId(pane.discussion, ids),
@@ -5031,6 +7382,8 @@ const removeArchivedDiscussionFromUi = (ids: ReadonlySet<string>) => {
     chatError = null;
     chatLoading = false;
     chatTruncated = false;
+    chatContextUsage = null;
+    chatContextCompacting = false;
   }
 };
 
@@ -5213,6 +7566,20 @@ const chatQuotaStatusFor = (account: AccountProfile | null): ChatQuotaStatus => 
     };
   }
 
+  if (
+    quota.refreshing &&
+    quota.sessionUsedPercent == null &&
+    quota.weeklyUsedPercent == null &&
+    quota.buckets.length === 0
+  ) {
+    return {
+      state: "loading",
+      remainingPercent: null,
+      resetAt: null,
+      detail: `Actualisation des limites de ${account.label} en arrière-plan.`,
+    };
+  }
+
   const remainingPercent = remainingQuotaPercent(quota);
   const resetAt = chatQuotaResetAt(quota);
   const windows = [
@@ -5244,7 +7611,7 @@ const chatQuotaStatusFor = (account: AccountProfile | null): ChatQuotaStatus => 
 let quotaAlternativeRefresh: Promise<void> | null = null;
 const refreshQuotaAlternatives = (): Promise<void> => {
   if (quotaAlternativeRefresh) return quotaAlternativeRefresh;
-  const pending = refreshLimitStatus(true).finally(() => {
+  const pending = refreshLimitStatus(true, true).finally(() => {
     if (quotaAlternativeRefresh === pending) quotaAlternativeRefresh = null;
     if (activeView !== "chat") return;
     if (isQuotaExhaustionError(chatTurn?.error)) refreshChatFeed();
@@ -5317,7 +7684,7 @@ const automaticallyTransferQuotaExhaustedDiscussion = (
         ? quotaSuggestionFor(currentTurn, currentDiscussion)
         : quotaAlternativeForAccount(currentTurn.accountId, currentDiscussion);
       if (!suggestion) {
-        statusText = "Quota epuise : aucun autre compte compatible avec du quota disponible";
+        statusText = "Aucune capacité compatible n’est disponible pour poursuivre la conversation pour le moment";
         if (activeView === "chat") {
           if (pane) refreshExpertChatPane(pane);
           else render();
@@ -5326,7 +7693,7 @@ const automaticallyTransferQuotaExhaustedDiscussion = (
       }
 
       if (shouldRecoverRunningQuotaTurn(currentTurn, limitStatus)) {
-        statusText = `Quota epuise : arret de la commande avant transfert vers « ${suggestion.accountLabel} »...`;
+        statusText = "Continuité automatique · préparation de la reprise…";
         if (activeView === "chat") {
           if (pane) refreshExpertChatPane(pane);
           else render();
@@ -5356,6 +7723,7 @@ const automaticallyTransferQuotaExhaustedDiscussion = (
         if (pane) {
           pane.messages = markLatestPendingMessageFailed(pane.messages);
           pane.turn = failedTurn;
+          explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
           stopExpertChatTurnPoll(pane);
           if (activeView === "chat") refreshExpertChatPane(pane);
         } else {
@@ -5378,11 +7746,13 @@ const automaticallyTransferQuotaExhaustedDiscussion = (
         return;
       }
 
-      statusText = `Quota epuise : transfert automatique vers « ${suggestion.accountLabel} »...`;
-      await continueDiscussionWith(currentDiscussion, suggestion.accountId, pane);
+      statusText = "Continuité automatique en cours…";
+      await continueDiscussionWith(currentDiscussion, suggestion.accountId, pane, {
+        preserveNavigation: true,
+      });
     })
     .catch((error) => {
-      statusText = `Transfert automatique impossible : ${String(error)}`;
+      statusText = `Reprise automatique impossible : ${String(error)}`;
       if (activeView === "chat") render();
     })
     .finally(() => {
@@ -5616,13 +7986,22 @@ const chatPanelModel = (): ChatPanelModel => {
   return {
     title: discussion?.title?.trim() || "Nouvelle conversation",
     subtitle: metaParts.join(" \u00b7 "),
+    totalTokens: discussion ? discussion.totalTokens : 0,
+    contextUsage: chatContextUsage,
+    contextCompacting: chatContextCompacting,
+    supportsCompact: provider === "codex",
+    hasCompactableSession: isPlausibleSessionId(
+      discussion?.rolloutId || chatTurn?.sessionId || discussion?.sessionId,
+    ),
     accountLabel: account?.label ?? discussion?.accountLabel ?? "Aucun compte",
-    providerLabel: providerLabel(accountProvider(account)),
+    providerLabel: accountProviderLabel(account),
+    nodeLabel: chatTurn?.nodeLabel ?? discussion?.nodeLabel ?? null,
     loading: chatLoading,
     error: chatError,
     truncated: chatTruncated,
     syncState: discussion ? chatSyncState : "closed",
     messages: chatMessages,
+    visibleTurnLimit: chatVisibleTurnLimit,
     activities: chatTurn?.activities ?? [],
     thoughts: chatTurn?.thoughts ?? [],
     parts: chatTurn?.parts ?? [],
@@ -5636,20 +8015,18 @@ const chatPanelModel = (): ChatPanelModel => {
       chatCapacityRetryTimer !== null,
     ),
     waitingForUser: conversationWaitsForUser(chatMessages, chatTurn?.parts ?? []),
+    turnStatusDisplayMode: chatTurnStatusDisplayMode,
     quotaStatus: chatQuotaStatusFor(account),
     quotaSuggestion: quotaSuggestionFor(chatTurn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
       id: candidate.id,
       label: candidate.label,
-      providerLabel: providerLabel(accountProvider(candidate)),
+      providerLabel: accountProviderLabel(candidate),
       model: accountModel(candidate),
     })),
     selectedAccountId: account?.id ?? "",
     selectedModel,
-    modelSuggestions:
-      provider === "claude"
-        ? CLAUDE_MODEL_SUGGESTIONS
-        : catalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS,
+    modelSuggestions: modelSuggestionsForAccount(account, catalog),
     selectedReasoningEffort: reasoningEffortForChatModel(
       account,
       selectedModel,
@@ -5657,11 +8034,14 @@ const chatPanelModel = (): ChatPanelModel => {
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: provider === "codex",
+    composerSelectorsEnabled: chatComposerSelectorsEnabled,
+    favoritePrompts: loadFavoritePromptShortcuts(),
     supportsGoals: provider === "codex",
     agentTools: chatAgentToolDefinitions(),
     enabledTools: chatEnabledTools,
     mode: chatMode,
     draft: chatDraft,
+    imageAttachments: chatImageAttachments,
     queuedCount: chatQueuedSubmissions.length,
     newConversation: !discussion,
     workspaceLabel: workspace ? displayProjectDir(workspace) : "Environnement",
@@ -5672,11 +8052,18 @@ const chatPanelModel = (): ChatPanelModel => {
 const patchChatRuntimeStatus = (root: ParentNode, model: ChatPanelModel): boolean => {
   const current = root.querySelector<HTMLElement>("[data-chat-control='runtime']");
   const turnStatus = root.querySelector<HTMLElement>("[data-chat-control='turn-status']");
-  if (!current && !turnStatus) return false;
+  const tokenUsage = root.querySelector<HTMLElement>("[data-chat-control='tokens']");
+  if (!current && !turnStatus && !tokenUsage) return false;
   const signature = chatRuntimeRenderSignature(model);
   if (chatRuntimeSignatures.get(root) === signature) return false;
   if (current) current.outerHTML = renderChatRuntimeStatus(model);
   if (turnStatus) turnStatus.outerHTML = renderChatTurnStatus(model);
+  if (tokenUsage) {
+    tokenUsage.outerHTML = renderChatTokenUsage(
+      model,
+      chatTurnIsBusy(model.turnStatus) || model.contextCompacting,
+    );
+  }
   chatRuntimeSignatures.set(root, signature);
   return true;
 };
@@ -5739,8 +8126,8 @@ const refreshChatSyncIndicator = () => {
 const rememberChatFeedScroll = (
   feed: HTMLElement,
   state: ChatScrollState,
-  userMovedAway = false,
-) => updateChatScrollState(state, feed, userMovedAway);
+  userIntent: ChatScrollUserIntent = "none",
+) => updateChatScrollState(state, feed, userIntent);
 
 const captureChatFeedScroll = () => {
   if (skipNextChatScrollCapture) {
@@ -5758,7 +8145,7 @@ const restoreChatFeedScroll = (
   if (!feed) return;
   const applyPosition = () => {
     feed.scrollTop = restoreChatScrollTop(state, feed);
-    state.scrollTop = feed.scrollTop;
+    if (state.followLatest) state.scrollTop = feed.scrollTop;
   };
   applyPosition();
 
@@ -5782,10 +8169,42 @@ const bindChatFeedScroll = (
   feed: HTMLDivElement,
   state: ChatScrollState = chatScrollState,
 ) => {
-  let pointerDown = false;
+  let scrollbarPointerDown = false;
+  let userScrollIntent: ChatScrollUserIntent = "none";
+  let clearUserScrollIntentTimer: number | null = null;
+  const markUserScrollIntent = (intent: Exclude<ChatScrollUserIntent, "none">) => {
+    userScrollIntent = intent;
+    if (clearUserScrollIntentTimer !== null) {
+      window.clearTimeout(clearUserScrollIntentTimer);
+    }
+    clearUserScrollIntentTimer = window.setTimeout(() => {
+      userScrollIntent = "none";
+      clearUserScrollIntentTimer = null;
+    }, 300);
+  };
+  const resumeIfUserReachedLatest = () => {
+    if (chatIsAtBottom(feed)) {
+      rememberChatFeedScroll(feed, state, "toward-latest");
+    }
+  };
+
   feed.addEventListener("scroll", () => {
-    const userMovedAway = feed.scrollTop < state.scrollTop - 0.5;
-    rememberChatFeedScroll(feed, state, userMovedAway);
+    const previousScrollTop = state.scrollTop;
+    const movedAway = feed.scrollTop < previousScrollTop - 0.5;
+    const movedTowardLatest = feed.scrollTop > previousScrollTop + 0.5;
+    const userIntent = scrollbarPointerDown
+      ? movedAway
+        ? "away"
+        : movedTowardLatest
+          ? "toward-latest"
+          : "none"
+      : userScrollIntent === "away" && movedAway
+        ? "away"
+        : userScrollIntent === "toward-latest" && movedTowardLatest
+          ? "toward-latest"
+          : "none";
+    rememberChatFeedScroll(feed, state, userIntent);
+    if (userIntent !== "none") markUserScrollIntent(userIntent);
   }, { passive: true });
 
   // Le listener scroll arrive apres le geste. On desactive donc le suivi des le
@@ -5794,42 +8213,56 @@ const bindChatFeedScroll = (
     "wheel",
     (event) => {
       if (event.deltaY < 0 && feed.scrollTop > 0) {
+        markUserScrollIntent("away");
         pauseChatScrollFollow(state, feed);
+      } else if (event.deltaY > 0) {
+        markUserScrollIntent("toward-latest");
+        resumeIfUserReachedLatest();
       }
     },
     { passive: true },
   );
 
   feed.addEventListener("pointerdown", (event) => {
-    pointerDown = true;
     const bounds = feed.getBoundingClientRect();
-    const usesScrollbar =
+    scrollbarPointerDown =
       event.pointerType === "mouse" &&
       feed.scrollHeight > feed.clientHeight &&
       event.clientX >= bounds.left + feed.clientWidth;
-    if (usesScrollbar && feed.scrollTop > 0) pauseChatScrollFollow(state, feed);
+    if (scrollbarPointerDown && feed.scrollTop > 0) pauseChatScrollFollow(state, feed);
   }, { passive: true });
   feed.addEventListener("pointerup", () => {
-    pointerDown = false;
+    scrollbarPointerDown = false;
   }, { passive: true });
   feed.addEventListener("pointercancel", () => {
-    pointerDown = false;
+    scrollbarPointerDown = false;
   }, { passive: true });
   feed.addEventListener("pointerleave", (event) => {
-    if (pointerDown && event.buttons > 0 && feed.scrollTop > 0) {
+    if (scrollbarPointerDown && event.buttons > 0 && feed.scrollTop > 0) {
       pauseChatScrollFollow(state, feed);
     }
-    pointerDown = false;
+    scrollbarPointerDown = false;
   }, { passive: true });
 
   feed.addEventListener("keydown", (event) => {
-    if (event.target !== feed || feed.scrollTop <= 0) return;
+    if (event.target !== feed) return;
     const movesUp =
       event.key === "ArrowUp" ||
       event.key === "PageUp" ||
       event.key === "Home" ||
       (event.key === " " && event.shiftKey);
-    if (movesUp) pauseChatScrollFollow(state, feed);
+    const movesDown =
+      event.key === "ArrowDown" ||
+      event.key === "PageDown" ||
+      event.key === "End" ||
+      (event.key === " " && !event.shiftKey);
+    if (movesUp && feed.scrollTop > 0) {
+      markUserScrollIntent("away");
+      pauseChatScrollFollow(state, feed);
+    } else if (movesDown) {
+      markUserScrollIntent("toward-latest");
+      resumeIfUserReachedLatest();
+    }
   });
 
   let lastTouchY: number | null = null;
@@ -5845,7 +8278,11 @@ const bindChatFeedScroll = (
     (event) => {
       const touchY = event.touches[0]?.clientY ?? null;
       if (touchY !== null && lastTouchY !== null && touchY > lastTouchY && feed.scrollTop > 0) {
+        markUserScrollIntent("away");
         pauseChatScrollFollow(state, feed);
+      } else if (touchY !== null && lastTouchY !== null && touchY < lastTouchY) {
+        markUserScrollIntent("toward-latest");
+        resumeIfUserReachedLatest();
       }
       lastTouchY = touchY;
     },
@@ -5868,14 +8305,10 @@ const refreshChatFeed = () => {
     render();
     return;
   }
-  chatScrollState.scrollTop = feed.scrollTop;
+  rememberChatFeedScroll(feed, chatScrollState);
   const model = chatPanelModel();
-  const feedSignature = chatFeedRenderSignature(model);
-  const feedChanged = chatFeedSignatures.get(feed) !== feedSignature;
-  if (feedChanged) {
-    feed.innerHTML = renderChatFeedInner(model);
-    chatFeedSignatures.set(feed, feedSignature);
-  }
+  const feedPatchRoot = patchChatFeedContent(feed, model);
+  const feedChanged = feedPatchRoot !== null;
   const panel = document.querySelector<HTMLElement>("#chatPanel");
   const runtimeChanged = panel ? patchChatRuntimeStatus(panel, model) : false;
   const subtitle = document.querySelector<HTMLSpanElement>("#chatSubtitle");
@@ -5885,7 +8318,8 @@ const refreshChatFeed = () => {
     historyCount.textContent = String(chatMessages.filter((message) => message.role === "user").length);
   }
   refreshChatSyncIndicator();
-  if (feedChanged || runtimeChanged) renderIcons(panel ?? feed);
+  if (feedPatchRoot) renderIcons(feedPatchRoot);
+  if (runtimeChanged && panel) renderIcons(panel);
   if (feedChanged) restoreChatFeedScroll(feed);
 };
 
@@ -5912,6 +8346,7 @@ const attachCreatedChat = async (sessionId: string): Promise<boolean> => {
   if (!discussion) return false;
 
   chatDiscussion = discussion;
+  chatContextUsage = null;
   chatAccountId = discussion.accountId;
   void loadChatModelCatalog(chatAccountId);
   chatLoading = false;
@@ -5937,6 +8372,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   const previousStatus = chatTurn?.status;
   const previousStartedAt = chatTurn?.startedAt;
   const previousTurnId = chatTurn?.id;
+  const turnIdentityChanged = previousTurnId !== snapshot.id;
   if (
     previousStartedAt != null &&
     (previousTurnId === 0 || previousTurnId === snapshot.id)
@@ -5980,7 +8416,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     chatTurnIsBusy(previousStatus) &&
     !chatTurnIsBusy(snapshot.status)
   ) {
-    void refreshLimitStatus(true);
+    void refreshLimitStatus(true, true);
   }
   if (chatBecameAvailable(previousStatus, snapshot.status)) {
     void playChatReadySound(chatReadySoundPreferences);
@@ -5988,7 +8424,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   const promptHadFocus = document.activeElement ===
     document.querySelector<HTMLTextAreaElement>("#chatPrompt");
   if (activeView === "chat") {
-    if (previousStatus !== snapshot.status) render();
+    if (previousStatus !== snapshot.status || turnIdentityChanged) render();
     else refreshChatFeed();
   }
   if (promptHadFocus) focusMainChatPrompt();
@@ -6026,13 +8462,60 @@ const startChatTurnPoll = () => {
   );
 };
 
+const IMAGE_ONLY_CHAT_PROMPT = "Image jointe.";
+
+type ChatImageAttachmentBinding = {
+  current: () => ChatImageAttachment[];
+  update: (images: ChatImageAttachment[]) => void;
+  refresh: () => void;
+  focus: () => void;
+};
+
+const attachPastedChatImages = async (
+  event: ClipboardEvent,
+  binding: ChatImageAttachmentBinding,
+): Promise<void> => {
+  const files = clipboardChatImageFiles(event.clipboardData);
+  if (!files.length) return;
+  event.preventDefault();
+  try {
+    const current = binding.current();
+    const additions = await readChatImageAttachments(files, current);
+    binding.update([...current, ...additions]);
+    statusText = `${additions.length} image${additions.length > 1 ? "s" : ""} jointe${additions.length > 1 ? "s" : ""} au prochain message`;
+  } catch (error) {
+    statusText = String(error instanceof Error ? error.message : error);
+  }
+  binding.refresh();
+  binding.focus();
+};
+
+const removeChatImageAttachment = (
+  imageId: string,
+  binding: ChatImageAttachmentBinding,
+): void => {
+  const current = binding.current();
+  const removed = current.find((image) => image.id === imageId);
+  if (!removed) return;
+  disposeChatImagePreviews([removed]);
+  binding.update(current.filter((image) => image.id !== imageId));
+  statusText = "Image retiree du prochain message";
+  binding.refresh();
+  binding.focus();
+};
+
 const chatSubmissionPrompt = (
   input: HTMLTextAreaElement | null,
   fallback: string,
   intent: ChatSubmitIntent,
+  hasImageAttachments = false,
 ): string => {
   const value = (input?.value ?? fallback).trim();
   if (!value) {
+    if (intent === "message" && hasImageAttachments) {
+      input?.setCustomValidity("");
+      return IMAGE_ONLY_CHAT_PROMPT;
+    }
     if (intent === "goal" && input) {
       input.setCustomValidity("Décrivez l'objectif du goal avant de le créer.");
       input.reportValidity();
@@ -6052,6 +8535,77 @@ const focusMainChatPrompt = () => {
   });
 };
 
+const compactedContextStatus = (
+  usage: ChatContextWindowUsage | null,
+): string => {
+  if (!usage) return "Contexte compacté";
+  const presentation = chatTokenUsagePresentation(null, usage);
+  return `Contexte compacté · ${presentation.value} tokens · ${usage.usedPercent} % de la fenêtre exploitable`;
+};
+
+const updateCompactionStatus = (message: string) => {
+  statusText = message;
+  syncStatusTextDom();
+};
+
+const compactCurrentChatContext = async (
+  clearCommandDraft = false,
+): Promise<boolean> => {
+  const account = chatSelectedAccount();
+  const discussion = chatDiscussion;
+  const sessionId =
+    discussion?.rolloutId?.trim()
+    || chatTurn?.sessionId?.trim()
+    || discussion?.sessionId?.trim()
+    || null;
+  if (!account || accountProvider(account) !== "codex") {
+    updateCompactionStatus("La commande /compact est disponible uniquement avec Codex");
+    return false;
+  }
+  if (!isPlausibleSessionId(sessionId)) {
+    updateCompactionStatus("Envoyez un premier message avant de compacter le contexte");
+    return false;
+  }
+  if (chatContextCompacting) {
+    updateCompactionStatus("La compaction du contexte est déjà en cours");
+    return false;
+  }
+  if (
+    chatTurnIsBusy(chatTurn?.status)
+    || chatQueuedSubmissions.length > 0
+    || (discussion ? discussionHasRunningTurn(discussion) : false)
+  ) {
+    updateCompactionStatus("Attendez la fin de la réponse et de la file avant de lancer /compact");
+    return false;
+  }
+
+  if (clearCommandDraft) chatDraft = "";
+  chatContextCompacting = true;
+  updateCompactionStatus("Compaction du contexte Codex en cours…");
+  if (activeView === "chat") render();
+  try {
+    const result = await invoke<CompactChatSessionResult>("compact_chat_session", {
+      accountId: account.id,
+      sessionId,
+    });
+    const usage = normalizeChatContextUsage(result.contextUsage);
+    if (chatDiscussion === discussion) {
+      if (usage) chatContextUsage = usage;
+      await loadChatTranscript();
+    }
+    updateCompactionStatus(compactedContextStatus(usage));
+    void refreshDiscussions();
+    return true;
+  } catch (error) {
+    updateCompactionStatus(`/compact impossible : ${String(error)}`);
+    return false;
+  } finally {
+    chatContextCompacting = false;
+    if (activeView === "chat") render();
+    focusMainChatPrompt();
+  }
+};
+
 const sendChatMessage = async (
   intent: ChatSubmitIntent = "message",
   queuedSubmission: QueuedChatSubmission | null = null,
@@ -6059,7 +8613,13 @@ const sendChatMessage = async (
   const input = queuedSubmission
     ? null
     : document.querySelector<HTMLTextAreaElement>("#chatPrompt");
-  const prompt = queuedSubmission?.prompt ?? chatSubmissionPrompt(input, chatDraft, intent);
+  const draftImageAttachments = queuedSubmission?.imageAttachments ?? chatImageAttachments;
+  const prompt = queuedSubmission?.prompt ?? chatSubmissionPrompt(
+    input,
+    chatDraft,
+    intent,
+    draftImageAttachments.length > 0,
+  );
   const account = queuedSubmission
     ? accountById(queuedSubmission.accountId)
     : chatSelectedAccount();
@@ -6071,6 +8631,18 @@ const sendChatMessage = async (
   }
   if (intent === "goal" && accountProvider(account) !== "codex") {
     statusText = "Les goals sont disponibles avec Codex";
+    return false;
+  }
+  if (
+    !queuedSubmission
+    && intent === "message"
+    && draftImageAttachments.length === 0
+    && isCompactSlashCommand(prompt)
+  ) {
+    return compactCurrentChatContext(true);
+  }
+  if (chatContextCompacting) {
+    updateCompactionStatus("Attendez la fin de la compaction avant d'envoyer un message");
     return false;
   }
   const preferences = queuedSubmission
@@ -6092,6 +8664,7 @@ const sendChatMessage = async (
 
   const submission = queuedSubmission ?? {
     prompt,
+    imageAttachments: [...draftImageAttachments],
     accountId: account.id,
     mode: chatMode,
     model: preferences.model,
@@ -6106,6 +8679,10 @@ const sendChatMessage = async (
     if (queuedSubmission) chatQueuedSubmissions.unshift(submission);
     else chatQueuedSubmissions.push(submission);
     if (!queuedSubmission) chatDraft = "";
+    if (!queuedSubmission) {
+      disposeChatImagePreviews(chatImageAttachments);
+      chatImageAttachments = [];
+    }
     statusText = chatTurnIsBusy(chatTurn?.status)
       ? `Message mis en attente · ${chatQueuedSubmissions.length} dans la file`
       : "Envoi du prochain message en attente";
@@ -6123,6 +8700,10 @@ const sendChatMessage = async (
     chatDiscussion?.sessionId ??
     null;
   if (!queuedSubmission) chatDraft = "";
+  if (!queuedSubmission) {
+    disposeChatImagePreviews(chatImageAttachments);
+    chatImageAttachments = [];
+  }
   chatError = null;
   chatMessages = [
     ...chatMessages,
@@ -6170,6 +8751,7 @@ const sendChatMessage = async (
       accountId: account.id,
       sessionId: resumeSessionId,
       prompt,
+      imageAttachments: chatImageAttachmentPayloads(submission.imageAttachments),
       projectDir:
         discussionFolderPath(chatDiscussion) ?? pendingChatWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
       mode: submission.mode,
@@ -6219,6 +8801,7 @@ const sendChatMessage = async (
         error: String(error),
       } as ChatTurnSnapshot;
       pane.turn = failedTurn;
+      explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
       statusText = String(error);
       const modelCapacityReached = isModelCapacityError(String(error));
       if (modelCapacityReached) {
@@ -6399,8 +8982,13 @@ const applyChatTranscript = (
   );
   const changed = !chatMessagesEqual(chatMessages, nextMessages);
   const truncationChanged = chatTruncated !== transcript.truncated;
+  const nextContextUsage = Object.hasOwn(transcript, "contextUsage")
+    ? normalizeChatContextUsage(transcript.contextUsage)
+    : chatContextUsage;
+  const contextChanged = JSON.stringify(chatContextUsage) !== JSON.stringify(nextContextUsage);
   chatMessages = nextMessages;
   chatTruncated = transcript.truncated;
+  chatContextUsage = nextContextUsage;
   chatLoading = false;
   chatError = null;
   if (activeView === "chat" && (changed || truncationChanged || wasLoading)) {
@@ -6408,6 +8996,10 @@ const applyChatTranscript = (
     else refreshChatFeed();
   } else if (activeView === "chat") {
     refreshChatSyncIndicator();
+  }
+  if (activeView === "chat" && contextChanged) {
+    const panel = document.querySelector<HTMLElement>("#chatPanel");
+    if (panel && patchChatRuntimeStatus(panel, chatPanelModel())) renderIcons(panel);
   }
 };
 
@@ -6506,9 +9098,13 @@ const startChatSync = () => {
 
 const openDiscussionChat = async (discussion: DiscussionSummary) => {
   closeMobileOverlays();
+  const existing = expertChatPanes.find(
+    (pane) => pane.discussion?.sessionId === discussion.sessionId,
+  );
+  if (existing && minimizeActiveBusyExpertChat(existing)) return;
   try {
     await restoreDiscussionFolder(discussion);
-    openDiscussionInExpert(discussion);
+    openDiscussionInExpert(discussion, true);
   } catch (error) {
     statusText = `Environnement de la discussion non restaure : ${String(error)}`;
     render();
@@ -6533,6 +9129,8 @@ const createExpertChatPane = (
     loading: !!discussion,
     error: null,
     truncated: false,
+    contextUsage: null,
+    contextCompacting: false,
     syncState: "closed",
     liveUnlisten: null,
     fallbackPoll: null,
@@ -6541,6 +9139,7 @@ const createExpertChatPane = (
     turnPoll: null,
     turnPollInFlight: false,
     draft: persisted.draft ?? "",
+    imageAttachments: [],
     queuedSubmissions: [],
     queueDrainInFlight: false,
     activeSubmission: null,
@@ -6556,10 +9155,16 @@ const createExpertChatPane = (
       settings?.defaultAccountId ??
       settings?.accounts[0]?.id ??
       null,
+    executionTargetId:
+      typeof persisted.executionTargetId === "string" && persisted.executionTargetId.trim()
+        ? persisted.executionTargetId.trim().toLowerCase()
+        : null,
     historyOpen: false,
     pendingWorkspace:
       discussionFolderPath(discussion) ?? capturedWorkspace ?? currentWorkspace(),
     autonomousAgentId: persisted.autonomousAgentId ?? null,
+    automaticOrchestrationEnabled: persisted.automaticOrchestrationEnabled === true,
+    automaticOrchestrationLaunching: false,
     orchestrationId: persisted.orchestrationId ?? null,
     orchestrationRole:
       persisted.orchestrationRole === "orchestrator" || persisted.orchestrationRole === "worker"
@@ -6568,6 +9173,7 @@ const createExpertChatPane = (
     orchestrationTaskId: persisted.orchestrationTaskId ?? null,
     followLatest: true,
     scrollTop: 0,
+    visibleTurnLimit: initialVisibleChatTurnLimit(),
   };
 };
 
@@ -6588,8 +9194,49 @@ const expertChatPanesForCurrentEnvironment = (): ExpertChatPane[] => {
   });
 };
 
+const expertChatPaneHasBusyTurn = (pane: ExpertChatPane): boolean =>
+  chatTurnIsBusy(pane.turn?.status)
+  || activeChatTurnForDiscussion(activeChatTurns, pane.discussion) !== null;
+
 const expertChatPaneIsAvailable = (pane: ExpertChatPane): boolean =>
-  !chatTurnIsBusy(pane.turn?.status);
+  !expertChatPaneHasBusyTurn(pane)
+  || automaticQuotaResumeVisibilityPins.has(pane.key)
+  || explicitlyOpenedBusyChatVisibilityPins.has(pane.key);
+
+const pinExplicitlyOpenedBusyExpertChat = (pane: ExpertChatPane): void => {
+  if (
+    expertChatDisplayMode === "available"
+    && expertChatPaneHasBusyTurn(pane)
+  ) {
+    explicitlyOpenedBusyChatVisibilityPins.add(pane.key);
+  }
+};
+
+const minimizeActiveBusyExpertChat = (pane: ExpertChatPane): boolean => {
+  if (
+    activeView !== "chat"
+    || !shouldMinimizeActiveBusyExpertChat(
+      expertChatDisplayMode,
+      expertChatPaneHasBusyTurn(pane),
+      pane.key === activeExpertChatKey,
+      expertChatPaneIsAvailable(pane),
+    )
+  ) {
+    return false;
+  }
+
+  // La reduction est une intention explicite : elle prend le pas sur les deux
+  // raisons temporaires qui peuvent garder un chat orange dans le mur.
+  automaticQuotaResumeVisibilityPins.delete(pane.key);
+  explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
+  if (expertChatFullscreenKey === pane.key) expertChatFullscreenKey = null;
+  reconcileExpertChatPage();
+  statusText = `Chat en cours réduit · ${expertChatStatusText()}`;
+  persistExpertChats();
+  render();
+  startAllExpertChatWork();
+  return true;
+};
 
 const displayedExpertChatPanesForCurrentEnvironment = (): ExpertChatPane[] =>
   expertChatsForDisplay(
@@ -6604,25 +9251,106 @@ const activeExpertChatPane = (): ExpertChatPane | null =>
   expertChatPanesForCurrentEnvironment()[0] ??
   null;
 
+const EXPERT_CHAT_DESKTOP_TOOLBAR_HEIGHT = 70;
+const EXPERT_CHAT_DESKTOP_GRID_INSET = 16;
+const EXPERT_CHAT_MOBILE_CHROME_HEIGHT = 110;
+const EXPERT_CHAT_MOBILE_GRID_INSET = 8;
+
+const expertChatResponsiveViewport = () => {
+  const mobile = window.matchMedia("(max-width: 860px)").matches;
+  const sidebarWidth = mobile ? 0 : displayedChatSidebarWidth();
+  const contextSidebarWidth = chatContextSidebarWidth(window.innerWidth);
+  const toolbarHeight = mobile || expertChatToolbarHidden
+    ? 0
+    : EXPERT_CHAT_DESKTOP_TOOLBAR_HEIGHT;
+  const mobileChromeHeight = mobile ? EXPERT_CHAT_MOBILE_CHROME_HEIGHT : 0;
+  const gridInset = mobile
+    ? EXPERT_CHAT_MOBILE_GRID_INSET
+    : EXPERT_CHAT_DESKTOP_GRID_INSET;
+  return {
+    mobile,
+    width: Math.max(
+      1,
+      window.innerWidth - sidebarWidth - contextSidebarWidth - gridInset,
+    ),
+    height: Math.max(
+      1,
+      window.innerHeight - toolbarHeight - mobileChromeHeight - gridInset,
+    ),
+  };
+};
+
+const effectiveExpertChatPageSizeMode = (): ExpertChatPageSizeMode => {
+  if (expertChatPageSizeMode !== "auto") return expertChatPageSizeMode;
+  const viewport = expertChatResponsiveViewport();
+  return viewport.mobile
+    ? 1
+    : expertChatResponsiveCapacity(viewport.width, viewport.height);
+};
+
+const responsiveExpertChatGridDimensions = (
+  visibleChatCount: number,
+) => {
+  const viewport = expertChatResponsiveViewport();
+  if (viewport.mobile) {
+    return { columns: 1, rows: Math.max(1, visibleChatCount) };
+  }
+  return expertChatResponsiveGridDimensions(
+    visibleChatCount,
+    viewport.width,
+    viewport.height,
+  );
+};
+
+const expertChatLayoutSignature = (visibleChatCount: number): string => {
+  const viewport = expertChatResponsiveViewport();
+  const pageSize = resolveExpertChatPageSize(effectiveExpertChatPageSizeMode());
+  const { columns, rows } = responsiveExpertChatGridDimensions(visibleChatCount);
+  return [viewport.mobile, pageSize, expertChatPage, columns, rows].join(":");
+};
+
+const scheduleExpertChatResponsiveRender = () => {
+  if (expertChatResponsiveRenderFrame) {
+    window.cancelAnimationFrame(expertChatResponsiveRenderFrame);
+  }
+  expertChatResponsiveRenderFrame = window.requestAnimationFrame(() => {
+    expertChatResponsiveRenderFrame = 0;
+    if (!settings || activeView !== "chat") return;
+
+    reconcileExpertChatPage();
+    const visibleCount = visibleExpertChatPanes().length;
+    if (expertChatLayoutSignature(visibleCount) === renderedExpertChatLayoutSignature) {
+      return;
+    }
+    render();
+    startAllExpertChatWork();
+  });
+};
+
 const expertChatPageTotal = (): number =>
   expertChatPageCount(
     displayedExpertChatPanesForCurrentEnvironment().length,
-    expertChatPageSizeMode,
+    effectiveExpertChatPageSizeMode(),
   );
 
 const visibleExpertChatPanes = (): ExpertChatPane[] =>
   expertChatsOnPage(
     displayedExpertChatPanesForCurrentEnvironment(),
     expertChatPage,
-    expertChatPageSizeMode,
+    effectiveExpertChatPageSizeMode(),
   );
 
 const expertChatStatusText = (): string => {
   const totalCount = expertChatPanesForCurrentEnvironment().length;
-  const count = displayedExpertChatPanesForCurrentEnvironment().length;
+  const displayedPanes = displayedExpertChatPanesForCurrentEnvironment();
+  const count = displayedPanes.length;
   const totalPages = expertChatPageTotal();
   if (expertChatDisplayMode === "available") {
-    return `${count} chat${count > 1 ? "s" : ""} disponible${count > 1 ? "s" : ""} sur ${totalCount} · page ${expertChatPage + 1}/${totalPages}`;
+    const visibleBusyCount = displayedPanes.filter(expertChatPaneHasBusyTurn).length;
+    const busyDetail = visibleBusyCount
+      ? ` · ${visibleBusyCount} en cours`
+      : "";
+    return `${count} chat${count > 1 ? "s" : ""} affiché${count > 1 ? "s" : ""} sur ${totalCount}${busyDetail} · page ${expertChatPage + 1}/${totalPages}`;
   }
   return `${count} chat${count > 1 ? "s" : ""} dans cet environnement · page ${expertChatPage + 1}/${totalPages}`;
 };
@@ -6630,9 +9358,10 @@ const expertChatStatusText = (): string => {
 const moveExpertChatPageToPane = (pane: ExpertChatPane | null) => {
   const panes = displayedExpertChatPanesForCurrentEnvironment();
   const index = pane ? panes.indexOf(pane) : -1;
+  const pageSizeMode = effectiveExpertChatPageSizeMode();
   expertChatPage = index >= 0
-    ? expertChatPageForIndex(index, expertChatPageSizeMode)
-    : clampExpertChatPage(expertChatPage, panes.length, expertChatPageSizeMode);
+    ? expertChatPageForIndex(index, pageSizeMode)
+    : clampExpertChatPage(expertChatPage, panes.length, pageSizeMode);
 };
 
 const reconcileExpertChatPage = () => {
@@ -6647,7 +9376,7 @@ const reconcileExpertChatPage = () => {
   expertChatPage = clampExpertChatPage(
     expertChatPage,
     panes.length,
-    expertChatPageSizeMode,
+    effectiveExpertChatPageSizeMode(),
   );
 };
 
@@ -6668,8 +9397,11 @@ const refreshExpertChatDisplayAfterAvailabilityChange = (
   return true;
 };
 
+const expertChatInstanceId = (pane: ExpertChatPane): string =>
+  pane.key.replace(/[^a-zA-Z0-9_-]/g, "-");
+
 const expertChatPaneRoot = (pane: ExpertChatPane): HTMLElement | null =>
-  document.getElementById(`chatPanel-${pane.key.replace(/[^a-zA-Z0-9_-]/g, "-")}`);
+  document.getElementById(`chatPanel-${expertChatInstanceId(pane)}`);
 
 const expertChatSelectedAccount = (pane: ExpertChatPane): AccountProfile | null => {
   const preferred = pane.discussion?.accountId ?? pane.accountId ?? settings?.defaultAccountId;
@@ -6694,6 +9426,13 @@ const expertChatResumeSessionId = (pane: ExpertChatPane): string | null =>
   || pane.turn?.sessionId?.trim()
   || pane.discussion?.sessionId?.trim()
   || null;
+
+const expertChatSourceTurnIsBusy = (pane: ExpertChatPane): boolean =>
+  chatTurnIsBusy(pane.turn?.status)
+  || (pane.discussion ? discussionHasRunningTurn(pane.discussion) : false);
+
+const expertChatOrchestrationQueueIsBusy = (pane: ExpertChatPane): boolean =>
+  pane.queueDrainInFlight || pane.queuedSubmissions.length > 0;
 
 const autonomousAgentForPane = (pane: ExpertChatPane): AutonomousAgentSnapshot | null =>
   pane.autonomousAgentId
@@ -6739,6 +9478,25 @@ const expertChatAutonomousOption = (
   };
 };
 
+const expertChatAutomaticOrchestrationOption = (
+  pane: ExpertChatPane,
+): NonNullable<Parameters<typeof renderChatPanel>[1]>["automaticOrchestration"] => {
+  if (
+    pane.orchestrationRole
+    || autonomousAgentForPane(pane)
+    || (pane.autonomousAgentId && !autonomousAgentsLoaded)
+  ) {
+    return undefined;
+  }
+  return {
+    enabled: pane.automaticOrchestrationEnabled,
+    detail: pane.automaticOrchestrationEnabled
+      ? "Mode actif : chaque demande est évaluée et une équipe est lancée seulement si elle apporte un vrai gain."
+      : "Mode inactif : activer l'évaluation automatique avant chaque demande.",
+    disabled: pane.automaticOrchestrationLaunching,
+  };
+};
+
 const expertChatOrchestrationOption = (
   pane: ExpertChatPane,
 ): NonNullable<Parameters<typeof renderChatPanel>[1]>["orchestration"] => {
@@ -6766,22 +9524,7 @@ const expertChatOrchestrationOption = (
     };
   }
 
-  const sessionId = expertChatResumeSessionId(pane);
-  const busy =
-    chatTurnIsBusy(pane.turn?.status)
-    || (pane.discussion ? discussionHasRunningTurn(pane.discussion) : false)
-    || pane.queueDrainInFlight
-    || pane.queuedSubmissions.length > 0;
-  return {
-    role: "available",
-    label: "Orchestrer",
-    detail: !sessionId
-      ? "Envoyez un premier message avant de transformer ce chat en orchestration."
-      : busy
-        ? "Attendez la fin du tour et de la file d’attente avant de lancer l’orchestration."
-        : "Transformer ce chat en orchestration et ouvrir des fenêtres workers.",
-    disabled: !sessionId || busy || orchestrationConversion?.busy === true,
-  };
+  return undefined;
 };
 
 const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
@@ -6795,6 +9538,9 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
   const catalog = account ? chatModelCatalogs.get(account.id) : undefined;
   const workspace =
     discussionFolderPath(discussion) ?? pane.pendingWorkspace ?? currentWorkspace() ?? account?.projectDir ?? null;
+  const requestedTargetLabel = pane.executionTargetId
+    ? remoteChatExecutionTargets().find((target) => target.id === pane.executionTargetId)?.label ?? null
+    : null;
   const metaParts = managedByOrchestration
     ? [
         pane.orchestrationRole === "orchestrator" ? "Orchestrateur" : `Worker ${task?.position ?? ""}`.trim(),
@@ -6807,7 +9553,11 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
         workspace ? displayProjectDir(workspace) : "",
         `${pane.messages.length || discussion.messageCount} message(s)`,
       ].filter(Boolean)
-    : [account?.label ?? "Choisissez un compte", workspace ? displayProjectDir(workspace) : "Environnement a choisir"];
+    : [
+        account?.label ?? "Choisissez un compte",
+        requestedTargetLabel ? `Cible ${requestedTargetLabel}` : "Cible automatique",
+        workspace ? displayProjectDir(workspace) : "Environnement a choisir",
+      ];
   return {
     title:
       pane.orchestrationRole === "orchestrator"
@@ -6816,13 +9566,20 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
           ? task?.title || "Worker en préparation"
           : discussion?.title?.trim() || "Nouvelle conversation",
     subtitle: metaParts.join(" \u00b7 "),
+    totalTokens: discussion ? discussion.totalTokens : 0,
+    contextUsage: pane.contextUsage,
+    contextCompacting: pane.contextCompacting,
+    supportsCompact: provider === "codex",
+    hasCompactableSession: isPlausibleSessionId(expertChatResumeSessionId(pane)),
     accountLabel: account?.label ?? discussion?.accountLabel ?? "Aucun compte",
-    providerLabel: providerLabel(provider),
+    providerLabel: accountProviderLabel(account),
+    nodeLabel: pane.turn?.nodeLabel ?? discussion?.nodeLabel ?? null,
     loading: pane.loading || (managedByOrchestration && !discussion),
     error: pane.error,
     truncated: pane.truncated,
     syncState: discussion ? pane.syncState : "closed",
     messages: pane.messages,
+    visibleTurnLimit: pane.visibleTurnLimit,
     activities: pane.turn?.activities ?? [],
     thoughts: pane.turn?.thoughts ?? [],
     parts: pane.turn?.parts ?? [],
@@ -6836,20 +9593,18 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
       pane.capacityRetryTimer !== null,
     ),
     waitingForUser: conversationWaitsForUser(pane.messages, pane.turn?.parts ?? []),
+    turnStatusDisplayMode: chatTurnStatusDisplayMode,
     quotaStatus: chatQuotaStatusFor(account),
     quotaSuggestion: managedByOrchestration ? null : quotaSuggestionFor(pane.turn, discussion),
     accounts: (settings?.accounts ?? []).map((candidate) => ({
       id: candidate.id,
       label: candidate.label,
-      providerLabel: providerLabel(accountProvider(candidate)),
+      providerLabel: accountProviderLabel(candidate),
       model: accountModel(candidate),
     })),
     selectedAccountId: account?.id ?? "",
     selectedModel,
-    modelSuggestions:
-      provider === "claude"
-        ? CLAUDE_MODEL_SUGGESTIONS
-        : catalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS,
+    modelSuggestions: modelSuggestionsForAccount(account, catalog),
     selectedReasoningEffort: reasoningEffortForChatModel(
       account,
       selectedModel,
@@ -6857,11 +9612,14 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: provider === "codex",
+    composerSelectorsEnabled: chatComposerSelectorsEnabled,
+    favoritePrompts: loadFavoritePromptShortcuts(),
     supportsGoals: provider === "codex",
     agentTools: chatAgentToolDefinitions(),
     enabledTools: pane.enabledTools,
     mode: pane.mode,
     draft: pane.draft,
+    imageAttachments: pane.imageAttachments,
     queuedCount: pane.queuedSubmissions.length,
     newConversation: !discussion && !managedByOrchestration,
     workspaceLabel: workspace ? displayProjectDir(workspace) : "Environnement",
@@ -6875,11 +9633,6 @@ const expertChatSidebarStatus = (
 ) => {
   const serverTurn = activeChatTurnForDiscussion(activeChatTurns, discussion);
   const localTurn = pane?.turn;
-  const turn = chatTurnIsBusy(localTurn?.status)
-    ? localTurn
-    : serverTurn && serverTurn.id !== localTurn?.id
-      ? serverTurn
-      : localTurn ?? serverTurn;
   const localWaitsForUser = conversationWaitsForUser(
     pane?.messages ?? [],
     localTurn?.parts ?? [],
@@ -6888,8 +9641,9 @@ const expertChatSidebarStatus = (
     (!localTurn || serverTurn.id !== localTurn.id || chatTurnIsBusy(localTurn.status)) &&
     serverTurn.waitingForUser;
   return chatSidebarStatus(
-    turn?.status,
+    localTurn?.status,
     localWaitsForUser || serverWaitsForUser,
+    serverTurn?.status,
   );
 };
 
@@ -6898,6 +9652,7 @@ const renderChatSidebarStatus = (
   discussion: DiscussionSummary | null = pane?.discussion ?? null,
 ): string => {
   const status = expertChatSidebarStatus(pane, discussion);
+  if (pane) chatSidebarPaneStatuses.set(pane, status);
   const label = chatSidebarStatusLabel(status);
   const paneAttribute = pane
     ? ` data-chat-status-pane="${escapeAttr(pane.key)}"`
@@ -6907,6 +9662,16 @@ const renderChatSidebarStatus = (
 
 const refreshExpertChatSidebarStatus = (pane: ExpertChatPane) => {
   const status = expertChatSidebarStatus(pane);
+  const previousStatus = chatSidebarPaneStatuses.get(pane);
+  chatSidebarPaneStatuses.set(pane, status);
+  if (
+    previousStatus !== undefined
+    && previousStatus !== status
+    && (chatSidebarPriorityMode !== "recent" || chatSidebarHideRunning)
+  ) {
+    refreshChatSidebarConversations();
+    return;
+  }
   const label = chatSidebarStatusLabel(status);
   const indicator = [...document.querySelectorAll<HTMLElement>("[data-chat-status-pane]")]
     .find((candidate) => candidate.dataset.chatStatusPane === pane.key);
@@ -6931,11 +9696,13 @@ const persistExpertChats = () => {
       key: pane.key,
       sessionId: pane.discussion?.sessionId ?? null,
       accountId: pane.accountId,
+      executionTargetId: pane.executionTargetId,
       draft: pane.draft,
       mode: pane.mode,
       enabledTools: pane.enabledTools,
       pendingWorkspace: pane.pendingWorkspace,
       autonomousAgentId: pane.autonomousAgentId,
+      automaticOrchestrationEnabled: pane.automaticOrchestrationEnabled,
       orchestrationId: pane.orchestrationId,
       orchestrationRole: pane.orchestrationRole,
       orchestrationTaskId: pane.orchestrationTaskId,
@@ -6991,6 +9758,50 @@ const restoreExpertChatScroll = (pane: ExpertChatPane, root = expertChatPaneRoot
 
 const captureAllExpertChatScroll = () => expertChatPanes.forEach((pane) => captureExpertChatScroll(pane));
 
+type ExpertChatPromptFocusSnapshot = {
+  paneKey: string;
+  selectionStart: number;
+  selectionEnd: number;
+  selectionDirection: "forward" | "backward" | "none";
+  scrollTop: number;
+  scrollLeft: number;
+};
+
+const captureFocusedExpertChatPrompt = (): ExpertChatPromptFocusSnapshot | null => {
+  const prompt = document.activeElement;
+  if (
+    !(prompt instanceof HTMLTextAreaElement)
+    || prompt.dataset.chatControl !== "prompt"
+  ) return null;
+  const paneKey = prompt.closest<HTMLElement>("[data-chat-panel]")?.dataset.chatPanel;
+  if (!paneKey) return null;
+  return {
+    paneKey,
+    selectionStart: prompt.selectionStart,
+    selectionEnd: prompt.selectionEnd,
+    selectionDirection: prompt.selectionDirection,
+    scrollTop: prompt.scrollTop,
+    scrollLeft: prompt.scrollLeft,
+  };
+};
+
+const restoreFocusedExpertChatPrompt = (
+  snapshot: ExpertChatPromptFocusSnapshot | null,
+): void => {
+  if (!snapshot || activeView !== "chat") return;
+  const pane = expertChatPanes.find((candidate) => candidate.key === snapshot.paneKey);
+  const prompt = pane
+    ? expertChatPaneRoot(pane)?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']")
+    : null;
+  if (!prompt) return;
+  const selectionStart = Math.min(snapshot.selectionStart, prompt.value.length);
+  const selectionEnd = Math.min(snapshot.selectionEnd, prompt.value.length);
+  prompt.focus({ preventScroll: true });
+  prompt.setSelectionRange(selectionStart, selectionEnd, snapshot.selectionDirection);
+  prompt.scrollTop = snapshot.scrollTop;
+  prompt.scrollLeft = snapshot.scrollLeft;
+};
+
 const renderExpertChatPane = (pane: ExpertChatPane): string =>
   renderChatPanel(expertChatPanelModel(pane), {
     instanceId: pane.key,
@@ -7000,6 +9811,7 @@ const renderExpertChatPane = (pane: ExpertChatPane): string =>
     fullscreen: pane.key === expertChatFullscreenKey,
     autonomous: expertChatAutonomousOption(pane),
     orchestration: expertChatOrchestrationOption(pane),
+    automaticOrchestration: expertChatAutomaticOrchestrationOption(pane),
     accountTransition: expertChatAccountTransitions.get(pane.key),
   });
 
@@ -7017,13 +9829,9 @@ const refreshExpertChatFeed = (pane: ExpertChatPane) => {
   const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
   if (!root || !feed) return;
   const model = expertChatPanelModel(pane);
-  const feedSignature = chatFeedRenderSignature(model);
-  const feedChanged = chatFeedSignatures.get(feed) !== feedSignature;
-  if (feedChanged) {
-    pane.scrollTop = feed.scrollTop;
-    feed.innerHTML = renderChatFeedInner(model, pane.key);
-    chatFeedSignatures.set(feed, feedSignature);
-  }
+  rememberChatFeedScroll(feed, pane);
+  const feedPatchRoot = patchChatFeedContent(feed, model, pane.key);
+  const feedChanged = feedPatchRoot !== null;
   const runtimeChanged = patchChatRuntimeStatus(root, model);
   const subtitle = root.querySelector<HTMLElement>("[data-chat-control='subtitle']");
   if (subtitle) subtitle.textContent = model.subtitle;
@@ -7032,8 +9840,35 @@ const refreshExpertChatFeed = (pane: ExpertChatPane) => {
     historyCount.textContent = String(pane.messages.filter((message) => message.role === "user").length);
   }
   refreshExpertChatSyncIndicator(pane);
-  if (feedChanged || runtimeChanged) renderIcons(root);
+  if (feedPatchRoot) renderIcons(feedPatchRoot);
+  if (runtimeChanged) renderIcons(root);
   if (feedChanged) restoreExpertChatScroll(pane, root);
+};
+
+const syncExpertChatHistoryUi = (pane: ExpertChatPane, root: HTMLElement): void => {
+  const conversation = root.querySelector<HTMLElement>(".chat-conversation-body");
+  const currentHistory = conversation?.querySelector<HTMLElement>("[data-chat-control='history']");
+  const toggle = root.querySelector<HTMLButtonElement>("[data-chat-action='history-toggle']");
+
+  root.classList.toggle("chat-panel--history", pane.historyOpen);
+  toggle?.classList.toggle("primary", pane.historyOpen);
+  toggle?.setAttribute("aria-expanded", String(pane.historyOpen));
+
+  if (!conversation) return;
+  if (!pane.historyOpen) {
+    currentHistory?.remove();
+    return;
+  }
+  if (currentHistory) return;
+
+  conversation.insertAdjacentHTML(
+    "beforeend",
+    renderChatHistory(expertChatPanelModel(pane), expertChatInstanceId(pane)),
+  );
+  const nextHistory = conversation.querySelector<HTMLElement>("[data-chat-control='history']");
+  if (!nextHistory) return;
+  renderIcons(nextHistory);
+  bindExpertChatHistoryPanelUi(pane, root);
 };
 
 const refreshExpertChatPane = (pane: ExpertChatPane) => {
@@ -7094,6 +9929,33 @@ const stopAllExpertChatWork = () => {
   });
 };
 
+const automaticOrchestrationDecisionFromParts = (
+  parts: readonly ChatPart[],
+): AutomaticOrchestrationDecision | null =>
+  parseAutomaticOrchestrationDecision(
+    parts
+      .filter((part) => part.kind === "text" && part.text?.trim())
+      .map((part) => part.text!.trim())
+      .join("\n"),
+  );
+
+const presentAutomaticOrchestrationMessage = (message: ChatMessage): ChatMessage => {
+  if (message.role !== "assistant") return message;
+  const decision =
+    parseAutomaticOrchestrationDecision(message.text)
+    ?? automaticOrchestrationDecisionFromParts(message.parts ?? []);
+  if (!decision) return message;
+  const notice = automaticOrchestrationNotice(decision);
+  return {
+    ...message,
+    text: notice,
+    parts: message.parts?.map((part) =>
+      part.kind === "text" && parseAutomaticOrchestrationDecision(part.text)
+        ? { ...part, text: notice }
+        : part),
+  };
+};
+
 const applyExpertChatTranscript = (
   pane: ExpertChatPane,
   discussion: DiscussionSummary,
@@ -7103,13 +9965,18 @@ const applyExpertChatTranscript = (
   const wasLoading = pane.loading;
   const nextMessages = reconcileChatMessages(
     pane.messages,
-    transcript.messages,
+    transcript.messages.map(presentAutomaticOrchestrationMessage),
     true,
   );
   const changed = !chatMessagesEqual(pane.messages, nextMessages);
   const truncationChanged = pane.truncated !== transcript.truncated;
+  const nextContextUsage = Object.hasOwn(transcript, "contextUsage")
+    ? normalizeChatContextUsage(transcript.contextUsage)
+    : pane.contextUsage;
+  const contextChanged = JSON.stringify(pane.contextUsage) !== JSON.stringify(nextContextUsage);
   pane.messages = nextMessages;
   pane.truncated = transcript.truncated;
+  pane.contextUsage = nextContextUsage;
   pane.loading = false;
   pane.error = null;
   if (activeView === "chat" && (changed || truncationChanged || wasLoading)) {
@@ -7117,6 +9984,10 @@ const applyExpertChatTranscript = (
     else refreshExpertChatFeed(pane);
   } else if (activeView === "chat") {
     refreshExpertChatSyncIndicator(pane);
+  }
+  if (activeView === "chat" && contextChanged) {
+    const root = expertChatPaneRoot(pane);
+    if (root && patchChatRuntimeStatus(root, expertChatPanelModel(pane))) renderIcons(root);
   }
 };
 
@@ -7210,6 +10081,7 @@ const attachCreatedExpertChat = async (
     pane.pendingWorkspace = capturedWorkspace;
   }
   pane.discussion = discussion;
+  pane.contextUsage = null;
   pane.accountId = discussion.accountId;
   pane.loading = false;
   pane.error = null;
@@ -7218,6 +10090,94 @@ const attachCreatedExpertChat = async (
   persistExpertChats();
   void loadExpertChatTranscript(pane);
   return true;
+};
+
+const automaticOrchestrationName = (objective: string): string => {
+  const compact = objective.replace(/\s+/g, " ").trim();
+  if (compact.length <= 120) return compact;
+  return `${compact.slice(0, 117).trimEnd()}…`;
+};
+
+const launchAutomaticOrchestration = async (
+  pane: ExpertChatPane,
+  submission: QueuedChatSubmission,
+  snapshot: ChatTurnSnapshot,
+  decision: AutomaticOrchestrationDecision,
+): Promise<void> => {
+  const account = accountById(submission.accountId) ?? expertChatSelectedAccount(pane);
+  const sessionId = snapshot.sessionId?.trim() || expertChatResumeSessionId(pane);
+  const projectDir =
+    discussionFolderPath(pane.discussion)
+    ?? userEnvironmentPath(pane.pendingWorkspace)
+    ?? userEnvironmentPath(currentWorkspace())
+    ?? account?.projectDir
+    ?? "";
+  const queuedPrompts = pane.queuedSubmissions
+    .map((queued) => queued.prompt.trim())
+    .filter(Boolean);
+  const objective = [
+    submission.prompt.trim(),
+    queuedPrompts.length
+      ? `Demandes ajoutées pendant la décision de routage :\n${queuedPrompts.map((prompt, index) => `${index + 1}. ${prompt}`).join("\n")}`
+      : "",
+  ].filter(Boolean).join("\n\n");
+
+  if (!account || !sessionId || !projectDir) {
+    pane.automaticOrchestrationLaunching = false;
+    if (!pane.draft.trim()) pane.draft = submission.prompt;
+    statusText = !account
+      ? "Orchestration automatique impossible : compte introuvable"
+      : !sessionId
+        ? "Orchestration automatique impossible : session introuvable"
+        : "Orchestration automatique impossible : environnement introuvable";
+    persistExpertChats();
+    refreshExpertChatPane(pane);
+    return;
+  }
+
+  statusText = `Orchestration automatique retenue · préparation de ${decision.workerCount} worker${decision.workerCount > 1 ? "s" : ""}`;
+  refreshExpertChatPane(pane);
+  try {
+    const created = await invoke<OrchestrationSnapshot>("create_orchestration", {
+      request: {
+        name: automaticOrchestrationName(submission.prompt) || null,
+        objective,
+        workerCount: decision.workerCount,
+        orchestratorSessionId: sessionId,
+        orchestratorAccountId: account.id,
+        workerAccountIds: Array.from({ length: decision.workerCount }, () => account.id),
+        accountId: account.id,
+        projectDir,
+        model: submission.model,
+        reasoningEffort: accountProvider(account) === "codex" ? submission.reasoningEffort : null,
+        testCommand: orchestrationTestCommandDraft.trim() || "git diff --check",
+        testTimeoutSeconds: Math.max(5, Math.min(1800, orchestrationTestTimeoutSeconds)),
+      },
+    });
+    updateOrchestrationLocally(created);
+    pane.automaticOrchestrationLaunching = false;
+    pane.orchestrationId = created.id;
+    pane.orchestrationRole = "orchestrator";
+    pane.orchestrationTaskId = null;
+    pane.pendingWorkspace = created.projectDir;
+    pane.draft = "";
+    pane.queuedSubmissions = [];
+    orchestrationWorkerCount = created.workerCount;
+    syncOrchestrationChatPanes();
+    persistExpertChats();
+    statusText = `Orchestration automatique lancée · ${created.workerCount} worker${created.workerCount > 1 ? "s" : ""}`;
+    render();
+    startAllExpertChatWork();
+    startOrchestrationsPoll();
+    void refreshOrchestrations();
+  } catch (error) {
+    pane.automaticOrchestrationLaunching = false;
+    if (!pane.draft.trim()) pane.draft = submission.prompt;
+    statusText = `Orchestration automatique recommandée mais non lancée : ${String(error)}`;
+    persistExpertChats();
+    refreshExpertChatPane(pane);
+    focusExpertChatPrompt(pane);
+  }
 };
 
 const applyExpertChatTurnSnapshot = async (
@@ -7230,6 +10190,36 @@ const applyExpertChatTurnSnapshot = async (
   const previousStatus = pane.turn?.status;
   const previousStartedAt = pane.turn?.startedAt;
   const previousTurnId = pane.turn?.id;
+  const turnIdentityChanged = previousTurnId !== snapshot.id;
+  const automaticSubmission = pane.activeSubmission?.automaticOrchestration
+    ? pane.activeSubmission
+    : null;
+  const automaticDecision =
+    snapshot.status === "completed" && automaticSubmission
+      ? automaticOrchestrationDecisionFromParts(snapshot.parts)
+      : null;
+  const shouldLaunchAutomaticOrchestration =
+    !!automaticDecision
+    && !pane.orchestrationRole
+    && !pane.automaticOrchestrationLaunching;
+  if (automaticDecision) {
+    snapshot = {
+      ...snapshot,
+      parts: snapshot.parts.map((part) =>
+        part.kind === "text" && parseAutomaticOrchestrationDecision(part.text)
+          ? { ...part, text: automaticOrchestrationNotice(automaticDecision) }
+          : part),
+    };
+  }
+  if (shouldLaunchAutomaticOrchestration) {
+    // Réserver immédiatement le lancement : un poll peut recevoir le même snapshot
+    // pendant la synchronisation de la discussion et ne doit pas créer une seconde équipe.
+    pane.automaticOrchestrationLaunching = true;
+  }
+  const automaticOrchestrationPending =
+    !!automaticDecision
+    && !pane.orchestrationRole
+    && pane.automaticOrchestrationLaunching;
   if (
     previousStartedAt != null &&
     (previousTurnId === 0 || previousTurnId === snapshot.id)
@@ -7237,20 +10227,32 @@ const applyExpertChatTurnSnapshot = async (
     snapshot = { ...snapshot, startedAt: Math.min(previousStartedAt, snapshot.startedAt) };
   }
   pane.turn = snapshot;
+  if (!chatTurnIsBusy(snapshot.status)) {
+    automaticQuotaResumeVisibilityPins.delete(pane.key);
+    explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
+  }
   const quotaExhausted =
     snapshot.status === "failed" &&
     isQuotaExhaustionError(snapshot.error);
   const modelCapacityReached =
     snapshot.status === "failed" &&
     isModelCapacityError(snapshot.error);
-  const attached = snapshot.sessionId
-    ? await attachCreatedExpertChat(pane, snapshot.sessionId)
-    : !!pane.discussion;
+  let attached: boolean;
+  try {
+    attached = snapshot.sessionId
+      ? await attachCreatedExpertChat(pane, snapshot.sessionId)
+      : !!pane.discussion;
+  } catch (error) {
+    if (shouldLaunchAutomaticOrchestration) pane.automaticOrchestrationLaunching = false;
+    throw error;
+  }
 
   if (snapshot.status === "finalizing") {
     statusText = "Reponse terminee, synchronisation…";
   } else if (snapshot.status === "completed") {
-    statusText = "Reponse terminee";
+    statusText = automaticOrchestrationPending
+      ? "Orchestration automatique retenue · préparation de l'équipe"
+      : "Reponse terminee";
     if (attached) await loadExpertChatTranscript(pane);
     stopExpertChatTurnPoll(pane);
   } else if (snapshot.status === "failed") {
@@ -7275,7 +10277,7 @@ const applyExpertChatTurnSnapshot = async (
     chatTurnIsBusy(previousStatus) &&
     !chatTurnIsBusy(snapshot.status)
   ) {
-    void refreshLimitStatus(true);
+    void refreshLimitStatus(true, true);
   }
   if (chatBecameAvailable(previousStatus, snapshot.status)) {
     void playChatReadySound(chatReadySoundPreferences);
@@ -7286,7 +10288,7 @@ const applyExpertChatTurnSnapshot = async (
       wasAvailable,
     );
     if (!displayChanged) {
-      if (previousStatus !== snapshot.status) refreshExpertChatPane(pane);
+      if (previousStatus !== snapshot.status || turnIdentityChanged) refreshExpertChatPane(pane);
       else refreshExpertChatFeed(pane);
     }
   }
@@ -7298,6 +10300,19 @@ const applyExpertChatTurnSnapshot = async (
     }
   } else if (modelCapacityReached) {
     // Les messages suivants restent en file jusqu'a la reprise du meme modele.
+  } else if (
+    shouldLaunchAutomaticOrchestration
+    && automaticSubmission
+    && automaticDecision
+  ) {
+    void launchAutomaticOrchestration(
+      pane,
+      automaticSubmission,
+      snapshot,
+      automaticDecision,
+    );
+  } else if (automaticOrchestrationPending) {
+    // Le premier traitement de ce verdict possède la réservation et lancera l'équipe.
   } else if (!chatTurnIsBusy(snapshot.status)) {
     void drainExpertChatSubmissionQueue(pane);
   }
@@ -7336,6 +10351,64 @@ const focusExpertChatPrompt = (pane: ExpertChatPane) => {
   });
 };
 
+const compactExpertChatContext = async (
+  pane: ExpertChatPane,
+  clearCommandDraft = false,
+): Promise<boolean> => {
+  const account = expertChatSelectedAccount(pane);
+  const discussion = pane.discussion;
+  const sessionId = expertChatResumeSessionId(pane);
+  if (!account || accountProvider(account) !== "codex") {
+    updateCompactionStatus("La commande /compact est disponible uniquement avec Codex");
+    return false;
+  }
+  if (!isPlausibleSessionId(sessionId)) {
+    updateCompactionStatus("Envoyez un premier message avant de compacter le contexte");
+    return false;
+  }
+  if (pane.contextCompacting) {
+    updateCompactionStatus("La compaction du contexte est déjà en cours");
+    return false;
+  }
+  if (
+    chatTurnIsBusy(pane.turn?.status)
+    || pane.queuedSubmissions.length > 0
+    || (discussion ? discussionHasRunningTurn(discussion) : false)
+  ) {
+    updateCompactionStatus("Attendez la fin de la réponse et de la file avant de lancer /compact");
+    return false;
+  }
+
+  if (clearCommandDraft) pane.draft = "";
+  pane.contextCompacting = true;
+  updateCompactionStatus("Compaction du contexte Codex en cours…");
+  refreshExpertChatPane(pane);
+  try {
+    const result = await invoke<CompactChatSessionResult>("compact_chat_session", {
+      accountId: account.id,
+      sessionId,
+    });
+    if (!expertChatPanes.includes(pane)) return true;
+    const usage = normalizeChatContextUsage(result.contextUsage);
+    if (pane.discussion === discussion) {
+      if (usage) pane.contextUsage = usage;
+      await loadExpertChatTranscript(pane);
+    }
+    updateCompactionStatus(compactedContextStatus(usage));
+    void refreshDiscussions();
+    return true;
+  } catch (error) {
+    updateCompactionStatus(`/compact impossible : ${String(error)}`);
+    return false;
+  } finally {
+    pane.contextCompacting = false;
+    if (expertChatPanes.includes(pane)) {
+      refreshExpertChatPane(pane);
+      focusExpertChatPrompt(pane);
+    }
+  }
+};
+
 const sendExpertChatMessage = async (
   pane: ExpertChatPane,
   root: HTMLElement | null,
@@ -7346,10 +10419,12 @@ const sendExpertChatMessage = async (
   const input = queuedSubmission
     ? null
     : root?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']") ?? null;
+  const draftImageAttachments = queuedSubmission?.imageAttachments ?? pane.imageAttachments;
   const prompt = queuedSubmission?.prompt ?? chatSubmissionPrompt(
     promptOverride === undefined ? input : null,
     promptOverride ?? pane.draft,
     intent,
+    draftImageAttachments.length > 0,
   );
   const account = queuedSubmission
     ? accountById(queuedSubmission.accountId)
@@ -7362,6 +10437,18 @@ const sendExpertChatMessage = async (
   }
   if (intent === "goal" && accountProvider(account) !== "codex") {
     statusText = "Les goals sont disponibles avec Codex";
+    return false;
+  }
+  if (
+    !queuedSubmission
+    && intent === "message"
+    && draftImageAttachments.length === 0
+    && isCompactSlashCommand(prompt)
+  ) {
+    return compactExpertChatContext(pane, true);
+  }
+  if (pane.contextCompacting) {
+    updateCompactionStatus("Attendez la fin de la compaction avant d'envoyer un message");
     return false;
   }
   const preferences = queuedSubmission
@@ -7381,14 +10468,24 @@ const sendExpertChatMessage = async (
   }
   if (preferences.changed) persistChatPreferences(account.id);
 
+  const automaticOrchestration =
+    intent === "message"
+    && pane.automaticOrchestrationEnabled
+    && !pane.orchestrationRole
+    && !pane.autonomousAgentId;
   const submission = queuedSubmission ?? {
     prompt,
+    imageAttachments: [...draftImageAttachments],
     accountId: account.id,
     mode: pane.mode,
     model: preferences.model,
     reasoningEffort: preferences.reasoningEffort,
     enabledTools: [...pane.enabledTools],
-    agentSkills: chatAgentSkillPrompts(pane.enabledTools),
+    agentSkills: [
+      ...chatAgentSkillPrompts(pane.enabledTools),
+      ...(automaticOrchestration ? [automaticOrchestrationRoutingSkill(pane.mode)] : []),
+    ],
+    automaticOrchestration,
   };
   if (
     chatTurnIsBusy(pane.turn?.status) ||
@@ -7397,6 +10494,10 @@ const sendExpertChatMessage = async (
     if (queuedSubmission) pane.queuedSubmissions.unshift(submission);
     else pane.queuedSubmissions.push(submission);
     if (!queuedSubmission) pane.draft = "";
+    if (!queuedSubmission) {
+      disposeChatImagePreviews(pane.imageAttachments);
+      pane.imageAttachments = [];
+    }
     statusText = chatTurnIsBusy(pane.turn?.status)
       ? `Message mis en attente · ${pane.queuedSubmissions.length} dans la file`
       : "Envoi du prochain message en attente";
@@ -7418,6 +10519,10 @@ const sendExpertChatMessage = async (
     pane.discussion?.sessionId ??
     null;
   if (!queuedSubmission) pane.draft = "";
+  if (!queuedSubmission) {
+    disposeChatImagePreviews(pane.imageAttachments);
+    pane.imageAttachments = [];
+  }
   pane.error = null;
   pane.messages = [
     ...pane.messages,
@@ -7455,6 +10560,15 @@ const sendExpertChatMessage = async (
     ],
     parts: [],
   };
+  if (
+    shouldPinActiveExpertChatDuringTurn(
+      expertChatDisplayMode,
+      wasAvailable,
+      pane.key === activeExpertChatKey,
+    )
+  ) {
+    pinExplicitlyOpenedBusyExpertChat(pane);
+  }
   pane.followLatest = true;
   pane.scrollTop = 0;
   statusText = `${providerLabel(accountProvider(account))} travaille…`;
@@ -7471,12 +10585,14 @@ const sendExpertChatMessage = async (
       accountId: account.id,
       sessionId: resumeSessionId,
       prompt,
+      imageAttachments: chatImageAttachmentPayloads(submission.imageAttachments),
       projectDir:
         discussionFolderPath(pane.discussion) ?? pane.pendingWorkspace ?? currentWorkspace() ?? account.projectDir ?? null,
       mode: submission.mode,
       model: preferences.model,
       reasoningEffort: preferences.reasoningEffort,
       sourceChatKey: pane.key,
+      targetNodeId: resumeSessionId ? null : pane.executionTargetId,
       agentTools: submission.enabledTools.filter(isChatAgentModeId),
       agentSkills: submission.agentSkills,
     });
@@ -7505,6 +10621,8 @@ const sendExpertChatMessage = async (
       error: String(error),
     } as ChatTurnSnapshot;
     pane.turn = failedTurn;
+    automaticQuotaResumeVisibilityPins.delete(pane.key);
+    explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
     statusText = String(error);
     const modelCapacityReached = isModelCapacityError(String(error));
     if (modelCapacityReached) {
@@ -7567,6 +10685,8 @@ const stopExpertChatTurn = async (pane: ExpertChatPane) => {
   if (pane.turn.id === 0) {
     const wasAvailable = expertChatPaneIsAvailable(pane);
     pane.turn = { ...pane.turn, status: "cancelled" };
+    automaticQuotaResumeVisibilityPins.delete(pane.key);
+    explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
     stopExpertChatTurnPoll(pane);
     const displayChanged = refreshExpertChatDisplayAfterAvailabilityChange(
       pane,
@@ -7640,7 +10760,7 @@ const setExpertChatPage = (requestedPage: number) => {
   expertChatPage = clampExpertChatPage(
     requestedPage,
     environmentPanes.length,
-    expertChatPageSizeMode,
+    effectiveExpertChatPageSizeMode(),
   );
   const panes = visibleExpertChatPanes();
   if (!panes.some((pane) => pane.key === activeExpertChatKey)) {
@@ -7654,7 +10774,11 @@ const setExpertChatPage = (requestedPage: number) => {
 
 const addExpertChatPane = (
   accountId: string | null = null,
-  options: { mode?: ChatMode; pendingWorkspace?: string | null } = {},
+  options: {
+    mode?: ChatMode;
+    pendingWorkspace?: string | null;
+    executionTargetId?: string | null;
+  } = {},
 ) => {
   const environmentPath = userEnvironmentPath(options.pendingWorkspace ?? currentWorkspace());
   if (!environmentPath) {
@@ -7665,6 +10789,9 @@ const addExpertChatPane = (
     accountId: accountId ?? selectedAccountId ?? settings?.defaultAccountId ?? null,
     pendingWorkspace: environmentPath,
     mode: options.mode,
+    executionTargetId: options.executionTargetId === undefined
+      ? workspaceExecutionTargetIdForPath(environmentPath)
+      : normalizeWorkspaceExecutionTargetId(options.executionTargetId),
   });
   expertChatPanes.push(pane);
   activeExpertChatKey = pane.key;
@@ -7678,11 +10805,15 @@ const addExpertChatPane = (
   return pane;
 };
 
-const openDiscussionInExpert = (discussion: DiscussionSummary): ExpertChatPane => {
+const openDiscussionInExpert = (
+  discussion: DiscussionSummary,
+  revealBusyChat = false,
+): ExpertChatPane => {
   const existing = expertChatPanes.find(
     (pane) => pane.discussion?.sessionId === discussion.sessionId,
   );
   if (existing) {
+    if (revealBusyChat) pinExplicitlyOpenedBusyExpertChat(existing);
     activeView = "chat";
     activateExpertChatPane(existing);
     statusText = expertChatStatusText();
@@ -7692,6 +10823,7 @@ const openDiscussionInExpert = (discussion: DiscussionSummary): ExpertChatPane =
   }
   const pane = createExpertChatPane(discussion);
   expertChatPanes.push(pane);
+  if (revealBusyChat) pinExplicitlyOpenedBusyExpertChat(pane);
   activeExpertChatKey = pane.key;
   moveExpertChatPageToPane(pane);
   activeView = "chat";
@@ -7729,6 +10861,7 @@ const attachOrchestrationDiscussion = (
     stopExpertChatSync(pane);
     pane.discussion = null;
     pane.messages = [];
+    pane.contextUsage = null;
     pane.loading = false;
     pane.error = null;
     changed = true;
@@ -7737,6 +10870,7 @@ const attachOrchestrationDiscussion = (
   const discussion = discussionForSession(allDiscussions(), accountId, sessionId);
   if (!discussion) return changed;
   pane.discussion = discussion;
+  pane.contextUsage = null;
   pane.accountId = discussion.accountId;
   pane.loading = true;
   pane.error = null;
@@ -7881,6 +11015,7 @@ type ExpertChatAccountTransferSnapshot = {
   loading: boolean;
   error: string | null;
   truncated: boolean;
+  contextUsage: ChatContextWindowUsage | null;
   turn: ChatTurnSnapshot | null;
   draft: string;
   queuedSubmissions: QueuedChatSubmission[];
@@ -7904,6 +11039,7 @@ const captureExpertChatAccountTransfer = (
   loading: pane.loading,
   error: pane.error,
   truncated: pane.truncated,
+  contextUsage: pane.contextUsage,
   turn: pane.turn,
   draft: pane.draft,
   queuedSubmissions: pane.queuedSubmissions.map((submission) => ({ ...submission })),
@@ -7931,6 +11067,8 @@ const prepareExpertChatAccountTransfer = (
 
   pane.discussion = discussion;
   pane.accountId = account.id;
+  pane.contextUsage = null;
+  pane.contextCompacting = false;
   pane.loading = false;
   pane.error = null;
   pane.turn = null;
@@ -7954,8 +11092,8 @@ const prepareExpertChatAccountTransfer = (
   if (activatePane) {
     activeExpertChatKey = pane.key;
     moveExpertChatPageToPane(pane);
+    activeView = "chat";
   }
-  activeView = "chat";
 
   const transition = expertChatAccountTransitions.get(pane.key);
   if (transition) {
@@ -7981,6 +11119,7 @@ const restoreExpertChatAfterAccountTransfer = (
   stopExpertChatTurnPoll(pane);
   resetExpertModelCapacityRetry(pane);
   expertChatAccountTransitions.delete(pane.key);
+  automaticQuotaResumeVisibilityPins.delete(pane.key);
 
   pane.discussion = snapshot.discussion;
   pane.accountId = snapshot.accountId;
@@ -7988,6 +11127,8 @@ const restoreExpertChatAfterAccountTransfer = (
   pane.loading = snapshot.loading;
   pane.error = snapshot.error;
   pane.truncated = snapshot.truncated;
+  pane.contextUsage = snapshot.contextUsage;
+  pane.contextCompacting = false;
   pane.turn = snapshot.turn;
   pane.draft = snapshot.draft;
   pane.queuedSubmissions = snapshot.queuedSubmissions;
@@ -8017,23 +11158,54 @@ const restoreExpertChatAfterAccountTransfer = (
 // Ouvre la continuation dans la grille de chats et demarre son premier tour en
 // arriere-plan. Les boutons « Reprendre » et « Deplacer + reprendre » restent
 // ainsi dans l'interface de chat, sans creer de terminal interactif.
+type ResumeDiscussionInChatOptions = {
+  preserveNavigation?: boolean;
+};
+
 const resumeDiscussionInChat = async (
   discussion: DiscussionSummary | null,
   accountId: string,
   folderPath: string,
   prompt: string,
   reusePane: ExpertChatPane | null = null,
+  options: ResumeDiscussionInChatOptions = {},
 ): Promise<ExpertChatPane | null> => {
   if (discussion) discussion.folderPath = folderPath;
   const targetAccount = accountById(accountId);
   if (!targetAccount) return null;
+  const preserveNavigation = options.preserveNavigation === true;
+  const keepReusedPaneVisible = preserveNavigation
+    && !!reusePane
+    && !!expertChatPaneRoot(reusePane);
   const transferSnapshot = reusePane
     ? captureExpertChatAccountTransfer(reusePane)
     : null;
-  const activateReusePane = !!reusePane && activeView !== "chat";
-  const pane = reusePane ?? (discussion
+  const activateReusePane = !!reusePane && !preserveNavigation && activeView !== "chat";
+  let pane = reusePane;
+  if (!pane && preserveNavigation) {
+    pane = discussion
+      ? expertChatPanes.find(
+          (candidate) =>
+            candidate.discussion?.accountId === discussion.accountId
+            && candidate.discussion.sessionId === discussion.sessionId,
+        ) ?? null
+      : null;
+    if (!pane) {
+      pane = createExpertChatPane(discussion, {
+        accountId,
+        mode: "build",
+        pendingWorkspace: folderPath,
+      });
+      expertChatPanes.push(pane);
+      if (discussion) startExpertChatSync(pane);
+      void loadChatModelCatalog(accountId);
+      persistExpertChats();
+      refreshChatSidebarConversations();
+    }
+  }
+  pane ??= discussion
     ? openDiscussionInExpert(discussion)
-    : addExpertChatPane(accountId, { mode: "build", pendingWorkspace: folderPath }));
+    : addExpertChatPane(accountId, { mode: "build", pendingWorkspace: folderPath });
   if (!pane) return null;
 
   if (transferSnapshot) {
@@ -8050,6 +11222,7 @@ const resumeDiscussionInChat = async (
     pane.mode = "build";
   }
   if (
+    !preserveNavigation &&
     (!transferSnapshot || activateReusePane) &&
     expertChatFullscreenKey &&
     expertChatFullscreenKey !== pane.key
@@ -8059,18 +11232,19 @@ const resumeDiscussionInChat = async (
   persistExpertChats();
 
   let root = expertChatPaneRoot(pane);
-  if (!root && !transferSnapshot) {
+  if (!root && !transferSnapshot && !preserveNavigation) {
     render();
     await waitForFrame();
     root = expertChatPaneRoot(pane);
   }
-  if (!root && !transferSnapshot) {
+  if (!root && !transferSnapshot && !preserveNavigation) {
     return null;
   }
 
   const transferSubmission: QueuedChatSubmission | null = transferSnapshot
     ? {
         prompt,
+        imageAttachments: [],
         accountId: targetAccount.id,
         mode: "build",
         model: accountModel(targetAccount),
@@ -8082,10 +11256,20 @@ const resumeDiscussionInChat = async (
             )
           : null,
         enabledTools: [...pane.enabledTools],
-        agentSkills: chatAgentSkillPrompts(pane.enabledTools),
+        agentSkills: [
+          ...chatAgentSkillPrompts(pane.enabledTools),
+          ...(pane.automaticOrchestrationEnabled && !pane.orchestrationRole && !pane.autonomousAgentId
+            ? [automaticOrchestrationRoutingSkill("build")]
+            : []),
+        ],
+        automaticOrchestration:
+          pane.automaticOrchestrationEnabled && !pane.orchestrationRole && !pane.autonomousAgentId,
         resumeSessionId: discussion?.rolloutId || discussion?.sessionId || null,
       }
     : null;
+  if (keepReusedPaneVisible) {
+    automaticQuotaResumeVisibilityPins.add(pane.key);
+  }
   const sent = await sendExpertChatMessage(
     pane,
     root,
@@ -8095,25 +11279,123 @@ const resumeDiscussionInChat = async (
   );
   if (!sent && transferSnapshot) {
     restoreExpertChatAfterAccountTransfer(pane, transferSnapshot);
+  } else if (!sent) {
+    automaticQuotaResumeVisibilityPins.delete(pane.key);
   }
   return sent ? pane : null;
 };
 
+const expertChatFullscreenAnimations = new WeakMap<HTMLElement, Animation>();
+
+const syncExpertChatFullscreenPanelUi = (
+  root: HTMLElement,
+  fullscreen: boolean,
+): void => {
+  root.classList.toggle("is-fullscreen", fullscreen);
+  const button = root.querySelector<HTMLButtonElement>("[data-chat-action='fullscreen']");
+  if (!button) return;
+  const label = fullscreen ? "Quitter le plein écran" : "Afficher ce chat en plein écran";
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  button.setAttribute("aria-pressed", String(fullscreen));
+  button.innerHTML = `<i data-lucide="${fullscreen ? "minimize-2" : "maximize-2"}"></i>`;
+  renderIcons(button);
+};
+
+const animateExpertChatFullscreenChange = (
+  root: HTMLElement,
+  previousRect: DOMRect,
+): void => {
+  expertChatFullscreenAnimations.get(root)?.cancel();
+  if (
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    || window.matchMedia("(max-width: 860px)").matches
+  ) return;
+
+  const nextRect = root.getBoundingClientRect();
+  if (
+    previousRect.width <= 0
+    || previousRect.height <= 0
+    || nextRect.width <= 0
+    || nextRect.height <= 0
+  ) return;
+
+  const translateX = previousRect.left - nextRect.left;
+  const translateY = previousRect.top - nextRect.top;
+  const scaleX = previousRect.width / nextRect.width;
+  const scaleY = previousRect.height / nextRect.height;
+  if (
+    Math.abs(translateX) < 8
+    && Math.abs(translateY) < 8
+    && Math.abs(scaleX - 1) < 0.03
+    && Math.abs(scaleY - 1) < 0.03
+  ) return;
+
+  root.classList.add("is-fullscreen-transitioning");
+  const animation = root.animate(
+    [
+      {
+        opacity: 0.94,
+        transform: `translate3d(${translateX}px, ${translateY}px, 0) scale(${scaleX}, ${scaleY})`,
+        transformOrigin: "top left",
+      },
+      { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)", transformOrigin: "top left" },
+    ],
+    { duration: 220, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+  );
+  expertChatFullscreenAnimations.set(root, animation);
+  const cleanup = () => {
+    if (expertChatFullscreenAnimations.get(root) !== animation) return;
+    expertChatFullscreenAnimations.delete(root);
+    root.classList.remove("is-fullscreen-transitioning");
+  };
+  animation.addEventListener("finish", cleanup, { once: true });
+  animation.addEventListener("cancel", cleanup, { once: true });
+};
+
 const toggleExpertChatFullscreen = (pane: ExpertChatPane) => {
   if (!expertChatPanes.includes(pane)) return;
-  expertChatFullscreenKey = expertChatFullscreenKey === pane.key ? null : pane.key;
-  if (expertChatFullscreenKey) activeExpertChatKey = pane.key;
-  render();
-  if (expertChatFullscreenKey) {
-    window.requestAnimationFrame(() => {
-      expertChatPaneRoot(pane)
-        ?.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']")
-        ?.focus();
-    });
+  const root = expertChatPaneRoot(pane);
+  if (!root) return;
+
+  const previousFullscreenPane = expertChatPanes.find(
+    (candidate) => candidate.key === expertChatFullscreenKey,
+  ) ?? null;
+  const previousFullscreenRoot = previousFullscreenPane && previousFullscreenPane !== pane
+    ? expertChatPaneRoot(previousFullscreenPane)
+    : null;
+  const previousFullscreenRect = previousFullscreenRoot?.getBoundingClientRect() ?? null;
+  const previousRect = root.getBoundingClientRect();
+  const nextFullscreen = expertChatFullscreenKey !== pane.key;
+
+  expertChatFullscreenKey = nextFullscreen ? pane.key : null;
+  pane.historyOpen = expertChatHistoryOpenAfterFullscreenChange(
+    pane.historyOpen,
+    nextFullscreen,
+    {
+      openOnFullscreen: expertChatHistoryOpenOnFullscreen,
+      closeOnCompact: expertChatHistoryCloseOnCompact,
+    },
+  );
+  if (nextFullscreen) activeExpertChatKey = pane.key;
+
+  document.querySelectorAll<HTMLElement>("[data-chat-panel]").forEach((panel) => {
+    panel.classList.toggle("active", panel.dataset.chatPanel === activeExpertChatKey);
+  });
+  if (previousFullscreenRoot && previousFullscreenRect) {
+    syncExpertChatFullscreenPanelUi(previousFullscreenRoot, false);
+    animateExpertChatFullscreenChange(previousFullscreenRoot, previousFullscreenRect);
   }
+  syncExpertChatHistoryUi(pane, root);
+  syncExpertChatFullscreenPanelUi(root, nextFullscreen);
+  animateExpertChatFullscreenChange(root, previousRect);
 };
 
 const closeExpertChatPane = (pane: ExpertChatPane) => {
+  if (pane.contextCompacting) {
+    updateCompactionStatus("Attendez la fin de la compaction avant de fermer ce chat");
+    return;
+  }
   if (chatTurnIsBusy(pane.turn?.status)) {
     statusText = pane.turn?.status === "finalizing"
       ? "La conversation termine sa synchronisation"
@@ -8130,7 +11412,11 @@ const closeExpertChatPane = (pane: ExpertChatPane) => {
   stopExpertChatSync(pane);
   stopExpertChatTurnPoll(pane);
   resetExpertModelCapacityRetry(pane);
+  disposeChatImagePreviews(pane.imageAttachments);
+  pane.imageAttachments = [];
   expertChatAccountTransitions.delete(pane.key);
+  automaticQuotaResumeVisibilityPins.delete(pane.key);
+  explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
   expertChatPanes.splice(index, 1);
   const environmentPanes = expertChatPanesForCurrentEnvironment();
   if (activeExpertChatKey === pane.key) {
@@ -8144,12 +11430,53 @@ const closeExpertChatPane = (pane: ExpertChatPane) => {
   startAllExpertChatWork();
 };
 
+function bindExpertChatHistoryPanelUi(pane: ExpertChatPane, root: HTMLElement): void {
+  root.querySelector<HTMLButtonElement>("[data-chat-action='history-close']")?.addEventListener("click", () => {
+    pane.historyOpen = false;
+    syncExpertChatHistoryUi(pane, root);
+  });
+  root.querySelectorAll<HTMLButtonElement>("[data-chat-history-message]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const index = Number(button.dataset.chatHistoryMessage);
+      if (!Number.isInteger(index)) return;
+      const reveal = () => {
+        const liveRoot = expertChatPaneRoot(pane);
+        const message = liveRoot?.querySelector<HTMLElement>(`[data-chat-message-index='${index}']`);
+        message?.scrollIntoView({ behavior: "smooth", block: "center" });
+        message?.classList.add("chat-msg--located");
+        window.setTimeout(() => message?.classList.remove("chat-msg--located"), 1400);
+      };
+      if (window.matchMedia("(max-width: 760px)").matches) {
+        pane.visibleTurnLimit = null;
+        pane.historyOpen = false;
+        syncExpertChatHistoryUi(pane, root);
+        refreshExpertChatFeed(pane);
+        window.requestAnimationFrame(reveal);
+      } else {
+        reveal();
+      }
+    });
+  });
+}
+
 const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   root.addEventListener("pointerdown", () => {
     if (pane.key !== activeExpertChatKey) activateExpertChatPane(pane);
   });
   root.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
+    if (target?.closest("[data-chat-action='show-older-turns']")) {
+      event.preventDefault();
+      pane.visibleTurnLimit = (pane.visibleTurnLimit ?? 0) + chatTurnBatchForViewport();
+      refreshExpertChatFeed(pane);
+      return;
+    }
+    if (target?.closest("[data-chat-action='compact']")) {
+      event.preventDefault();
+      activateExpertChatPane(pane, true);
+      void compactExpertChatContext(pane);
+      return;
+    }
     if (!target?.closest("[data-chat-action='focus-prompt']")) return;
     activateExpertChatPane(pane, true);
   });
@@ -8167,6 +11494,16 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
     .forEach((button) => {
       button.addEventListener("click", () => openAutonomousChatEditor(pane));
     });
+  root.querySelector<HTMLButtonElement>("[data-chat-action='toggle-automatic-orchestration']")?.addEventListener("click", () => {
+    if (pane.automaticOrchestrationLaunching || pane.orchestrationRole) return;
+    pane.automaticOrchestrationEnabled = !pane.automaticOrchestrationEnabled;
+    persistExpertChats();
+    statusText = pane.automaticOrchestrationEnabled
+      ? "Orchestration automatique active : chaque demande sera évaluée"
+      : "Orchestration automatique inactive";
+    refreshExpertChatPane(pane);
+    focusExpertChatPrompt(pane);
+  });
   root.querySelector<HTMLButtonElement>("[data-chat-action='orchestrate']")?.addEventListener("click", () => {
     openOrchestrationConversion(pane);
   });
@@ -8181,35 +11518,9 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   });
   root.querySelector<HTMLButtonElement>("[data-chat-action='history-toggle']")?.addEventListener("click", () => {
     pane.historyOpen = !pane.historyOpen;
-    refreshExpertChatPane(pane);
+    syncExpertChatHistoryUi(pane, root);
   });
-  root.querySelector<HTMLButtonElement>("[data-chat-action='history-close']")?.addEventListener("click", () => {
-    pane.historyOpen = false;
-    refreshExpertChatPane(pane);
-  });
-  root.querySelectorAll<HTMLButtonElement>("[data-chat-history-message]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const index = Number(button.dataset.chatHistoryMessage);
-      if (!Number.isInteger(index)) return;
-      const reveal = () => {
-        const message = root.querySelector<HTMLElement>(`[data-chat-message-index='${index}']`);
-        message?.scrollIntoView({ behavior: "smooth", block: "center" });
-        message?.classList.add("chat-msg--located");
-        window.setTimeout(() => message?.classList.remove("chat-msg--located"), 1400);
-      };
-      if (window.matchMedia("(max-width: 760px)").matches) {
-        pane.historyOpen = false;
-        refreshExpertChatPane(pane);
-        window.requestAnimationFrame(() => {
-          const nextRoot = expertChatPaneRoot(pane);
-          const message = nextRoot?.querySelector<HTMLElement>(`[data-chat-message-index='${index}']`);
-          message?.scrollIntoView({ behavior: "smooth", block: "center" });
-        });
-      } else {
-        reveal();
-      }
-    });
-  });
+  bindExpertChatHistoryPanelUi(pane, root);
   root.querySelector<HTMLButtonElement>("[data-chat-action='stop']")?.addEventListener("click", () => {
     void stopExpertChatTurn(pane);
   });
@@ -8221,6 +11532,15 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   });
   root.querySelector<HTMLButtonElement>("[data-chat-action='goal']")?.addEventListener("click", () => {
     void sendExpertChatMessage(pane, root, undefined, "goal");
+  });
+  root.querySelector<HTMLButtonElement>("[data-chat-action='prompts']")?.addEventListener("click", () => {
+    openExpertChatPromptQuickPicker(pane, root);
+  });
+  root.querySelectorAll<HTMLButtonElement>("[data-chat-action='favorite-prompt']").forEach((button) => {
+    button.addEventListener("click", () => {
+      const promptId = button.dataset.chatPromptId;
+      if (promptId) insertFavoritePromptInExpertChat(pane, root, promptId);
+    });
   });
   root.querySelectorAll<HTMLButtonElement>("[data-chat-action='toggle-agent-tool']").forEach((button) => {
     button.addEventListener("click", () => {
@@ -8235,6 +11555,20 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
     });
   });
   const prompt = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
+  const imageAttachmentBinding: ChatImageAttachmentBinding = {
+    current: () => pane.imageAttachments,
+    update: (images) => {
+      pane.imageAttachments = images;
+    },
+    refresh: () => refreshExpertChatPane(pane),
+    focus: () => focusExpertChatPrompt(pane),
+  };
+  root.querySelectorAll<HTMLButtonElement>("[data-chat-action='remove-image']").forEach((button) => {
+    button.addEventListener("click", () => {
+      const imageId = button.dataset.chatImageId;
+      if (imageId) removeChatImageAttachment(imageId, imageAttachmentBinding);
+    });
+  });
   const promptMaxHeight = root.matches(".chat-panel--compact:not(.is-fullscreen)") ? 64 : 132;
   const resizePrompt = () => {
     if (!prompt) return;
@@ -8251,6 +11585,9 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
       event.preventDefault();
       void sendExpertChatMessage(pane, root);
     }
+  });
+  prompt?.addEventListener("paste", (event) => {
+    void attachPastedChatImages(event, imageAttachmentBinding);
   });
   resizePrompt();
   bindVoiceComposer(root);
@@ -8384,6 +11721,9 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
         <button class="tool-button primary" data-open-chat="${escapeAttr(discussion.sessionId)}" title="Ouvrir cette conversation dans le chat">
           <i data-lucide="messages-square"></i><span>Ouvrir le chat</span>
         </button>
+        <button class="icon-button wide" data-rename-session="${escapeAttr(discussion.sessionId)}" data-rename-account="${escapeAttr(discussion.accountId)}" title="Renommer ce chat" aria-label="Renommer ${escapeAttr(title)}">
+          <i data-lucide="pencil"></i>
+        </button>
         <button class="icon-button wide danger" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Retirer de l'historique (archive toutes les reprises)">
           <i data-lucide="trash-2"></i>
         </button>
@@ -8430,7 +11770,7 @@ const renderDiscussionsPanel = () => {
     <section class="discussions-panel">
       <div class="discussions-head">
         <div>
-          <strong>Discussions</strong>
+          <strong>Historique</strong>
           <span>${total} discussion(s) · ${connected}/${settings?.accounts.length ?? 0} compte(s)</span>
         </div>
         <div class="discussions-tools">
@@ -8465,6 +11805,9 @@ const clearChatDragUi = () => {
     .querySelectorAll<HTMLElement>(".chat-side-item.dragging, .chat-workspace-group.drag-over")
     .forEach((element) => element.classList.remove("dragging", "drag-over"));
   document.body.classList.remove("chat-dragging");
+  if (chatSidebarRefreshPending) {
+    window.requestAnimationFrame(refreshChatSidebarConversations);
+  }
 };
 
 // Attache les gestionnaires de la liste de workspaces. Le root optionnel permet
@@ -8604,6 +11947,12 @@ const refreshWorkspaceSwitcher = () => {
 };
 
 const bindDiscussionRowUi = () => {
+  document.querySelectorAll<HTMLButtonElement>("[data-rename-session]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const discussion = findDiscussion(button.dataset.renameSession, button.dataset.renameAccount);
+      if (discussion) void renameDiscussion(discussion);
+    });
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-delete-session]").forEach((button) => {
     button.addEventListener("click", () => {
       const discussion = findDiscussion(button.dataset.deleteSession);
@@ -8623,7 +11972,9 @@ const bindDiscussionRowUi = () => {
       const pane = expertChatPanes.find((item) => item.key === button.dataset.openPane);
       if (!pane) return;
       closeMobileOverlays();
+      if (minimizeActiveBusyExpertChat(pane)) return;
       activeView = "chat";
+      pinExplicitlyOpenedBusyExpertChat(pane);
       activateExpertChatPane(pane, true);
       statusText = expertChatStatusText();
       render();
@@ -8674,194 +12025,30 @@ const bindDiscussionRowUi = () => {
 // Le backend renvoie les messages utilisateur individuellement. La vue les
 // regroupe par session ET par compte afin qu'une carte resume exclusivement les
 // messages envoyes dans le chat ou le terminal correspondant.
-const PROMPT_RENDER_LIMIT = 400;
-
-const refreshPromptHistory = async () => {
-  try {
-    promptHistory = await invoke<PromptHistoryView>("list_prompt_history", { limit: 4000 });
-    promptHistoryLoaded = true;
-  } catch (error) {
-    statusText = String(error);
-    promptHistoryLoaded = true;
-  }
-
-  // Rerender complet quand on est sur la vue : reconstruit aussi l'en-tete
-  // (compteur « X demande(s) » + note de troncature), pas seulement la liste.
-  if (activeView === "history") render();
-};
-
-const allPrompts = (): PromptEntry[] => promptHistory?.prompts ?? [];
-
-const promptSessions = (): PromptSessionHistory[] => {
-  const groups = new Map<string, PromptSessionHistory>();
-  for (const entry of allPrompts()) {
-    const key = `${entry.accountId}\u0000${entry.sessionId}`;
-    const existing = groups.get(key);
-    if (existing) {
-      const duplicate = existing.prompts.some(
-        (candidate) => candidate.timestamp === entry.timestamp && candidate.text === entry.text,
-      );
-      if (!duplicate) existing.prompts.push(entry);
-      existing.firstTimestamp = Math.min(existing.firstTimestamp, entry.timestamp);
-      existing.lastTimestamp = Math.max(existing.lastTimestamp, entry.timestamp);
-      existing.cwd ||= entry.cwd;
-      existing.sessionTitle ||= entry.sessionTitle;
-      continue;
+const refreshPromptHistory = (): Promise<void> => {
+  if (promptHistoryRefreshPromise) return promptHistoryRefreshPromise;
+  promptHistoryRefreshPromise = (async () => {
+    try {
+      promptHistory = await invoke<PromptHistoryView>("list_prompt_history", { limit: 4000 });
+      promptHistoryLoaded = true;
+    } catch (error) {
+      statusText = String(error);
+      promptHistoryLoaded = true;
     }
-    groups.set(key, {
-      key,
-      sessionId: entry.sessionId,
-      accountId: entry.accountId,
-      accountLabel: entry.accountLabel,
-      cwd: entry.cwd,
-      sessionTitle: entry.sessionTitle,
-      firstTimestamp: entry.timestamp,
-      lastTimestamp: entry.timestamp,
-      prompts: [entry],
-    });
-  }
-  return [...groups.values()]
-    .map((session) => ({
-      ...session,
-      prompts: session.prompts.sort((left, right) => left.timestamp - right.timestamp),
-    }))
-    .sort((left, right) => right.lastTimestamp - left.lastTimestamp);
+
+    if (activeView === "history") render();
+  })().finally(() => {
+    promptHistoryRefreshPromise = null;
+  });
+  return promptHistoryRefreshPromise;
 };
 
-const promptSessionMatches = (session: PromptSessionHistory) => {
-  const query = promptSearch.trim().toLowerCase();
-  if (!query) return true;
-  return [
-    ...session.prompts.map((entry) => entry.text),
-    session.cwd ?? "",
-    session.accountLabel,
-    session.sessionTitle ?? "",
-    session.sessionId,
-  ].some((field) => field.toLowerCase().includes(query));
-};
-
-const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-// Surligne les occurrences de la requete en matchant sur le texte BRUT (les
-// bornes <mark> tombent donc toujours sur des frontieres de caracteres reels,
-// jamais au milieu d'une entite HTML ni decalees par toLowerCase), puis echappe
-// CHAQUE tranche emise : aucune injection possible et le rendu reste exact.
-const highlightMatch = (text: string, query: string) => {
-  const needle = query.trim();
-  if (!needle) return escapeHtml(text);
-  const re = new RegExp(escapeRegExp(needle), "gi");
-  let result = "";
-  let last = 0;
-  for (const match of text.matchAll(re)) {
-    const start = match.index ?? 0;
-    if (match[0].length === 0) break;
-    result += escapeHtml(text.slice(last, start));
-    result += `<mark>${escapeHtml(match[0])}</mark>`;
-    last = start + match[0].length;
-  }
-  result += escapeHtml(text.slice(last));
-  return result;
-};
-
-const renderPromptSession = (session: PromptSessionHistory) => {
-  const meta = [
-    `<span><i data-lucide="clock-3"></i>${escapeHtml(formatTimestamp(session.lastTimestamp))}</span>`,
-    `<span><i data-lucide="users"></i>${escapeHtml(session.accountLabel)}</span>`,
-    session.cwd
-      ? `<span title="${escapeAttr(session.cwd)}"><i data-lucide="folder-open"></i>${escapeHtml(displayProjectDir(session.cwd))}</span>`
-      : "",
-    `<span><i data-lucide="message-square-text"></i>${session.prompts.length} message(s) envoye(s)</span>`,
-  ]
-    .filter(Boolean)
-    .join("");
-  const title = session.sessionTitle?.trim() || session.prompts[0]?.text.trim() || "Session sans titre";
-  const messages = session.prompts
-    .map(
-      (entry, index) => `
-        <li>
-          <span class="prompt-message-index">${index + 1}</span>
-          <span>${highlightMatch(entry.text, promptSearch)}</span>
-          <time>${escapeHtml(formatTimestamp(entry.timestamp))}</time>
-        </li>`,
-    )
-    .join("");
-  return `
-    <div class="prompt-row prompt-session-row">
-      <div class="prompt-main">
-        <strong class="prompt-session-title">${highlightMatch(title, promptSearch)}</strong>
-        <span class="prompt-meta">${meta}</span>
-        <ol class="prompt-session-messages">${messages}</ol>
-      </div>
-      <div class="prompt-actions">
-        <button class="tool-button" data-prompt-discussion="${escapeAttr(session.sessionId)}" data-prompt-account="${escapeAttr(session.accountId)}" title="Voir la conversation">
-          <i data-lucide="messages-square"></i><span>Conversation</span>
-        </button>
-      </div>
-    </div>
-  `;
-};
-
-const renderPromptRows = () => {
-  if (!promptHistoryLoaded) {
-    return `<div class="pool-empty">Lecture des demandes Codex…</div>`;
-  }
-  const all = promptSessions();
-  if (all.length === 0) {
-    return `<div class="pool-empty">Aucune demande trouvee</div>`;
-  }
-  const matches = all.filter(promptSessionMatches);
-  if (matches.length === 0) {
-    return `<div class="pool-empty">Aucune demande ne correspond a « ${escapeHtml(promptSearch)} »</div>`;
-  }
-  const shown = matches.slice(0, PROMPT_RENDER_LIMIT);
-  const capped =
-    matches.length > shown.length
-      ? `<div class="prompt-more">Affichage limite a ${PROMPT_RENDER_LIMIT} sur ${matches.length} resultats — affine la recherche.</div>`
-      : "";
-  return `${shown.map(renderPromptSession).join("")}${capped}`;
-};
-
-const renderPromptHistoryPanel = () => {
-  const returned = promptHistory?.returned ?? 0;
-  const truncatedNote = promptHistory?.truncated ? ` · ${returned} plus recentes indexees` : "";
-  const sessions = promptSessions();
-  const sessionCount = sessions.length;
-  const messageCount = sessions.reduce((sum, session) => sum + session.prompts.length, 0);
-  const countLabel = promptHistoryLoaded
-    ? `${sessionCount} chat(s) / terminal(aux) · ${messageCount} message(s)${truncatedNote}`
-    : "Lecture…";
-  return `
-    <section class="discussions-panel">
-      <div class="discussions-head">
-        <div>
-          <strong>Historique par chat ou terminal</strong>
-          <span>${escapeHtml(countLabel)}</span>
-        </div>
-        <div class="discussions-tools">
-          <label class="discussion-search">
-            <i data-lucide="search"></i>
-            <input id="promptSearch" type="search" placeholder="Rechercher dans les chats, terminaux et messages" value="${escapeAttr(promptSearch)}" />
-          </label>
-          <button id="refreshPromptHistory" class="tool-button" title="Actualiser">
-            <i data-lucide="refresh-ccw"></i><span>Actualiser</span>
-          </button>
-        </div>
-      </div>
-      <div class="discussion-groups" id="promptList">${renderPromptRows()}</div>
-    </section>
-  `;
-};
-
-const refreshPromptList = () => {
-  const host = document.querySelector<HTMLDivElement>("#promptList");
-  if (!host) {
-    render();
-    return;
-  }
-  host.innerHTML = renderPromptRows();
-  renderIcons(host);
-  bindPromptRowUi();
-};
+const promptHistoryPanelModel = () => ({
+  history: promptHistory,
+  loaded: promptHistoryLoaded,
+  formatTimestamp,
+  displayProjectDir,
+});
 
 const openDiscussionForSession = (accountId: string, sessionId: string) => {
   const discussion = discussionForSession(allDiscussions(), accountId, sessionId);
@@ -8875,16 +12062,6 @@ const openDiscussionForSession = (accountId: string, sessionId: string) => {
   } else {
     setActiveView("discussions");
   }
-};
-
-const bindPromptRowUi = () => {
-  document.querySelectorAll<HTMLButtonElement>("[data-prompt-discussion]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const sessionId = button.dataset.promptDiscussion;
-      const accountId = button.dataset.promptAccount;
-      if (accountId && sessionId) openDiscussionForSession(accountId, sessionId);
-    });
-  });
 };
 
 const restoreTerminals = async () => {
@@ -8959,6 +12136,495 @@ const restoreTerminals = async () => {
     statusText = `${records.length} terminaux restaures; la limite de la fenetre est atteinte`;
   }
   persistTerminalSessions();
+};
+
+const readClaudeDesignSessions = (): Record<string, string> => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(DESIGN_CLAUDE_SESSIONS_STORAGE_KEY) ?? "{}") as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed)
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim().length > 0),
+    );
+  } catch {
+    return {};
+  }
+};
+
+const writeClaudeDesignSessions = (sessions: Record<string, string>) => {
+  try {
+    localStorage.setItem(DESIGN_CLAUDE_SESSIONS_STORAGE_KEY, JSON.stringify(sessions));
+  } catch {
+    // Le studio reste utilisable si le stockage du navigateur est indisponible.
+  }
+};
+
+const claudeDesignAccounts = (): AccountProfile[] =>
+  (settings?.accounts ?? []).filter((account) => accountProvider(account) === "claude");
+
+const selectedClaudeDesignAccount = (): AccountProfile | null => {
+  const accounts = claudeDesignAccounts();
+  return accounts.find((account) => account.id === designClaudeAccountId) ?? accounts[0] ?? null;
+};
+
+const claudeDesignContextKeyFor = (
+  account: AccountProfile,
+  projectDir: string | null,
+): string => JSON.stringify([account.id, projectDir ?? ""]);
+
+const stopClaudeDesignPoll = () => {
+  if (designClaudePoll !== null) {
+    clearInterval(designClaudePoll);
+    designClaudePoll = null;
+  }
+};
+
+const syncClaudeDesignContext = (): boolean => {
+  const account = selectedClaudeDesignAccount();
+  if (!account) {
+    if (designClaudeContextKey === null && designClaudeAccountId === null) return false;
+    stopClaudeDesignPoll();
+    designClaudeTranscriptRequestId += 1;
+    designClaudeAccountId = null;
+    designClaudeContextKey = null;
+    designClaudeProjectDir = currentProjectDir();
+    designClaudeSessionId = null;
+    designClaudeMessages = [];
+    designClaudeTurn = null;
+    designClaudeError = null;
+    designClaudeLoading = false;
+    designClaudeTranscriptLoaded = true;
+    return true;
+  }
+
+  if (designClaudeAccountId !== account.id) {
+    designClaudeAccountId = account.id;
+    localStorage.setItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY, account.id);
+  }
+  const projectDir = currentProjectDir() ?? account.projectDir?.trim() ?? null;
+  const contextKey = claudeDesignContextKeyFor(account, projectDir);
+  if (contextKey === designClaudeContextKey) return false;
+  if (chatTurnIsBusy(designClaudeTurn?.status)) return false;
+
+  stopClaudeDesignPoll();
+  designClaudeTranscriptRequestId += 1;
+  designClaudeContextKey = contextKey;
+  designClaudeProjectDir = projectDir;
+  designClaudeSessionId = readClaudeDesignSessions()[contextKey] ?? null;
+  designClaudeMessages = [];
+  designClaudeTurn = null;
+  designClaudeError = null;
+  designClaudeLoading = !!designClaudeSessionId;
+  designClaudeTranscriptLoaded = !designClaudeSessionId;
+  designClaudeTranscriptInFlight = false;
+  return true;
+};
+
+const rememberClaudeDesignSession = (sessionId: string | null | undefined) => {
+  const normalized = sessionId?.trim();
+  if (!normalized || !designClaudeContextKey) return;
+  designClaudeSessionId = normalized;
+  const sessions = readClaudeDesignSessions();
+  sessions[designClaudeContextKey] = normalized;
+  writeClaudeDesignSessions(sessions);
+};
+
+const forgetCurrentClaudeDesignSession = () => {
+  if (!designClaudeContextKey) return;
+  const sessions = readClaudeDesignSessions();
+  delete sessions[designClaudeContextKey];
+  writeClaudeDesignSessions(sessions);
+};
+
+const loadClaudeDesignTranscriptIfNeeded = async () => {
+  syncClaudeDesignContext();
+  const account = selectedClaudeDesignAccount();
+  const sessionId = designClaudeSessionId;
+  const contextKey = designClaudeContextKey;
+  if (
+    !account || !sessionId || !contextKey ||
+    designClaudeTranscriptLoaded || designClaudeTranscriptInFlight ||
+    chatTurnIsBusy(designClaudeTurn?.status)
+  ) {
+    return;
+  }
+
+  const requestId = ++designClaudeTranscriptRequestId;
+  designClaudeTranscriptInFlight = true;
+  designClaudeLoading = true;
+  try {
+    const transcript = await invoke<DiscussionTranscriptView>("get_discussion_transcript", {
+      accountId: account.id,
+      sessionId,
+    });
+    if (requestId !== designClaudeTranscriptRequestId || contextKey !== designClaudeContextKey) return;
+    designClaudeMessages = transcript.messages;
+    designClaudeError = null;
+  } catch (error) {
+    if (requestId !== designClaudeTranscriptRequestId || contextKey !== designClaudeContextKey) return;
+    designClaudeError = `Session Design introuvable : ${String(error)}`;
+  } finally {
+    if (requestId === designClaudeTranscriptRequestId && contextKey === designClaudeContextKey) {
+      designClaudeLoading = false;
+      designClaudeTranscriptLoaded = true;
+      designClaudeTranscriptInFlight = false;
+      if (activeView === "design" && activeDesignTool === "claude") render();
+    }
+  }
+};
+
+const claudeDesignModeLabel = (mode: ClaudeDesignMode): string => {
+  switch (mode) {
+    case "wireframe": return "wireframe et parcours utilisateur";
+    case "presentation": return "présentation et narration visuelle";
+    case "system": return "design system, composants et tokens";
+    default: return "prototype d’interface fonctionnel";
+  }
+};
+
+const claudeDesignSkill = (
+  mode: ClaudeDesignMode,
+  projectDir: string,
+): ChatAgentSkillPrompt => ({
+  id: "claude-design-studio",
+  name: "Claude Design Studio intégré",
+  content: `# Mission
+
+Tu travailles dans le studio Design intégré de Codex Switch Terminal. La demande concerne un ${claudeDesignModeLabel(mode)}.
+La racine locale obligatoire du projet est : ${projectDir.replaceAll("`", "'")}
+
+- Commence par comprendre le projet et son langage visuel existant avant de proposer ou modifier quoi que ce soit.
+- Toute réalisation demandée doit être enregistrée physiquement sur le PC dans cette racine projet avant la réponse finale. Ne livre jamais uniquement du code ou un prototype dans le chat.
+- Pour une application existante, modifie les fichiers source appropriés à leur emplacement actuel. Pour un livrable autonome sans emplacement indiqué, crée-le sous \`design-output/<nom-du-livrable>/\` dans la racine projet.
+- N’écris jamais en dehors de la racine projet. Utilise les outils disponibles pour inspecter, créer et modifier les fichiers.
+- Avant de terminer, vérifie sur disque que chaque fichier annoncé existe et que les validations pertinentes passent. Si l’écriture échoue, signale clairement l’échec au lieu de prétendre avoir sauvegardé.
+- Produis une interface crédible, responsive, accessible et cohérente avec le produit, pas une simple description théorique.
+- Préserve les changements existants et évite toute opération destructive hors du besoin exprimé.
+- À la fin, donne les chemins locaux exacts des fichiers créés ou modifiés et la manière de les prévisualiser ou de les vérifier.
+- Reste dans le périmètre design demandé et échange en français sauf demande contraire.`,
+});
+
+const claudeDesignAssistantText = (snapshot: ChatTurnSnapshot): string =>
+  snapshot.parts
+    .filter((part) => part.kind === "text" && part.text?.trim())
+    .map((part) => part.text!.trim())
+    .join("\n\n")
+    .trim();
+
+const settleLatestClaudeDesignMessage = (failed = false) => {
+  for (let index = designClaudeMessages.length - 1; index >= 0; index -= 1) {
+    const message = designClaudeMessages[index];
+    if (message.role !== "user" || message.deliveryState !== "pending") continue;
+    designClaudeMessages[index] = failed
+      ? { ...message, deliveryState: "failed" }
+      : { role: message.role, text: message.text, timestamp: message.timestamp };
+    break;
+  }
+};
+
+const claudeDesignStudioModel = (): ClaudeDesignStudioModel => {
+  syncClaudeDesignContext();
+  const accounts = claudeDesignAccounts();
+  const account = selectedClaudeDesignAccount();
+  return {
+    accounts: accounts.map((candidate) => ({
+      id: candidate.id,
+      label: candidate.label,
+      model: accountModel(candidate),
+    })),
+    selectedAccountId: account?.id ?? "",
+    projectDir: designClaudeProjectDir ?? currentProjectDir(),
+    messages: designClaudeMessages,
+    livePartsHtml: designClaudeTurn?.parts.length
+      ? renderChatTurnParts(
+          designClaudeTurn.parts,
+          "Claude",
+          designClaudeTurn.startedAt,
+          designClaudeTurn.finishedAt ?? null,
+        )
+      : "",
+    status: designClaudeTurn?.status ?? "idle",
+    error: designClaudeError,
+    draft: designClaudeDraft,
+    loading: designClaudeLoading,
+    mode: designClaudeMode,
+    sessionId: designClaudeSessionId,
+  };
+};
+
+const scrollClaudeDesignFeedToEnd = () => {
+  window.requestAnimationFrame(() => {
+    const feed = document.querySelector<HTMLElement>("#claudeDesignFeed");
+    if (feed) feed.scrollTop = feed.scrollHeight;
+  });
+};
+
+const syncClaudeDesignLiveDom = () => {
+  if (activeView !== "design" || activeDesignTool !== "claude") return;
+  const feed = document.querySelector<HTMLElement>("#claudeDesignFeed");
+  const live = document.querySelector<HTMLElement>("#claudeDesignLive");
+  const followLatest = !!feed && feed.scrollHeight - feed.scrollTop - feed.clientHeight < 120;
+  const busy = chatTurnIsBusy(designClaudeTurn?.status);
+  if (live) {
+    live.innerHTML = designClaudeTurn?.parts.length
+      ? renderChatTurnParts(
+          designClaudeTurn.parts,
+          "Claude",
+          designClaudeTurn.startedAt,
+          designClaudeTurn.finishedAt ?? null,
+        )
+      : "";
+    live.dataset.busy = String(busy);
+    renderIcons(live);
+  }
+
+  const state = document.querySelector<HTMLElement>("#claudeDesignRunState");
+  if (state) {
+    const label = designClaudeTurn?.status === "finalizing" ? "Finalisation" : busy ? "Claude travaille" : "Prêt";
+    state.classList.toggle("is-running", busy);
+    state.innerHTML = `<i data-lucide="${busy ? "loader-circle" : "circle-check"}"></i>${label}`;
+    renderIcons(state);
+  }
+
+  const error = document.querySelector<HTMLElement>("#claudeDesignError");
+  if (error) {
+    error.hidden = !designClaudeError;
+    error.innerHTML = designClaudeError
+      ? `<i data-lucide="circle-alert"></i><span>${escapeHtml(designClaudeError)}</span>`
+      : "";
+    if (designClaudeError) renderIcons(error);
+  }
+  if (followLatest && feed) feed.scrollTop = feed.scrollHeight;
+};
+
+const applyClaudeDesignSnapshot = async (snapshot: ChatTurnSnapshot) => {
+  const previousStatus = designClaudeTurn?.status;
+  designClaudeTurn = snapshot;
+  rememberClaudeDesignSession(snapshot.sessionId);
+
+  if (chatTurnIsBusy(snapshot.status)) {
+    statusText = snapshot.status === "finalizing"
+      ? "Claude Design finalise le résultat…"
+      : "Claude Design travaille dans le projet…";
+    syncStatusTextDom();
+    syncClaudeDesignLiveDom();
+    return;
+  }
+
+  stopClaudeDesignPoll();
+  if (snapshot.status === "completed") {
+    settleLatestClaudeDesignMessage(false);
+    const response = claudeDesignAssistantText(snapshot);
+    if (response && previousStatus !== "completed") {
+      designClaudeMessages.push({
+        role: "assistant",
+        text: response,
+        timestamp: snapshot.finishedAt ?? Math.floor(Date.now() / 1000),
+      });
+    }
+    designClaudeTurn = { ...snapshot, parts: [] };
+    designClaudeError = null;
+    designClaudeTranscriptLoaded = true;
+    statusText = "Claude Design a terminé";
+    void refreshDiscussions();
+  } else if (snapshot.status === "failed") {
+    settleLatestClaudeDesignMessage(true);
+    designClaudeError = snapshot.error || "Claude Design n’a pas pu terminer la demande.";
+    statusText = designClaudeError;
+  } else {
+    settleLatestClaudeDesignMessage(false);
+    designClaudeError = null;
+    statusText = "Claude Design arrêté";
+  }
+  if (activeView === "design" && activeDesignTool === "claude") {
+    render();
+    scrollClaudeDesignFeedToEnd();
+  } else {
+    syncStatusTextDom();
+  }
+};
+
+const pollClaudeDesignTurn = async () => {
+  if (!designClaudeTurn || designClaudeTurn.id <= 0 || designClaudePollInFlight) return;
+  designClaudePollInFlight = true;
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("chat_turn_status", { id: designClaudeTurn.id });
+    await applyClaudeDesignSnapshot(snapshot);
+  } catch (error) {
+    designClaudeError = `Suivi de Claude Design impossible : ${String(error)}`;
+    syncClaudeDesignLiveDom();
+  } finally {
+    designClaudePollInFlight = false;
+  }
+};
+
+const startClaudeDesignPoll = () => {
+  stopClaudeDesignPoll();
+  designClaudePoll = window.setInterval(
+    () => runWhenPageVisible(() => void pollClaudeDesignTurn()),
+    650,
+  );
+};
+
+const sendClaudeDesignMessage = async () => {
+  syncClaudeDesignContext();
+  const input = document.querySelector<HTMLTextAreaElement>("#claudeDesignPrompt");
+  const prompt = (input?.value ?? designClaudeDraft).trim();
+  const account = selectedClaudeDesignAccount();
+  if (!account) {
+    designClaudeError = "Ajoute d’abord un compte Claude dans la page Comptes.";
+    render();
+    return;
+  }
+  const projectDir = designClaudeProjectDir ?? account.projectDir?.trim() ?? null;
+  if (!projectDir) {
+    designClaudeError = "Sélectionne un environnement local avant de lancer Claude Design : les fichiers doivent être sauvegardés dans un dossier précis du PC.";
+    statusText = "Claude Design · dossier local requis";
+    render();
+    return;
+  }
+  if (!prompt || chatTurnIsBusy(designClaudeTurn?.status)) {
+    if (!prompt) {
+      input?.setCustomValidity("Décris ce que Claude doit concevoir.");
+      input?.reportValidity();
+    }
+    return;
+  }
+
+  const startedAt = Math.floor(Date.now() / 1000);
+  designClaudeDraft = "";
+  designClaudeError = null;
+  designClaudeMessages.push({
+    role: "user",
+    text: prompt,
+    timestamp: startedAt,
+    deliveryState: "pending",
+  });
+  designClaudeTurn = {
+    id: 0,
+    accountId: account.id,
+    sessionId: designClaudeSessionId,
+    status: "running",
+    startedAt,
+    finishedAt: null,
+    error: null,
+    activities: [],
+    thoughts: [],
+    parts: [],
+  };
+  statusText = "Claude Design démarre…";
+  render();
+  scrollClaudeDesignFeedToEnd();
+
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("start_chat_turn", {
+      accountId: account.id,
+      sessionId: designClaudeSessionId,
+      prompt,
+      projectDir,
+      mode: "build",
+      model: accountModel(account),
+      reasoningEffort: null,
+      sourceChatKey: "claude-design-studio",
+      agentTools: [],
+      agentSkills: [claudeDesignSkill(designClaudeMode, projectDir)],
+    });
+    await applyClaudeDesignSnapshot(snapshot);
+    if (chatTurnIsBusy(snapshot.status)) startClaudeDesignPoll();
+  } catch (error) {
+    settleLatestClaudeDesignMessage(true);
+    designClaudeTurn = {
+      ...designClaudeTurn!,
+      status: "failed",
+      finishedAt: Math.floor(Date.now() / 1000),
+      error: String(error),
+    };
+    designClaudeError = String(error);
+    statusText = designClaudeError;
+    stopClaudeDesignPoll();
+    if (activeView === "design" && activeDesignTool === "claude") render();
+  }
+};
+
+const stopClaudeDesignTurn = async () => {
+  if (!designClaudeTurn || designClaudeTurn.id <= 0) {
+    designClaudeError = "Claude est encore en cours de démarrage.";
+    syncClaudeDesignLiveDom();
+    return;
+  }
+  try {
+    const snapshot = await invoke<ChatTurnSnapshot>("stop_chat_turn", { id: designClaudeTurn.id });
+    await applyClaudeDesignSnapshot(snapshot);
+  } catch (error) {
+    designClaudeError = `Arrêt impossible : ${String(error)}`;
+    syncClaudeDesignLiveDom();
+  }
+};
+
+const resetClaudeDesignSession = () => {
+  if (chatTurnIsBusy(designClaudeTurn?.status)) return;
+  stopClaudeDesignPoll();
+  forgetCurrentClaudeDesignSession();
+  designClaudeTranscriptRequestId += 1;
+  designClaudeSessionId = null;
+  designClaudeMessages = [];
+  designClaudeTurn = null;
+  designClaudeDraft = "";
+  designClaudeError = null;
+  designClaudeLoading = false;
+  designClaudeTranscriptLoaded = true;
+  statusText = "Nouvelle session Claude Design";
+  render();
+};
+
+const selectClaudeDesignAccount = (accountId: string) => {
+  if (chatTurnIsBusy(designClaudeTurn?.status)) return;
+  const account = claudeDesignAccounts().find((candidate) => candidate.id === accountId);
+  if (!account) return;
+  designClaudeAccountId = account.id;
+  localStorage.setItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY, account.id);
+  designClaudeContextKey = null;
+  syncClaudeDesignContext();
+  statusText = `Claude Design · ${account.label}`;
+  render();
+  void loadClaudeDesignTranscriptIfNeeded();
+};
+
+const selectClaudeDesignMode = (mode: ClaudeDesignMode) => {
+  designClaudeMode = mode;
+  localStorage.setItem(DESIGN_CLAUDE_MODE_STORAGE_KEY, mode);
+  render();
+  window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#claudeDesignPrompt")?.focus());
+};
+
+const selectDesignTool = (tool: DesignTool) => {
+  activeDesignTool = tool;
+  localStorage.setItem(DESIGN_TOOL_STORAGE_KEY, tool);
+  statusText = tool === "kombai"
+    ? "Kombai · IDE frontend embarqué"
+    : "Claude Design · studio intégré";
+
+  if (tool === "kombai") {
+    startKombaiPoll();
+  } else {
+    stopKombaiPoll();
+    syncClaudeDesignContext();
+  }
+  render();
+  if (tool === "kombai") void refreshKombaiStatus();
+  else void loadClaudeDesignTranscriptIfNeeded();
+};
+
+const copyDesignProjectPath = async () => {
+  const projectDir = designClaudeProjectDir ?? currentProjectDir();
+  if (!projectDir) return;
+  try {
+    await navigator.clipboard.writeText(projectDir);
+    statusText = "Chemin du projet copié";
+  } catch (error) {
+    statusText = `Copie impossible : ${String(error)}`;
+  }
+  syncStatusTextDom();
 };
 
 const startKombai = async () => {
@@ -9229,7 +12895,36 @@ const openFolderTerminals = async (value: string): Promise<void> => {
   render();
 };
 
-const closeExpertChatAndDiscussion = async (pane: ExpertChatPane) => {
+const finalizeClosedExpertChatDiscussion = async (
+  discussion: DiscussionSummary,
+  pendingStatus: string,
+): Promise<void> => {
+  let finalStatus: string;
+  try {
+    const count = await archiveDiscussionById(
+      discussion.accountId,
+      discussion.sessionId,
+      [discussion.rolloutId],
+    );
+    finalStatus = count > 1
+      ? `Chat fermé et discussion archivée (${count} fichiers)`
+      : "Chat fermé et discussion archivée";
+  } catch (error) {
+    finalStatus = `Suppression du chat impossible : ${String(error)}`;
+  }
+
+  if (discussionBusyId === discussion.sessionId) discussionBusyId = null;
+  await refreshDiscussions();
+  // Le snapshot peut rester identique apres un echec : retire dans tous les cas
+  // l'etat visuel « en cours » sans reconstruire les autres panneaux de chat.
+  if (activeView === "chat") refreshChatSidebarConversations();
+  if (statusText === pendingStatus) {
+    statusText = finalStatus;
+    syncStatusTextDom();
+  }
+};
+
+const closeExpertChatAndDiscussion = (pane: ExpertChatPane) => {
   if (!expertChatPanes.includes(pane)) return;
   if (chatTurnIsBusy(pane.turn?.status)) {
     statusText = pane.turn?.status === "finalizing"
@@ -9248,25 +12943,23 @@ const closeExpertChatAndDiscussion = async (pane: ExpertChatPane) => {
     render();
     return;
   }
+  if (discussionBusyId) return;
 
   discussionBusyId = discussion.sessionId;
-  let finalStatus: string;
-  try {
-    const count = await archiveDiscussionById(
-      discussion.accountId,
-      discussion.sessionId,
-      [discussion.rolloutId],
-    );
-    finalStatus = count > 1
-      ? `Chat ferme et discussion archivee (${count} fichiers)`
-      : "Chat ferme et discussion archivee";
-  } catch (error) {
-    finalStatus = `Suppression du chat impossible : ${String(error)}`;
+  // La fermeture visible ne doit pas attendre le deplacement des fichiers ni
+  // le rescannage de tout l'historique. L'archivage se termine en arriere-plan.
+  closeExpertChatPane(pane);
+  if (expertChatPanes.includes(pane)) {
+    // closeExpertChatPane peut refuser pendant une compaction demarree entre les
+    // controles ci-dessus et la fermeture effective.
+    if (discussionBusyId === discussion.sessionId) discussionBusyId = null;
+    return;
   }
-  discussionBusyId = null;
-  await refreshDiscussions();
-  statusText = finalStatus;
-  render();
+
+  const pendingStatus = "Chat fermé · archivage de la discussion en cours…";
+  statusText = pendingStatus;
+  syncStatusTextDom();
+  void finalizeClosedExpertChatDiscussion(discussion, pendingStatus);
 };
 
 const selectWorkspaceFilter = (value: string) => {
@@ -9469,6 +13162,8 @@ function closeMobileOverlays(): void {
 
 function mobileViewLabel(view: AppView): string {
   switch (view) {
+    case "tutorial":
+      return "Tuto";
     case "tasks":
       return "Tâches";
     case "prompts":
@@ -9481,16 +13176,26 @@ function mobileViewLabel(view: AppView): string {
       return "Limites";
     case "dashboard":
       return "Stats";
+    case "video":
+      return "Vidéo";
+    case "vps":
+      return "VPS";
     case "doctolib-lab":
       return "RDV Lab";
     case "autonomous":
       return "Agents autonomes";
+    case "bug-report":
+      return "Signaler un bug";
     case "orchestration":
       return "Chats orchestrés";
-    case "kombai":
-      return "Kombai";
+    case "design":
+      return "Design";
+    case "forum":
+      return "Forum";
+    case "messaging":
+      return "Messagerie";
     case "discussions":
-      return "Discussions";
+      return "Historique";
     case "chat":
       return "Conversation";
     case "history":
@@ -9509,6 +13214,16 @@ function mobileViewLabel(view: AppView): string {
 function syncMobileChrome(): void {
   const chrome = document.querySelector(".m-chrome");
   if (!chrome) return;
+  const tutorialBadge = chrome.querySelector<HTMLElement>("[data-tutorial-nav-badge]");
+  if (tutorialBadge) tutorialBadge.hidden = tutorialHasStarted();
+  const privateMessageUnreadCount = messagingModule?.messagingUnreadCount() ?? 0;
+  const messagingBadge = chrome.querySelector<HTMLElement>("[data-messaging-nav-count]");
+  if (messagingBadge) {
+    messagingBadge.textContent = privateMessageUnreadCount > 99
+      ? "99+"
+      : String(privateMessageUnreadCount);
+    messagingBadge.hidden = privateMessageUnreadCount === 0;
+  }
   const chatContext = activeView === "chat" || activeView === "discussions";
   chrome.classList.toggle("is-chat-context", chatContext);
   chrome.querySelectorAll<HTMLElement>(".m-tab[data-view]").forEach((tab) => {
@@ -9541,13 +13256,21 @@ function syncMobileChrome(): void {
     const tasksContext = activeView === "tasks";
     const promptsContext = activeView === "prompts";
     const scheduledChatContext = activeView === "scheduled-chat";
+    const forumContext = activeView === "forum";
+    const messagingContext = activeView === "messaging";
     const available = chatContext
       || terminalContext
       || tasksContext
       || promptsContext
-      || scheduledChatContext;
+      || scheduledChatContext
+      || forumContext
+      || messagingContext;
     const label = chatContext
       ? "Ouvrir un nouveau chat"
+      : messagingContext
+        ? "Écrire un nouveau message privé"
+      : forumContext
+        ? "Ouvrir un nouveau sujet"
       : tasksContext
         ? "Ajouter une tâche"
         : promptsContext
@@ -9643,8 +13366,8 @@ function ensureMobileChrome(): void {
     <nav class="m-bottomnav" aria-label="Navigation">
       <button class="m-tab" type="button" data-view="chat"><i data-lucide="messages-square"></i><span>Chats</span></button>
       <button class="m-tab" type="button" data-view="terminal"><i data-lucide="square-terminal"></i><span>Terminal</span></button>
-      <button class="m-tab" type="button" data-view="pool"><i data-lucide="users"></i><span>Comptes</span></button>
-      <button class="m-tab" type="button" data-view="dashboard"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
+      <button class="m-tab" type="button" data-view="messaging"><i data-lucide="mail"></i><span>Messages</span><b data-messaging-nav-count hidden></b></button>
+      <button class="m-tab" type="button" data-view="forum"><i data-lucide="messages-square"></i><span>Forum</span></button>
       <button class="m-tab" type="button" data-m="menu" aria-haspopup="menu" aria-expanded="false" aria-controls="mobileActionSheet"><i data-lucide="layout-grid"></i><span>Menu</span></button>
     </nav>
     <div class="m-scrim" data-m="scrim"></div>
@@ -9652,17 +13375,23 @@ function ensureMobileChrome(): void {
       <div class="m-sheet-panel" role="menu" aria-label="Plus d'actions">
         <div class="m-sheet-handle"></div>
         <div class="m-sheet-grid">
+          <button type="button" class="m-tutorial-entry" role="menuitem" data-view="tutorial"><i data-lucide="compass"></i><span>Tuto</span><b class="tutorial-nav-badge" data-tutorial-nav-badge>Nouveau</b></button>
+          <button type="button" role="menuitem" data-view="pool"><i data-lucide="users"></i><span>Comptes</span></button>
           <button type="button" role="menuitem" data-view="tasks"><i data-lucide="list-checks"></i><span>Tâches</span></button>
           <button type="button" role="menuitem" data-view="scheduled-chat"><i data-lucide="calendar-clock"></i><span>Chat planifié</span></button>
           <button type="button" role="menuitem" data-view="prompts"><i data-lucide="message-square-text"></i><span>Prompts</span></button>
+          <button type="button" role="menuitem" data-view="video"><i data-lucide="wand-sparkles"></i><span>Studio IA</span></button>
           <button type="button" role="menuitem" data-view="limits"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
-          <button type="button" class="m-autonomous-entry" role="menuitem" data-view="autonomous"><i data-lucide="bot"></i><span><strong>Agents autonomes</strong><small>Création et suivi 24/7</small></span><b>24/7</b></button>
+          <button type="button" role="menuitem" data-view="dashboard"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
+          ${isRemoteMode() ? `<button type="button" role="menuitem" data-view="vps"><i data-lucide="server"></i><span>VPS</span></button>` : ""}
+          <button type="button" class="m-bug-report-entry" role="menuitem" data-view="bug-report"><i data-lucide="bug"></i><span><strong>Signaler un bug</strong><small>Lancer un agent de correction</small></span><b data-bug-report-nav-badge>Auto</b></button>
+          <button type="button" class="m-autonomous-entry" role="menuitem" data-view="autonomous"><i data-lucide="bot"></i><span><strong>Agents autonomes</strong><small>Création et suivi 24/7</small></span><b class="${autonomousReportDeliveries(true).length ? "has-results" : ""}">${autonomousReportDeliveries(true).length || "24/7"}</b></button>
           <button type="button" class="m-orchestration-entry" role="menuitem" data-view="orchestration"><i data-lucide="users"></i><span><strong>Chats orchestrés</strong><small>Plan, preuves et revue</small></span><b>Bêta</b></button>
-          <button type="button" role="menuitem" data-view="kombai"><i data-lucide="bot"></i><span>Kombai</span></button>
-          <button type="button" role="menuitem" data-view="discussions"><i data-lucide="messages-square"></i><span>Discussions</span></button>
-          <button type="button" role="menuitem" data-view="history"><i data-lucide="history"></i><span>Historique</span></button>
+          <button type="button" role="menuitem" data-view="design"><i data-lucide="layout-template"></i><span>Design</span></button>
+          <button type="button" role="menuitem" data-view="discussions"><i data-lucide="history"></i><span>Historique</span></button>
           <button type="button" role="menuitem" data-view="skills"><i data-lucide="library"></i><span>Skills</span></button>
           <button type="button" role="menuitem" data-view="audit"><i data-lucide="scan-eye"></i><span>Audit</span></button>
+          <button type="button" role="menuitem" data-view="settings"><i data-lucide="settings"></i><span>Paramètres</span></button>
           <button type="button" role="menuitem" data-act="poolTerminal"><i data-lucide="shuffle"></i><span>Pool term</span></button>
           <button type="button" role="menuitem" data-act="agents"><i data-lucide="bot"></i><span>Agents</span></button>
           <button type="button" role="menuitem" data-act="fullscreen"><i data-lucide="maximize-2"></i><span>Plein ecran</span></button>
@@ -9717,6 +13446,8 @@ function ensureMobileChrome(): void {
       case "new":
         closeMobileOverlays();
         if (activeView === "chat" || activeView === "discussions") openNewChat();
+        else if (activeView === "messaging") messagingModule?.openMessagingComposer(render);
+        else if (activeView === "forum") forumModule?.openForumComposer(render);
         else if (activeView === "terminal") openNewTerminalModal();
         else if (activeView === "tasks") {
           window.setTimeout(() => document.querySelector<HTMLInputElement>("#taskTitle")?.focus(), 0);
@@ -9960,7 +13691,10 @@ const renderChatSidebarConversations = (): string => {
       const current = openedPane?.key === activeExpertChatKey;
       const title = discussion.title?.trim() || "Conversation sans titre";
       const busy = discussionBusyId === discussion.sessionId;
-      return `<div class="chat-side-item ${openedPane ? "active" : ""} ${current ? "current" : ""} ${busy ? "moving" : ""}" aria-busy="${busy}">
+      const status = expertChatSidebarStatus(openedPane ?? null, discussion);
+      return {
+        status,
+        html: `<div class="chat-side-item ${openedPane ? "active" : ""} ${current ? "current" : ""} ${busy ? "moving" : ""}" aria-busy="${busy}">
         <button type="button" class="chat-side-open" data-open-chat="${escapeAttr(discussion.sessionId)}" title="${escapeAttr(title)}">
           ${renderChatSidebarStatus(openedPane ?? null, discussion)}
           <i class="chat-side-terminal-icon" data-lucide="message-square"></i>
@@ -9969,12 +13703,15 @@ const renderChatSidebarConversations = (): string => {
             <small>${escapeHtml(discussion.accountLabel)} · ${escapeHtml(providerLabel(discussion.provider ?? "codex"))}</small>
           </span>
         </button>
+        <button type="button" class="chat-side-rename" data-rename-session="${escapeAttr(discussion.sessionId)}" data-rename-account="${escapeAttr(discussion.accountId)}" title="Renommer ce chat" aria-label="Renommer ${escapeAttr(title)}">
+          <i data-lucide="pencil"></i>
+        </button>
         <button type="button" class="chat-side-delete" data-delete-session="${escapeAttr(discussion.sessionId)}" title="Supprimer la conversation" aria-label="Supprimer ${escapeAttr(title)}">
           <i data-lucide="trash-2"></i>
         </button>
-      </div>`;
-    })
-    .join("");
+      </div>`,
+      };
+    });
 
   // La grille de chats compte chaque pane ouvert de l'environnement (y compris
   // un nouveau chat sans premier message, ou un chat dont la discussion n'a pas
@@ -9995,9 +13732,12 @@ const renderChatSidebarConversations = (): string => {
       const account = expertChatSelectedAccount(pane);
       const title = pane.discussion?.title?.trim() || "Nouveau chat";
       const subtitle = account
-        ? `${account.label} · ${providerLabel(accountProvider(account))}`
+        ? `${account.label} · ${accountProviderLabel(account)}`
         : "Choisissez un agent";
-      return `<div class="chat-side-item active ${current ? "current" : ""}">
+      const status = expertChatSidebarStatus(pane);
+      return {
+        status,
+        html: `<div class="chat-side-item active ${current ? "current" : ""}">
         <button type="button" class="chat-side-open" data-open-pane="${escapeAttr(pane.key)}" title="${escapeAttr(title)}">
           ${renderChatSidebarStatus(pane)}
           <i class="chat-side-terminal-icon" data-lucide="message-square-plus"></i>
@@ -10009,17 +13749,31 @@ const renderChatSidebarConversations = (): string => {
         <button type="button" class="chat-side-delete" data-close-pane="${escapeAttr(pane.key)}" title="Fermer ce chat" aria-label="Fermer ${escapeAttr(title)}">
           <i data-lucide="x"></i>
         </button>
-      </div>`;
-    })
-    .join("");
+      </div>`,
+      };
+    });
 
   const totalCount = discussions.length + draftPanes.length;
-  const listItems = `${draftItems}${conversationItems}`;
+  const visibleItems = arrangeChatSidebarItems(
+    [...draftItems, ...conversationItems],
+    chatSidebarPriorityMode,
+    chatSidebarHideRunning,
+  );
+  const hiddenRunningCount = totalCount - visibleItems.length;
+  const listItems = visibleItems.map((item) => item.html).join("");
+  const countTitle = hiddenRunningCount > 0
+    ? `${hiddenRunningCount} chat${hiddenRunningCount > 1 ? "s orange masqués" : " orange masqué"}`
+    : `${totalCount} chat${totalCount > 1 ? "s affichés" : " affiché"}`;
+  const emptyMessage = hiddenRunningCount > 0
+    ? `${hiddenRunningCount} chat${hiddenRunningCount > 1 ? "s orange sont masqués" : " orange est masqué"} par vos paramètres.`
+    : query
+      ? "Aucun résultat"
+      : "Aucun chat. Ouvrez-en un avec l'agent de votre choix.";
 
   return `<section class="chat-workspace-group active chat-current-environment-chats">
-    <div class="chat-folder-section-label"><span>Chats de cet environnement</span><b>${totalCount}</b></div>
+    <div class="chat-folder-section-label"><span>Chats de cet environnement</span><b title="${escapeAttr(countTitle)}">${visibleItems.length}</b></div>
     <div class="chat-workspace-terminals">
-      ${listItems || `<div class="chat-workspace-empty">${query ? "Aucun resultat" : "Aucun chat. Ouvrez-en un avec l'agent de votre choix."}</div>`}
+      ${listItems || `<div class="chat-workspace-empty">${escapeHtml(emptyMessage)}</div>`}
     </div>
   </section>`;
 };
@@ -10028,6 +13782,7 @@ const refreshChatSidebarConversations = () => {
   if (activeView !== "chat" || draggedChatSessionId) return;
   const host = document.querySelector<HTMLElement>("#chatSideConversations");
   if (!host) return;
+  chatSidebarRefreshPending = false;
   host.innerHTML = renderChatSidebarConversations();
   renderIcons(host);
   bindDiscussionRowUi();
@@ -10045,10 +13800,70 @@ const activeChatTurnsStatusSignature = (turns: ActiveChatTurnSummary[]): string 
     ]),
   );
 
-const refreshActiveChatTurns = async () => {
-  if (activeChatTurnsInFlight) return;
+const openChatFromModelRequest = async (request: ChatOpenRequest): Promise<void> => {
+  if (!settings) throw new Error("Les parametres de l'application ne sont pas charges.");
+  const account = accountById(request.accountId);
+  if (!account) throw new Error("Le compte du chat source n'est plus disponible.");
+  const environmentPath =
+    userEnvironmentPath(request.projectDir)
+    ?? userEnvironmentPath(account.projectDir)
+    ?? userEnvironmentPath(currentWorkspace());
+  if (!environmentPath) throw new Error("L'environnement du chat source n'est plus disponible.");
+
+  setCurrentWorkspace(environmentPath);
+  setChatWorkspaceFilter(workspaceIdForPath(environmentPath));
+  terminalFolderFilter = environmentPath;
+  void upsertWorkspaceRegistry(environmentPath);
+  const pane = addExpertChatPane(account.id, {
+    mode: request.mode,
+    pendingWorkspace: environmentPath,
+  });
+  if (!pane) throw new Error("Le nouveau chat n'a pas pu etre cree.");
+
+  const model = request.model?.trim() || accountModel(account);
+  const submission: QueuedChatSubmission = {
+    prompt: request.prompt,
+    imageAttachments: [],
+    accountId: account.id,
+    mode: request.mode,
+    model,
+    reasoningEffort: accountProvider(account) === "codex"
+      ? request.reasoningEffort?.trim() || accountReasoningEffort(account)
+      : null,
+    enabledTools: [],
+    agentSkills: [],
+  };
+  if (!await startNewChatWithPrompt(pane, request.prompt, submission)) {
+    throw new Error("Le chat a ete cree, mais son message initial n'a pas pu etre envoye.");
+  }
+};
+
+const claimChatOpenRequests = async (): Promise<void> => {
+  if (!isRemoteMode() || chatOpenRequestsInFlight) return;
+  chatOpenRequestsInFlight = true;
+  try {
+    const requests = await invoke<ChatOpenRequest[]>("claim_chat_open_requests");
+    for (const request of requests) {
+      try {
+        await openChatFromModelRequest(request);
+      } catch (error) {
+        statusText = `Ouverture du chat demandee : ${String(error)}`;
+        render();
+      }
+    }
+  } catch {
+    // Pendant un deploiement progressif, l'ancien serveur peut ne pas encore
+    // connaitre cette route. Le prochain poll retentera sans perturber le chat.
+  } finally {
+    chatOpenRequestsInFlight = false;
+  }
+};
+
+const refreshActiveChatTurns = async (): Promise<boolean> => {
+  if (activeChatTurnsInFlight) return false;
   activeChatTurnsInFlight = true;
   try {
+    await claimChatOpenRequests();
     const next = await invoke<ActiveChatTurnSummary[]>("list_active_chat_turns");
     const nextSidebarSignature = activeChatTurnsStatusSignature(next);
     const sidebarChanged = nextSidebarSignature !== activeChatTurnsSidebarSignature;
@@ -10091,28 +13906,190 @@ const refreshActiveChatTurns = async () => {
     }));
 
     if (sidebarChanged) refreshChatSidebarConversations();
+    return true;
   } catch {
     // Une panne de cette reconciliation ne doit jamais effacer un etat local
     // encore suivi individuellement par son poll de tour.
+    return false;
   } finally {
     activeChatTurnsInFlight = false;
+    scheduleRuntimeSyncFlush();
   }
 };
 
-const stopActiveChatTurnsPoll = () => {
+const clearActiveChatTurnsPoll = () => {
   if (activeChatTurnsPoll !== null) {
     clearInterval(activeChatTurnsPoll);
     activeChatTurnsPoll = null;
   }
 };
 
+const stopActiveChatTurnsPoll = () => {
+  activeChatTurnsTracking = false;
+  clearActiveChatTurnsPoll();
+};
+
 const startActiveChatTurnsPoll = () => {
-  stopActiveChatTurnsPoll();
+  activeChatTurnsTracking = true;
   void refreshActiveChatTurns();
-  activeChatTurnsPoll = window.setInterval(
-    () => runWhenPageVisible(() => void refreshActiveChatTurns()),
-    1_000,
+  syncRuntimeFallbackPolling();
+};
+
+function syncRuntimeFallbackPolling(): void {
+  const fallback = runtimeSyncState !== "live";
+  if (fallback) clearRuntimeSyncRetryTimers();
+  messagingModule?.setMessagingRealtimeAvailable(!fallback);
+  if (fallback && autonomousAgentsTracking) {
+    if (autonomousAgentsPoll === null) {
+      autonomousAgentsPoll = window.setInterval(
+        () => runWhenPageVisible(() => void refreshAutonomousAgents()),
+        2_000,
+      );
+    }
+  } else {
+    clearAutonomousAgentsPoll();
+  }
+
+  if (fallback && activeChatTurnsTracking) {
+    if (activeChatTurnsPoll === null) {
+      activeChatTurnsPoll = window.setInterval(
+        () => runWhenPageVisible(() => void refreshActiveChatTurns()),
+        1_000,
+      );
+    }
+  } else {
+    clearActiveChatTurnsPoll();
+  }
+}
+
+const runtimeSyncRetryDelay = (topic: RuntimeSyncTopic): number => {
+  if (topic === "activeChatTurns") return 1_000;
+  if (topic === "autonomousAgents") return 2_000;
+  return 8_000;
+};
+
+const clearRuntimeSyncRetry = (topic: RuntimeSyncTopic) => {
+  const timer = runtimeSyncRetryTimers.get(topic);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  runtimeSyncRetryTimers.delete(topic);
+};
+
+function clearRuntimeSyncRetryTimers(): void {
+  runtimeSyncRetryTimers.forEach((timer) => clearTimeout(timer));
+  runtimeSyncRetryTimers.clear();
+}
+
+const scheduleRuntimeSyncRetry = (topic: RuntimeSyncTopic) => {
+  if (runtimeSyncState !== "live" || runtimeSyncRetryTimers.has(topic)) return;
+  const timer = window.setTimeout(() => {
+    runtimeSyncRetryTimers.delete(topic);
+    if (runtimeSyncState === "live") queueRuntimeSyncUpdate(topic);
+  }, runtimeSyncRetryDelay(topic));
+  runtimeSyncRetryTimers.set(topic, timer);
+};
+
+function scheduleRuntimeSyncFlush(delay = 0): void {
+  if (runtimeSyncPendingTopics.size === 0 || runtimeSyncRefreshTimer !== null) return;
+  runtimeSyncRefreshTimer = window.setTimeout(flushRuntimeSyncUpdates, delay);
+}
+
+const refreshRuntimeSyncTopic = (topic: RuntimeSyncTopic) => {
+  let refresh: Promise<boolean>;
+  if (topic === "activeChatTurns") {
+    refresh = refreshActiveChatTurns();
+  } else if (topic === "autonomousAgents") {
+    refresh = refreshAutonomousAgents();
+  } else {
+    privateMessagesSyncInFlight = true;
+    refresh = loadMessagingModule()
+      .then((module) => module.refreshMessaging(render, { silent: true }))
+      .catch(() => false)
+      .finally(() => {
+        privateMessagesSyncInFlight = false;
+        scheduleRuntimeSyncFlush();
+      });
+  }
+  void refresh.then((success) => {
+    if (success) clearRuntimeSyncRetry(topic);
+    else scheduleRuntimeSyncRetry(topic);
+  });
+};
+
+const flushRuntimeSyncUpdates = () => {
+  runtimeSyncRefreshTimer = null;
+  if (
+    runtimeSyncPendingTopics.has("activeChatTurns")
+    && !activeChatTurnsInFlight
+  ) {
+    runtimeSyncPendingTopics.delete("activeChatTurns");
+    refreshRuntimeSyncTopic("activeChatTurns");
+  }
+  if (
+    runtimeSyncPendingTopics.has("autonomousAgents")
+    && !autonomousAgentsInFlight
+  ) {
+    runtimeSyncPendingTopics.delete("autonomousAgents");
+    refreshRuntimeSyncTopic("autonomousAgents");
+  }
+  if (
+    runtimeSyncPendingTopics.has("privateMessages")
+    && !privateMessagesSyncInFlight
+  ) {
+    runtimeSyncPendingTopics.delete("privateMessages");
+    refreshRuntimeSyncTopic("privateMessages");
+  }
+};
+
+const queueRuntimeSyncUpdate = (topic: RuntimeSyncTopic) => {
+  clearRuntimeSyncRetry(topic);
+  runtimeSyncPendingTopics.add(topic);
+  scheduleRuntimeSyncFlush();
+};
+
+const handleRuntimeSyncMessage = (message: RuntimeSyncMessage) => {
+  if (message.type === "pong") return;
+  if (message.type === "hello" || message.type === "resync") {
+    queueRuntimeSyncUpdate("activeChatTurns");
+    queueRuntimeSyncUpdate("autonomousAgents");
+    queueRuntimeSyncUpdate("privateMessages");
+    return;
+  }
+  if (
+    message.type === "change"
+    && (
+      message.topic === "activeChatTurns"
+      || message.topic === "autonomousAgents"
+      || message.topic === "privateMessages"
+    )
+  ) {
+    queueRuntimeSyncUpdate(message.topic);
+  }
+};
+
+const startRuntimeSync = () => {
+  runtimeSyncUnlisten?.();
+  runtimeSyncState = "connecting";
+  runtimeSyncUnlisten = subscribeRuntimeUpdates(
+    handleRuntimeSyncMessage,
+    (state) => {
+      runtimeSyncState = state;
+      syncRuntimeFallbackPolling();
+    },
   );
+};
+
+const stopRuntimeSync = () => {
+  runtimeSyncUnlisten?.();
+  runtimeSyncUnlisten = null;
+  runtimeSyncState = "closed";
+  if (runtimeSyncRefreshTimer !== null) {
+    clearTimeout(runtimeSyncRefreshTimer);
+    runtimeSyncRefreshTimer = null;
+  }
+  runtimeSyncPendingTopics.clear();
+  clearRuntimeSyncRetryTimers();
+  syncRuntimeFallbackPolling();
 };
 
 // Signature legere de l'en-tete : evite tout churn DOM au poll quand les
@@ -10171,6 +14148,98 @@ const formatAutonomousTimestamp = (timestamp: number | null | undefined): string
   }).format(new Date(timestamp * 1000));
 };
 
+type AutonomousReportDelivery = {
+  agent: AutonomousAgentSnapshot;
+  report: AutonomousAgentReport;
+};
+
+type AutonomousProposalDelivery = {
+  agent: AutonomousAgentSnapshot;
+  proposal: AutonomousAgentProposal;
+  executionAgent: AutonomousAgentSnapshot | null;
+};
+
+const autonomousReportDeliveries = (unreadOnly = false): AutonomousReportDelivery[] =>
+  autonomousAgents
+    .flatMap((agent) => {
+      const reports = unreadOnly
+        ? autonomousAgentUnreadReports(agent, autonomousSeenReportIds)
+        : autonomousAgentReports(agent);
+      return reports.map((report) => ({ agent, report }));
+    })
+    .sort((left, right) =>
+      right.report.createdAt - left.report.createdAt
+      || right.report.runCount - left.report.runCount,
+    );
+
+const autonomousProposalDeliveries = (): AutonomousProposalDelivery[] =>
+  autonomousAgents
+    .filter((agent) => !agent.systemManaged)
+    .flatMap((agent) => autonomousAgentProposals(agent).map((proposal) => ({
+      agent,
+      proposal,
+      executionAgent: autonomousProposalExecutionAgent(proposal.id, autonomousAgents),
+    })))
+    .sort((left, right) =>
+      Number(Boolean(left.executionAgent)) - Number(Boolean(right.executionAgent))
+      || right.proposal.createdAt - left.proposal.createdAt
+      || right.proposal.runCount - left.proposal.runCount,
+    );
+
+const syncAutonomousUnreadBadges = (): void => {
+  const unreadCount = autonomousReportDeliveries(true).length;
+  const desktopBadge = document.querySelector<HTMLElement>(".chat-side-autonomous-entry > b");
+  if (desktopBadge) {
+    desktopBadge.textContent = unreadCount ? String(unreadCount) : "24/7";
+    desktopBadge.classList.toggle("has-results", unreadCount > 0);
+  }
+  const desktopCopy = document.querySelector<HTMLElement>(".chat-side-autonomous-copy small");
+  if (desktopCopy) {
+    desktopCopy.textContent = unreadCount
+      ? `${unreadCount} nouveau${unreadCount > 1 ? "x" : ""} résultat${unreadCount > 1 ? "s" : ""}`
+      : "Création et suivi continu";
+  }
+  const mobileBadge = document.querySelector<HTMLElement>(".m-autonomous-entry > b");
+  if (mobileBadge) {
+    mobileBadge.textContent = unreadCount ? String(unreadCount) : "24/7";
+    mobileBadge.classList.toggle("has-results", unreadCount > 0);
+  }
+};
+
+const persistSeenAutonomousReportIds = (): void => {
+  const bounded = [...autonomousSeenReportIds].slice(-512);
+  autonomousSeenReportIds = new Set(bounded);
+  localStorage.setItem(AUTONOMOUS_SEEN_REPORTS_STORAGE_KEY, JSON.stringify(bounded));
+};
+
+const markAutonomousReportSeen = async (reportId: string): Promise<void> => {
+  if (!reportId || autonomousSeenReportIds.has(reportId)) return;
+  const delivery = autonomousReportDeliveries(false).find(({ report }) => report.id === reportId);
+  if (!delivery) throw new Error("Compte rendu autonome introuvable");
+  autonomousSeenReportIds.add(reportId);
+  persistSeenAutonomousReportIds();
+  syncAutonomousUnreadBadges();
+  try {
+    const updated = await invoke<AutonomousAgentSnapshot>("mark_autonomous_agent_report_read", {
+      id: delivery.agent.id,
+      reportId,
+    });
+    updateAutonomousAgentLocally(updated);
+  } catch (error) {
+    autonomousSeenReportIds.delete(reportId);
+    persistSeenAutonomousReportIds();
+    syncAutonomousUnreadBadges();
+    throw error;
+  }
+};
+
+const autonomousReportPreview = (content: string, maxChars = 220): string => {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  return normalized.length > maxChars
+    ? `${normalized.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+    : normalized;
+};
+
 const autonomousScheduleInputValue = (timestamp: number): string => {
   const date = new Date(timestamp * 1000);
   const pad = (value: number) => String(value).padStart(2, "0");
@@ -10210,8 +14279,10 @@ const autonomousAccountLabel = (agent: AutonomousAgentSnapshot): string =>
 
 const selectedAutonomousMonitorAgent = (): AutonomousAgentSnapshot | null => {
   const selected = autonomousAgents.find((agent) => agent.id === autonomousMonitorAgentId);
-  if (selected) return selected;
+  if (selected && autonomousMonitorOpen) return selected;
   return autonomousAgents.find((agent) => agent.pendingReview)
+    ?? autonomousReportDeliveries(true)[0]?.agent
+    ?? selected
     ?? autonomousAgents.find(autonomousAgentIsRunning)
     ?? autonomousAgents.find((agent) => agent.status === "needs_attention")
     ?? autonomousAgents.find((agent) => agent.status === "active")
@@ -10244,11 +14315,117 @@ const renderAutonomousMonitorTimeline = (agent: AutonomousAgentSnapshot): string
     : "";
 };
 
+const autonomousReviewEvidenceKey = (agentId: string, reviewId: string): string =>
+  `${agentId}:${reviewId}`;
+
+const validateAutonomousReviewEvidenceImage = (dataUrl: string): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const candidate = new Image();
+    candidate.onload = () => {
+      if (candidate.naturalWidth > 0 && candidate.naturalHeight > 0) resolve();
+      else reject(new Error("La capture visuelle ne contient aucune image exploitable"));
+    };
+    candidate.onerror = () => reject(new Error("La capture visuelle ne peut pas etre decodee"));
+    candidate.src = dataUrl;
+  });
+
+const loadAutonomousReviewEvidence = async (
+  agentId: string,
+  reviewId: string,
+): Promise<void> => {
+  const key = autonomousReviewEvidenceKey(agentId, reviewId);
+  if (
+    autonomousReviewEvidenceCache.has(key)
+    || autonomousReviewEvidenceErrors.has(key)
+    || autonomousReviewEvidenceInFlight.has(key)
+  ) return;
+  autonomousReviewEvidenceInFlight.add(key);
+  try {
+    const evidence = await invoke<AutonomousReviewEvidence>("read_autonomous_review_evidence", {
+      id: agentId,
+      reviewId,
+    });
+    const supportedMime = ["image/png", "image/jpeg", "image/webp"].includes(evidence.mimeType);
+    if (!supportedMime || !evidence.dataUrl.startsWith(`data:${evidence.mimeType};base64,`)) {
+      throw new Error("Format de preuve visuelle invalide");
+    }
+    await validateAutonomousReviewEvidenceImage(evidence.dataUrl);
+    autonomousReviewEvidenceCache.set(key, evidence);
+  } catch (error) {
+    autonomousReviewEvidenceErrors.set(key, String(error));
+  } finally {
+    autonomousReviewEvidenceInFlight.delete(key);
+    if (autonomousMonitorOpen) syncAutonomousMonitorUi();
+  }
+};
+
+const renderAutonomousReviewEvidence = (
+  agent: AutonomousAgentSnapshot,
+  review: AutonomousReviewRequest,
+): string => {
+  const path = review.evidencePath?.trim();
+  if (!path) return "";
+  const key = autonomousReviewEvidenceKey(agent.id, review.id);
+  const evidence = autonomousReviewEvidenceCache.get(key);
+  const error = autonomousReviewEvidenceErrors.get(key);
+  if (evidence) {
+    return `<figure class="autonomous-monitor-review-evidence">
+      <div><img src="${escapeAttr(evidence.dataUrl)}" alt="Apercu visuel propose par ${escapeAttr(agent.name || "l'agent")}" /></div>
+      <figcaption><span><i data-lucide="image"></i>Rendu propose avant autorisation</span><code>${escapeHtml(path)}</code></figcaption>
+    </figure>`;
+  }
+  if (error) {
+    return `<div class="autonomous-monitor-review-evidence-error"><i data-lucide="image-off"></i><span><strong>Capture indisponible</strong><small>${escapeHtml(error)}</small><code>${escapeHtml(path)}</code></span></div>`;
+  }
+  return `<div class="autonomous-monitor-review-evidence-loading" data-autonomous-review-evidence-agent="${escapeAttr(agent.id)}" data-autonomous-review-evidence-id="${escapeAttr(review.id)}"><span></span><p>Chargement de la proposition visuelle...</p></div>`;
+};
+
+const autonomousPaymentIsReady = (payment: AutonomousPaymentRequest): boolean =>
+  payment.status === "pending"
+  && typeof payment.reference === "string"
+  && !!payment.reference.trim()
+  && typeof payment.merchant === "string"
+  && !!payment.merchant.trim()
+  && Number.isSafeInteger(Number(payment.amountMinor))
+  && Number(payment.amountMinor) > 0
+  && Number(payment.amountMinor) <= 1_000_000_000
+  && /^[A-Z]{3}$/.test(payment.currency?.trim().toUpperCase() ?? "")
+  && autonomousPaymentCheckoutUrl(payment.checkoutUrl) != null;
+
+const renderAutonomousPaymentRequest = (
+  payment: AutonomousPaymentRequest,
+  agentId: string,
+  busy: boolean,
+): string => {
+  const checkout = autonomousPaymentCheckoutUrl(payment.checkoutUrl);
+  const ready = autonomousPaymentIsReady(payment) && checkout;
+  return `<section class="autonomous-monitor-payment ${ready ? "" : "is-invalid"}" aria-label="Demande de paiement">
+    <header><span><i data-lucide="credit-card"></i></span><div><small>Paiement préparé par l'agent</small><strong>${escapeHtml(formatAutonomousPaymentAmount(payment))}</strong></div></header>
+    <dl>
+      <div><dt>Marchand</dt><dd>${escapeHtml(payment.merchant || "Inconnu")}</dd></div>
+      <div><dt>Objet</dt><dd>${escapeHtml(payment.description || "Non précisé")}</dd></div>
+      <div><dt>Référence</dt><dd><code>${escapeHtml(payment.reference || "Invalide")}</code></dd></div>
+      <div><dt>Domaine</dt><dd><code>${escapeHtml(checkout?.hostname ?? "Lien invalide")}</code></dd></div>
+    </dl>
+    ${ready
+      ? `<button type="button" class="tool-button primary autonomous-monitor-payment-open" data-autonomous-payment-open="${escapeAttr(checkout.toString())}" data-autonomous-payment-agent="${escapeAttr(agentId)}" data-autonomous-payment-id="${escapeAttr(payment.id)}" ${busy ? "disabled" : ""}><i data-lucide="wallet-cards"></i><span>Payer</span></button>
+        <p class="autonomous-monitor-payment-one-click"><i data-lucide="mouse-pointer-click"></i><span>Un seul clic dans Codex Terminal. Google Pay, la biométrie ou 3D Secure restent affichés seulement si le marchand ou la banque les exige.</span></p>`
+      : `<p class="autonomous-monitor-payment-error"><i data-lucide="shield-alert"></i><span>Demande invalide ou lien non public. Aucun paiement ne peut être ouvert ni confirmé.</span></p>`}
+  </section>`;
+};
+
 const renderAutonomousMonitorReview = (
   agent: AutonomousAgentSnapshot,
   review: AutonomousReviewRequest,
 ): string => {
   const busy = autonomousBusyId === agent.id;
+  const evidenceKey = autonomousReviewEvidenceKey(agent.id, review.id);
+  const visualEvidenceRequired = !!agent.requireVisualReviewEvidence;
+  const visualEvidenceReady = !!review.evidencePath?.trim()
+    && autonomousReviewEvidenceCache.has(evidenceKey);
+  const payment = review.payment ?? null;
+  const paymentReady = !!payment && autonomousPaymentIsReady(payment);
+  const approvalBlocked = (visualEvidenceRequired && !visualEvidenceReady) || (!!payment && !paymentReady);
   const approveLabel = review.externalAction
     ? "Autoriser cette action et reprendre"
     : review.kind === "verification" ? "Valider et reprendre" : "Autoriser et reprendre";
@@ -10256,18 +14433,140 @@ const renderAutonomousMonitorReview = (
   return `<section class="autonomous-monitor-review review-${escapeAttr(review.kind)}">
     <header>
       <span><i data-lucide="shield-question"></i></span>
-      <div><small>${escapeHtml(autonomousReviewKindLabel(review.kind))} requise${review.externalAction ? " · action externe" : ""}</small><h3>${escapeHtml(autonomousMonitorReviewTitle(review))}</h3></div>
+      <div><small>${payment ? "Confirmation financière requise" : `${escapeHtml(autonomousReviewKindLabel(review.kind))} requise${review.externalAction ? " · action externe" : ""}`}</small><h3>${payment ? "L'agent a préparé un paiement" : escapeHtml(autonomousMonitorReviewTitle(review))}</h3></div>
     </header>
     <div class="autonomous-monitor-request">
       <small>Ce que l'agent veut faire</small>
       <p>${escapeHtml(review.request)}</p>
     </div>
-    ${review.externalAction ? `<p class="autonomous-monitor-external-notice"><i data-lucide="unplug"></i><span>Cette autorisation ne vaut que pour l’action décrite et sera consommée après le prochain tour. Les suppressions restent bloquées.</span></p>` : ""}
+    ${payment ? renderAutonomousPaymentRequest(payment, agent.id, busy) : ""}
+    ${renderAutonomousReviewEvidence(agent, review)}
+    ${visualEvidenceRequired && !review.evidencePath?.trim() ? `<p class="autonomous-monitor-review-evidence-error"><i data-lucide="image-off"></i><span><strong>Capture obligatoire avant autorisation</strong><small>L'agent doit fournir le rendu propose dans <code>.codex-proof/</code>.</small></span></p>` : ""}
+    ${payment
+      ? `<p class="autonomous-monitor-external-notice"><i data-lucide="shield-check"></i><span>Le bouton Payer autorise ce checkout exact et l'ouvre. Après ton retour, l'agent vérifiera le reçu du marchand sans considérer le simple clic comme un paiement réussi.</span></p>`
+      : review.externalAction ? `<p class="autonomous-monitor-external-notice"><i data-lucide="unplug"></i><span>Cette autorisation ne vaut que pour l’action décrite et sera consommée après le prochain tour. Les suppressions restent bloquées.</span></p>` : ""}
     ${agent.lastSummary ? `<details><summary>Contexte fourni par l'agent <i data-lucide="chevron-down"></i></summary><p>${escapeHtml(agent.lastSummary)}</p></details>` : ""}
     <label><span>Instruction complémentaire <small>facultatif</small></span><textarea id="autonomousMonitorInstruction" maxlength="2000" placeholder="Précise une limite, une condition ou le résultat attendu…" ${busy ? "disabled" : ""}>${escapeHtml(autonomousMonitorInstructionDraft)}</textarea></label>
     <div class="autonomous-monitor-review-actions">
-      <button type="button" class="tool-button primary" data-autonomous-monitor-review="approveReview" data-autonomous-id="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="check"></i><span>${approveLabel}</span></button>
+      ${payment ? "" : `<button type="button" class="tool-button primary" data-autonomous-monitor-review="approveReview" data-autonomous-id="${escapeAttr(agent.id)}" ${busy || approvalBlocked ? "disabled" : ""}${approvalBlocked ? ` title="La preuve ou la demande doit etre valide avant l'autorisation"` : ""}><i data-lucide="check"></i><span>${approveLabel}</span></button>`}
       <button type="button" class="tool-button" data-autonomous-monitor-review="rejectReview" data-autonomous-id="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="x"></i><span>${rejectLabel}</span></button>
+    </div>
+  </section>`;
+};
+
+const renderAutonomousReports = (
+  agent: AutonomousAgentSnapshot,
+  context: "monitor" | "card" = "card",
+): string => {
+  const reports = autonomousAgentReports(agent);
+  if (!reports.length) return "";
+  const unreadCount = autonomousAgentUnreadReports(agent, autonomousSeenReportIds).length;
+  const isProjectRadar = autonomousAgentIsProjectRadar(agent);
+  const renderReport = (report: AutonomousAgentReport, latest: boolean): string => {
+    const unread = report.readAt == null && !autonomousSeenReportIds.has(report.id);
+    const radarIdeas = isProjectRadar ? autonomousRadarReportIdeas(report) : [];
+    const content = radarIdeas.length
+      ? `<div class="autonomous-radar-ideas">${radarIdeas.map((idea, ideaIndex) => {
+          const proposal = autonomousRadarIdeaProposal(agent, report, ideaIndex);
+          const implementationAgent = autonomousRadarImplementationAgent(
+            report.id,
+            ideaIndex,
+            autonomousAgents,
+          ) ?? (proposal
+            ? autonomousProposalExecutionAgent(proposal.id, autonomousAgents)
+            : null);
+          const action = implementationAgent
+            ? `<button type="button" class="tool-button autonomous-radar-implement-button autonomous-radar-chat-button" data-autonomous-monitor-open="${escapeAttr(implementationAgent.id)}" aria-label="Aller au chat de l'idée ${ideaIndex + 1}"><i data-lucide="message-square"></i><span>Aller au chat</span></button>`
+            : `<button type="button" class="tool-button primary autonomous-radar-implement-button" data-autonomous-radar-implement="${escapeAttr(agent.id)}" data-autonomous-radar-report="${escapeAttr(report.id)}" data-autonomous-radar-idea="${ideaIndex}" aria-label="Implémenter l'idée ${ideaIndex + 1}"><i data-lucide="wrench"></i><span>Implémenter</span></button>`;
+          return `<section class="autonomous-radar-idea">
+            <p>${escapeHtml(idea)}</p>
+            ${action}
+          </section>`;
+        }).join("")}</div>`
+      : `<p>${escapeHtml(report.content)}</p>`;
+    const markSeen = unread
+      ? `<button type="button" class="tool-button" data-autonomous-report-seen="${escapeAttr(report.id)}"><i data-lucide="check-check"></i><span>Marquer comme lu</span></button>`
+      : `<span class="autonomous-report-read"><i data-lucide="check"></i>Lu</span>`;
+    if (latest) {
+      return `<article class="autonomous-report-latest ${unread ? "is-unread" : ""}">
+        <header><div><small>Tour #${report.runCount}</small><time>${escapeHtml(formatAutonomousTimestamp(report.createdAt))}</time></div>${markSeen}</header>
+        ${content}
+      </article>`;
+    }
+    return `<details class="autonomous-report-history-item ${unread ? "is-unread" : ""}">
+      <summary><span><strong>Compte rendu du tour #${report.runCount}</strong><small>${escapeHtml(formatAutonomousTimestamp(report.createdAt))}</small></span><span>${unread ? "Nouveau" : "Lu"}<i data-lucide="chevron-down"></i></span></summary>
+      <div>${content}${markSeen}</div>
+    </details>`;
+  };
+  const heading = `<span><i data-lucide="${agent.systemManaged ? "list-filter" : "inbox"}"></i></span><div><small>${agent.systemManaged ? "Synthèses classées par priorité" : "Résultats remis à l'utilisateur"}</small><strong>${unreadCount ? `${unreadCount} nouveau${unreadCount > 1 ? "x" : ""} compte${unreadCount > 1 ? "s" : ""} rendu${unreadCount > 1 ? "s" : ""}` : agent.systemManaged ? "Dernier compte rendu général" : "Dernier compte rendu"}</strong></div><b>${reports.length}</b>`;
+  const content = `${renderReport(reports[0], true)}
+    ${reports.length > 1 ? `<details class="autonomous-report-history"><summary>Historique des ${reports.length - 1} compte${reports.length > 2 ? "s" : ""} rendu${reports.length > 2 ? "s" : ""}<i data-lucide="chevron-down"></i></summary><div>${reports.slice(1).map((report) => renderReport(report, false)).join("")}</div></details>` : ""}`;
+  if (context === "monitor") {
+    const disclosureKey = `reports:${agent.id}`;
+    return `<details class="autonomous-reports autonomous-reports-monitor" data-autonomous-monitor-section="${escapeAttr(disclosureKey)}"${autonomousMonitorDisclosureAttribute(disclosureKey, unreadCount > 0)}>
+      <summary>${heading}<i class="autonomous-monitor-disclosure-chevron" data-lucide="chevron-down"></i></summary>
+      <div class="autonomous-reports-content">${content}</div>
+    </details>`;
+  }
+  return `<section class="autonomous-reports autonomous-reports-${context}">
+    <header>${heading}</header>
+    ${content}
+  </section>`;
+};
+
+const renderAutonomousUnreadInbox = (): string => {
+  const deliveries = autonomousReportDeliveries(true);
+  if (!deliveries.length) return "";
+  const rows = deliveries.slice(0, 6).map(({ agent, report }) => `
+    <button type="button" data-autonomous-report-open="${escapeAttr(agent.id)}" data-autonomous-report-id="${escapeAttr(report.id)}">
+      <span><i data-lucide="sparkles"></i></span>
+      <span><small>Nouveau compte rendu · tour #${report.runCount}</small><strong>${escapeHtml(agent.name || agent.objective)}</strong><p>${escapeHtml(autonomousReportPreview(report.content))}</p></span>
+      <time>${escapeHtml(formatAutonomousTimestamp(report.createdAt))}</time>
+      <i data-lucide="arrow-up-right"></i>
+    </button>`).join("");
+  return `<details class="autonomous-report-inbox">
+    <summary><span><i data-lucide="inbox"></i></span><strong>${deliveries.length} nouveau${deliveries.length > 1 ? "x" : ""} résultat${deliveries.length > 1 ? "s" : ""}</strong><b>${deliveries.length}</b><i data-lucide="chevron-down"></i></summary>
+    <div>${rows}</div>
+    ${deliveries.length > 6 ? `<small>Et ${deliveries.length - 6} autre${deliveries.length - 6 > 1 ? "s" : ""} compte${deliveries.length - 6 > 1 ? "s" : ""} rendu${deliveries.length - 6 > 1 ? "s" : ""} dans le moniteur.</small>` : ""}
+  </details>`;
+};
+
+const renderAutonomousProposalsTab = (): string => {
+  const deliveries = autonomousProposalDeliveries();
+  const pending = deliveries.filter(({ executionAgent }) => !executionAgent).length;
+  const launched = deliveries.length - pending;
+  const sources = new Set(deliveries.map(({ agent }) => agent.id)).size;
+  const rows = deliveries.map(({ agent, proposal, executionAgent }) => {
+    const busy = autonomousBusyId === `proposal:${proposal.id}`;
+    const project = agent.projectDir?.trim() || "Sans environnement";
+    return `<article class="autonomous-proposal-card ${executionAgent ? "is-executed" : ""}">
+      <header>
+        <span class="autonomous-proposal-icon"><i data-lucide="lightbulb"></i></span>
+        <div>
+          <small>${escapeHtml(agent.name || "Agent autonome")} · tour #${proposal.runCount}</small>
+          <h3>${escapeHtml(proposal.title)}</h3>
+        </div>
+        <time>${escapeHtml(formatAutonomousTimestamp(proposal.createdAt))}</time>
+      </header>
+      <p>${escapeHtml(proposal.objective)}</p>
+      <footer>
+        <span title="${escapeAttr(project)}"><i data-lucide="folder-open"></i>${escapeHtml(project)}</span>
+        ${executionAgent
+          ? `<span class="autonomous-proposal-executed"><i data-lucide="circle-check"></i><span><small>Agent lancé</small><strong>${escapeHtml(executionAgent.name || executionAgent.objective)}</strong></span></span>
+            <button type="button" class="tool-button" data-autonomous-monitor-open="${escapeAttr(executionAgent.id)}"><i data-lucide="panel-right-open"></i><span>Voir l’agent</span></button>`
+          : `<button type="button" class="tool-button primary" data-autonomous-proposal-execute="${escapeAttr(agent.id)}" data-autonomous-proposal-id="${escapeAttr(proposal.id)}" ${busy || autonomousBusyId ? "disabled" : ""}><i data-lucide="${busy ? "loader-circle" : "play"}"></i><span>${busy ? "Lancement…" : "Exécuter"}</span></button>`}
+      </footer>
+    </article>`;
+  }).join("");
+  return `<section id="autonomousProposals" class="autonomous-proposals-panel" role="tabpanel" aria-labelledby="autonomousProposalsTab">
+    <header class="autonomous-proposals-hero">
+      <div><span><i data-lucide="list-checks"></i></span><div><small>Actions proposées librement par les agents</small><h2>Propositions des agents</h2><p>Un clic lance un agent dédié dans le même projet, avec validation humaine avant toute modification.</p></div></div>
+      <dl><div><dt>À décider</dt><dd>${pending}</dd></div><div><dt>Lancées</dt><dd>${launched}</dd></div><div><dt>Sources</dt><dd>${sources}</dd></div></dl>
+    </header>
+    <div class="autonomous-proposal-list">
+      ${!autonomousAgentsLoaded
+        ? `<div class="autonomous-empty"><i data-lucide="loader-circle"></i><strong>Chargement des propositions…</strong></div>`
+        : rows || `<div class="autonomous-proposals-empty"><span><i data-lucide="lightbulb"></i></span><strong>Aucune proposition pour le moment</strong><p>Radar projet et les autres agents peuvent publier ici une liste d’actions concrètes quand ils détectent une opportunité utile.</p></div>`}
     </div>
   </section>`;
 };
@@ -10276,7 +14575,8 @@ const renderAutonomousMonitorLive = (agent: AutonomousAgentSnapshot | null): str
   if (!agent) {
     return `<div class="autonomous-monitor-empty"><i data-lucide="bot"></i><strong>Aucun agent autonome</strong><p>Crée un agent pour suivre son travail depuis n'importe quelle page.</p><button type="button" class="tool-button primary" data-autonomous-monitor-page><i data-lucide="plus"></i><span>Créer un agent</span></button></div>`;
   }
-  if (agent.pendingReview) return renderAutonomousMonitorReview(agent, agent.pendingReview);
+  const reports = renderAutonomousReports(agent, "monitor");
+  if (agent.pendingReview) return `${renderAutonomousMonitorReview(agent, agent.pendingReview)}${reports}`;
 
   const turn = autonomousMonitorTurnAgentId === agent.id
     && autonomousMonitorTurn?.id === agent.currentTurnId
@@ -10296,29 +14596,29 @@ const renderAutonomousMonitorLive = (agent: AutonomousAgentSnapshot | null): str
       <header><span class="autonomous-monitor-stage-icon"><i data-lucide="flask-conical"></i></span><div><small>Validation automatique</small><h3>Le test réel est en cours</h3></div><span class="autonomous-monitor-pulse"><i></i><i></i><i></i></span></header>
       ${agent.testCommand ? `<code>${escapeHtml(agent.testCommand)}</code>` : ""}
       <p>Le moteur attend le résultat avant de décider si l'objectif est réellement terminé.</p>
-    </section>`;
+    </section>${reports}`;
   }
   if (agent.currentStartId != null || agent.currentTurnId != null) {
     return `<section class="autonomous-monitor-stage is-running">
       <header><span class="autonomous-monitor-stage-icon"><i data-lucide="bot"></i></span><div><small>Activité en direct</small><h3>${waitingForInput ? "L'agent attend une vérification" : agent.currentTurnId != null ? `Tour #${agent.currentTurnId} en cours` : "Démarrage du tour"}</h3></div><span class="autonomous-monitor-pulse"><i></i><i></i><i></i></span></header>
       ${waitingForInput ? `<p class="autonomous-monitor-inline-warning"><i data-lucide="circle-alert"></i><span>Ouvre l'action ci-dessous pour voir exactement ce que l'agent demande.</span></p>` : ""}
       ${liveParts || `<div class="autonomous-monitor-loading"><span></span><p>Connexion au flux d'activité…</p></div>`}
-    </section>`;
+    </section>${reports}`;
   }
   if (agent.status === "needs_attention") {
     const busy = autonomousBusyId === agent.id;
     return `<section class="autonomous-monitor-stage needs-attention">
       <header><span class="autonomous-monitor-stage-icon"><i data-lucide="triangle-alert"></i></span><div><small>Intervention nécessaire</small><h3>L'agent ne peut plus avancer seul</h3></div></header>
       <p>${escapeHtml(agent.lastError || "Ajoute une instruction avant de relancer l'agent.")}</p>
-      ${agent.lastSummary ? `<div class="autonomous-monitor-summary"><small>Dernier compte rendu</small><p>${escapeHtml(agent.lastSummary)}</p></div>` : ""}
+      ${!reports && agent.lastSummary ? `<div class="autonomous-monitor-summary"><small>Dernier compte rendu</small><p>${escapeHtml(agent.lastSummary)}</p></div>` : ""}
       <label><span>Instruction pour la reprise</span><textarea id="autonomousMonitorInstruction" maxlength="2000" placeholder="Explique comment contourner le blocage…" ${busy ? "disabled" : ""}>${escapeHtml(autonomousMonitorInstructionDraft)}</textarea></label>
       <button type="button" class="tool-button primary" data-autonomous-monitor-action="resume" data-autonomous-id="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="play"></i><span>Ajouter l'instruction et reprendre</span></button>
-    </section>`;
+    </section>${reports}`;
   }
   const lastTestTone = agent.testStatus === "passed" ? "passed" : agent.testStatus === "failed" ? "failed" : "idle";
   return `<section class="autonomous-monitor-stage stage-${escapeAttr(agent.status)}">
     <header><span class="autonomous-monitor-stage-icon"><i data-lucide="${agent.status === "completed" ? "badge-check" : agent.status === "paused" ? "pause" : "clock-3"}"></i></span><div><small>${escapeHtml(autonomousStatusLabel(agent.status))}</small><h3>${escapeHtml(formatAutonomousSchedule(agent))}</h3></div></header>
-    ${agent.lastSummary ? `<div class="autonomous-monitor-summary"><small>Dernier compte rendu</small><p>${escapeHtml(agent.lastSummary)}</p></div>` : `<p>L'agent n'a pas encore produit de compte rendu.</p>`}
+    ${reports || (agent.lastSummary ? `<div class="autonomous-monitor-summary"><small>Dernier compte rendu</small><p>${escapeHtml(agent.lastSummary)}</p></div>` : `<p>L'agent n'a pas encore produit de compte rendu.</p>`)}
     ${agent.testCommand ? `<details class="autonomous-monitor-test test-${lastTestTone}"><summary><span><i data-lucide="flask-conical"></i>Dernière validation : ${escapeHtml(autonomousTestStatusLabel(agent.testStatus))}</span><i data-lucide="chevron-down"></i></summary><code>${escapeHtml(agent.testCommand)}</code>${agent.lastTestOutput ? `<pre>${escapeHtml(agent.lastTestOutput)}</pre>` : ""}</details>` : ""}
   </section>`;
 };
@@ -10326,14 +14626,17 @@ const renderAutonomousMonitorLive = (agent: AutonomousAgentSnapshot | null): str
 const renderAutonomousMonitor = (): string => {
   if (activeView === "orchestration") return "";
   const attention = autonomousAgents.filter((agent) => agent.pendingReview || agent.status === "needs_attention");
+  const unreadReports = autonomousReportDeliveries(true);
   const running = autonomousAgents.filter(autonomousAgentIsRunning);
   const active = autonomousAgents.filter((agent) => agent.status === "active");
   const selected = selectedAutonomousMonitorAgent();
-  const launcherTone = attention.length ? "attention" : running.length ? "running" : active.length ? "active" : "idle";
+  const launcherTone = attention.length ? "attention" : unreadReports.length ? "report" : running.length ? "running" : active.length ? "active" : "idle";
   const launcherTitle = !autonomousAgentsLoaded
     ? "Chargement des agents"
     : attention.length
-      ? `${attention.length} vérification${attention.length > 1 ? "s" : ""} requise${attention.length > 1 ? "s" : ""}`
+      ? `${attention.length} vérification${attention.length > 1 ? "s" : ""} requise${attention.length > 1 ? "s" : ""}${unreadReports.length ? ` · ${unreadReports.length} nouveau${unreadReports.length > 1 ? "x" : ""} résultat${unreadReports.length > 1 ? "s" : ""}` : ""}`
+      : unreadReports.length
+        ? `${unreadReports.length} nouveau${unreadReports.length > 1 ? "x" : ""} compte${unreadReports.length > 1 ? "s" : ""} rendu${unreadReports.length > 1 ? "s" : ""}`
       : running.length
         ? `${running.length} agent${running.length > 1 ? "s" : ""} travaille${running.length > 1 ? "nt" : ""}`
         : active.length
@@ -10343,10 +14646,11 @@ const renderAutonomousMonitor = (): string => {
             : "Aucun agent configuré";
   const tabs = autonomousAgents.map((agent) => {
     const tone = autonomousStatusTone(agent.status);
+    const unreadForAgent = autonomousAgentUnreadReports(agent, autonomousSeenReportIds).length;
     const selectedTab = agent.id === selected?.id;
-    return `<button type="button" class="autonomous-monitor-agent-tab tone-${tone} ${selectedTab ? "is-selected" : ""}" data-autonomous-monitor-agent="${escapeAttr(agent.id)}" aria-pressed="${selectedTab}">
+    return `<button type="button" class="autonomous-monitor-agent-tab tone-${tone} ${unreadForAgent ? "has-unread-report" : ""} ${selectedTab ? "is-selected" : ""}" data-autonomous-monitor-agent="${escapeAttr(agent.id)}" aria-pressed="${selectedTab}">
       <span><i></i><strong>${escapeHtml(agent.name || agent.objective)}</strong></span>
-      <small>${escapeHtml(agent.pendingReview ? autonomousReviewKindLabel(agent.pendingReview.kind) + " requise" : formatAutonomousSchedule(agent))}</small>
+      <small>${escapeHtml(agent.pendingReview ? autonomousReviewKindLabel(agent.pendingReview.kind) + " requise" : unreadForAgent ? `${unreadForAgent} nouveau${unreadForAgent > 1 ? "x" : ""} compte${unreadForAgent > 1 ? "s" : ""} rendu${unreadForAgent > 1 ? "s" : ""}` : formatAutonomousSchedule(agent))}</small>
     </button>`;
   }).join("");
   const busy = selected && autonomousBusyId === selected.id;
@@ -10361,46 +14665,91 @@ const renderAutonomousMonitor = (): string => {
   const compactToggleLabel = autonomousMonitorCompact
     ? "Agrandir le bouton Agents autonomes"
     : "Réduire le bouton Agents autonomes";
-  return `<div id="autonomousMonitorHost" class="autonomous-monitor-host tone-${launcherTone} ${autonomousMonitorOpen ? "is-open" : ""} ${autonomousMonitorCompact ? "is-compact" : ""}">
+  const agentPickerKey = "agents";
+  const overviewKey = selected ? `overview:${selected.id}` : "";
+  const planKey = selected ? `plan:${selected.id}` : "";
+  const timelineKey = selected ? `timeline:${selected.id}` : "";
+  const actionsKey = selected ? `actions:${selected.id}` : "actions";
+  const workProgress = selected
+    ? autonomousWorkPlanProgress({ workItems: selected.workItems ?? [] })
+    : { done: 0, total: 0 };
+  const timelineCount = selected ? Math.min(selected.events.length, 8) : 0;
+  const runNow = selected?.status === "active" && !selected.systemManaged && !autonomousAgentIsRunning(selected)
+    ? `<button type="button" class="tool-button" data-autonomous-monitor-action="runNow" data-autonomous-id="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="refresh-ccw"></i><span>Exécuter</span></button>`
+    : "";
+  const secondaryActions = `${selected && autonomousAgentCanReschedule(selected) && autonomousScheduleEditingId !== selected.id ? `<button type="button" class="tool-button" data-autonomous-schedule-open="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="calendar-clock"></i><span>Planifier</span></button>` : ""}${selected && !selected.systemManaged ? `<button type="button" class="tool-button" data-autonomous-orchestrate="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="users"></i><span>Orchestrer</span></button>` : ""}${selected && !selected.systemManaged && !deletePending ? `<button type="button" class="tool-button danger" data-autonomous-monitor-delete="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="trash-2"></i><span>Supprimer</span></button>` : ""}<button type="button" class="tool-button" data-autonomous-monitor-page><i data-lucide="panel-right-open"></i><span>Ouvrir la page complète</span></button>`;
+  return `<div id="autonomousMonitorHost" class="autonomous-monitor-host tone-${launcherTone} ${autonomousMonitorOpen ? "is-open" : ""} ${autonomousMonitorCompact ? "is-compact" : ""}" style="--chat-context-sidebar-offset: ${chatContextSidebarWidth(window.innerWidth)}px">
     <div class="autonomous-monitor-launcher-shell">
       <button id="autonomousMonitorLauncher" type="button" aria-expanded="${autonomousMonitorOpen}" aria-controls="autonomousMonitorWindow" aria-label="Suivre les agents autonomes : ${escapeAttr(launcherTitle)}" title="Suivre les agents autonomes">
         <span class="autonomous-monitor-launcher-mark"><i data-lucide="bot"></i><b></b></span>
         <span class="autonomous-monitor-launcher-copy"><small>Agents autonomes</small><strong>${escapeHtml(launcherTitle)}</strong></span>
-        <span class="autonomous-monitor-launcher-count">${attention.length || running.length || active.length || autonomousAgents.length}</span>
+        <span class="autonomous-monitor-launcher-count">${attention.length + unreadReports.length || running.length || active.length || autonomousAgents.length}</span>
       </button>
       <button id="autonomousMonitorCompactToggle" type="button" aria-controls="autonomousMonitorLauncher" aria-pressed="${autonomousMonitorCompact}" aria-label="${compactToggleLabel}" title="${compactToggleLabel}"><i data-lucide="${autonomousMonitorCompact ? "chevron-left" : "chevron-right"}" aria-hidden="true"></i></button>
     </div>
     ${autonomousMonitorOpen ? `<button type="button" class="autonomous-monitor-scrim" data-autonomous-monitor-close aria-label="Fermer le moniteur"></button>
-      <aside id="autonomousMonitorWindow" class="autonomous-monitor-window" role="dialog" aria-modal="false" aria-labelledby="autonomousMonitorTitle">
-        <header class="autonomous-monitor-head">
+      <aside id="autonomousMonitorWindow" class="autonomous-monitor-window ${tabs ? "has-agent-tabs" : "has-no-agent-tabs"}" role="dialog" aria-modal="false" aria-labelledby="autonomousMonitorTitle">
+        <header class="autonomous-monitor-head" data-autonomous-monitor-drag-handle>
           <span class="autonomous-monitor-head-mark"><i data-lucide="activity"></i></span>
-          <div><small>Suivi permanent</small><h2 id="autonomousMonitorTitle">Activité des agents</h2></div>
-          <span class="autonomous-monitor-global-state"><i></i>${running.length ? `${running.length} en cours` : attention.length ? `${attention.length} à vérifier` : "À jour"}</span>
+          <div title="Faire glisser pour déplacer la fenêtre"><small>Suivi permanent</small><h2 id="autonomousMonitorTitle">Agents autonomes</h2></div>
+          <span class="autonomous-monitor-global-state"><i></i>${attention.length ? `${attention.length} à vérifier` : unreadReports.length ? `${unreadReports.length} à lire` : running.length ? `${running.length} en cours` : "À jour"}</span>
           <button type="button" class="icon-button" data-autonomous-monitor-close aria-label="Fermer"><i data-lucide="x"></i></button>
         </header>
-        ${tabs ? `<nav class="autonomous-monitor-agent-tabs" aria-label="Agents autonomes">${tabs}</nav>` : ""}
+        ${selected ? `<div class="autonomous-monitor-focus-bar">
+          ${tabs ? `<details class="autonomous-monitor-agent-picker" data-autonomous-monitor-section="${agentPickerKey}"${autonomousMonitorDisclosureAttribute(agentPickerKey)}>
+            <summary aria-label="Choisir un agent autonome"><i data-lucide="users"></i><span>Agents</span><b>${autonomousAgents.length}</b><i data-lucide="chevron-down"></i></summary>
+            <nav class="autonomous-monitor-agent-tabs" aria-label="Agents autonomes">${tabs}</nav>
+          </details>` : ""}
+          <details class="autonomous-monitor-overview" data-autonomous-monitor-section="${escapeAttr(overviewKey)}"${autonomousMonitorDisclosureAttribute(overviewKey)}>
+            <summary>
+              <span class="autonomous-monitor-overview-tone tone-${autonomousStatusTone(selected.status)}"><i></i></span>
+              <span><strong>${escapeHtml(selected.name || selected.objective)}</strong><small>${escapeHtml(autonomousStatusLabel(selected.status))} · ${escapeHtml(formatAutonomousSchedule(selected))}</small></span>
+              <span class="autonomous-monitor-overview-label"><i data-lucide="info"></i>Infos</span>
+              <i data-lucide="chevron-down"></i>
+            </summary>
+            <section class="autonomous-monitor-agent-head">
+              <div><span class="autonomous-status status-${autonomousStatusTone(selected.status)}"><i></i>${escapeHtml(autonomousStatusLabel(selected.status))}</span>${selected.systemManaged ? `<span class="autonomous-system-managed"><i data-lucide="shield-check"></i>Géré par le système · contrôle horaire</span>` : ""}${selected.requireUserReview ? `<span class="autonomous-review-policy ${selected.approvedReview && !selected.approvedReview.payment ? "is-approved" : ""}"><i data-lucide="shield-check"></i>${selected.approvedReview && !selected.approvedReview.payment ? "Application autorisée" : "Review obligatoire"}</span>` : ""}<h3>${escapeHtml(selected.name || selected.objective)}</h3><p>${escapeHtml(selected.objective)}</p></div>
+              <dl><div><dt>Compte</dt><dd>${escapeHtml(autonomousAccountLabel(selected))}</dd></div><div><dt>Tours</dt><dd>${selected.runCount}</dd></div><div><dt>Test</dt><dd>${escapeHtml(autonomousTestStatusLabel(selected.testStatus))}</dd></div></dl>
+            </section>
+          </details>
+        </div>` : ""}
         <div class="autonomous-monitor-body">
-          ${selected ? `<section class="autonomous-monitor-agent-head">
-            <div><span class="autonomous-status status-${autonomousStatusTone(selected.status)}"><i></i>${escapeHtml(autonomousStatusLabel(selected.status))}</span>${selected.systemManaged ? `<span class="autonomous-system-managed"><i data-lucide="shield-check"></i>Géré par le système · contrôle horaire</span>` : ""}${selected.requireUserReview ? `<span class="autonomous-review-policy ${selected.approvedReview ? "is-approved" : ""}"><i data-lucide="shield-check"></i>${selected.approvedReview ? "Application autorisée" : "Review obligatoire"}</span>` : ""}<h3>${escapeHtml(selected.name || selected.objective)}</h3><p>${escapeHtml(selected.objective)}</p></div>
-            <dl><div><dt>Compte</dt><dd>${escapeHtml(autonomousAccountLabel(selected))}</dd></div><div><dt>Tours</dt><dd>${selected.runCount}</dd></div><div><dt>Test</dt><dd>${escapeHtml(autonomousTestStatusLabel(selected.testStatus))}</dd></div></dl>
-          </section>` : ""}
           ${autonomousMonitorError ? `<p class="autonomous-monitor-error"><i data-lucide="circle-alert"></i><span>${escapeHtml(autonomousMonitorError)}</span></p>` : ""}
           ${selected && autonomousScheduleEditingId === selected.id && autonomousAgentCanReschedule(selected) ? renderAutonomousScheduleEditor(selected) : ""}
           <div id="autonomousMonitorLive">${renderAutonomousMonitorLive(selected)}</div>
-          ${selected ? renderAutonomousWorkPlan(selected, true) : ""}
-          ${selected ? renderAutonomousMonitorTimeline(selected) : ""}
+          ${selected ? `<div class="autonomous-monitor-folds">
+            <details class="autonomous-monitor-disclosure" data-autonomous-monitor-section="${escapeAttr(planKey)}"${autonomousMonitorDisclosureAttribute(planKey)}>
+              <summary><span><i data-lucide="list-checks"></i><span><strong>Plan de travail</strong><small>${workProgress.total ? `${workProgress.done} sur ${workProgress.total} tâches terminées` : "À structurer au prochain tour"}</small></span></span><b>${workProgress.total || "—"}</b><i data-lucide="chevron-down"></i></summary>
+              <div>${renderAutonomousWorkPlan(selected, true)}</div>
+            </details>
+            ${timelineCount ? `<details class="autonomous-monitor-disclosure" data-autonomous-monitor-section="${escapeAttr(timelineKey)}"${autonomousMonitorDisclosureAttribute(timelineKey)}>
+              <summary><span><i data-lucide="list-tree"></i><span><strong>Journal récent</strong><small>${timelineCount} événement${timelineCount > 1 ? "s" : ""} à afficher</small></span></span><b>${timelineCount}</b><i data-lucide="chevron-down"></i></summary>
+              <div>${renderAutonomousMonitorTimeline(selected)}</div>
+            </details>` : ""}
+          </div>` : ""}
         </div>
         ${selected && !selected.systemManaged && deletePending ? `<section class="autonomous-monitor-delete-confirm" role="alert">
-          <div class="autonomous-monitor-delete-copy"><span><i data-lucide="triangle-alert"></i></span><div><strong>Supprimer « ${escapeHtml(selected.name || selected.objective)} » ?</strong><small>${autonomousAgentIsRunning(selected) ? "Son travail en cours sera arrêté. " : ""}Sa configuration, sa mémoire autonome et son historique d'activité seront supprimés. Aucun chat autonome n'est conservé dans Discussions.</small></div></div>
+          <div class="autonomous-monitor-delete-copy"><span><i data-lucide="triangle-alert"></i></span><div><strong>Supprimer « ${escapeHtml(selected.name || selected.objective)} » ?</strong><small>${autonomousAgentIsRunning(selected) ? "Son travail en cours sera arrêté. " : ""}Sa configuration, sa mémoire autonome et son historique d'activité seront supprimés. Aucun chat autonome n'est conservé dans l'historique.</small></div></div>
           <div class="autonomous-monitor-delete-actions">
             <button type="button" class="tool-button danger" data-autonomous-monitor-delete-confirm="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="trash-2"></i><span>Supprimer définitivement</span></button>
             <button type="button" class="tool-button" data-autonomous-monitor-delete-cancel><span>Annuler</span></button>
           </div>
         </section>` : ""}
         <footer class="autonomous-monitor-footer">
-          <div>${lifecycle}${selected?.status === "active" && !selected.systemManaged && !autonomousAgentIsRunning(selected) ? `<button type="button" class="tool-button" data-autonomous-monitor-action="runNow" data-autonomous-id="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="refresh-ccw"></i><span>Exécuter</span></button>` : ""}${selected && autonomousAgentCanReschedule(selected) && autonomousScheduleEditingId !== selected.id ? `<button type="button" class="tool-button" data-autonomous-schedule-open="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="calendar-clock"></i><span>Planifier</span></button>` : ""}${selected && !selected.systemManaged && !deletePending ? `<button type="button" class="tool-button danger" data-autonomous-monitor-delete="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="trash-2"></i><span>Supprimer</span></button>` : ""}</div>
-          <div>${selected && !selected.systemManaged ? `<button type="button" class="tool-button primary" data-autonomous-orchestrate="${escapeAttr(selected.id)}" ${busy ? "disabled" : ""}><i data-lucide="users"></i><span>Orchestrer</span></button>` : ""}<button type="button" class="tool-button" data-autonomous-monitor-page><i data-lucide="panel-right-open"></i><span>Page complète</span></button></div>
+          <div class="autonomous-monitor-primary-actions">${lifecycle}${runNow}${!lifecycle && !runNow ? `<span class="autonomous-monitor-footer-state"><i></i>${selected ? escapeHtml(autonomousStatusLabel(selected.status)) : "Aucun agent"}</span>` : ""}</div>
+          <details class="autonomous-monitor-actions-menu" data-autonomous-monitor-section="${escapeAttr(actionsKey)}"${autonomousMonitorDisclosureAttribute(actionsKey)}>
+            <summary class="tool-button"><i data-lucide="settings-2"></i><span>Actions</span><i data-lucide="chevron-up"></i></summary>
+            <div>${secondaryActions}</div>
+          </details>
         </footer>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="n" title="Redimensionner la fenêtre" aria-hidden="true"></span>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="ne" title="Redimensionner la fenêtre" aria-hidden="true"></span>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="e" title="Redimensionner la fenêtre" aria-hidden="true"></span>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="se" title="Redimensionner la fenêtre" aria-hidden="true"></span>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="s" title="Redimensionner la fenêtre" aria-hidden="true"></span>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="sw" title="Redimensionner la fenêtre" aria-hidden="true"></span>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="w" title="Redimensionner la fenêtre" aria-hidden="true"></span>
+        <span class="autonomous-monitor-resize-handle" data-autonomous-monitor-resize="nw" title="Redimensionner la fenêtre" aria-hidden="true"></span>
       </aside>` : ""}
   </div>`;
 };
@@ -10418,12 +14767,298 @@ const syncAutonomousMonitorLiveUi = () => {
   });
   renderIcons(live);
   bindAutonomousMonitorLiveUi();
+  syncAutonomousMonitorPositionUi();
+};
+
+const AUTONOMOUS_MONITOR_VIEWPORT_GAP = 8;
+const AUTONOMOUS_MONITOR_MIN_WIDTH = 340;
+const AUTONOMOUS_MONITOR_MIN_HEIGHT = 300;
+type AutonomousMonitorResizeDirection = "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "nw";
+
+const autonomousMonitorIsFullscreen = (): boolean =>
+  window.matchMedia("(max-width: 860px)").matches;
+
+const clearAutonomousMonitorPositionStyles = (monitor: HTMLElement): void => {
+  monitor.style.removeProperty("top");
+  monitor.style.removeProperty("right");
+  monitor.style.removeProperty("bottom");
+  monitor.style.removeProperty("left");
+};
+
+const clearAutonomousMonitorSizeStyles = (monitor: HTMLElement): void => {
+  monitor.style.removeProperty("width");
+  monitor.style.removeProperty("height");
+  monitor.classList.remove("has-custom-size");
+};
+
+const persistAutonomousMonitorPosition = (): void => {
+  try {
+    if (autonomousMonitorPosition) {
+      localStorage.setItem(
+        AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY,
+        JSON.stringify(autonomousMonitorPosition),
+      );
+    } else {
+      localStorage.removeItem(AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY);
+    }
+  } catch {
+    // Le déplacement reste utilisable même si le stockage local est indisponible.
+  }
+};
+
+const persistAutonomousMonitorSize = (): void => {
+  try {
+    if (autonomousMonitorSize) {
+      localStorage.setItem(
+        AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY,
+        JSON.stringify(autonomousMonitorSize),
+      );
+    } else {
+      localStorage.removeItem(AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY);
+    }
+  } catch {
+    // Le redimensionnement reste utilisable même si le stockage local est indisponible.
+  }
+};
+
+const syncAutonomousMonitorSizeStyles = (monitor: HTMLElement): void => {
+  if (!autonomousMonitorSize || autonomousMonitorIsFullscreen()) {
+    clearAutonomousMonitorSizeStyles(monitor);
+    return;
+  }
+  monitor.classList.add("has-custom-size");
+  monitor.style.width = `${Math.round(autonomousMonitorSize.width)}px`;
+  monitor.style.height = `${Math.round(autonomousMonitorSize.height)}px`;
+};
+
+const placeAutonomousMonitorWindow = (
+  monitor: HTMLElement,
+  requested: AutonomousMonitorPosition,
+): AutonomousMonitorPosition => {
+  const bounds = monitor.getBoundingClientRect();
+  const reservedContextWidth = chatContextSidebarWidth(window.innerWidth);
+  const maxX = Math.max(
+    AUTONOMOUS_MONITOR_VIEWPORT_GAP,
+    window.innerWidth
+      - reservedContextWidth
+      - bounds.width
+      - AUTONOMOUS_MONITOR_VIEWPORT_GAP,
+  );
+  const maxY = Math.max(
+    AUTONOMOUS_MONITOR_VIEWPORT_GAP,
+    window.innerHeight - bounds.height - AUTONOMOUS_MONITOR_VIEWPORT_GAP,
+  );
+  const next = {
+    x: Math.round(Math.min(maxX, Math.max(AUTONOMOUS_MONITOR_VIEWPORT_GAP, requested.x))),
+    y: Math.round(Math.min(maxY, Math.max(AUTONOMOUS_MONITOR_VIEWPORT_GAP, requested.y))),
+  };
+  monitor.style.top = `${next.y}px`;
+  monitor.style.right = "auto";
+  monitor.style.bottom = "auto";
+  monitor.style.left = `${next.x}px`;
+  return next;
+};
+
+const syncAutonomousMonitorPositionUi = (persist = false): void => {
+  const monitor = document.querySelector<HTMLElement>("#autonomousMonitorWindow");
+  if (!monitor) return;
+  syncAutonomousMonitorSizeStyles(monitor);
+  if (autonomousMonitorIsFullscreen()) {
+    clearAutonomousMonitorPositionStyles(monitor);
+    return;
+  }
+  if (!autonomousMonitorPosition) {
+    clearAutonomousMonitorPositionStyles(monitor);
+    return;
+  }
+  autonomousMonitorPosition = placeAutonomousMonitorWindow(monitor, autonomousMonitorPosition);
+  if (persist) persistAutonomousMonitorPosition();
+};
+
+const bindAutonomousMonitorResizeUi = (): void => {
+  const monitor = document.querySelector<HTMLElement>("#autonomousMonitorWindow");
+  if (!monitor) return;
+
+  monitor.querySelectorAll<HTMLElement>("[data-autonomous-monitor-resize]").forEach((handle) => {
+    let pointerId: number | null = null;
+    let direction: AutonomousMonitorResizeDirection | null = null;
+    let pointerStartX = 0;
+    let pointerStartY = 0;
+    let windowStartLeft = 0;
+    let windowStartTop = 0;
+    let windowStartRight = 0;
+    let windowStartBottom = 0;
+    let resized = false;
+
+    const finishResize = (event: PointerEvent): void => {
+      if (pointerId !== event.pointerId) return;
+      const capturedPointerId = pointerId;
+      pointerId = null;
+      direction = null;
+      monitor.classList.remove("is-resizing");
+      document.body.classList.remove("autonomous-monitor-resizing");
+      if (resized) {
+        persistAutonomousMonitorSize();
+        persistAutonomousMonitorPosition();
+      }
+      if (handle.hasPointerCapture(capturedPointerId)) {
+        handle.releasePointerCapture(capturedPointerId);
+      }
+    };
+
+    handle.addEventListener("pointerdown", (event) => {
+      const requestedDirection = handle.dataset.autonomousMonitorResize as AutonomousMonitorResizeDirection | undefined;
+      if (
+        autonomousMonitorIsFullscreen()
+        || !requestedDirection
+        || !event.isPrimary
+        || event.button !== 0
+      ) {
+        return;
+      }
+      const bounds = monitor.getBoundingClientRect();
+      event.preventDefault();
+      event.stopPropagation();
+      pointerId = event.pointerId;
+      direction = requestedDirection;
+      pointerStartX = event.clientX;
+      pointerStartY = event.clientY;
+      windowStartLeft = bounds.left;
+      windowStartTop = bounds.top;
+      windowStartRight = bounds.right;
+      windowStartBottom = bounds.bottom;
+      resized = false;
+      autonomousMonitorPosition = { x: bounds.left, y: bounds.top };
+      autonomousMonitorSize = { width: bounds.width, height: bounds.height };
+      monitor.classList.add("has-custom-size", "is-resizing");
+      monitor.style.top = `${Math.round(bounds.top)}px`;
+      monitor.style.right = "auto";
+      monitor.style.bottom = "auto";
+      monitor.style.left = `${Math.round(bounds.left)}px`;
+      monitor.style.width = `${Math.round(bounds.width)}px`;
+      monitor.style.height = `${Math.round(bounds.height)}px`;
+      handle.setPointerCapture(event.pointerId);
+      document.body.classList.add("autonomous-monitor-resizing");
+    });
+
+    handle.addEventListener("pointermove", (event) => {
+      if (pointerId !== event.pointerId || !direction) return;
+      const deltaX = event.clientX - pointerStartX;
+      const deltaY = event.clientY - pointerStartY;
+      if (!resized && Math.hypot(deltaX, deltaY) < 3) return;
+      event.preventDefault();
+      resized = true;
+
+      const viewportLeft = AUTONOMOUS_MONITOR_VIEWPORT_GAP;
+      const viewportTop = AUTONOMOUS_MONITOR_VIEWPORT_GAP;
+      const viewportRight = Math.max(viewportLeft, window.innerWidth - AUTONOMOUS_MONITOR_VIEWPORT_GAP);
+      const viewportBottom = Math.max(viewportTop, window.innerHeight - AUTONOMOUS_MONITOR_VIEWPORT_GAP);
+      const minWidth = Math.min(AUTONOMOUS_MONITOR_MIN_WIDTH, viewportRight - viewportLeft);
+      const minHeight = Math.min(AUTONOMOUS_MONITOR_MIN_HEIGHT, viewportBottom - viewportTop);
+      let left = windowStartLeft;
+      let top = windowStartTop;
+      let right = windowStartRight;
+      let bottom = windowStartBottom;
+
+      if (direction.includes("w")) {
+        left = Math.min(windowStartRight - minWidth, Math.max(viewportLeft, windowStartLeft + deltaX));
+      } else if (direction.includes("e")) {
+        right = Math.max(windowStartLeft + minWidth, Math.min(viewportRight, windowStartRight + deltaX));
+      }
+      if (direction.includes("n")) {
+        top = Math.min(windowStartBottom - minHeight, Math.max(viewportTop, windowStartTop + deltaY));
+      } else if (direction.includes("s")) {
+        bottom = Math.max(windowStartTop + minHeight, Math.min(viewportBottom, windowStartBottom + deltaY));
+      }
+
+      const nextPosition = { x: Math.round(left), y: Math.round(top) };
+      const nextSize = {
+        width: Math.round(right - left),
+        height: Math.round(bottom - top),
+      };
+      autonomousMonitorPosition = nextPosition;
+      autonomousMonitorSize = nextSize;
+      monitor.style.top = `${nextPosition.y}px`;
+      monitor.style.left = `${nextPosition.x}px`;
+      monitor.style.width = `${nextSize.width}px`;
+      monitor.style.height = `${nextSize.height}px`;
+    });
+
+    handle.addEventListener("pointerup", finishResize);
+    handle.addEventListener("pointercancel", finishResize);
+    handle.addEventListener("lostpointercapture", finishResize);
+  });
+};
+
+const bindAutonomousMonitorDragUi = (): void => {
+  const monitor = document.querySelector<HTMLElement>("#autonomousMonitorWindow");
+  const handle = monitor?.querySelector<HTMLElement>("[data-autonomous-monitor-drag-handle]");
+  if (!monitor || !handle) return;
+
+  syncAutonomousMonitorPositionUi();
+  let pointerId: number | null = null;
+  let pointerStartX = 0;
+  let pointerStartY = 0;
+  let windowStartX = 0;
+  let windowStartY = 0;
+  let moved = false;
+
+  const finishDrag = (event: PointerEvent): void => {
+    if (pointerId !== event.pointerId) return;
+    const capturedPointerId = pointerId;
+    pointerId = null;
+    monitor.classList.remove("is-dragging");
+    document.body.classList.remove("autonomous-monitor-dragging");
+    if (moved) persistAutonomousMonitorPosition();
+    if (handle.hasPointerCapture(capturedPointerId)) {
+      handle.releasePointerCapture(capturedPointerId);
+    }
+  };
+
+  handle.addEventListener("pointerdown", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (
+      autonomousMonitorIsFullscreen()
+      || !event.isPrimary
+      || event.button !== 0
+      || target?.closest("button, a, input, textarea, select, summary, [data-autonomous-monitor-resize]")
+    ) {
+      return;
+    }
+    const bounds = monitor.getBoundingClientRect();
+    event.preventDefault();
+    pointerId = event.pointerId;
+    pointerStartX = event.clientX;
+    pointerStartY = event.clientY;
+    windowStartX = bounds.left;
+    windowStartY = bounds.top;
+    moved = false;
+    handle.setPointerCapture(event.pointerId);
+    monitor.classList.add("is-dragging");
+    document.body.classList.add("autonomous-monitor-dragging");
+  });
+  handle.addEventListener("pointermove", (event) => {
+    if (pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - pointerStartX;
+    const deltaY = event.clientY - pointerStartY;
+    if (!moved && Math.hypot(deltaX, deltaY) < 3) return;
+    moved = true;
+    autonomousMonitorPosition = placeAutonomousMonitorWindow(monitor, {
+      x: windowStartX + deltaX,
+      y: windowStartY + deltaY,
+    });
+  });
+  handle.addEventListener("pointerup", finishDrag);
+  handle.addEventListener("pointercancel", finishDrag);
+  handle.addEventListener("lostpointercapture", finishDrag);
 };
 
 const syncAutonomousMonitorUi = () => {
   const host = document.querySelector<HTMLElement>("#autonomousMonitorHost");
   if (!host) return;
   const bodyScroll = host.querySelector<HTMLElement>(".autonomous-monitor-body")?.scrollTop ?? 0;
+  document.body.classList.remove("autonomous-monitor-dragging");
+  document.body.classList.remove("autonomous-monitor-resizing");
   host.outerHTML = renderAutonomousMonitor();
   const next = document.querySelector<HTMLElement>("#autonomousMonitorHost");
   if (!next) return;
@@ -10443,6 +15078,71 @@ const openAutonomousMonitor = (agentId?: string | null) => {
   syncAutonomousMonitorUi();
 };
 
+let mobilePaymentHandoffInFlight = false;
+
+const openMobilePaymentHandoff = async (handoff: MobilePaymentHandoff): Promise<void> => {
+  if (mobilePaymentHandoffInFlight) return;
+  mobilePaymentHandoffInFlight = true;
+  try {
+    await refreshAutonomousAgents();
+    const agent = autonomousAgents.find((candidate) => candidate.id === handoff.agentId);
+    const pendingPayment = agent?.pendingReview?.payment;
+    if (agent && pendingPayment?.id === handoff.paymentId && pendingPayment.status === "pending") {
+      statusText = `Validation requise : ${formatAutonomousPaymentAmount(pendingPayment)} chez ${pendingPayment.merchant}`;
+      openAutonomousMonitor(agent.id);
+      return;
+    }
+    if (agent) {
+      statusText = "Cette demande de paiement a deja ete traitee ou remplacee.";
+      openAutonomousMonitor(agent.id);
+      return;
+    }
+    statusText = "La demande de paiement mobile n'est plus disponible sur ce serveur.";
+    setActiveView("autonomous");
+  } catch (error) {
+    statusText = `Handoff de paiement indisponible : ${String(error)}`;
+    setActiveView("autonomous");
+  } finally {
+    mobilePaymentHandoffInFlight = false;
+  }
+};
+
+let mobileAutonomousAgentHandoffInFlight = false;
+
+const openMobileAutonomousAgentHandoff = async (
+  handoff: MobileAutonomousAgentHandoff,
+): Promise<void> => {
+  if (mobileAutonomousAgentHandoffInFlight) return;
+  mobileAutonomousAgentHandoffInFlight = true;
+  try {
+    await refreshAutonomousAgents();
+    const agent = autonomousAgents.find((candidate) => candidate.id === handoff.agentId);
+    if (agent) {
+      statusText = agent.status === "needs_attention"
+        ? `Intervention requise par « ${agent.name || agent.objective} »`
+        : `Nouveau compte rendu de « ${agent.name || agent.objective} »`;
+      openAutonomousMonitor(agent.id);
+      return;
+    }
+    statusText = "Cet agent autonome n’est plus disponible sur ce serveur.";
+    setActiveView("autonomous");
+  } catch (error) {
+    statusText = `Notification mobile indisponible : ${String(error)}`;
+    setActiveView("autonomous");
+  } finally {
+    mobileAutonomousAgentHandoffInFlight = false;
+  }
+};
+
+const bindAutonomousMonitorOpenButtons = (root: ParentNode | null): void => {
+  if (!root) return;
+  root.querySelectorAll<HTMLButtonElement>("[data-autonomous-monitor-open]").forEach((button) => {
+    if (button.dataset.autonomousMonitorOpenBound === "1") return;
+    button.dataset.autonomousMonitorOpenBound = "1";
+    button.addEventListener("click", () => openAutonomousMonitor(button.dataset.autonomousMonitorOpen));
+  });
+};
+
 const closeAutonomousMonitor = () => {
   autonomousMonitorOpen = false;
   autonomousMonitorError = "";
@@ -10454,12 +15154,170 @@ const closeAutonomousMonitor = () => {
   document.querySelector<HTMLButtonElement>("#autonomousMonitorLauncher")?.focus();
 };
 
+const executeAutonomousProposal = async (
+  sourceAgentId: string,
+  proposalId: string,
+): Promise<void> => {
+  if (autonomousBusyId) return;
+  const sourceAgent = autonomousAgents.find((agent) => agent.id === sourceAgentId);
+  const proposal = sourceAgent
+    ? autonomousAgentProposals(sourceAgent).find((candidate) => candidate.id === proposalId)
+    : null;
+  if (!sourceAgent || sourceAgent.systemManaged || !proposal) {
+    statusText = "Proposition autonome introuvable";
+    render();
+    return;
+  }
+  const existing = autonomousProposalExecutionAgent(proposal.id, autonomousAgents);
+  if (existing) {
+    openAutonomousMonitor(existing.id);
+    return;
+  }
+
+  autonomousBusyId = `proposal:${proposal.id}`;
+  statusText = `Lancement de « ${proposal.title} »`;
+  render();
+  try {
+    const created = await invoke<AutonomousAgentSnapshot>("create_autonomous_agent", {
+      request: {
+        name: `Exécution · ${proposal.title}`.slice(0, 120),
+        objective: `Exécute la proposition validée ci-dessous dans le projet. Vérifie d'abord le constat dans l'état actuel, puis réalise la plus petite solution complète et sûre. Préserve les changements existants, ajoute ou adapte les validations pertinentes et consigne une preuve claire du résultat. Si le constat n'est plus vrai, ne modifie rien et explique précisément pourquoi.\n\nPROPOSITION VALIDÉE PAR L'UTILISATEUR\n${proposal.objective}`,
+        role: "Agent d'exécution chargé d'appliquer une proposition choisie par l'utilisateur, de façon ciblée, testée et réversible.",
+        sourceProposalId: proposal.id,
+        accountId: sourceAgent.accountId,
+        projectDir: sourceAgent.projectDir?.trim() || null,
+        mode: "build",
+        requireUserReview: true,
+        connectors: [],
+        model: sourceAgent.model?.trim() || null,
+        reasoningEffort: sourceAgent.reasoningEffort?.trim() || null,
+        intervalSeconds: 15 * 60,
+        triggerKind: "schedule",
+        watchPaths: [],
+        debounceSeconds: 10,
+        allowGitPublish: false,
+        initialMemory: `Mission issue de la proposition ${proposal.id}, publiée par « ${sourceAgent.name || sourceAgent.objective} » au tour #${proposal.runCount}${proposal.reportId ? ` dans le rapport ${proposal.reportId}` : ""}. Ne pas élargir la mission à d'autres propositions.`,
+        testCommand: null,
+        testTimeoutSeconds: 5 * 60,
+      },
+    });
+    updateAutonomousAgentLocally(created);
+    statusText = `Proposition lancée avec l’agent « ${created.name} »`;
+    startAutonomousAgentsPoll();
+  } catch (error) {
+    statusText = `Proposition non lancée : ${String(error)}`;
+  } finally {
+    autonomousBusyId = null;
+    render();
+    void refreshAutonomousAgents();
+  }
+};
+
+const prepareAutonomousRadarImplementation = (
+  agentId: string,
+  reportId: string,
+  ideaIndex: number,
+): void => {
+  const agent = autonomousAgents.find((candidate) => candidate.id === agentId);
+  const report = agent ? autonomousAgentReports(agent).find((candidate) => candidate.id === reportId) : null;
+  const idea = report ? autonomousRadarReportIdeas(report)[ideaIndex]?.trim() : "";
+  if (!agent || !report || !autonomousAgentIsProjectRadar(agent) || !idea) {
+    statusText = "Idée Radar introuvable";
+    if (activeView === "autonomous") render();
+    else syncAutonomousMonitorUi();
+    return;
+  }
+
+  const proposal = autonomousRadarIdeaProposal(agent, report, ideaIndex);
+  const implementationAgent = autonomousRadarImplementationAgent(
+    report.id,
+    ideaIndex,
+    autonomousAgents,
+  ) ?? (proposal
+    ? autonomousProposalExecutionAgent(proposal.id, autonomousAgents)
+    : null);
+  if (implementationAgent) {
+    if (report.readAt == null && !autonomousSeenReportIds.has(report.id)) {
+      void markAutonomousReportSeen(report.id).catch(() => undefined);
+    }
+    openAutonomousMonitor(implementationAgent.id);
+    return;
+  }
+
+  const projectDir = agent.projectDir?.trim() || currentWorkspace() || "";
+  const knownEnvironment = projectDir
+    ? knownWorkspaces().some((workspace) => workspaceIdForPath(workspace.path) === workspaceIdForPath(projectDir))
+    : false;
+  autonomousTemplateId = null;
+  autonomousRadarSourceDraft = {
+    reportId: report.id,
+    ideaIndex,
+    proposalId: proposal?.id ?? null,
+  };
+  autonomousNameDraft = `Implémentation Radar · ${autonomousReportPreview(idea, 78)}`.slice(0, 120);
+  autonomousRoleDraft = "Ingénieur logiciel chargé d'implémenter une idée validée, avec une modification ciblée, testée et réversible.";
+  autonomousObjectiveDraft = `Implémente l'idée validée ci-dessous dans le projet. Vérifie d'abord le constat dans le code, puis applique la plus petite solution complète et sûre. Préserve les changements existants, ajoute ou adapte les tests pertinents et exécute-les. Si le constat n'est plus vrai, ne modifie rien et explique-le dans le compte rendu.\n\nIDÉE VALIDÉE PAR L'UTILISATEUR\n${idea}`;
+  autonomousInitialMemoryDraft = `Cette mission vient de l'idée #${ideaIndex + 1} du compte rendu Radar ${report.id}, tour #${report.runCount}. L'utilisateur a explicitement choisi cette idée. Ne pas élargir la mission à d'autres suggestions du même compte rendu.`;
+  autonomousAccountId = agent.accountId;
+  autonomousProjectDir = projectDir;
+  autonomousEnvironmentCustom = Boolean(projectDir) && !knownEnvironment;
+  autonomousIntervalSeconds = 15 * 60;
+  autonomousTriggerKind = "schedule";
+  autonomousWatchPathsDraft = "src\npublic\nindex.html\npackage.json";
+  autonomousDebounceSeconds = 10;
+  autonomousAllowGitPublish = false;
+  autonomousMode = "build";
+  autonomousLaunchMode = "autonomous";
+  autonomousRequireUserReview = true;
+  autonomousConnectors = [];
+  autonomousTestCommandDraft = "";
+  autonomousTestTimeoutSeconds = 5 * 60;
+  autonomousCreateOpen = true;
+  autonomousCreatePreferenceSet = true;
+  autonomousCreateOptionsOpen = false;
+  autonomousOverviewOpen = false;
+  autonomousTemplatesOpen = false;
+
+  if (report.readAt == null && !autonomousSeenReportIds.has(report.id)) {
+    void markAutonomousReportSeen(report.id).catch(() => undefined);
+  }
+  if (autonomousMonitorOpen) closeAutonomousMonitor();
+  setActiveView("autonomous");
+  statusText = "Idée Radar prête à être implémentée ; vérifie la mission puis démarre l'agent";
+  const toast = document.querySelector<HTMLElement>(".chat-status-toast");
+  if (toast) toast.textContent = statusText;
+  window.setTimeout(() => {
+    document.querySelector<HTMLDetailsElement>("#autonomousCreateShell")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+    document.querySelector<HTMLTextAreaElement>("#autonomousObjective")?.focus();
+  }, 0);
+};
+
+const bindAutonomousRadarImplementationButtons = (root: ParentNode | null): void => {
+  if (!root) return;
+  root.querySelectorAll<HTMLButtonElement>("[data-autonomous-radar-implement]").forEach((button) => {
+    if (button.dataset.autonomousRadarBound === "1") return;
+    button.dataset.autonomousRadarBound = "1";
+    button.addEventListener("click", () => {
+      const agentId = button.dataset.autonomousRadarImplement;
+      const reportId = button.dataset.autonomousRadarReport;
+      const ideaIndex = Number(button.dataset.autonomousRadarIdea);
+      if (!agentId || !reportId || !Number.isInteger(ideaIndex) || ideaIndex < 0) return;
+      prepareAutonomousRadarImplementation(agentId, reportId, ideaIndex);
+    });
+  });
+};
+
 const controlAutonomousAgentFromMonitor = async (
   id: string,
   action: AutonomousAgentAction,
-) => {
-  if (autonomousBusyId) return;
-  if (autonomousAgents.find((agent) => agent.id === id)?.systemManaged) return;
+): Promise<boolean> => {
+  if (autonomousBusyId) return false;
+  const target = autonomousAgents.find((agent) => agent.id === id);
+  if (target?.systemManaged) return false;
+  const paymentId = target?.pendingReview?.payment?.id;
   autonomousBusyId = id;
   autonomousMonitorError = "";
   syncAutonomousMonitorUi();
@@ -10472,11 +15330,19 @@ const controlAutonomousAgentFromMonitor = async (
       });
       updateAutonomousAgentLocally(withMemory);
     }
-    const updated = await invoke<AutonomousAgentSnapshot>("control_autonomous_agent", { id, action });
+    const updated = await invoke<AutonomousAgentSnapshot>("control_autonomous_agent", {
+      id,
+      action,
+      paymentId,
+    });
     updateAutonomousAgentLocally(updated);
     autonomousMonitorInstructionDraft = "";
     statusText = action === "approveReview"
       ? "Demande autorisée ; l'agent reprend son travail"
+      : action === "authorizePayment"
+        ? "Checkout autorisé ; ouverture du marchand et vérification du reçu planifiée"
+      : action === "confirmPayment"
+        ? "Paiement confirmé ; l'agent reprend sans accès au moyen de paiement"
       : action === "rejectReview"
         ? "Demande refusée ; l'agent cherche une alternative"
         : action === "pause"
@@ -10484,12 +15350,57 @@ const controlAutonomousAgentFromMonitor = async (
           : action === "resume"
             ? "Agent autonome repris"
             : "Exécution autonome planifiée";
+    return true;
   } catch (error) {
     autonomousMonitorError = String(error);
+    return false;
   } finally {
     autonomousBusyId = null;
     if (activeView === "autonomous") render();
-    else syncAutonomousMonitorUi();
+    else {
+      if (activeView === "bug-report") syncBugReportPanelUi();
+      syncAutonomousMonitorUi();
+    }
+    void refreshAutonomousAgents();
+  }
+};
+
+const pauseAllAutonomousAgents = async (): Promise<void> => {
+  if (autonomousBusyId) return;
+  const targets = autonomousAgentsToPause(autonomousAgents);
+  if (!targets.length) {
+    statusText = "Aucun agent utilisateur actif à mettre en pause";
+    render();
+    return;
+  }
+
+  autonomousBusyId = AUTONOMOUS_PAUSE_ALL_BUSY_ID;
+  statusText = `Mise en pause de ${targets.length} agent${targets.length > 1 ? "s" : ""}`;
+  render();
+  try {
+    const results = await Promise.allSettled(
+      targets.map((agent) => invoke<AutonomousAgentSnapshot>("control_autonomous_agent", {
+        id: agent.id,
+        action: "pause",
+      })),
+    );
+    let pausedCount = 0;
+    const failures: string[] = [];
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        pausedCount += 1;
+        updateAutonomousAgentLocally(result.value);
+      } else {
+        failures.push(`${targets[index].name || "Agent autonome"} : ${String(result.reason)}`);
+      }
+    });
+    const pausedLabel = `${pausedCount} agent${pausedCount > 1 ? "s" : ""} mis en pause`;
+    statusText = failures.length
+      ? `${pausedLabel} · ${failures.length} échec${failures.length > 1 ? "s" : ""} (${failures.join(" ; ")})`
+      : pausedLabel;
+  } finally {
+    autonomousBusyId = null;
+    render();
     void refreshAutonomousAgents();
   }
 };
@@ -10499,8 +15410,15 @@ const removeAutonomousAgentLocally = (id: string): void => {
   autonomousAgentsSignature = JSON.stringify(autonomousAgents);
   autonomousAgentsLoaded = true;
   autonomousMemoryDrafts.delete(id);
+  autonomousMessageDrafts.delete(id);
+  autonomousMessageModes.delete(id);
   autonomousScheduleDrafts.delete(id);
   autonomousFrequencyDrafts.delete(id);
+  autonomousExpandedAgentIds.delete(id);
+  autonomousCollapsedAgentCards.delete(id);
+  for (const key of autonomousExpandedAgentSectionKeys) {
+    if (key.startsWith(`${id}:`)) autonomousExpandedAgentSectionKeys.delete(key);
+  }
   if (autonomousScheduleEditingId === id) autonomousScheduleEditingId = null;
   if (autonomousEditingId === id) closeAutonomousAgentEditor();
   autonomousDeletePendingId = null;
@@ -10519,7 +15437,10 @@ const deleteAutonomousAgent = async (id: string) => {
   autonomousBusyId = id;
   autonomousMonitorError = "";
   if (activeView === "autonomous") render();
-  else syncAutonomousMonitorUi();
+  else {
+    if (activeView === "bug-report") syncBugReportPanelUi();
+    syncAutonomousMonitorUi();
+  }
   try {
     await invoke("delete_autonomous_agent", { id });
     removeAutonomousAgentLocally(id);
@@ -10531,7 +15452,10 @@ const deleteAutonomousAgent = async (id: string) => {
   } finally {
     autonomousBusyId = null;
     if (activeView === "autonomous") render();
-    else syncAutonomousMonitorUi();
+    else {
+      if (activeView === "bug-report") syncBugReportPanelUi();
+      syncAutonomousMonitorUi();
+    }
     void refreshAutonomousAgents();
   }
 };
@@ -10645,9 +15569,96 @@ const bindAutonomousScheduleUi = (root: ParentNode | null) => {
   });
 };
 
+const bindAutonomousMonitorDisclosures = (root: ParentNode | null) => {
+  if (!root) return;
+  root.querySelectorAll<HTMLDetailsElement>("details[data-autonomous-monitor-section]").forEach((details) => {
+    if (details.dataset.autonomousMonitorDisclosureBound === "1") return;
+    details.dataset.autonomousMonitorDisclosureBound = "1";
+    details.addEventListener("toggle", () => {
+      const key = details.dataset.autonomousMonitorSection;
+      if (key) autonomousMonitorDisclosureState.set(key, details.open);
+      if (
+        details.open
+        && details.matches(".autonomous-monitor-agent-picker, .autonomous-monitor-actions-menu")
+      ) {
+        document.querySelectorAll<HTMLDetailsElement>(
+          ".autonomous-monitor-agent-picker[open], .autonomous-monitor-actions-menu[open]",
+        ).forEach((other) => {
+          if (other !== details) other.open = false;
+        });
+      }
+    });
+  });
+};
+
 const bindAutonomousMonitorLiveUi = () => {
+  const monitorLive = document.querySelector("#autonomousMonitorLive");
+  bindAutonomousMonitorDisclosures(monitorLive);
+  bindAutonomousRadarImplementationButtons(monitorLive);
+  bindAutonomousMonitorOpenButtons(monitorLive);
+  document.querySelectorAll<HTMLButtonElement>("#autonomousMonitorLive [data-autonomous-report-seen]").forEach((button) => {
+    button.addEventListener("click", () => void (async () => {
+      const reportId = button.dataset.autonomousReportSeen;
+      if (!reportId) return;
+      try {
+        await markAutonomousReportSeen(reportId);
+        const selected = selectedAutonomousMonitorAgent();
+        if (selected && !autonomousAgentUnreadReports(selected, autonomousSeenReportIds).length) {
+          autonomousMonitorDisclosureState.set(`reports:${selected.id}`, false);
+        }
+        statusText = "Compte rendu marqué comme lu";
+      } catch (error) {
+        statusText = String(error);
+      }
+      if (activeView === "autonomous") render();
+      else syncAutonomousMonitorUi();
+    })());
+  });
   document.querySelector<HTMLTextAreaElement>("#autonomousMonitorInstruction")?.addEventListener("input", (event) => {
     autonomousMonitorInstructionDraft = (event.currentTarget as HTMLTextAreaElement).value;
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-autonomous-payment-open]").forEach((button) => {
+    button.addEventListener("click", () => void (async () => {
+      const checkoutUrl = button.dataset.autonomousPaymentOpen;
+      const agentId = button.dataset.autonomousPaymentAgent;
+      const paymentId = button.dataset.autonomousPaymentId;
+      const agent = autonomousAgents.find((candidate) => candidate.id === agentId);
+      const payment = agent?.pendingReview?.payment;
+      if (!checkoutUrl
+        || !agentId
+        || !paymentId
+        || payment?.id !== paymentId
+        || payment.status !== "pending"
+        || !autonomousPaymentCheckoutUrl(checkoutUrl)
+      ) return;
+      const reserveBrowserWindow = !isTauriRuntime() && !hasMobileSettings();
+      const reservedCheckoutWindow = reserveBrowserWindow
+        ? window.open("about:blank", "_blank")
+        : null;
+      if (reserveBrowserWindow && !reservedCheckoutWindow) {
+        statusText = "Le navigateur a bloqué l'ouverture du paiement.";
+        syncAutonomousMonitorUi();
+        return;
+      }
+      if (reservedCheckoutWindow) reservedCheckoutWindow.opener = null;
+      button.disabled = true;
+      try {
+        const authorized = await controlAutonomousAgentFromMonitor(agentId, "authorizePayment");
+        if (!authorized) {
+          reservedCheckoutWindow?.close();
+          return;
+        }
+        if (reservedCheckoutWindow) reservedCheckoutWindow.location.replace(checkoutUrl);
+        else await openExternalHttpsUrl(checkoutUrl);
+        statusText = "Checkout marchand ouvert ; utilise Google Pay s'il est proposé. Le reçu sera vérifié automatiquement.";
+      } catch (error) {
+        reservedCheckoutWindow?.close();
+        statusText = String(error);
+      } finally {
+        button.disabled = false;
+      }
+      syncAutonomousMonitorUi();
+    })());
   });
   document.querySelectorAll<HTMLButtonElement>("[data-autonomous-monitor-review]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -10673,6 +15684,11 @@ const bindAutonomousMonitorLiveUi = () => {
 };
 
 const bindAutonomousMonitorUi = () => {
+  document.querySelectorAll<HTMLElement>("[data-autonomous-review-evidence-agent]").forEach((element) => {
+    const agentId = element.dataset.autonomousReviewEvidenceAgent;
+    const reviewId = element.dataset.autonomousReviewEvidenceId;
+    if (agentId && reviewId) void loadAutonomousReviewEvidence(agentId, reviewId);
+  });
   document.querySelector<HTMLButtonElement>("#autonomousMonitorLauncher")?.addEventListener("click", () => openAutonomousMonitor());
   document.querySelector<HTMLButtonElement>("#autonomousMonitorCompactToggle")?.addEventListener("click", () => {
     autonomousMonitorCompact = !autonomousMonitorCompact;
@@ -10686,6 +15702,7 @@ const bindAutonomousMonitorUi = () => {
   document.querySelectorAll<HTMLButtonElement>("[data-autonomous-monitor-agent]").forEach((button) => {
     button.addEventListener("click", () => {
       autonomousMonitorAgentId = button.dataset.autonomousMonitorAgent ?? null;
+      autonomousMonitorDisclosureState.set("agents", false);
       autonomousMonitorInstructionDraft = "";
       autonomousMonitorError = "";
       autonomousMonitorTurn = null;
@@ -10734,7 +15751,10 @@ const bindAutonomousMonitorUi = () => {
     });
   });
   bindAutonomousMonitorLiveUi();
+  bindAutonomousMonitorDisclosures(document.querySelector("#autonomousMonitorWindow"));
   bindAutonomousScheduleUi(document.querySelector("#autonomousMonitorWindow"));
+  bindAutonomousMonitorResizeUi();
+  bindAutonomousMonitorDragUi();
 };
 
 const renderAutonomousWorkPlan = (
@@ -10799,6 +15819,9 @@ const autonomousAgentEditDraftFromSnapshot = (
       ? reasoningEffortForChatModel(account, model, agent.reasoningEffort)
       : "",
     connectors: normalizeAutonomousConnectors(agent.connectors),
+    mobileNotificationsEnabled: !!agent.mobileNotificationsEnabled,
+    telegramNotificationChannelId: agent.telegramNotificationChannelId?.trim() || null,
+    whatsappNotificationChannelId: agent.whatsappNotificationChannelId?.trim() || null,
     intervalSeconds: agent.intervalSeconds,
     triggerKind: agent.triggerKind ?? "schedule",
     watchPaths: (agent.watchPaths ?? []).join("\n"),
@@ -10819,13 +15842,23 @@ const renderAutonomousAgentEditor = (
   const account = accountById(draft.accountId);
   const provider = accountProvider(account);
   const connectorsSupported = !!account && provider === "codex";
+  const currentTelegramChannel = connectedTelegramChannelId();
+  const telegramNotificationsEnabled = Boolean(draft.telegramNotificationChannelId);
+  const telegramChannelStale = telegramNotificationsEnabled
+    && draft.telegramNotificationChannelId !== currentTelegramChannel;
+  const telegramToggleDisabled = busy || (!currentTelegramChannel && !telegramNotificationsEnabled);
+  const currentWhatsAppChannel = connectedWhatsAppChannelId();
+  const whatsappNotificationsEnabled = Boolean(draft.whatsappNotificationChannelId);
+  const whatsappChannelStale = whatsappNotificationsEnabled
+    && draft.whatsappNotificationChannelId !== currentWhatsAppChannel;
+  const whatsappToggleDisabled = busy || (!currentWhatsAppChannel && !whatsappNotificationsEnabled);
   const disabled = busy ? "disabled" : "";
   const intervalMinutes = Number((Math.max(60, draft.intervalSeconds) / 60).toFixed(2));
   const environmentListId = `autonomousEditEnvironments-${agent.id}`;
   const environmentOptions = knownWorkspaces()
     .map((workspace) => `<option value="${escapeAttr(workspace.path)}">${escapeHtml(workspace.label)}</option>`)
     .join("");
-  const modelSuggestions = (provider === "claude" ? CLAUDE_MODEL_SUGGESTIONS : CODEX_MODEL_SUGGESTIONS)
+  const modelSuggestions = modelSuggestionsForAccount(account)
     .map((model) => `<option value="${escapeAttr(model)}"></option>`)
     .join("");
   const effortValues = provider === "codex"
@@ -10871,8 +15904,8 @@ const renderAutonomousAgentEditor = (
         ${draft.triggerKind === "schedule"
           ? `<label><span>Fréquence</span><span class="autonomous-agent-edit-unit"><input data-autonomous-edit-field="intervalMinutes" type="number" min="1" max="10080" step="any" required value="${intervalMinutes}" ${disabled} /><small>minutes</small></span></label>`
           : `<label><span>Stabilisation</span><span class="autonomous-agent-edit-unit"><input data-autonomous-edit-field="debounceSeconds" type="number" min="2" max="600" step="1" required value="${draft.debounceSeconds}" ${disabled} /><small>secondes</small></span></label>`}
-        <label><span>Modèle</span><input data-autonomous-edit-field="model" list="autonomousEditModels-${escapeAttr(agent.id)}" maxlength="160" required value="${escapeAttr(draft.model)}" placeholder="${provider === "claude" ? "sonnet" : DEFAULT_CODEX_MODEL}" ${disabled} /><datalist id="autonomousEditModels-${escapeAttr(agent.id)}">${modelSuggestions}</datalist></label>
-        ${provider === "codex" ? `<label><span>Effort de raisonnement</span><select data-autonomous-edit-field="reasoningEffort" ${disabled}>${effortValues.map((option) => `<option value="${escapeAttr(option.value)}" ${option.value === draft.reasoningEffort ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select></label>` : `<div class="autonomous-agent-edit-readonly"><span>Effort de raisonnement</span><small>Géré directement par Claude Code.</small></div>`}
+        <label><span>Modèle</span><input data-autonomous-edit-field="model" list="autonomousEditModels-${escapeAttr(agent.id)}" maxlength="160" required value="${escapeAttr(draft.model)}" placeholder="${escapeAttr(providerDefaultModel(provider, accountInferenceProvider(account)))}" ${disabled} /><datalist id="autonomousEditModels-${escapeAttr(agent.id)}">${modelSuggestions}</datalist></label>
+        ${provider === "codex" ? `<label><span>Effort de raisonnement</span><select data-autonomous-edit-field="reasoningEffort" ${disabled}>${effortValues.map((option) => `<option value="${escapeAttr(option.value)}" ${option.value === draft.reasoningEffort ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select></label>` : `<div class="autonomous-agent-edit-readonly"><span>Effort de raisonnement</span><small>Géré directement par ${escapeHtml(accountProviderLabel(account))}.</small></div>`}
       </div>
 
       ${draft.triggerKind === "workspace_change" ? `<section class="autonomous-agent-edit-trigger">
@@ -10890,6 +15923,33 @@ const renderAutonomousAgentEditor = (
         <div>${connectorOptions}</div>
         <small>${connectorsSupported ? "Les accès restent propres à cet agent ; les écritures externes demandent toujours une autorisation." : "Les connecteurs Gmail et Google Agenda nécessitent un compte Codex."}</small>
       </fieldset>
+
+      <section class="autonomous-agent-edit-whatsapp autonomous-agent-edit-mobile">
+        <label class="autonomous-review-toggle autonomous-agent-edit-review">
+          <input data-autonomous-edit-field="mobileNotifications" type="checkbox" ${draft.mobileNotificationsEnabled ? "checked" : ""} ${disabled} />
+          <span><strong>Notifications dans l’app mobile</strong><small>Chaque nouveau compte rendu et chaque alerte importante ouvrent directement cet agent dans Codex Terminal Android.</small></span>
+          <i data-lucide="smartphone"></i>
+        </label>
+        ${hasMobilePaymentSettings() ? `<button type="button" class="tool-button" data-autonomous-open-mobile-settings><i data-lucide="settings"></i><span>Configurer</span></button>` : ""}
+      </section>
+
+      <section class="autonomous-agent-edit-whatsapp autonomous-agent-edit-telegram ${telegramChannelStale ? "needs-connection" : ""}">
+        <label class="autonomous-review-toggle autonomous-agent-edit-review">
+          <input data-autonomous-edit-field="telegramNotifications" type="checkbox" ${telegramNotificationsEnabled ? "checked" : ""} ${telegramToggleDisabled ? "disabled" : ""} />
+          <span><strong>Notifications Telegram · gratuit</strong><small>${telegramChannelStale ? "Canal déconnecté : décoche cette option ou reconnecte Telegram." : currentTelegramChannel ? `Rapports envoyés à ${escapeHtml(telegramConnection?.userHint || "ton compte Telegram")}. Tu peux répondre directement à l’agent.` : "Lie d’abord un bot Telegram gratuit dans les paramètres."}</small></span>
+          <i data-lucide="send"></i>
+        </label>
+        ${currentTelegramChannel ? "" : `<button type="button" class="tool-button" data-autonomous-open-telegram-settings><i data-lucide="link"></i><span>Lier Telegram</span></button>`}
+      </section>
+
+      <section class="autonomous-agent-edit-whatsapp ${whatsappChannelStale ? "needs-connection" : ""}">
+        <label class="autonomous-review-toggle autonomous-agent-edit-review">
+          <input data-autonomous-edit-field="whatsappNotifications" type="checkbox" ${whatsappNotificationsEnabled ? "checked" : ""} ${whatsappToggleDisabled ? "disabled" : ""} />
+          <span><strong>Notifications WhatsApp</strong><small>${whatsappChannelStale ? "Canal déconnecté : décoche cette option ou reconnecte WhatsApp." : currentWhatsAppChannel ? `Rapports envoyés à ${escapeHtml(whatsappConnection?.recipientHint || "ton numéro")}.` : "Lie d’abord un compte WhatsApp Business dans les paramètres."}</small></span>
+          <i data-lucide="message-circle"></i>
+        </label>
+        ${currentWhatsAppChannel ? "" : `<button type="button" class="tool-button" data-autonomous-open-whatsapp-settings><i data-lucide="link"></i><span>Lier WhatsApp</span></button>`}
+      </section>
 
       <label class="autonomous-review-toggle autonomous-agent-edit-review">
         <input data-autonomous-edit-field="requireUserReview" type="checkbox" ${draft.requireUserReview ? "checked" : ""} ${disabled} />
@@ -10912,14 +15972,109 @@ const renderAutonomousAgentEditor = (
   </section>`;
 };
 
+const renderAutonomousAgentSubsection = (
+  agentId: string,
+  section: "configuration" | "plan" | "reports" | "payments" | "memory",
+  icon: string,
+  label: string,
+  meta: string,
+  content: string,
+  forceOpen = false,
+): string => {
+  if (!content) return "";
+  const key = `${agentId}:${section}`;
+  const open = forceOpen || autonomousExpandedAgentSectionKeys.has(key);
+  return `<details class="autonomous-agent-subsection ${section === "memory" ? "autonomous-agent-details" : ""}" data-autonomous-agent-section="${escapeAttr(key)}" ${open ? "open" : ""}>
+    <summary><span><i data-lucide="${escapeAttr(icon)}"></i>${escapeHtml(label)}</span>${meta ? `<small>${escapeHtml(meta)}</small>` : ""}<i data-lucide="chevron-down"></i></summary>
+    <div class="autonomous-agent-subsection-body">
+      ${content}
+      <button type="button" class="tool-button autonomous-agent-subsection-hide" data-autonomous-section-hide="${escapeAttr(key)}"><i data-lucide="chevron-up"></i><span>Masquer</span></button>
+    </div>
+  </details>`;
+};
+
+const autonomousAgentMessageHint = (
+  agent: AutonomousAgentSnapshot,
+  mode: AutonomousAgentMessageMode,
+): string => {
+  if (mode === "objective") {
+    return autonomousAgentIsRunning(agent)
+      ? "Le cycle en cours sera arrêté, le plan sera réinitialisé et la nouvelle mission démarrera immédiatement."
+      : "La mission actuelle et son plan seront remplacés, puis l’agent démarrera immédiatement.";
+  }
+  if (agent.pendingReview) {
+    return "Le message sera mémorisé, mais la vérification humaine en attente restera obligatoire.";
+  }
+  if (agent.status === "completed") {
+    return "Le message sera mémorisé. Choisis « Changer sa mission » pour réactiver cet agent terminé.";
+  }
+  if (autonomousAgentIsRunning(agent)) {
+    return "Le cycle en cours sera arrêté proprement puis relancé avec cette consigne en mémoire.";
+  }
+  if (agent.status === "paused" || agent.status === "needs_attention") {
+    return "Le message sera mémorisé et l’agent reprendra immédiatement avec cette consigne.";
+  }
+  return "Le message sera mémorisé et un nouveau cycle démarrera immédiatement.";
+};
+
+const autonomousAgentMessageButtonLabel = (
+  agent: AutonomousAgentSnapshot,
+  mode: AutonomousAgentMessageMode,
+): string => {
+  if (mode === "objective") return "Changer la mission";
+  if (agent.pendingReview || agent.status === "completed") return "Mémoriser le message";
+  if (autonomousAgentIsRunning(agent)) return "Envoyer et réorienter";
+  if (agent.status === "paused" || agent.status === "needs_attention") return "Envoyer et reprendre";
+  return "Envoyer et lancer";
+};
+
+const autonomousTokenUsageFor = (agent: AutonomousAgentSnapshot) => ({
+  inputTokens: Math.max(0, Number(agent.tokenUsage?.inputTokens) || 0),
+  cachedInputTokens: Math.max(0, Number(agent.tokenUsage?.cachedInputTokens) || 0),
+  outputTokens: Math.max(0, Number(agent.tokenUsage?.outputTokens) || 0),
+  reasoningOutputTokens: Math.max(0, Number(agent.tokenUsage?.reasoningOutputTokens) || 0),
+  totalTokens: Math.max(0, Number(agent.tokenUsage?.totalTokens) || 0),
+});
+
+const autonomousTokenUsageTotal = (agents: readonly AutonomousAgentSnapshot[]) =>
+  agents.reduce(
+    (total, agent) => {
+      const usage = autonomousTokenUsageFor(agent);
+      total.inputTokens += usage.inputTokens;
+      total.cachedInputTokens += usage.cachedInputTokens;
+      total.outputTokens += usage.outputTokens;
+      total.reasoningOutputTokens += usage.reasoningOutputTokens;
+      total.totalTokens += usage.totalTokens;
+      return total;
+    },
+    { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
+  );
+
+const renderAutonomousPaymentHistory = (agent: AutonomousAgentSnapshot): string => {
+  const payments = (agent.payments ?? []).slice().reverse();
+  if (!payments.length) {
+    return `<p class="autonomous-payment-history-empty"><i data-lucide="wallet-cards"></i><span>Aucune demande de paiement. Les agents ne disposent d'aucun moyen de paiement enregistré.</span></p>`;
+  }
+  const rows = payments.map((payment) => {
+    const checkout = autonomousPaymentCheckoutUrl(payment.checkoutUrl);
+    return `<li class="status-${escapeAttr(payment.status)}">
+      <span><i data-lucide="${payment.status === "confirmed" ? "badge-check" : payment.status === "rejected" ? "circle-x" : payment.status === "cancelled" ? "ban" : "clock-3"}"></i></span>
+      <div><small>${escapeHtml(autonomousPaymentStatusLabel(payment.status))} · ${escapeHtml(checkout?.hostname ?? "domaine invalide")}</small><strong>${escapeHtml(formatAutonomousPaymentAmount(payment))} · ${escapeHtml(payment.merchant)}</strong><p>${escapeHtml(payment.description)}</p><code>${escapeHtml(payment.reference)}</code></div>
+      <time>${escapeHtml(formatAutonomousTimestamp(payment.resolvedAt ?? payment.authorizedAt ?? payment.createdAt))}</time>
+    </li>`;
+  }).join("");
+  return `<section class="autonomous-payment-history"><p><i data-lucide="shield-check"></i><span>Journal des confirmations uniquement ; aucune donnée bancaire n'est stockée.</span></p><ol>${rows}</ol></section>`;
+};
+
 const renderAutonomousAgentCard = (agent: AutonomousAgentSnapshot): string => {
-  const busy = autonomousBusyId === agent.id;
+  const busy = autonomousBusyId === agent.id || autonomousBusyId === AUTONOMOUS_PAUSE_ALL_BUSY_ID;
   const systemManaged = Boolean(agent.systemManaged);
   const eventTriggered = (agent.triggerKind ?? "schedule") === "workspace_change";
   const running = autonomousAgentIsRunning(agent);
   const editDraft = autonomousEditingId === agent.id ? autonomousEditDraft : null;
   const tone = autonomousStatusTone(agent.status);
   const testStatus = agent.testStatus ?? (agent.testCommand ? "idle" : "not_configured");
+  const tokenUsage = autonomousTokenUsageFor(agent);
   const memories = agent.memory ?? [];
   const workPlanProgress = autonomousWorkPlanProgress({ workItems: agent.workItems ?? [] });
   const connectors = normalizeAutonomousConnectors(agent.connectors);
@@ -10929,6 +16084,15 @@ const renderAutonomousAgentCard = (agent: AutonomousAgentSnapshot): string => {
       return `<span><i data-lucide="${escapeAttr(definition?.icon ?? "unplug")}"></i>${escapeHtml(autonomousConnectorLabel(id))}</span>`;
     })
     .join("");
+  const telegramNotificationBadge = agent.telegramNotificationChannelId
+    ? `<span><i data-lucide="send"></i>Telegram</span>`
+    : "";
+  const whatsappNotificationBadge = agent.whatsappNotificationChannelId
+    ? `<span><i data-lucide="message-circle"></i>WhatsApp</span>`
+    : "";
+  const mobileNotificationBadge = agent.mobileNotificationsEnabled
+    ? `<span><i data-lucide="smartphone"></i>App mobile</span>`
+    : "";
   const events = agent.events
     .slice(-4)
     .reverse()
@@ -10951,16 +16115,27 @@ const renderAutonomousAgentCard = (agent: AutonomousAgentSnapshot): string => {
     )
     .join("");
   const memoryDraft = autonomousMemoryDrafts.get(agent.id) ?? "";
+  const messageDraft = autonomousMessageDrafts.get(agent.id) ?? "";
+  const messageMode = autonomousMessageModes.get(agent.id) ?? "guidance";
+  const conversationRows = autonomousConversationEntries(agent, 6)
+    .map((entry) => `<li class="from-${entry.author}">
+      <div><span>${entry.author === "user" ? "Vous" : escapeHtml(agent.name || "Agent")}</span><time>${escapeHtml(formatAutonomousTimestamp(entry.createdAt))}</time></div>
+      <p>${escapeHtml(autonomousReportPreview(entry.content, 520))}</p>
+    </li>`)
+    .join("");
   const deletePending = autonomousDeletePendingId === agent.id;
-  const lifecycleAction = systemManaged
+  const headerLifecycleAction = systemManaged
     ? ""
     : agent.status === "active"
-    ? `<button type="button" class="tool-button" data-autonomous-action="pause" data-autonomous-id="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="pause"></i><span>Pause</span></button>`
+    ? `<button type="button" class="tool-button autonomous-agent-lifecycle-button" data-autonomous-action="pause" data-autonomous-id="${escapeAttr(agent.id)}" title="Mettre cet agent en pause" aria-label="Mettre ${escapeAttr(agent.name || agent.objective)} en pause" ${busy ? "disabled" : ""}><i data-lucide="pause"></i><span>Pause</span></button>`
     : agent.pendingReview
-      ? `<button type="button" class="tool-button primary" data-autonomous-monitor-open="${escapeAttr(agent.id)}"><i data-lucide="shield-question"></i><span>Examiner la demande</span></button>`
+      ? ""
       : agent.status === "paused" || agent.status === "needs_attention"
-      ? `<button type="button" class="tool-button primary" data-autonomous-action="resume" data-autonomous-id="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="play"></i><span>Reprendre</span></button>`
+      ? `<button type="button" class="tool-button primary autonomous-agent-lifecycle-button" data-autonomous-action="resume" data-autonomous-id="${escapeAttr(agent.id)}" title="Reprendre cet agent" aria-label="Reprendre ${escapeAttr(agent.name || agent.objective)}" ${busy ? "disabled" : ""}><i data-lucide="play"></i><span>Reprendre</span></button>`
       : "";
+  const reviewAction = !systemManaged && agent.pendingReview
+    ? `<button type="button" class="tool-button primary" data-autonomous-monitor-open="${escapeAttr(agent.id)}"><i data-lucide="shield-question"></i><span>Examiner la demande</span></button>`
+    : "";
   const deleteAction = systemManaged
     ? ""
     : deletePending
@@ -10969,98 +16144,112 @@ const renderAutonomousAgentCard = (agent: AutonomousAgentSnapshot): string => {
         <button type="button" class="tool-button" data-autonomous-delete-cancel="${escapeAttr(agent.id)}"><span>Annuler</span></button>
       </span>`
     : `<button type="button" class="tool-button danger autonomous-agent-delete-trigger" data-autonomous-delete="${escapeAttr(agent.id)}" title="Supprimer cet agent autonome" aria-label="Supprimer ${escapeAttr(agent.name || agent.objective)}" ${busy ? "disabled" : ""}><i data-lucide="trash-2"></i><span>Supprimer</span></button>`;
-
-  return `<article class="autonomous-agent-card tone-${tone} ${running ? "is-running" : ""} ${editDraft ? "is-editing" : ""}">
-    <header class="autonomous-agent-card-head">
-      <span class="autonomous-agent-orb" aria-hidden="true"><i data-lucide="bot"></i></span>
-      <div class="autonomous-agent-title">
-        <span class="autonomous-status status-${tone}"><i></i>${escapeHtml(autonomousStatusLabel(agent.status))}</span>
-        ${systemManaged ? `<span class="autonomous-system-managed"><i data-lucide="shield-check"></i>Géré par le système · toutes les heures</span>` : ""}
-        <h3>${escapeHtml(agent.name || agent.objective)}</h3>
-        ${agent.role ? `<small>${escapeHtml(agent.role)}</small>` : ""}
-      </div>
-      <div class="autonomous-agent-head-actions">
-        ${editDraft || systemManaged ? "" : `<button type="button" class="icon-button" data-autonomous-edit-open="${escapeAttr(agent.id)}" title="Modifier toute la configuration" aria-label="Modifier ${escapeAttr(agent.name || agent.objective)}" ${busy ? "disabled" : ""}><i data-lucide="pencil"></i></button>`}
-        ${editDraft ? "" : deleteAction}
-      </div>
+  const runNowAction = agent.status === "active" && !systemManaged
+    ? `<button type="button" class="tool-button" data-autonomous-action="runNow" data-autonomous-id="${escapeAttr(agent.id)}" ${busy || running ? "disabled" : ""}><i data-lucide="refresh-ccw"></i><span>Exécuter</span></button>`
+    : "";
+  const detailsOpen = autonomousExpandedAgentIds.has(agent.id)
+    || autonomousScheduleEditingId === agent.id
+    || deletePending;
+  const cardCollapsed = autonomousCollapsedAgentCards.get(agent.id) ?? systemManaged;
+  const reportsContent = renderAutonomousReports(agent)
+    || (agent.lastSummary ? `<section class="autonomous-agent-summary"><small>Dernier compte rendu</small><p>${escapeHtml(agent.lastSummary)}</p></section>` : "");
+  const conversationContent = systemManaged ? "" : `<section class="autonomous-agent-conversation" aria-label="Messages avec ${escapeAttr(agent.name || "l’agent autonome")}">
+    <header>
+      <span><i data-lucide="messages-square"></i></span>
+      <div><strong>Échanger avec l’agent</strong><small>Chaque message rejoint sa mémoire durable</small></div>
+      <button type="button" class="tool-button" data-autonomous-edit-open="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="sliders-horizontal"></i><span>Réglages</span></button>
     </header>
-    <p class="autonomous-agent-objective">${escapeHtml(agent.objective)}</p>
-    ${editDraft ? renderAutonomousAgentEditor(agent, editDraft, busy) : ""}
-    ${agent.pendingReview ? `<button type="button" class="autonomous-agent-review-callout" data-autonomous-monitor-open="${escapeAttr(agent.id)}"><span><i data-lucide="shield-question"></i></span><div><small>${escapeHtml(autonomousReviewKindLabel(agent.pendingReview.kind))} requise</small><strong>${escapeHtml(agent.pendingReview.request)}</strong></div><i data-lucide="arrow-up-right"></i></button>` : ""}
-    <div class="autonomous-agent-state-grid">
-      <div class="autonomous-agent-schedule">
-        <span><i data-lucide="${eventTriggered ? "bell-ring" : "clock-3"}"></i></span>
-        <div>
-          <small>${escapeHtml(autonomousTriggerLabel(agent))}</small>
-          <strong data-autonomous-schedule="${escapeAttr(agent.id)}">${escapeHtml(formatAutonomousSchedule(agent))}</strong>
-          <small>${eventTriggered
-            ? `${(agent.watchPaths ?? []).length} chemin${(agent.watchPaths ?? []).length > 1 ? "s" : ""} · stabilité ${agent.debounceSeconds ?? 10} s`
-            : `Toutes les ${escapeHtml(formatAutonomousInterval(agent.intervalSeconds))}`}</small>
-        </div>
-        ${running ? `<span class="autonomous-live-wave" aria-label="Agent en cours d'exécution"><i></i><i></i><i></i></span>` : ""}
+    ${conversationRows
+      ? `<ol class="autonomous-agent-conversation-thread">${conversationRows}</ol>`
+      : `<p class="autonomous-agent-conversation-empty">Envoie une consigne pour préciser la prochaine étape, ou remplace directement la mission de l’agent.</p>`}
+    <form data-autonomous-message-form="${escapeAttr(agent.id)}">
+      <textarea data-autonomous-message-input maxlength="2000" required placeholder="Ex. Priorise le bug mobile et conserve les changements déjà présents…" aria-label="Message pour ${escapeAttr(agent.name || "l’agent autonome")}" ${busy ? "disabled" : ""}>${escapeHtml(messageDraft)}</textarea>
+      <small class="autonomous-agent-message-hint" data-autonomous-message-hint><i data-lucide="brain-circuit"></i><span>${escapeHtml(autonomousAgentMessageHint(agent, messageMode))}</span></small>
+      <div class="autonomous-agent-message-actions">
+        <label><span>Intention</span><select data-autonomous-message-mode ${busy ? "disabled" : ""}><option value="guidance" ${messageMode === "guidance" ? "selected" : ""}>Aiguiller le travail</option><option value="objective" ${messageMode === "objective" ? "selected" : ""}>Changer sa mission</option></select></label>
+        <small>Ctrl + Entrée pour envoyer</small>
+        <button type="submit" class="tool-button primary" ${busy ? "disabled" : ""}><i data-lucide="send"></i><span data-autonomous-message-submit-label>${busy ? "Envoi…" : escapeHtml(autonomousAgentMessageButtonLabel(agent, messageMode))}</span></button>
       </div>
-      <div class="autonomous-agent-signal test-${testStatus}">
-        <span><i data-lucide="flask-conical"></i></span>
-        <div><small>Validation</small><strong>${escapeHtml(autonomousTestStatusLabel(testStatus))}</strong></div>
-      </div>
+    </form>
+  </section>`;
+  const configurationContent = `
+    ${agent.role ? `<p class="autonomous-agent-role"><i data-lucide="badge"></i><span>${escapeHtml(agent.role)}</span></p>` : ""}
+    <div class="autonomous-agent-secondary-actions">
+      ${systemManaged ? `<span class="autonomous-system-managed-note"><i data-lucide="shield-check"></i><span>Cycle de supervision protégé</span></span>` : `<button type="button" class="tool-button" data-autonomous-edit-open="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="pencil"></i><span>Modifier</span></button>`}
+      ${systemManaged ? "" : `<button type="button" class="tool-button" data-autonomous-orchestrate="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="users"></i><span>Orchestration</span></button>`}
+      ${autonomousAgentCanReschedule(agent) && autonomousScheduleEditingId !== agent.id ? `<button type="button" class="tool-button" data-autonomous-schedule-open="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="calendar-clock"></i><span>Planning</span></button>` : ""}
+      ${agent.status === "active" && !systemManaged && agent.testCommand ? `<button type="button" class="tool-button" data-autonomous-action="testNow" data-autonomous-id="${escapeAttr(agent.id)}" ${busy || running ? "disabled" : ""}><i data-lucide="flask-conical"></i><span>Tester</span></button>` : ""}
+      ${deleteAction}
     </div>
     ${autonomousScheduleEditingId === agent.id && autonomousAgentCanReschedule(agent) ? renderAutonomousScheduleEditor(agent) : ""}
     <dl class="autonomous-agent-metrics">
       <div><dt>Compte</dt><dd>${escapeHtml(autonomousAccountLabel(agent))}</dd></div>
       <div><dt>Tours</dt><dd>${agent.runCount}</dd></div>
+      <div><dt>Tokens cumulés</dt><dd>${escapeHtml(formatTokens(tokenUsage.totalTokens))}</dd></div>
       <div><dt>Plan</dt><dd>${workPlanProgress.total ? `${workPlanProgress.done} / ${workPlanProgress.total}` : "À créer"}</dd></div>
       <div><dt>Activité</dt><dd>${escapeHtml(formatAutonomousTimestamp(agent.lastTestFinishedAt ?? agent.lastRunFinishedAt ?? agent.lastRunStartedAt))}</dd></div>
     </dl>
+    <dl class="autonomous-agent-metrics autonomous-agent-token-breakdown" aria-label="Détail des tokens consommés par cet agent">
+      <div><dt>Entrée</dt><dd>${escapeHtml(formatTokens(tokenUsage.inputTokens))}</dd></div>
+      <div><dt>Cache</dt><dd>${escapeHtml(formatTokens(tokenUsage.cachedInputTokens))}</dd></div>
+      <div><dt>Sortie</dt><dd>${escapeHtml(formatTokens(tokenUsage.outputTokens))}</dd></div>
+      <div><dt>Raisonnement</dt><dd>${escapeHtml(formatTokens(tokenUsage.reasoningOutputTokens))}</dd></div>
+      <div><dt>Total</dt><dd>${escapeHtml(formatTokens(tokenUsage.totalTokens))}</dd></div>
+    </dl>
     ${agent.projectDir ? `<p class="autonomous-agent-path"><i data-lucide="folder-open"></i><span>${escapeHtml(agent.projectDir)}</span></p>` : ""}
     ${eventTriggered ? `<p class="autonomous-agent-trigger-paths"><i data-lucide="radar"></i><span><strong>Surveille</strong>${escapeHtml((agent.watchPaths ?? []).join(", "))}</span></p>` : ""}
-    ${systemManaged ? `<p class="autonomous-system-managed-note"><i data-lucide="lock-keyhole"></i><span>Compte d’exécution sélectionné automatiquement parmi les agents supervisés : <strong>${escapeHtml(autonomousAccountLabel(agent))}</strong>.</span></p>` : `<label class="orchestration-member-account autonomous-agent-account">
-      <span>Adresse e-mail / compte</span>
-      <select data-autonomous-account="${escapeAttr(agent.id)}" aria-label="Adresse e-mail ou compte de ${escapeAttr(agent.name || agent.objective)}" ${busy || !settings?.accounts.length ? "disabled" : ""}>
-        ${orchestrationAccountOptions(agent.accountId)}
-      </select>
-      <small>Le prochain cycle utilisera ce compte ; un tour actif sera arrêté proprement avant le changement.</small>
-    </label>`}
-    ${connectorBadges ? `<div class="autonomous-agent-connectors"><small>Accès externe</small>${connectorBadges}</div>` : ""}
-    ${agent.allowGitPublish ? `<p class="autonomous-agent-publish-policy"><i data-lucide="git-branch"></i><span>Push GitHub sans force et publication du site autorisés pour cet agent</span></p>` : ""}
-    ${agent.requireUserReview ? `<p class="autonomous-agent-review-policy ${agent.approvedReview ? "is-approved" : ""}"><i data-lucide="shield-check"></i><span>${agent.approvedReview ? "Review validée · application autorisée pour le prochain tour" : "Review utilisateur obligatoire avant chaque application"}</span></p>` : ""}
-    ${renderAutonomousWorkPlan(agent)}
-    ${agent.lastSummary ? `<section class="autonomous-agent-summary"><small>Dernier compte rendu</small><p>${escapeHtml(agent.lastSummary)}</p></section>` : ""}
-    ${agent.lastError ? `<p class="autonomous-agent-error"><i data-lucide="circle-alert"></i><span>${escapeHtml(agent.lastError)}</span></p>` : ""}
-    ${agent.triggerError ? `<p class="autonomous-agent-error"><i data-lucide="bell-off"></i><span>${escapeHtml(agent.triggerError)}</span></p>` : ""}
-    <details class="autonomous-agent-details">
-      <summary>
-        <span><i data-lucide="brain-circuit"></i>Détails, mémoire et journal</span>
-        <small>${workPlanProgress.total} tâche${workPlanProgress.total > 1 ? "s" : ""} · ${memories.length} souvenir${memories.length > 1 ? "s" : ""}</small>
-        <i data-lucide="chevron-down"></i>
-      </summary>
-      <div class="autonomous-agent-details-body">
-        ${agent.testCommand ? `<section class="autonomous-test-box test-${testStatus}">
-          <header><span><i data-lucide="flask-conical"></i>Validation réelle</span><strong>${escapeHtml(autonomousTestStatusLabel(testStatus))}</strong></header>
-          <code>${escapeHtml(agent.testCommand)}</code>
-          <small>Timeout ${agent.testTimeoutSeconds ?? 300} s${agent.lastTestDurationMs != null ? ` · dernière durée ${(agent.lastTestDurationMs / 1000).toFixed(1)} s` : ""}${agent.lastTestExitCode != null ? ` · code ${agent.lastTestExitCode}` : ""}</small>
-          ${agent.lastTestOutput ? `<details><summary>Sortie du dernier test</summary><pre>${escapeHtml(agent.lastTestOutput)}</pre></details>` : ""}
-        </section>` : `<p class="autonomous-no-test"><i data-lucide="flask-conical"></i><span>Aucune commande de validation configurée.</span></p>`}
-        <details class="autonomous-memory" ${memories.length ? "" : "open"}>
-          <summary><span><i data-lucide="brain-circuit"></i>Mémoire durable</span><small>${memories.length}/64</small></summary>
-          ${memoryRows ? `<ul>${memoryRows}</ul>` : `<p class="autonomous-memory-empty">Aucun souvenir. Ajoute le contexte stable que l'agent doit conserver entre ses tours.</p>`}
-          ${systemManaged ? "" : `<form data-autonomous-memory-form="${escapeAttr(agent.id)}">
-            <input maxlength="2000" value="${escapeAttr(memoryDraft)}" placeholder="Fait, contrainte ou décision à retenir" ${busy ? "disabled" : ""} />
-            <button type="submit" class="tool-button" ${busy ? "disabled" : ""}><i data-lucide="plus"></i><span>Retenir</span></button>
-          </form>`}
-        </details>
-        ${events ? `<details class="autonomous-agent-events"><summary>Journal récent</summary><ul>${events}</ul></details>` : ""}
-      </div>
+    ${systemManaged ? `<p class="autonomous-system-managed-note"><i data-lucide="lock-keyhole"></i><span>Compte choisi automatiquement : <strong>${escapeHtml(autonomousAccountLabel(agent))}</strong>.</span></p>` : `<label class="orchestration-member-account autonomous-agent-account"><span>Compte</span><select data-autonomous-account="${escapeAttr(agent.id)}" aria-label="Compte de ${escapeAttr(agent.name || agent.objective)}" ${busy || !settings?.accounts.length ? "disabled" : ""}>${orchestrationAccountOptions(agent.accountId)}</select></label>`}
+    ${connectorBadges || mobileNotificationBadge || telegramNotificationBadge || whatsappNotificationBadge ? `<div class="autonomous-agent-connectors"><small>Services</small>${connectorBadges}${mobileNotificationBadge}${telegramNotificationBadge}${whatsappNotificationBadge}</div>` : ""}
+    ${agent.allowGitPublish ? `<p class="autonomous-agent-publish-policy"><i data-lucide="git-branch"></i><span>Publication GitHub autorisée</span></p>` : ""}
+    ${agent.requireUserReview ? `<p class="autonomous-agent-review-policy ${agent.approvedReview && !agent.approvedReview.payment ? "is-approved" : ""}"><i data-lucide="shield-check"></i><span>${agent.approvedReview && !agent.approvedReview.payment ? "Review validée" : "Review requise avant application"}</span></p>` : ""}`;
+  const memoryContent = `
+    ${agent.testCommand ? `<section class="autonomous-test-box test-${testStatus}"><header><span><i data-lucide="flask-conical"></i>Validation</span><strong>${escapeHtml(autonomousTestStatusLabel(testStatus))}</strong></header><code>${escapeHtml(agent.testCommand)}</code><small>Timeout ${agent.testTimeoutSeconds ?? 300} s${agent.lastTestDurationMs != null ? ` · ${(agent.lastTestDurationMs / 1000).toFixed(1)} s` : ""}${agent.lastTestExitCode != null ? ` · code ${agent.lastTestExitCode}` : ""}</small>${agent.lastTestOutput ? `<details><summary>Sortie du dernier test</summary><pre>${escapeHtml(agent.lastTestOutput)}</pre></details>` : ""}</section>` : `<p class="autonomous-no-test"><i data-lucide="flask-conical"></i><span>Aucune validation configurée.</span></p>`}
+    <details class="autonomous-memory" ${memories.length ? "" : "open"}>
+      <summary><span><i data-lucide="brain-circuit"></i>Mémoire durable</span><small>${memories.length}/64</small></summary>
+      ${memoryRows ? `<ul>${memoryRows}</ul>` : `<p class="autonomous-memory-empty">Aucun souvenir.</p>`}
+      ${systemManaged ? "" : `<form data-autonomous-memory-form="${escapeAttr(agent.id)}"><input maxlength="2000" value="${escapeAttr(memoryDraft)}" placeholder="Information à retenir" ${busy ? "disabled" : ""} /><button type="submit" class="tool-button" ${busy ? "disabled" : ""}><i data-lucide="plus"></i><span>Retenir</span></button></form>`}
     </details>
-    <footer>
-      <div>
-        ${systemManaged ? `<span class="autonomous-system-managed-note"><i data-lucide="shield-check"></i><span>Cycle de supervision protégé</span></span>` : `<button type="button" class="tool-button" data-autonomous-edit-open="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="pencil"></i><span>Modifier</span></button>`}
-        ${lifecycleAction}
-        ${systemManaged ? "" : `<button type="button" class="tool-button primary" data-autonomous-orchestrate="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="users"></i><span>Passer en orchestration</span></button>`}
-        ${agent.status === "active" && !systemManaged ? `<button type="button" class="tool-button" data-autonomous-action="runNow" data-autonomous-id="${escapeAttr(agent.id)}" ${busy || running ? "disabled" : ""}><i data-lucide="refresh-ccw"></i><span>Exécuter maintenant</span></button>` : ""}
-        ${autonomousAgentCanReschedule(agent) && autonomousScheduleEditingId !== agent.id ? `<button type="button" class="tool-button" data-autonomous-schedule-open="${escapeAttr(agent.id)}" ${busy ? "disabled" : ""}><i data-lucide="calendar-clock"></i><span>Fréquence & heure</span></button>` : ""}
-        ${agent.status === "active" && !systemManaged && agent.testCommand ? `<button type="button" class="tool-button" data-autonomous-action="testNow" data-autonomous-id="${escapeAttr(agent.id)}" ${busy || running ? "disabled" : ""}><i data-lucide="flask-conical"></i><span>Tester maintenant</span></button>` : ""}
+    ${events ? `<details class="autonomous-agent-events"><summary>Journal récent</summary><ul>${events}</ul></details>` : ""}`;
+
+  return `<article class="autonomous-agent-card tone-${tone} ${running ? "is-running" : ""} ${editDraft ? "is-editing" : ""} ${cardCollapsed ? "is-collapsed" : ""}">
+    <header class="autonomous-agent-card-head">
+      <span class="autonomous-agent-orb" aria-hidden="true"><i data-lucide="bot"></i></span>
+      <div class="autonomous-agent-title">
+        <span class="autonomous-status status-${tone}"><i></i>${escapeHtml(autonomousStatusLabel(agent.status))}</span>
+        <h3>${escapeHtml(agent.name || agent.objective)}</h3>
+        <small>${escapeHtml(formatTokens(tokenUsage.totalTokens))} tokens consommés</small>
+        ${systemManaged ? `<span class="autonomous-system-managed" title="Géré par le système · toutes les heures"><i data-lucide="shield-check"></i>Système</span>` : ""}
       </div>
-    </footer>
+      <div class="autonomous-agent-card-controls">
+        ${running ? `<span class="autonomous-live-wave" aria-label="Agent en cours d'exécution"><i></i><i></i><i></i></span>` : ""}
+        ${headerLifecycleAction}
+        <button type="button" class="tool-button autonomous-agent-collapse-button" data-autonomous-agent-card-toggle="${escapeAttr(agent.id)}" aria-expanded="${!cardCollapsed}" aria-controls="autonomousAgentBody-${escapeAttr(agent.id)}"><i data-lucide="${cardCollapsed ? "chevron-down" : "chevron-up"}"></i><span>${cardCollapsed ? "Afficher" : "Masquer"}</span></button>
+      </div>
+    </header>
+    <div id="autonomousAgentBody-${escapeAttr(agent.id)}" class="autonomous-agent-card-body" ${cardCollapsed ? "hidden" : ""}>
+      ${editDraft
+        ? renderAutonomousAgentEditor(agent, editDraft, busy)
+        : `<p class="autonomous-agent-objective">${escapeHtml(agent.objective)}</p>
+        ${agent.pendingReview ? `<button type="button" class="autonomous-agent-review-callout" data-autonomous-monitor-open="${escapeAttr(agent.id)}"><span><i data-lucide="shield-question"></i></span><div><small>${escapeHtml(autonomousReviewKindLabel(agent.pendingReview.kind))} requise</small><strong>${escapeHtml(agent.pendingReview.request)}</strong></div><i data-lucide="arrow-up-right"></i></button>` : ""}
+        ${agent.lastError ? `<p class="autonomous-agent-error"><i data-lucide="circle-alert"></i><span>${escapeHtml(agent.lastError)}</span></p>` : ""}
+        ${agent.triggerError ? `<p class="autonomous-agent-error"><i data-lucide="bell-off"></i><span>${escapeHtml(agent.triggerError)}</span></p>` : ""}
+        ${conversationContent}
+        <div class="autonomous-agent-quick-state">
+          <span><i data-lucide="${eventTriggered ? "bell-ring" : "clock-3"}"></i><span><small>${escapeHtml(autonomousTriggerLabel(agent))}</small><strong data-autonomous-schedule="${escapeAttr(agent.id)}">${escapeHtml(formatAutonomousSchedule(agent))}</strong></span></span>
+          <span class="test-${testStatus}"><i data-lucide="flask-conical"></i><span><small>Validation</small><strong>${escapeHtml(autonomousTestStatusLabel(testStatus))}</strong></span></span>
+        </div>
+        ${reviewAction || runNowAction ? `<div class="autonomous-agent-primary-actions">${reviewAction}${runNowAction}</div>` : ""}
+        <details class="autonomous-agent-more" data-autonomous-agent-more="${escapeAttr(agent.id)}" ${detailsOpen ? "open" : ""}>
+          <summary><span><i data-lucide="sliders-horizontal"></i><b>${detailsOpen ? "Masquer" : "Détails"}</b></span><small>${agent.runCount} tour${agent.runCount > 1 ? "s" : ""}</small><i data-lucide="chevron-down"></i></summary>
+          <div class="autonomous-agent-more-body">
+            ${renderAutonomousAgentSubsection(agent.id, "configuration", "settings-2", "Configuration", autonomousAccountLabel(agent), configurationContent, autonomousScheduleEditingId === agent.id || deletePending)}
+            ${renderAutonomousAgentSubsection(agent.id, "plan", "list-checks", "Plan de travail", workPlanProgress.total ? `${workPlanProgress.done}/${workPlanProgress.total}` : "À structurer", renderAutonomousWorkPlan(agent))}
+            ${renderAutonomousAgentSubsection(agent.id, "reports", "inbox", "Comptes rendus", reportsContent ? "Disponible" : "", reportsContent)}
+            ${renderAutonomousAgentSubsection(agent.id, "payments", "wallet-cards", "Paiements", `${agent.payments?.length ?? 0} demande${(agent.payments?.length ?? 0) > 1 ? "s" : ""}`, renderAutonomousPaymentHistory(agent))}
+            ${renderAutonomousAgentSubsection(agent.id, "memory", "brain-circuit", "Mémoire et journal", `${memories.length} souvenir${memories.length > 1 ? "s" : ""}`, memoryContent)}
+          </div>
+        </details>`}
+    </div>
   </article>`;
 };
 
@@ -11085,13 +16274,18 @@ const renderAutonomousPanel = (): string => {
   const connectorAccount = accountById(accountId);
   const launchOrchestration = autonomousLaunchMode === "orchestrator";
   const eventTriggered = !launchOrchestration && autonomousTriggerKind === "workspace_change";
+  const mobileNotificationsSupported = !launchOrchestration;
+  const telegramChannelId = connectedTelegramChannelId();
+  const telegramNotificationsSupported = !launchOrchestration && Boolean(telegramChannelId);
+  const whatsappChannelId = connectedWhatsAppChannelId();
+  const whatsappNotificationsSupported = !launchOrchestration && Boolean(whatsappChannelId);
   const connectorsSupported = !launchOrchestration && !!connectorAccount && accountProvider(connectorAccount) === "codex";
   const connectorPrerequisite = isRemoteMode()
     ? "Prérequis sur le serveur : ouvre un chat ou terminal Codex avec ce même compte, lance /plugins, installe Gmail et/ou Google Calendar, puis connecte ton compte Google. L’agent et les connecteurs s’exécutent sur l’hôte du site :8080 ; aucun mot de passe n’est stocké dans le navigateur."
     : "Prérequis : dans le même compte Codex, ouvre /plugins, installe Gmail et/ou Google Calendar, puis connecte ton compte Google. Aucun mot de passe n’est stocké ici.";
   const accountOptions = settings?.accounts
     .map(
-      (account) => `<option value="${escapeAttr(account.id)}" ${account.id === accountId ? "selected" : ""}>${escapeHtml(account.label)} · ${escapeHtml(providerLabel(accountProvider(account)))}</option>`,
+      (account) => `<option value="${escapeAttr(account.id)}" ${account.id === accountId ? "selected" : ""}>${escapeHtml(account.label)} · ${escapeHtml(accountProviderLabel(account))}</option>`,
     )
     .join("") ?? "";
   const intervalOptions = AUTONOMOUS_INTERVAL_OPTIONS.map(
@@ -11114,7 +16308,6 @@ const renderAutonomousPanel = (): string => {
       </header>
       <p>${escapeHtml(template.description)}</p>
       <footer>
-        <span><i data-lucide="${template.requireUserReview ? "shield-check" : "scan-eye"}"></i>${escapeHtml(template.policyLabel)}</span>
         <button type="button" class="tool-button" data-autonomous-template="${escapeAttr(template.id)}" aria-pressed="${selected}" aria-label="Configurer ${escapeAttr(template.name)}"><i data-lucide="arrow-right"></i><span>${selected ? "Modèle chargé" : "Configurer"}</span></button>
       </footer>
     </article>`;
@@ -11130,8 +16323,19 @@ const renderAutonomousPanel = (): string => {
     .map((workspace) => `<option value="${escapeAttr(workspace.path)}" ${environmentPreset === workspace.path ? "selected" : ""}>${escapeHtml(workspace.label)} · ${escapeHtml(workspace.path)}</option>`)
     .join("");
   const activeCount = autonomousAgents.filter((agent) => agent.status === "active").length;
+  const pausableCount = autonomousAgentsToPause(autonomousAgents).length;
+  const userAgentCount = autonomousAgents.filter((agent) => !agent.systemManaged).length;
+  const pausingAll = autonomousBusyId === AUTONOMOUS_PAUSE_ALL_BUSY_ID;
+  const pauseAllTitle = pausableCount === 1
+    ? "Mettre en pause l’agent actif"
+    : pausableCount > 1
+      ? `Mettre en pause les ${pausableCount} agents actifs`
+      : "Aucun agent actif à mettre en pause";
   const workingCount = autonomousAgents.filter(autonomousAgentIsRunning).length;
   const validatedCount = autonomousAgents.filter((agent) => agent.testStatus === "passed").length;
+  const autonomousTokenTotal = autonomousTokenUsageTotal(autonomousAgents);
+  const proposalDeliveries = autonomousProposalDeliveries();
+  const pendingProposalCount = proposalDeliveries.filter(({ executionAgent }) => !executionAgent).length;
   const createOpen = autonomousCreateOpen || (!autonomousCreatePreferenceSet && autonomousAgentsLoaded && autonomousAgents.length === 0);
   const hostMessage = isRemoteMode()
     ? "Le moteur tourne sur cst-server, même lorsque ce navigateur est fermé. Le service doit rester démarré."
@@ -11142,27 +16346,43 @@ const renderAutonomousPanel = (): string => {
       <div class="autonomous-page-title">
         <span class="autonomous-page-mark" aria-hidden="true"><i data-lucide="bot"></i></span>
         <div>
-          <span class="autonomous-kicker"><i data-lucide="sparkles"></i>Travail continu et vérifiable</span>
           <h2>Agents autonomes</h2>
-          <p>Confie un objectif durable, impose une preuve de réussite et laisse l’agent reprendre exactement là où il s’est arrêté.</p>
+          <p>${autonomousAgents.length} agent${autonomousAgents.length > 1 ? "s" : ""} · ${workingCount} en cours</p>
         </div>
       </div>
       <div class="autonomous-head-actions">
-        <span class="autonomous-service-pill"><i></i><span><strong>${isRemoteMode() ? "Moteur serveur actif" : "Moteur desktop actif"}</strong><small>${escapeHtml(hostMessage)}</small></span></span>
-        <button id="autonomousNewAgent" type="button" class="tool-button primary"><i data-lucide="plus"></i><span>Nouvel agent</span></button>
+        <span class="autonomous-service-pill" title="${escapeAttr(hostMessage)}"><i></i><strong>${isRemoteMode() ? "Serveur actif" : "Application active"}</strong></span>
+        ${autonomousPanelTab === "agents" ? `<button id="autonomousNewAgent" type="button" class="tool-button primary"><i data-lucide="plus"></i><span>Nouvel agent</span></button>` : ""}
       </div>
     </header>
 
-    <section class="autonomous-overview" aria-label="État des agents autonomes">
+    <nav class="autonomous-page-tabs" role="tablist" aria-label="Agents autonomes">
+      <button id="autonomousAgentsTab" type="button" role="tab" aria-selected="${autonomousPanelTab === "agents"}" aria-controls="autonomousAgentsPage" class="${autonomousPanelTab === "agents" ? "is-active" : ""}" data-autonomous-tab="agents"><i data-lucide="bot"></i><span>Agents</span><b>${autonomousAgents.length}</b></button>
+      <button id="autonomousProposalsTab" type="button" role="tab" aria-selected="${autonomousPanelTab === "proposals"}" aria-controls="autonomousProposals" class="${autonomousPanelTab === "proposals" ? "is-active" : ""}" data-autonomous-tab="proposals"><i data-lucide="lightbulb"></i><span>Propositions</span><b class="${pendingProposalCount ? "has-pending" : ""}">${pendingProposalCount}</b></button>
+    </nav>
+
+    ${autonomousPanelTab === "proposals"
+      ? renderAutonomousProposalsTab()
+      : `<div id="autonomousAgentsPage" class="autonomous-agents-page" role="tabpanel" aria-labelledby="autonomousAgentsTab">
+    <nav class="autonomous-visibility-bar" aria-label="Affichage de la page">
+      <button type="button" class="tool-button ${autonomousOverviewOpen ? "is-active" : ""}" data-autonomous-panel-toggle="overview" aria-controls="autonomousOverview" aria-expanded="${autonomousOverviewOpen}"><i data-lucide="chart-no-axes-column"></i><span>Résumé</span><i data-lucide="chevron-down"></i></button>
+      <button type="button" class="tool-button ${autonomousTemplatesOpen ? "is-active" : ""}" data-autonomous-panel-toggle="templates" aria-controls="autonomousTemplates" aria-expanded="${autonomousTemplatesOpen}"><i data-lucide="layout-template"></i><span>Modèles</span><i data-lucide="chevron-down"></i></button>
+      <button id="autonomousCollapseAll" type="button" class="tool-button"><i data-lucide="minimize-2"></i><span>Tout masquer</span></button>
+    </nav>
+
+    <section id="autonomousOverview" class="autonomous-overview" aria-label="État des agents autonomes" ${autonomousOverviewOpen ? "" : "hidden"}>
       <article><span><i data-lucide="bot"></i></span><div><strong>${autonomousAgents.length}</strong><small>Agents créés</small></div></article>
       <article><span><i data-lucide="play"></i></span><div><strong>${activeCount}</strong><small>Actifs</small></div></article>
       <article><span><i data-lucide="refresh-ccw"></i></span><div><strong>${workingCount}</strong><small>En cours</small></div></article>
       <article class="is-validated"><span><i data-lucide="shield-check"></i></span><div><strong>${validatedCount}</strong><small>Validés par un test</small></div></article>
+      <article><span><i data-lucide="coins"></i></span><div><strong>${escapeHtml(formatTokens(autonomousTokenTotal.totalTokens))}</strong><small>Tokens des agents</small></div></article>
     </section>
 
-    <section class="autonomous-template-section" aria-labelledby="autonomousTemplateTitle">
+    ${renderAutonomousUnreadInbox()}
+
+    <section id="autonomousTemplates" class="autonomous-template-section" aria-labelledby="autonomousTemplateTitle" ${autonomousTemplatesOpen ? "" : "hidden"}>
       <header class="autonomous-template-head">
-        <div><span class="autonomous-section-kicker">Prêts à configurer</span><strong id="autonomousTemplateTitle">Agents suggérés</strong><small>Choisis une spécialité : la mission, le rythme et les garde-fous sont préremplis.</small></div>
+        <div><strong id="autonomousTemplateTitle">Modèles</strong><small>Choisis un point de départ.</small></div>
       </header>
       <div class="autonomous-template-grid">${templateCards}</div>
     </section>
@@ -11174,78 +16394,93 @@ const renderAutonomousPanel = (): string => {
         <span class="autonomous-create-summary-action"><b>${createOpen ? "Fermer" : "Configurer"}</b><i data-lucide="chevron-down"></i></span>
       </summary>
       <form id="autonomousCreateForm" class="autonomous-create-card">
-        <section class="autonomous-form-block">
-          <header><b>1</b><span><strong>Définir la mission</strong><small>Un nom court et un résultat observable.</small></span></header>
-          <div class="autonomous-create-grid autonomous-identity-grid">
-            <label><span>Nom de l'agent</span><input id="autonomousName" maxlength="120" value="${escapeAttr(autonomousNameDraft)}" placeholder="Ex. Optimiseur web" /></label>
-            <label class="autonomous-role-field"><span>Rôle / spécialité</span><input id="autonomousRole" maxlength="4000" value="${escapeAttr(autonomousRoleDraft)}" placeholder="Ex. Ingénieur performance prudent et orienté mesures" /></label>
-          </div>
+        <section class="autonomous-form-block autonomous-essential-fields">
           <label class="autonomous-objective-field">
-            <span>Objectif <small>obligatoire</small></span>
-            <textarea id="autonomousObjective" maxlength="32768" placeholder="Ex. Réduire l’utilisation des ressources de la page web et fournir des mesures avant/après." ${autonomousBusyId === "create" ? "disabled" : ""}>${escapeHtml(autonomousObjectiveDraft)}</textarea>
+            <span>Que doit faire l’agent ?</span>
+            <textarea id="autonomousObjective" maxlength="32768" required placeholder="Décris simplement le résultat attendu…" ${autonomousBusyId === "create" ? "disabled" : ""}>${escapeHtml(autonomousObjectiveDraft)}</textarea>
           </label>
-        </section>
-
-        <section class="autonomous-form-block">
-          <header><b>2</b><span><strong>Choisir l’exécution</strong><small>Où, avec quel compte et à quel rythme l’agent travaille.</small></span></header>
-          <div class="autonomous-create-grid autonomous-runtime-grid">
-            <label><span>Compte agent</span><select id="autonomousAccount" ${accountOptions ? "" : "disabled"}>${accountOptions || `<option value="">Aucun compte</option>`}</select></label>
-            <label><span>Type de lancement</span><select id="autonomousLaunchMode"><option value="autonomous" ${launchOrchestration ? "" : "selected"}>Agent autonome</option><option value="orchestrator" ${launchOrchestration ? "selected" : ""}>Orchestrateur + workers</option></select></label>
-            ${launchOrchestration
-              ? `<label><span>Workers <small>hors orchestrateur</small></span><span class="orchestration-worker-count"><input id="autonomousLaunchWorkerCount" type="number" min="1" max="12" step="1" required value="${autonomousLaunchWorkerCount}" /><small>${autonomousLaunchWorkerCount + 1} agents au total</small></span></label>`
-              : `<label><span>Déclenchement</span><select id="autonomousTriggerKind"><option value="schedule" ${eventTriggered ? "" : "selected"}>Planning récurrent</option><option value="workspace_change" ${eventTriggered ? "selected" : ""}>Modification du projet</option></select></label>`}
-            ${!launchOrchestration && !eventTriggered ? `<label><span>Rythme</span><select id="autonomousInterval">${intervalOptions}</select></label>` : ""}
-            ${eventTriggered ? `<label><span>Stabilisation</span><span class="autonomous-timeout-input"><input id="autonomousDebounceSeconds" type="number" min="2" max="600" step="1" value="${autonomousDebounceSeconds}" /><small>secondes</small></span></label>` : ""}
-            <label><span>Mode</span><select id="autonomousMode"><option value="build" ${autonomousMode === "build" ? "selected" : ""}>Construire et modifier</option><option value="plan" ${autonomousMode === "plan" ? "selected" : ""}>Analyser et planifier</option></select></label>
+          <div class="autonomous-create-grid autonomous-simple-runtime">
             <label class="autonomous-project-field"><span>Environnement de l'agent <small>projet isolé</small></span><select id="autonomousEnvironmentPreset"><option value="" ${environmentPreset === "" ? "selected" : ""}>Aucun environnement</option>${environmentOptions}<option value="__custom__" ${environmentPreset === "__custom__" ? "selected" : ""}>Autre chemin…</option></select><input id="autonomousProjectDir" value="${escapeAttr(autonomousProjectDir)}" placeholder="Ex. C:/projets/mon-site" ${environmentPreset === "__custom__" ? "" : "hidden"} />${knownEnvironment ? `<small class="autonomous-environment-path"><i data-lucide="folder-open"></i>${escapeHtml(knownEnvironment.path)}</small>` : `<small class="autonomous-environment-path">Choisis un environnement connu ou saisis un chemin personnalisé.</small>`}</label>
+            ${!launchOrchestration && !eventTriggered ? `<label><span>Rythme</span><select id="autonomousInterval">${intervalOptions}</select></label>` : ""}
           </div>
-          ${eventTriggered ? `<section class="autonomous-event-config">
-            <header><span><i data-lucide="bell-ring"></i></span><div><strong>Veille événementielle</strong><small>L’agent enregistre l’état actuel, dort, puis se réveille après une future modification stable.</small></div><em>0 tour pendant la veille</em></header>
-            <label><span>Fichiers et dossiers surveillés <small>chemins relatifs, un par ligne</small></span><textarea id="autonomousWatchPaths" maxlength="8000" required placeholder="src&#10;public&#10;package.json">${escapeHtml(autonomousWatchPathsDraft)}</textarea></label>
-            <label class="autonomous-review-toggle autonomous-publish-toggle">
-              <input id="autonomousAllowGitPublish" type="checkbox" ${autonomousAllowGitPublish ? "checked" : ""} />
-              <span><strong>Autoriser le push GitHub et la publication du site</strong><small>Exige une branche propre avec <code>origin</code> ; limité à <code>git push origin HEAD</code> sans force et aux commandes de déploiement prévues.</small></span>
-              <i data-lucide="git-branch"></i>
-            </label>
-          </section>` : ""}
-          ${launchOrchestration ? `<section class="orchestration-create-team autonomous-launch-team">
-            <header><span><small>Équipe orchestrée</small><strong>Choisir l’adresse de chaque worker</strong></span><button id="autonomousLaunchWorkersUseOrchestrator" type="button" class="tool-button"><i data-lucide="copy-check"></i><span>Même compte pour tous</span></button></header>
-            <div id="autonomousLaunchWorkerAccounts">${renderAutonomousLaunchWorkerAccounts(accountId)}</div>
-          </section>` : ""}
-          <section class="autonomous-connector-access ${connectorsSupported ? "" : "is-disabled"}" aria-labelledby="autonomousConnectorTitle">
-            <header><span><i data-lucide="unplug"></i></span><div><strong id="autonomousConnectorTitle">Services Google</strong><small>Accès explicite, propre à cet agent.</small></div><em>Codex uniquement</em></header>
-            <div class="autonomous-connector-grid">${connectorOptions}</div>
-            <p><i data-lucide="shield-check"></i><span>Lecture autonome. Envoi d’e-mail, création ou modification d’événement : autorisation ponctuelle dans le moniteur. Les suppressions sont bloquées.</span></p>
-            <small class="autonomous-connector-prerequisite">${launchOrchestration
-              ? "Les connecteurs autonomes ne sont pas transférés aux workers orchestrés."
-              : connectorsSupported
-              ? connectorPrerequisite
-              : "Sélectionne un compte Codex pour utiliser Gmail ou Google Agenda. Les comptes Claude ne chargent pas ces connecteurs."}</small>
-          </section>
-          <label class="autonomous-review-toggle">
-            <input id="autonomousRequireUserReview" type="checkbox" ${autonomousRequireUserReview ? "checked" : ""} />
-            <span><strong>Review par l'utilisateur avant d'appliquer les changements</strong><small>L'agent prépare d'abord son plan sans modifier les fichiers. Il applique seulement après ton autorisation dans le moniteur.</small></span>
-            <i data-lucide="shield-check"></i>
-          </label>
         </section>
 
-        <details class="autonomous-advanced" ${autonomousInitialMemoryDraft.trim() || autonomousTestCommandDraft.trim() ? "open" : ""}>
-          <summary><span><i data-lucide="shield-check"></i><span><strong>Garde-fous et mémoire</strong><small>Recommandé pour un agent fiable.</small></span></span><i data-lucide="chevron-down"></i></summary>
-          <div class="autonomous-advanced-body">
-            <label class="autonomous-objective-field autonomous-memory-seed-field">
-              <span>Mémoire initiale <small>optionnelle</small></span>
-              <textarea id="autonomousInitialMemory" maxlength="2000" placeholder="Contraintes durables, architecture connue, décisions déjà prises…">${escapeHtml(autonomousInitialMemoryDraft)}</textarea>
-            </label>
-            <section class="autonomous-validation-config">
-              <div><i data-lucide="flask-conical"></i><span><strong>Preuve de réussite</strong><small>Cette commande doit réussir avant que l’agent puisse terminer son objectif.</small></span></div>
-              <label class="autonomous-test-command-field"><span>Commande de test ${launchOrchestration ? "<small>obligatoire en orchestration</small>" : ""}</span><input id="autonomousTestCommand" maxlength="8000" value="${escapeAttr(autonomousTestCommandDraft)}" placeholder="Ex. npm test && npm run build" ${launchOrchestration ? "required" : ""} /></label>
-              <label><span>Timeout</span><span class="autonomous-timeout-input"><input id="autonomousTestTimeout" type="number" min="5" max="1800" value="${autonomousTestTimeoutSeconds}" /><small>secondes</small></span></label>
-            </section>
+        <details id="autonomousCreateOptions" class="autonomous-create-options" ${autonomousCreateOptionsOpen ? "open" : ""}>
+          <summary><span><i data-lucide="sliders-horizontal"></i><strong>Plus d’options</strong></span><small>Nom, compte, mode, services et tests</small><i data-lucide="chevron-down"></i></summary>
+          <div class="autonomous-create-options-body">
+            <div class="autonomous-create-grid autonomous-identity-grid">
+              <label><span>Nom <small>optionnel</small></span><input id="autonomousName" maxlength="120" value="${escapeAttr(autonomousNameDraft)}" placeholder="Agent autonome" /></label>
+              <label class="autonomous-role-field"><span>Rôle <small>optionnel</small></span><input id="autonomousRole" maxlength="4000" value="${escapeAttr(autonomousRoleDraft)}" placeholder="Spécialité ou limites" /></label>
+            </div>
+            <div class="autonomous-create-grid autonomous-runtime-grid">
+              <label><span>Compte</span><select id="autonomousAccount" ${accountOptions ? "" : "disabled"}>${accountOptions || `<option value="">Aucun compte</option>`}</select></label>
+              <label><span>Lancement</span><select id="autonomousLaunchMode"><option value="autonomous" ${launchOrchestration ? "" : "selected"}>Agent autonome</option><option value="orchestrator" ${launchOrchestration ? "selected" : ""}>Orchestrateur + workers</option></select></label>
+              ${launchOrchestration
+                ? `<label><span>Workers</span><span class="orchestration-worker-count"><input id="autonomousLaunchWorkerCount" type="number" min="1" max="12" step="1" required value="${autonomousLaunchWorkerCount}" /><small>${autonomousLaunchWorkerCount + 1} agents au total</small></span></label>`
+                : `<label><span>Déclenchement</span><select id="autonomousTriggerKind"><option value="schedule" ${eventTriggered ? "" : "selected"}>Planning récurrent</option><option value="workspace_change" ${eventTriggered ? "selected" : ""}>Modification du projet</option></select></label>`}
+              ${eventTriggered ? `<label><span>Stabilisation</span><span class="autonomous-timeout-input"><input id="autonomousDebounceSeconds" type="number" min="2" max="600" step="1" value="${autonomousDebounceSeconds}" /><small>secondes</small></span></label>` : ""}
+              <label><span>Mode</span><select id="autonomousMode"><option value="build" ${autonomousMode === "build" ? "selected" : ""}>Construire et modifier</option><option value="plan" ${autonomousMode === "plan" ? "selected" : ""}>Analyser et planifier</option></select></label>
+            </div>
+            ${eventTriggered ? `<section class="autonomous-event-config"><header><span><i data-lucide="bell-ring"></i></span><div><strong>Veille du projet</strong></div></header><label><span>Chemins surveillés <small>un par ligne</small></span><textarea id="autonomousWatchPaths" maxlength="8000" required placeholder="src&#10;public&#10;package.json">${escapeHtml(autonomousWatchPathsDraft)}</textarea></label><label class="autonomous-review-toggle autonomous-publish-toggle"><input id="autonomousAllowGitPublish" type="checkbox" ${autonomousAllowGitPublish ? "checked" : ""} /><span><strong>Autoriser le push GitHub et la publication du site</strong><small>Push sans force uniquement.</small></span><i data-lucide="git-branch"></i></label></section>` : ""}
+            ${launchOrchestration ? `<section class="orchestration-create-team autonomous-launch-team"><header><span><strong>Comptes des workers</strong></span><button id="autonomousLaunchWorkersUseOrchestrator" type="button" class="tool-button"><i data-lucide="copy-check"></i><span>Même compte pour tous</span></button></header><div id="autonomousLaunchWorkerAccounts">${renderAutonomousLaunchWorkerAccounts(accountId)}</div></section>` : ""}
+
+            <details class="autonomous-advanced">
+              <summary><span><i data-lucide="shield-check"></i><span><strong>Services et sécurité</strong></span></span><i data-lucide="chevron-down"></i></summary>
+              <div class="autonomous-advanced-body">
+                <section class="autonomous-connector-access ${connectorsSupported ? "" : "is-disabled"}" aria-labelledby="autonomousConnectorTitle">
+                  <header><span><i data-lucide="unplug"></i></span><div><strong id="autonomousConnectorTitle">Services Google</strong></div><em>Codex</em></header>
+                  <div class="autonomous-connector-grid">${connectorOptions}</div>
+                  <p><i data-lucide="shield-check"></i><span>Lecture autonome. Envoi d’e-mail, création ou modification d’événement : autorisation ponctuelle dans le moniteur. Les suppressions sont bloquées.</span></p>
+                  <small class="autonomous-connector-prerequisite">${launchOrchestration ? "Les connecteurs autonomes ne sont pas transférés aux workers orchestrés." : connectorsSupported ? connectorPrerequisite : "Sélectionne un compte Codex pour utiliser Gmail ou Google Agenda. Les comptes Claude ne chargent pas ces connecteurs."}</small>
+                </section>
+                <section class="autonomous-whatsapp-access autonomous-mobile-access ${mobileNotificationsSupported ? "" : "is-disabled"}" aria-labelledby="autonomousMobileNotificationsTitle">
+                  <header><span><i data-lucide="smartphone"></i></span><div><strong id="autonomousMobileNotificationsTitle">Notifications dans l’app mobile</strong><small>Firebase Cloud Messaging · Android</small></div><em>Privé</em></header>
+                  <label class="autonomous-review-toggle autonomous-whatsapp-toggle">
+                    <input id="autonomousMobileNotifications" type="checkbox" ${autonomousMobileNotifications ? "checked" : ""} ${mobileNotificationsSupported ? "" : "disabled"} />
+                    <span><strong>Envoyer les comptes rendus et les alertes à l’app</strong><small>Un toucher ouvre directement le moniteur du bon agent. Le contenu reste masqué sur l’écran verrouillé.</small></span>
+                    <i data-lucide="bell-ring"></i>
+                  </label>
+                  ${hasMobilePaymentSettings()
+                    ? `<button id="autonomousOpenMobileNotificationSettings" type="button" class="tool-button"><i data-lucide="settings"></i><span>Configurer les notifications mobiles</span></button>`
+                    : `<small><i data-lucide="info"></i>Enregistre au moins un appareil Android depuis Paramètres → Notifications mobiles.</small>`}
+                </section>
+                <section class="autonomous-whatsapp-access autonomous-telegram-access ${telegramNotificationsSupported ? "" : "is-disabled"}" aria-labelledby="autonomousTelegramTitle">
+                  <header><span><i data-lucide="send"></i></span><div><strong id="autonomousTelegramTitle">Notifications Telegram</strong><small>${telegramChannelId ? `Bot lié · ${escapeHtml(telegramConnection?.userHint || telegramConnection?.botUsername || "compte appairé")}` : telegramConnection?.connected ? "Bot connecté · appairage à terminer" : "Aucun bot Telegram lié"}</small></div><em>Gratuit · recommandé</em></header>
+                  <label class="autonomous-review-toggle autonomous-whatsapp-toggle">
+                    <input id="autonomousTelegramNotifications" type="checkbox" ${autonomousTelegramNotifications ? "checked" : ""} ${telegramNotificationsSupported ? "" : "disabled"} />
+                    <span><strong>Envoyer les rapports et parler à l’agent sur Telegram</strong><small>Chaque nouveau rapport arrive dans Telegram ; réponds au message pour guider directement le bon agent.</small></span>
+                    <i data-lucide="messages-square"></i>
+                  </label>
+                  ${telegramChannelId
+                    ? `<small><i data-lucide="shield-check"></i>Le jeton du bot reste côté serveur ; aucun numéro de téléphone n’est enregistré.</small>`
+                    : `<button id="autonomousOpenTelegramSettings" type="button" class="tool-button"><i data-lucide="link"></i><span>${telegramConnection?.connected ? "Terminer l’appairage Telegram" : "Lier Telegram dans les paramètres"}</span></button>`}
+                </section>
+                <section class="autonomous-whatsapp-access ${whatsappNotificationsSupported ? "" : "is-disabled"}" aria-labelledby="autonomousWhatsAppTitle">
+                  <header><span><i data-lucide="message-circle"></i></span><div><strong id="autonomousWhatsAppTitle">Notifications WhatsApp</strong><small>${whatsappChannelId ? `Canal lié · ${escapeHtml(whatsappConnection?.recipientHint || "destinataire configuré")}` : "Aucun compte WhatsApp Business lié"}</small></div><em>Meta</em></header>
+                  <label class="autonomous-review-toggle autonomous-whatsapp-toggle">
+                    <input id="autonomousWhatsAppNotifications" type="checkbox" ${autonomousWhatsAppNotifications ? "checked" : ""} ${whatsappNotificationsSupported ? "" : "disabled"} />
+                    <span><strong>Envoyer les comptes rendus sur WhatsApp</strong><small>Un message est envoyé pour chaque nouveau rapport et lorsqu’une intervention devient nécessaire.</small></span>
+                    <i data-lucide="bell-ring"></i>
+                  </label>
+                  ${whatsappChannelId
+                    ? `<small><i data-lucide="shield-check"></i>Le jeton Meta reste côté serveur ; l’agent ne conserve que l’identifiant du canal.</small>`
+                    : `<button id="autonomousOpenWhatsAppSettings" type="button" class="tool-button"><i data-lucide="link"></i><span>Lier WhatsApp dans les paramètres</span></button>`}
+                </section>
+                <label class="autonomous-review-toggle"><input id="autonomousRequireUserReview" type="checkbox" ${autonomousRequireUserReview ? "checked" : ""} /><span><strong>Review par l'utilisateur avant d'appliquer les changements</strong><small>L’agent demande ton accord avant de modifier.</small></span><i data-lucide="shield-check"></i></label>
+              </div>
+            </details>
+
+            <details class="autonomous-advanced" ${autonomousInitialMemoryDraft.trim() || autonomousTestCommandDraft.trim() || launchOrchestration ? "open" : ""}>
+              <summary><span><i data-lucide="flask-conical"></i><span><strong>Tests et mémoire</strong></span></span><i data-lucide="chevron-down"></i></summary>
+              <div class="autonomous-advanced-body">
+                <label class="autonomous-objective-field autonomous-memory-seed-field"><span>Mémoire initiale <small>optionnelle</small></span><textarea id="autonomousInitialMemory" maxlength="2000" placeholder="Contexte durable…">${escapeHtml(autonomousInitialMemoryDraft)}</textarea></label>
+                <section class="autonomous-validation-config"><div><i data-lucide="flask-conical"></i><span><strong>Preuve de réussite</strong></span></div><label class="autonomous-test-command-field"><span>Commande de test ${launchOrchestration ? "<small>obligatoire</small>" : ""}</span><input id="autonomousTestCommand" maxlength="8000" value="${escapeAttr(autonomousTestCommandDraft)}" placeholder="Ex. npm test" ${launchOrchestration ? "required" : ""} /></label><label><span>Timeout</span><span class="autonomous-timeout-input"><input id="autonomousTestTimeout" type="number" min="5" max="1800" value="${autonomousTestTimeoutSeconds}" /><small>secondes</small></span></label></section>
+              </div>
+            </details>
           </div>
         </details>
 
         <div class="autonomous-create-actions">
-          <small><i data-lucide="circle-alert"></i>Après 3 échecs, l’agent se suspend et attend ton intervention.</small>
           <button class="tool-button primary" type="submit" ${accountOptions && autonomousBusyId !== "create" ? "" : "disabled"}><i data-lucide="${launchOrchestration ? "users" : eventTriggered ? "moon-star" : "play"}"></i><span>${autonomousBusyId === "create" ? "Création…" : launchOrchestration ? "Créer et lancer l’orchestration" : eventTriggered ? "Créer et mettre en veille" : "Créer et démarrer"}</span></button>
         </div>
       </form>
@@ -11253,16 +16488,360 @@ const renderAutonomousPanel = (): string => {
 
     <section class="autonomous-agents-section">
       <header class="autonomous-list-head">
-        <div><span class="autonomous-section-kicker">Suivi en temps réel</span><strong>Mes agents</strong><small>Chaque objectif, sa validation et sa mémoire durable.</small></div>
-        <button id="autonomousRefresh" type="button" class="icon-button" title="Actualiser" aria-label="Actualiser les agents"><i data-lucide="refresh-ccw"></i></button>
+        <div><strong>Mes agents</strong></div>
+        <div class="autonomous-list-actions">
+          ${userAgentCount ? `<button id="autonomousPauseAll" type="button" class="tool-button autonomous-list-pause-all" title="${escapeAttr(pauseAllTitle)}" aria-label="${escapeAttr(pauseAllTitle)}" ${pausableCount && !autonomousBusyId ? "" : "disabled"}><i data-lucide="${pausingAll ? "loader-circle" : "pause"}"></i><span>${pausingAll ? "Mise en pause…" : pausableCount ? "Tout mettre en pause" : "Aucun agent actif"}</span></button>` : ""}
+          <button id="autonomousRefresh" type="button" class="icon-button" title="Actualiser" aria-label="Actualiser les agents" ${autonomousBusyId ? "disabled" : ""}><i data-lucide="refresh-ccw"></i></button>
+        </div>
       </header>
       <div class="autonomous-agent-list">
         ${!autonomousAgentsLoaded
           ? `<div class="autonomous-empty"><i data-lucide="loader-circle"></i><strong>Chargement des agents…</strong></div>`
-          : autonomousAgents.map(renderAutonomousAgentCard).join("") || `<div class="autonomous-empty"><i data-lucide="bot"></i><strong>Aucun agent autonome</strong><span>Ouvre « Créer un agent autonome » pour définir ton premier objectif.</span></div>`}
+          : autonomousAgents.map(renderAutonomousAgentCard).join("") || `<div class="autonomous-empty"><i data-lucide="bot"></i><strong>Aucun agent</strong><span>Crée ton premier agent ci-dessus.</span></div>`}
       </div>
     </section>
+    </div>`}
   </div>`;
+};
+
+const bugReportAgents = (): AutonomousAgentSnapshot[] =>
+  autonomousAgents
+    .filter(isBugReportAgent)
+    .slice()
+    .sort((left, right) => right.createdAt - left.createdAt);
+
+const bugReportAgentState = (agent: AutonomousAgentSnapshot): {
+  label: string;
+  detail: string;
+  tone: "working" | "success" | "warning" | "muted";
+  icon: string;
+} => {
+  if (agent.pendingReview) {
+    return {
+      label: "Validation requise",
+      detail: "L’agent attend ton accord avant de poursuivre.",
+      tone: "warning",
+      icon: "shield-question",
+    };
+  }
+  if (autonomousAgentIsRunning(agent)) {
+    return {
+      label: "Correction en cours",
+      detail: "L’agent analyse le projet en arrière-plan.",
+      tone: "working",
+      icon: "loader-circle",
+    };
+  }
+  if (agent.status === "completed") {
+    return {
+      label: "Traitement terminé",
+      detail: agent.testStatus === "passed"
+        ? "Le correctif a passé la commande de validation configurée."
+        : "L’agent a terminé sa mission et consigné son résultat.",
+      tone: "success",
+      icon: "badge-check",
+    };
+  }
+  if (agent.status === "needs_attention") {
+    return {
+      label: "Intervention requise",
+      detail: agent.lastError || "L’agent ne peut pas continuer sans aide.",
+      tone: "warning",
+      icon: "circle-alert",
+    };
+  }
+  if (agent.status === "paused") {
+    return {
+      label: "En pause",
+      detail: "Le traitement peut être repris depuis le moniteur.",
+      tone: "muted",
+      icon: "pause",
+    };
+  }
+  return {
+    label: "Agent lancé",
+    detail: formatAutonomousSchedule(agent, Date.now() / 1000),
+    tone: "working",
+    icon: "clock-3",
+  };
+};
+
+const renderBugReportOverview = (): string => {
+  const reports = bugReportAgents();
+  const working = reports.filter(autonomousAgentIsRunning).length;
+  const attention = reports.filter((agent) => agent.status === "needs_attention" || !!agent.pendingReview).length;
+  const completed = reports.filter((agent) => agent.status === "completed").length;
+  return `
+    <article><span><i data-lucide="bug"></i></span><div><strong>${reports.length}</strong><small>Signalements</small></div></article>
+    <article class="is-working"><span><i data-lucide="loader-circle"></i></span><div><strong>${working}</strong><small>En cours</small></div></article>
+    <article class="is-attention"><span><i data-lucide="circle-alert"></i></span><div><strong>${attention}</strong><small>À examiner</small></div></article>
+    <article class="is-completed"><span><i data-lucide="badge-check"></i></span><div><strong>${completed}</strong><small>Terminés</small></div></article>`;
+};
+
+const renderBugReportHistory = (): string => {
+  if (!autonomousAgentsLoaded) {
+    return `<div class="bug-report-empty"><i data-lucide="loader-circle"></i><strong>Chargement des signalements…</strong></div>`;
+  }
+  const reports = bugReportAgents();
+  if (!reports.length) {
+    return `<div class="bug-report-empty"><i data-lucide="clipboard-check"></i><strong>Aucun bug signalé ici</strong><span>Le premier ticket apparaîtra dans cette liste dès que son agent sera lancé.</span></div>`;
+  }
+  return reports.map((agent) => {
+    const state = bugReportAgentState(agent);
+    const summary = agent.lastSummary?.trim() || agent.lastError?.trim() || state.detail;
+    return `<article class="bug-report-ticket tone-${state.tone}">
+      <header>
+        <span class="bug-report-ticket-icon"><i data-lucide="${escapeAttr(state.icon)}"></i></span>
+        <div>
+          <span class="bug-report-ticket-state"><i></i>${escapeHtml(state.label)}</span>
+          <h3>${escapeHtml(bugReportTitleFromAgent(agent))}</h3>
+          <small>Signalé ${escapeHtml(formatAutonomousTimestamp(agent.createdAt))}</small>
+        </div>
+        <span class="bug-report-severity">${escapeHtml(agent.role?.match(/Gravité : ([^·]+)/)?.[1]?.trim() || "Bug")}</span>
+      </header>
+      <p>${escapeHtml(summary)}</p>
+      <dl>
+        <div><dt>Projet</dt><dd>${escapeHtml(agent.projectDir || "Non renseigné")}</dd></div>
+        <div><dt>Compte</dt><dd>${escapeHtml(autonomousAccountLabel(agent))}</dd></div>
+        <div><dt>Cycles</dt><dd>${agent.runCount}</dd></div>
+      </dl>
+      <footer>
+        <span><i data-lucide="clock-3"></i><span data-bug-report-schedule="${escapeAttr(agent.id)}">${escapeHtml(formatAutonomousSchedule(agent, Date.now() / 1000))}</span></span>
+        <button type="button" class="tool-button ${agent.pendingReview || agent.status === "needs_attention" ? "primary" : ""}" data-bug-report-monitor="${escapeAttr(agent.id)}"><i data-lucide="panel-right-open"></i><span>${agent.pendingReview ? "Examiner" : "Suivre l’agent"}</span></button>
+      </footer>
+    </article>`;
+  }).join("");
+};
+
+const renderBugReportFeedback = (): string => {
+  if (!bugReportFeedback) return "";
+  const agentExists = !!lastCreatedBugReportAgentId
+    && autonomousAgents.some((agent) => agent.id === lastCreatedBugReportAgentId);
+  return `<div class="bug-report-feedback tone-${bugReportFeedback.tone}" role="${bugReportFeedback.tone === "error" ? "alert" : "status"}">
+    <i data-lucide="${bugReportFeedback.tone === "success" ? "badge-check" : "circle-alert"}"></i>
+    <span>${escapeHtml(bugReportFeedback.message)}</span>
+    ${bugReportFeedback.tone === "success" && agentExists ? `<button type="button" class="tool-button" data-bug-report-monitor="${escapeAttr(lastCreatedBugReportAgentId!)}"><i data-lucide="panel-right-open"></i><span>Voir le travail</span></button>` : ""}
+  </div>`;
+};
+
+const renderBugReportPanel = (): string => {
+  const accountId = accountById(bugReportDraft.accountId)?.id
+    ?? selectedAccountId
+    ?? settings?.defaultAccountId
+    ?? settings?.accounts[0]?.id
+    ?? "";
+  const accountOptions = settings?.accounts.map((account) =>
+    `<option value="${escapeAttr(account.id)}" ${account.id === accountId ? "selected" : ""}>${escapeHtml(account.label)} · ${escapeHtml(accountProviderLabel(account))}</option>`,
+  ).join("") ?? "";
+  const workspaceOptions = knownWorkspaces().map((workspace) =>
+    `<option value="${escapeAttr(workspace.path)}">${escapeHtml(workspace.label)}</option>`,
+  ).join("");
+  const severityOptions = BUG_REPORT_SEVERITIES.map((severity) =>
+    `<option value="${severity.value}" ${severity.value === bugReportDraft.severity ? "selected" : ""}>${escapeHtml(severity.label)} — ${escapeHtml(severity.description)}</option>`,
+  ).join("");
+  const hostMessage = isRemoteMode()
+    ? "Le serveur continue le diagnostic même si cet onglet est fermé."
+    : "L’agent travaille tant que l’application desktop reste ouverte.";
+
+  return `<div class="panel bug-report-panel">
+    <header class="bug-report-hero">
+      <div class="bug-report-hero-copy">
+        <span class="bug-report-mark" aria-hidden="true"><i data-lucide="bug"></i></span>
+        <div>
+          <span class="bug-report-kicker"><i data-lucide="wrench"></i>Diagnostic et correction automatiques</span>
+          <h2>Signaler un bug</h2>
+          <p>Décris le problème une seule fois. Un agent autonome démarre immédiatement dans le projet, cherche la cause, prépare le correctif et vérifie qu’il ne régresse pas.</p>
+        </div>
+      </div>
+      <div class="bug-report-runtime"><i></i><span><strong>Moteur d’agents prêt</strong><small>${escapeHtml(hostMessage)}</small></span></div>
+    </header>
+
+    <section id="bugReportOverview" class="bug-report-overview" aria-label="État des signalements">${renderBugReportOverview()}</section>
+
+    <section class="bug-report-workspace">
+      <form id="bugReportForm" class="bug-report-form">
+        <header>
+          <span><i data-lucide="message-square-warning"></i></span>
+          <div><strong>Nouveau signalement</strong><small>Les champs marqués sont transmis tels quels à l’agent de correction.</small></div>
+        </header>
+
+        <div class="bug-report-form-grid">
+          <label class="bug-report-title-field"><span>Titre du bug <small>obligatoire</small></span><input id="bugReportTitle" maxlength="160" required value="${escapeAttr(bugReportDraft.title)}" placeholder="Ex. Le bouton Enregistrer ne répond plus" ${bugReportBusy ? "disabled" : ""} /></label>
+          <label><span>Gravité</span><select id="bugReportSeverity" ${bugReportBusy ? "disabled" : ""}>${severityOptions}</select></label>
+          <label class="bug-report-wide"><span>Description <small>obligatoire</small></span><textarea id="bugReportDescription" maxlength="8000" required placeholder="Que se passe-t-il, depuis quand et dans quel contexte ?" ${bugReportBusy ? "disabled" : ""}>${escapeHtml(bugReportDraft.description)}</textarea></label>
+          <label class="bug-report-wide"><span>Étapes pour reproduire <small>optionnel</small></span><textarea id="bugReportSteps" maxlength="5000" placeholder="1. Ouvrir…&#10;2. Cliquer sur…&#10;3. Observer…" ${bugReportBusy ? "disabled" : ""}>${escapeHtml(bugReportDraft.steps)}</textarea></label>
+          <label><span>Résultat attendu <small>optionnel</small></span><textarea id="bugReportExpected" maxlength="3000" placeholder="Ce qui devrait se produire" ${bugReportBusy ? "disabled" : ""}>${escapeHtml(bugReportDraft.expected)}</textarea></label>
+          <label><span>Résultat observé <small>optionnel</small></span><textarea id="bugReportActual" maxlength="3000" placeholder="Ce qui se produit réellement" ${bugReportBusy ? "disabled" : ""}>${escapeHtml(bugReportDraft.actual)}</textarea></label>
+        </div>
+
+        <section class="bug-report-execution">
+          <header><i data-lucide="bot"></i><span><strong>Agent de correction</strong><small>Il démarre dès l’envoi et poursuit ses cycles en arrière-plan jusqu’à résolution ou blocage.</small></span></header>
+          <div>
+            <label><span>Compte agent</span><select id="bugReportAccount" ${accountOptions && !bugReportBusy ? "" : "disabled"}>${accountOptions || `<option value="">Aucun compte disponible</option>`}</select></label>
+            <label><span>Dossier du projet <small>obligatoire</small></span><input id="bugReportProjectDir" list="bugReportWorkspaces" required value="${escapeAttr(bugReportDraft.projectDir)}" placeholder="C:/projets/mon-application" ${bugReportBusy ? "disabled" : ""} /><datalist id="bugReportWorkspaces">${workspaceOptions}</datalist></label>
+            <label class="bug-report-test-field"><span>Commande de validation <small>optionnelle</small></span><input id="bugReportTestCommand" maxlength="8000" value="${escapeAttr(bugReportDraft.testCommand)}" placeholder="Ex. npm test" ${bugReportBusy ? "disabled" : ""} /></label>
+          </div>
+          <label class="bug-report-review-toggle">
+            <input id="bugReportRequireReview" type="checkbox" ${bugReportDraft.requireUserReview ? "checked" : ""} ${bugReportBusy ? "disabled" : ""} />
+            <span><strong>Me demander avant de modifier les fichiers</strong><small>Désactivé par défaut pour que l’agent puisse réellement tenter le correctif sans attendre.</small></span>
+            <i data-lucide="shield-check"></i>
+          </label>
+        </section>
+
+        <div id="bugReportFeedback">${renderBugReportFeedback()}</div>
+        <footer>
+          <small><i data-lucide="shield-check"></i>L’agent ne publie rien et ne pousse aucun commit. Après trois échecs, il se suspend.</small>
+          <button type="submit" class="tool-button primary" ${accountOptions && !bugReportBusy ? "" : "disabled"}><i data-lucide="${bugReportBusy ? "loader-circle" : "play"}"></i><span>${bugReportBusy ? "Lancement de l’agent…" : "Signaler et lancer l’agent"}</span></button>
+        </footer>
+      </form>
+
+      <aside class="bug-report-guide">
+        <span><i data-lucide="lightbulb"></i></span>
+        <div><strong>Pour un diagnostic plus rapide</strong><p>Indique le dernier geste effectué, le message d’erreur exact et si le bug est systématique. Une reproduction précise évite à l’agent de modifier le projet sur une fausse piste.</p></div>
+        <ol><li><b>1</b><span>Reproduire</span></li><li><b>2</b><span>Corriger</span></li><li><b>3</b><span>Tester</span></li></ol>
+      </aside>
+    </section>
+
+    <section class="bug-report-history">
+      <header><div><span class="bug-report-section-kicker">Suivi automatique</span><strong>Mes signalements</strong><small>Ouvre le moniteur pour voir le raisonnement, les tests ou répondre à une demande.</small></div><button id="bugReportRefresh" type="button" class="icon-button" title="Actualiser" aria-label="Actualiser les signalements"><i data-lucide="refresh-ccw"></i></button></header>
+      <div id="bugReportHistoryList" class="bug-report-history-list">${renderBugReportHistory()}</div>
+    </section>
+  </div>`;
+};
+
+const readBugReportDraftFromForm = (): BugReportDraft => ({
+  title: document.querySelector<HTMLInputElement>("#bugReportTitle")?.value ?? bugReportDraft.title,
+  description: document.querySelector<HTMLTextAreaElement>("#bugReportDescription")?.value ?? bugReportDraft.description,
+  steps: document.querySelector<HTMLTextAreaElement>("#bugReportSteps")?.value ?? bugReportDraft.steps,
+  expected: document.querySelector<HTMLTextAreaElement>("#bugReportExpected")?.value ?? bugReportDraft.expected,
+  actual: document.querySelector<HTMLTextAreaElement>("#bugReportActual")?.value ?? bugReportDraft.actual,
+  severity: (document.querySelector<HTMLSelectElement>("#bugReportSeverity")?.value ?? bugReportDraft.severity) as BugReportSeverity,
+  accountId: document.querySelector<HTMLSelectElement>("#bugReportAccount")?.value ?? bugReportDraft.accountId,
+  projectDir: document.querySelector<HTMLInputElement>("#bugReportProjectDir")?.value ?? bugReportDraft.projectDir,
+  testCommand: document.querySelector<HTMLInputElement>("#bugReportTestCommand")?.value ?? bugReportDraft.testCommand,
+  requireUserReview: document.querySelector<HTMLInputElement>("#bugReportRequireReview")?.checked ?? bugReportDraft.requireUserReview,
+});
+
+const bindBugReportHistoryUi = (root: ParentNode = document): void => {
+  root.querySelectorAll<HTMLButtonElement>("[data-bug-report-monitor]").forEach((button) => {
+    button.addEventListener("click", () => openAutonomousMonitor(button.dataset.bugReportMonitor));
+  });
+};
+
+function syncBugReportPanelUi(): void {
+  const attention = bugReportAgents().filter(
+    (agent) => agent.status === "needs_attention" || !!agent.pendingReview,
+  ).length;
+  document.querySelectorAll<HTMLElement>("[data-bug-report-nav-badge]").forEach((badge) => {
+    badge.textContent = attention ? (attention > 9 ? "9+" : String(attention)) : "Auto";
+    badge.classList.toggle("has-attention", attention > 0);
+  });
+  const panel = document.querySelector<HTMLElement>(".bug-report-panel");
+  if (!panel) return;
+  const overview = panel.querySelector<HTMLElement>("#bugReportOverview");
+  const history = panel.querySelector<HTMLElement>("#bugReportHistoryList");
+  const feedback = panel.querySelector<HTMLElement>("#bugReportFeedback");
+  if (overview) overview.innerHTML = renderBugReportOverview();
+  if (history) history.innerHTML = renderBugReportHistory();
+  if (feedback) feedback.innerHTML = renderBugReportFeedback();
+  [overview, history, feedback].forEach((element) => {
+    if (element) renderIcons(element);
+  });
+  bindBugReportHistoryUi(panel);
+}
+
+const bindBugReportPanelUi = (): void => {
+  const form = document.querySelector<HTMLFormElement>("#bugReportForm");
+  if (!form) return;
+  form.addEventListener("input", () => {
+    bugReportDraft = readBugReportDraftFromForm();
+    if (bugReportFeedback?.tone === "error") {
+      bugReportFeedback = null;
+      const feedback = document.querySelector<HTMLElement>("#bugReportFeedback");
+      if (feedback) feedback.innerHTML = "";
+    }
+  });
+  form.addEventListener("change", () => {
+    bugReportDraft = readBugReportDraftFromForm();
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (bugReportBusy) return;
+    bugReportDraft = readBugReportDraftFromForm();
+    const account = accountById(bugReportDraft.accountId);
+    if (!account) {
+      bugReportFeedback = { tone: "error", message: "Choisis un compte agent valide." };
+      syncBugReportPanelUi();
+      return;
+    }
+    if (!bugReportDraft.projectDir.trim()) {
+      document.querySelector<HTMLInputElement>("#bugReportProjectDir")?.reportValidity();
+      return;
+    }
+
+    bugReportBusy = true;
+    bugReportFeedback = null;
+    statusText = "Création et lancement de l’agent de correction";
+    render();
+
+    void (async () => {
+      try {
+        const sourceId = typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        const severity = bugReportSeverityLabel(bugReportDraft.severity);
+        const created = await invoke<AutonomousAgentSnapshot>("create_autonomous_agent", {
+          request: {
+            name: `Bug · ${bugReportDraft.title.trim()}`.slice(0, 120),
+            objective: buildBugReportObjective(bugReportDraft),
+            role: `Ingénieur logiciel de diagnostic et correction · Gravité : ${severity}`,
+            sourceChatKey: createBugReportSourceKey(sourceId),
+            accountId: account.id,
+            projectDir: bugReportDraft.projectDir.trim(),
+            mode: "build",
+            requireUserReview: bugReportDraft.requireUserReview,
+            connectors: [],
+            model: accountModel(account),
+            reasoningEffort: accountProvider(account) === "codex" ? accountReasoningEffort(account) : null,
+            intervalSeconds: 15 * 60,
+            triggerKind: "schedule",
+            watchPaths: [],
+            debounceSeconds: 10,
+            allowGitPublish: false,
+            initialMemory: `Ticket utilisateur dédié : « ${bugReportDraft.title.trim()} ». Gravité : ${severity}. Rester strictement dans ce périmètre et conserver les preuves de reproduction et de validation.`,
+            testCommand: bugReportDraft.testCommand.trim() || null,
+            testTimeoutSeconds: 10 * 60,
+            deferFirstRun: false,
+          },
+        });
+        updateAutonomousAgentLocally(created);
+        lastCreatedBugReportAgentId = created.id;
+        const retained = {
+          accountId: bugReportDraft.accountId,
+          projectDir: bugReportDraft.projectDir,
+          requireUserReview: bugReportDraft.requireUserReview,
+        };
+        bugReportDraft = { ...emptyBugReportDraft(), ...retained };
+        bugReportFeedback = {
+          tone: "success",
+          message: `Le signalement « ${bugReportTitleFromAgent(created)} » est enregistré. Son agent travaille maintenant en arrière-plan.`,
+        };
+        statusText = `Agent de correction « ${created.name} » lancé`;
+        startAutonomousAgentsPoll();
+      } catch (error) {
+        bugReportFeedback = { tone: "error", message: String(error) };
+        statusText = String(error);
+      } finally {
+        bugReportBusy = false;
+        if (activeView === "bug-report") render();
+        void refreshAutonomousAgents();
+      }
+    })();
+  });
+  document.querySelector<HTMLButtonElement>("#bugReportRefresh")?.addEventListener("click", () => {
+    void refreshAutonomousAgents(true);
+  });
+  bindBugReportHistoryUi(document.querySelector(".bug-report-panel") ?? document);
 };
 
 const updateAutonomousAgentLocally = (updated: AutonomousAgentSnapshot) => {
@@ -11348,6 +16927,17 @@ const saveAutonomousAgentEdit = async (id: string): Promise<void> => {
         model,
         reasoningEffort,
         connectors: provider === "codex" ? draft.connectors : [],
+        mobileNotificationsEnabled: draft.mobileNotificationsEnabled,
+        telegramNotificationChannelId:
+          !connectedTelegramChannelId()
+          && draft.telegramNotificationChannelId === (original.telegramNotificationChannelId?.trim() || null)
+            ? undefined
+            : draft.telegramNotificationChannelId || "",
+        whatsappNotificationChannelId:
+          !connectedWhatsAppChannelId()
+          && draft.whatsappNotificationChannelId === (original.whatsappNotificationChannelId?.trim() || null)
+            ? undefined
+            : draft.whatsappNotificationChannelId || "",
         intervalSeconds: Math.max(60, Math.min(7 * 24 * 60 * 60, Math.round(draft.intervalSeconds))),
         triggerKind: draft.triggerKind,
         watchPaths: draft.triggerKind === "workspace_change" ? watchPaths : [],
@@ -11446,6 +17036,21 @@ const bindAutonomousAgentEditUi = (): void => {
           case "requireUserReview":
             draft.requireUserReview = control instanceof HTMLInputElement && control.checked;
             break;
+          case "mobileNotifications":
+            draft.mobileNotificationsEnabled = control instanceof HTMLInputElement && control.checked;
+            break;
+          case "telegramNotifications":
+            draft.telegramNotificationChannelId =
+              control instanceof HTMLInputElement && control.checked
+                ? connectedTelegramChannelId() || draft.telegramNotificationChannelId
+                : null;
+            break;
+          case "whatsappNotifications":
+            draft.whatsappNotificationChannelId =
+              control instanceof HTMLInputElement && control.checked
+                ? connectedWhatsAppChannelId() || draft.whatsappNotificationChannelId
+                : null;
+            break;
           case "allowGitPublish":
             draft.allowGitPublish = control instanceof HTMLInputElement && control.checked;
             break;
@@ -11480,6 +17085,30 @@ const bindAutonomousAgentEditUi = (): void => {
         input.closest(".autonomous-agent-edit-connector")?.classList.toggle("is-selected", input.checked);
       });
     });
+    form.querySelector<HTMLButtonElement>("[data-autonomous-open-whatsapp-settings]")
+      ?.addEventListener("click", () => {
+        setActiveView("settings");
+        window.setTimeout(() => {
+          document.querySelector<HTMLElement>("#whatsappConnectionSettings")?.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+        }, 150);
+      });
+    form.querySelector<HTMLButtonElement>("[data-autonomous-open-mobile-settings]")
+      ?.addEventListener("click", () => {
+        openMobilePaymentSettings();
+      });
+    form.querySelector<HTMLButtonElement>("[data-autonomous-open-telegram-settings]")
+      ?.addEventListener("click", () => {
+        setActiveView("settings");
+        window.setTimeout(() => {
+          document.querySelector<HTMLElement>("#telegramConnectionSettings")?.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+        }, 150);
+      });
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const projectInput = form.querySelector<HTMLInputElement>('[data-autonomous-edit-field="projectDir"]');
@@ -11504,6 +17133,104 @@ const bindAutonomousAgentEditUi = (): void => {
 };
 
 const bindAutonomousPanelUi = () => {
+  bindAutonomousRadarImplementationButtons(document.querySelector(".autonomous-panel"));
+  document.querySelectorAll<HTMLButtonElement>(".autonomous-panel [data-autonomous-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const tab = button.dataset.autonomousTab;
+      if (tab !== "agents" && tab !== "proposals") return;
+      autonomousPanelTab = tab;
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".autonomous-panel [data-autonomous-proposal-execute]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const sourceAgentId = button.dataset.autonomousProposalExecute;
+      const proposalId = button.dataset.autonomousProposalId;
+      if (!sourceAgentId || !proposalId) return;
+      void executeAutonomousProposal(sourceAgentId, proposalId);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".autonomous-panel [data-autonomous-panel-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.dataset.autonomousPanelToggle === "overview") {
+        autonomousOverviewOpen = !autonomousOverviewOpen;
+      } else if (button.dataset.autonomousPanelToggle === "templates") {
+        autonomousTemplatesOpen = !autonomousTemplatesOpen;
+      }
+      render();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#autonomousCollapseAll")?.addEventListener("click", () => {
+    autonomousOverviewOpen = false;
+    autonomousTemplatesOpen = false;
+    autonomousCreateOpen = false;
+    autonomousCreatePreferenceSet = true;
+    autonomousCreateOptionsOpen = false;
+    autonomousExpandedAgentIds.clear();
+    autonomousExpandedAgentSectionKeys.clear();
+    autonomousAgents.forEach((agent) => autonomousCollapsedAgentCards.set(agent.id, true));
+    render();
+  });
+  document.querySelectorAll<HTMLButtonElement>(".autonomous-panel [data-autonomous-agent-card-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.autonomousAgentCardToggle;
+      if (!id) return;
+      const agent = autonomousAgents.find((candidate) => candidate.id === id);
+      const collapsed = autonomousCollapsedAgentCards.get(id) ?? Boolean(agent?.systemManaged);
+      autonomousCollapsedAgentCards.set(id, !collapsed);
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLDetailsElement>(".autonomous-panel [data-autonomous-agent-more]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (!details.isConnected) return;
+      const id = details.dataset.autonomousAgentMore;
+      if (!id) return;
+      if (details.open) autonomousExpandedAgentIds.add(id);
+      else autonomousExpandedAgentIds.delete(id);
+      const label = details.querySelector<HTMLElement>("summary b");
+      if (label) label.textContent = details.open ? "Masquer" : "Détails";
+    });
+  });
+  document.querySelectorAll<HTMLDetailsElement>(".autonomous-panel [data-autonomous-agent-section]").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      if (!details.isConnected) return;
+      const key = details.dataset.autonomousAgentSection;
+      if (!key) return;
+      if (details.open) autonomousExpandedAgentSectionKeys.add(key);
+      else autonomousExpandedAgentSectionKeys.delete(key);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".autonomous-panel [data-autonomous-section-hide]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const details = button.closest<HTMLDetailsElement>("[data-autonomous-agent-section]");
+      const key = button.dataset.autonomousSectionHide;
+      if (!details || !key) return;
+      const summary = details.querySelector<HTMLElement>(":scope > summary");
+      autonomousExpandedAgentSectionKeys.delete(key);
+      details.open = false;
+      summary?.focus();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".autonomous-panel [data-autonomous-report-open]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const agentId = button.dataset.autonomousReportOpen;
+      if (agentId) openAutonomousMonitor(agentId);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>(".autonomous-panel [data-autonomous-report-seen]").forEach((button) => {
+    button.addEventListener("click", () => void (async () => {
+      const reportId = button.dataset.autonomousReportSeen;
+      if (!reportId) return;
+      try {
+        await markAutonomousReportSeen(reportId);
+        statusText = "Compte rendu marqué comme lu";
+      } catch (error) {
+        statusText = String(error);
+      }
+      render();
+    })());
+  });
   const createShell = document.querySelector<HTMLDetailsElement>("#autonomousCreateShell");
   const syncCreateShell = () => {
     // Un render remplace le <details>. Son ancien evenement `toggle` peut etre
@@ -11511,15 +17238,22 @@ const bindAutonomousPanelUi = () => {
     if (!createShell?.isConnected) return;
     autonomousCreatePreferenceSet = true;
     autonomousCreateOpen = createShell.open;
+    if (!createShell.open) autonomousCreateOptionsOpen = false;
     const label = createShell.querySelector<HTMLElement>(".autonomous-create-summary-action b");
     if (label) label.textContent = createShell.open ? "Fermer" : "Configurer";
   };
   createShell?.addEventListener("toggle", syncCreateShell);
+  const createOptions = document.querySelector<HTMLDetailsElement>("#autonomousCreateOptions");
+  createOptions?.addEventListener("toggle", () => {
+    if (!createOptions.isConnected) return;
+    autonomousCreateOptionsOpen = createOptions.open;
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-autonomous-template]").forEach((button) => {
     button.addEventListener("click", () => {
       const template = autonomousAgentTemplateById(button.dataset.autonomousTemplate);
       if (!template) return;
       autonomousTemplateId = template.id;
+      autonomousRadarSourceDraft = null;
       autonomousNameDraft = template.name;
       autonomousRoleDraft = template.role;
       autonomousObjectiveDraft = template.objective;
@@ -11536,6 +17270,8 @@ const bindAutonomousPanelUi = () => {
       autonomousTestTimeoutSeconds = 5 * 60;
       autonomousCreateOpen = true;
       autonomousCreatePreferenceSet = true;
+      autonomousCreateOptionsOpen = false;
+      autonomousTemplatesOpen = false;
       statusText = `Modèle « ${template.name} » chargé ; vérifie l'environnement puis démarre l'agent`;
       render();
       window.setTimeout(() => {
@@ -11546,11 +17282,16 @@ const bindAutonomousPanelUi = () => {
     });
   });
   document.querySelector<HTMLButtonElement>("#autonomousNewAgent")?.addEventListener("click", () => {
-    if (!createShell) return;
-    createShell.open = true;
-    syncCreateShell();
-    createShell.scrollIntoView({ behavior: "smooth", block: "start" });
-    window.setTimeout(() => document.querySelector<HTMLInputElement>("#autonomousName")?.focus(), 220);
+    autonomousCreateOpen = true;
+    autonomousCreatePreferenceSet = true;
+    autonomousCreateOptionsOpen = false;
+    autonomousOverviewOpen = false;
+    autonomousTemplatesOpen = false;
+    render();
+    window.setTimeout(() => {
+      document.querySelector<HTMLDetailsElement>("#autonomousCreateShell")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      document.querySelector<HTMLTextAreaElement>("#autonomousObjective")?.focus();
+    }, 0);
   });
   document.querySelector<HTMLInputElement>("#autonomousName")?.addEventListener("input", (event) => {
     autonomousNameDraft = (event.currentTarget as HTMLInputElement).value;
@@ -11577,11 +17318,15 @@ const bindAutonomousPanelUi = () => {
     render();
   });
   document.querySelector<HTMLSelectElement>("#autonomousLaunchMode")?.addEventListener("change", (event) => {
+    autonomousCreateOptionsOpen = true;
     autonomousLaunchMode = (event.currentTarget as HTMLSelectElement).value === "orchestrator"
       ? "orchestrator"
       : "autonomous";
     if (autonomousLaunchMode === "orchestrator") {
       autonomousConnectors = [];
+      autonomousMobileNotifications = false;
+      autonomousTelegramNotifications = false;
+      autonomousWhatsAppNotifications = false;
       autonomousTriggerKind = "schedule";
       autonomousAllowGitPublish = false;
       normalizeAutonomousLaunchWorkerAccounts(autonomousAccountId ?? "");
@@ -11627,6 +17372,7 @@ const bindAutonomousPanelUi = () => {
     autonomousIntervalSeconds = Number((event.currentTarget as HTMLSelectElement).value) || 15 * 60;
   });
   document.querySelector<HTMLSelectElement>("#autonomousTriggerKind")?.addEventListener("change", (event) => {
+    autonomousCreateOptionsOpen = true;
     const value = (event.currentTarget as HTMLSelectElement).value;
     autonomousTriggerKind = isAutonomousTriggerKind(value) ? value : "schedule";
     if (autonomousTriggerKind === "schedule") autonomousAllowGitPublish = false;
@@ -11664,12 +17410,49 @@ const bindAutonomousPanelUi = () => {
   document.querySelector<HTMLInputElement>("#autonomousRequireUserReview")?.addEventListener("change", (event) => {
     autonomousRequireUserReview = (event.currentTarget as HTMLInputElement).checked;
   });
+  document.querySelector<HTMLInputElement>("#autonomousMobileNotifications")?.addEventListener("change", (event) => {
+    autonomousMobileNotifications = (event.currentTarget as HTMLInputElement).checked;
+  });
+  document.querySelector<HTMLButtonElement>("#autonomousOpenMobileNotificationSettings")?.addEventListener("click", () => {
+    openMobilePaymentSettings();
+  });
+  document.querySelector<HTMLInputElement>("#autonomousTelegramNotifications")?.addEventListener("change", (event) => {
+    autonomousTelegramNotifications = Boolean(
+      connectedTelegramChannelId() && (event.currentTarget as HTMLInputElement).checked,
+    );
+  });
+  document.querySelector<HTMLButtonElement>("#autonomousOpenTelegramSettings")?.addEventListener("click", () => {
+    setActiveView("settings");
+    window.setTimeout(() => {
+      document.querySelector<HTMLElement>("#telegramConnectionSettings")?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }, 150);
+  });
+  document.querySelector<HTMLInputElement>("#autonomousWhatsAppNotifications")?.addEventListener("change", (event) => {
+    autonomousWhatsAppNotifications = Boolean(
+      connectedWhatsAppChannelId() && (event.currentTarget as HTMLInputElement).checked,
+    );
+  });
+  document.querySelector<HTMLButtonElement>("#autonomousOpenWhatsAppSettings")?.addEventListener("click", () => {
+    setActiveView("settings");
+    window.setTimeout(() => {
+      document.querySelector<HTMLElement>("#whatsappConnectionSettings")?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    }, 150);
+  });
   document.querySelectorAll<HTMLInputElement>("[data-autonomous-connector]").forEach((input) => {
     input.addEventListener("change", () => {
       const connectorId = input.dataset.autonomousConnector;
       if (!isAutonomousConnectorId(connectorId)) return;
       autonomousConnectors = toggleAutonomousConnector(autonomousConnectors, connectorId);
-      render();
+      input.closest(".autonomous-connector-option")?.classList.toggle(
+        "is-selected",
+        autonomousConnectors.includes(connectorId),
+      );
     });
   });
   document.querySelector<HTMLInputElement>("#autonomousTestCommand")?.addEventListener("input", (event) => {
@@ -11696,7 +17479,9 @@ const bindAutonomousPanelUi = () => {
     }
     if (!account) {
       statusText = "Choisis un compte pour l'agent autonome";
+      autonomousCreateOptionsOpen = true;
       render();
+      window.setTimeout(() => document.querySelector<HTMLSelectElement>("#autonomousAccount")?.focus(), 0);
       return;
     }
     if (
@@ -11719,15 +17504,23 @@ const bindAutonomousPanelUi = () => {
       return;
     }
     if (eventTriggered && !watchPaths.length) {
-      const input = document.querySelector<HTMLTextAreaElement>("#autonomousWatchPaths");
-      input?.setCustomValidity("Ajoute au moins un fichier ou dossier relatif à surveiller.");
-      input?.reportValidity();
+      autonomousCreateOptionsOpen = true;
+      render();
+      window.setTimeout(() => {
+        const input = document.querySelector<HTMLTextAreaElement>("#autonomousWatchPaths");
+        input?.setCustomValidity("Ajoute au moins un fichier ou dossier relatif à surveiller.");
+        input?.reportValidity();
+      }, 0);
       return;
     }
-    const testCommandInput = document.querySelector<HTMLInputElement>("#autonomousTestCommand");
     if (launchOrchestration && !autonomousTestCommandDraft.trim()) {
-      testCommandInput?.setCustomValidity("Indique la commande qui prouvera le travail de l'équipe.");
-      testCommandInput?.reportValidity();
+      autonomousCreateOptionsOpen = true;
+      render();
+      window.setTimeout(() => {
+        const input = document.querySelector<HTMLInputElement>("#autonomousTestCommand");
+        input?.setCustomValidity("Indique la commande qui prouvera le travail de l'équipe.");
+        input?.reportValidity();
+      }, 0);
       return;
     }
     const workerAccountIds = launchOrchestration
@@ -11752,11 +17545,21 @@ const bindAutonomousPanelUi = () => {
           name: autonomousNameDraft.trim() || null,
           objective: normalizedObjective,
           role: autonomousRoleDraft.trim() || null,
+          sourceProposalId: autonomousRadarSourceDraft?.proposalId ?? null,
+          sourceReportId: autonomousRadarSourceDraft?.reportId ?? null,
+          sourceReportIdeaIndex: autonomousRadarSourceDraft?.ideaIndex ?? null,
           accountId: account.id,
           projectDir: autonomousProjectDir.trim() || null,
           mode: autonomousMode,
           requireUserReview: autonomousRequireUserReview,
           connectors: accountProvider(account) === "codex" ? autonomousConnectors : [],
+          mobileNotificationsEnabled: autonomousMobileNotifications,
+          telegramNotificationChannelId: autonomousTelegramNotifications
+            ? connectedTelegramChannelId()
+            : null,
+          whatsappNotificationChannelId: autonomousWhatsAppNotifications
+            ? connectedWhatsAppChannelId()
+            : null,
           model: accountModel(account),
           reasoningEffort: accountProvider(account) === "codex" ? accountReasoningEffort(account) : null,
           intervalSeconds: autonomousIntervalSeconds,
@@ -11804,7 +17607,11 @@ const bindAutonomousPanelUi = () => {
       autonomousRoleDraft = "";
       autonomousInitialMemoryDraft = "";
       autonomousTemplateId = null;
+      autonomousRadarSourceDraft = null;
       autonomousConnectors = [];
+      autonomousMobileNotifications = false;
+      autonomousTelegramNotifications = false;
+      autonomousWhatsAppNotifications = false;
       autonomousTestCommandDraft = "";
       autonomousTriggerKind = "schedule";
       autonomousWatchPathsDraft = "src\npublic\nindex.html\npackage.json";
@@ -11814,6 +17621,7 @@ const bindAutonomousPanelUi = () => {
       autonomousLaunchMode = "autonomous";
       autonomousCreateOpen = false;
       autonomousCreatePreferenceSet = true;
+      autonomousCreateOptionsOpen = false;
       if (launchOrchestration) {
         setActiveView("orchestration");
         statusText = "Agent lancé directement en mode orchestrateur";
@@ -11841,9 +17649,10 @@ const bindAutonomousPanelUi = () => {
   document.querySelector<HTMLButtonElement>("#autonomousRefresh")?.addEventListener("click", () => {
     void refreshAutonomousAgents(true);
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-autonomous-monitor-open]").forEach((button) => {
-    button.addEventListener("click", () => openAutonomousMonitor(button.dataset.autonomousMonitorOpen));
+  document.querySelector<HTMLButtonElement>("#autonomousPauseAll")?.addEventListener("click", () => {
+    void pauseAllAutonomousAgents();
   });
+  bindAutonomousMonitorOpenButtons(document);
   document.querySelectorAll<HTMLSelectElement>(".autonomous-panel [data-autonomous-account]").forEach((select) => {
     select.addEventListener("change", async () => {
       const id = select.dataset.autonomousAccount;
@@ -11872,6 +17681,77 @@ const bindAutonomousPanelUi = () => {
     button.addEventListener("click", () => {
       const id = button.dataset.autonomousOrchestrate;
       if (id) openAutonomousOrchestrationPromotion(id);
+    });
+  });
+  document.querySelectorAll<HTMLFormElement>(".autonomous-panel [data-autonomous-message-form]").forEach((form) => {
+    const id = form.dataset.autonomousMessageForm;
+    const input = form.querySelector<HTMLTextAreaElement>("[data-autonomous-message-input]");
+    const modeSelect = form.querySelector<HTMLSelectElement>("[data-autonomous-message-mode]");
+    const syncMessageModeUi = () => {
+      if (!id) return;
+      const agent = autonomousAgents.find((candidate) => candidate.id === id);
+      if (!agent) return;
+      const mode: AutonomousAgentMessageMode = modeSelect?.value === "objective" ? "objective" : "guidance";
+      autonomousMessageModes.set(id, mode);
+      const hint = form.querySelector<HTMLElement>("[data-autonomous-message-hint] span");
+      const label = form.querySelector<HTMLElement>("[data-autonomous-message-submit-label]");
+      if (hint) hint.textContent = autonomousAgentMessageHint(agent, mode);
+      if (label) label.textContent = autonomousAgentMessageButtonLabel(agent, mode);
+      if (input) {
+        input.placeholder = mode === "objective"
+          ? "Décris la nouvelle mission durable de cet agent…"
+          : "Ex. Priorise le bug mobile et conserve les changements déjà présents…";
+      }
+    };
+    input?.addEventListener("input", () => {
+      if (id) autonomousMessageDrafts.set(id, input.value);
+    });
+    input?.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || (!event.ctrlKey && !event.metaKey)) return;
+      event.preventDefault();
+      form.requestSubmit();
+    });
+    modeSelect?.addEventListener("change", syncMessageModeUi);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const content = input?.value.trim() ?? "";
+      const mode: AutonomousAgentMessageMode = modeSelect?.value === "objective" ? "objective" : "guidance";
+      const previous = id ? autonomousAgents.find((candidate) => candidate.id === id) : null;
+      if (!id || !previous || !content || autonomousBusyId) {
+        input?.focus();
+        return;
+      }
+      autonomousMessageDrafts.set(id, content);
+      autonomousMessageModes.set(id, mode);
+      autonomousBusyId = id;
+      statusText = mode === "objective" ? "Changement de la mission autonome…" : "Envoi du message à l’agent…";
+      render();
+      try {
+        const updated = await invoke<AutonomousAgentSnapshot>("send_autonomous_agent_message", {
+          id,
+          request: { content, mode },
+        });
+        updateAutonomousAgentLocally(updated);
+        autonomousMessageDrafts.delete(id);
+        autonomousMessageModes.set(id, "guidance");
+        statusText = updated.lastError?.startsWith("Message memorise")
+          ? updated.lastError
+          : mode === "objective"
+            ? "Nouvelle mission mémorisée ; l’agent redémarre avec un plan neuf"
+            : previous.pendingReview
+              ? "Message mémorisé ; la vérification en attente reste à traiter"
+              : previous.status === "completed"
+                ? "Message mémorisé ; change la mission pour réactiver l’agent"
+                : previous.currentTurnId != null || previous.currentStartId != null || previous.currentTestId != null
+                  ? "Message mémorisé ; l’agent est relancé avec cette consigne"
+                  : "Message mémorisé ; prise en compte immédiate planifiée";
+      } catch (error) {
+        statusText = `Message non envoyé : ${String(error)}`;
+      } finally {
+        autonomousBusyId = null;
+        render();
+        void refreshAutonomousAgents();
+      }
     });
   });
   document.querySelectorAll<HTMLFormElement>("[data-autonomous-memory-form]").forEach((form) => {
@@ -11926,7 +17806,7 @@ const bindAutonomousPanelUi = () => {
     button.addEventListener("click", async () => {
       const id = button.dataset.autonomousId;
       const action = button.dataset.autonomousAction as AutonomousAgentAction | undefined;
-      if (!id || !action) return;
+      if (!id || !action || autonomousBusyId) return;
       autonomousBusyId = id;
       render();
       try {
@@ -11980,7 +17860,7 @@ const orchestrationAccountOptions = (selectedAccountId: string): string => {
     : "";
   return missing + known.map((account) => `
     <option value="${escapeAttr(account.id)}" ${account.id === selectedAccountId ? "selected" : ""}>
-      ${escapeHtml(account.label)} · ${escapeHtml(providerLabel(accountProvider(account)))}
+      ${escapeHtml(account.label)} · ${escapeHtml(accountProviderLabel(account))}
     </option>`).join("");
 };
 
@@ -12054,7 +17934,7 @@ const renderOrchestrationMember = (
       <select data-orchestration-account-role="${role}" data-orchestration-run-id="${escapeAttr(run.id)}" ${workerIndex ? `data-orchestration-worker-index="${workerIndex}"` : ""} aria-label="Adresse e-mail ou compte de ${escapeAttr(roleName)}" ${orchestrationAssignmentBusy || !settings?.accounts.length ? "disabled" : ""}>
         ${orchestrationAccountOptions(accountId)}
       </select>
-      <small>${escapeHtml(account ? providerLabel(accountProvider(account)) : "Compte supprimé")} · changement avec reprise de session</small>
+      <small>${escapeHtml(account ? accountProviderLabel(account) : "Compte supprimé")} · changement avec reprise de session</small>
     </label>
     <div class="orchestration-member-chat">${assignmentBusy ? '<i class="orchestration-member-loader" data-lucide="loader-circle"></i>' : chatAction}</div>
   </article>`;
@@ -12131,26 +18011,33 @@ const renderOrchestrationCard = (run: OrchestrationSnapshot): string => {
   const workerCount = Math.max(1, run.workerCount || run.tasks.length || 1);
   return `<article class="orchestration-card orchestration-command-center status-${escapeAttr(run.status)} ${running ? "is-running" : ""}">
     <header class="orchestration-card-head">
-      <span class="orchestration-orb"><i data-lucide="users"></i></span>
-      <div><span class="orchestration-status"><i></i>${escapeHtml(orchestrationStatusLabel(run.status))}</span><h3>${escapeHtml(run.name)}</h3><small>${escapeHtml(orchestrationPhaseLabel(run.phase))}</small></div>
-      ${deleteAction}
+      <div><span class="orchestration-status"><i></i>${escapeHtml(orchestrationStatusLabel(run.status))}<b>·</b>${escapeHtml(orchestrationPhaseLabel(run.phase))}</span><h3>${escapeHtml(run.name)}</h3></div>
+      <div class="orchestration-card-actions">${controls}${orchestratorChat}</div>
     </header>
     <p class="orchestration-objective">${escapeHtml(run.objective)}</p>
     <div class="orchestration-progress" aria-label="${progress.accepted} tâches acceptées sur ${progress.total}"><span><i style="width:${progress.percent}%"></i></span><small><b>${progress.accepted}/${progress.total || "–"}</b> tâches intégrées · ${progress.percent}%</small></div>
-    <dl class="orchestration-meta">
-      <div><dt>Orchestrateur</dt><dd>${escapeHtml(orchestrationAccountLabel(orchestrationOrchestratorAccountId(run)))}</dd></div>
-      <div><dt>Équipe</dt><dd>1 orchestrateur + ${workerCount} worker${workerCount > 1 ? "s" : ""}</dd></div>
-      <div><dt>Projet</dt><dd title="${escapeAttr(run.projectDir)}">${escapeHtml(workspaceBaseName(run.projectDir))}</dd></div>
-      <div><dt>Validation</dt><dd><code>${escapeHtml(run.testCommand)}</code></dd></div>
-      <div><dt>Isolation</dt><dd>${workerCount + 1} environnements</dd></div>
-    </dl>
-    ${renderOrchestrationTeam(run)}
-    ${run.planSummary ? `<section class="orchestration-plan-summary"><small>Plan de l’orchestrateur</small><p>${escapeHtml(run.planSummary)}</p></section>` : ""}
+    <div class="orchestration-quick-meta">
+      <span title="${escapeAttr(run.projectDir)}"><i data-lucide="folder-open"></i>${escapeHtml(workspaceBaseName(run.projectDir))}</span>
+      <span><i data-lucide="users"></i>${workerCount + 1} agents</span>
+    </div>
     ${run.lastError ? `<p class="orchestration-error"><i data-lucide="circle-alert"></i><span>${escapeHtml(run.lastError)}</span></p>` : ""}
-    <section class="orchestration-missions"><header><span><small>Exécution contrôlée</small><strong>Missions, preuves et revues</strong></span><b>${progress.accepted}/${progress.total || "–"}</b></header><div class="orchestration-task-list">${run.tasks.map((task) => renderOrchestrationTask(run, task)).join("") || `<div class="orchestration-planning"><i data-lucide="list-checks"></i><span><strong>L’orchestrateur construit le plan</strong><small>Les chats travailleurs apparaîtront ici.</small></span></div>`}</div></section>
+    <section class="orchestration-missions"><header><span><strong>Missions</strong><small>Ouvre une mission pour voir ses preuves et ses revues.</small></span><b>${progress.accepted}/${progress.total || "–"}</b></header><div class="orchestration-task-list">${run.tasks.map((task) => renderOrchestrationTask(run, task)).join("") || `<div class="orchestration-planning"><i data-lucide="list-checks"></i><span><strong>L’orchestrateur prépare les missions</strong><small>Elles apparaîtront ici automatiquement.</small></span></div>`}</div></section>
     ${run.finalSummary ? `<section class="orchestration-final"><i data-lucide="shield-check"></i><div><small>Rendu final</small><p>${escapeHtml(run.finalSummary)}</p></div></section>` : ""}
-    <details class="orchestration-journal"><summary><span><i data-lucide="history"></i>Journal de contrôle</span><i data-lucide="chevron-down"></i></summary><ul>${events || "<li>Aucun événement</li>"}</ul></details>
-    <footer><div>${controls}${orchestratorChat}</div><small><i data-lucide="folder-open"></i><span title="${escapeAttr(run.sandboxRoot)}">Sandboxes privés conservés jusqu’à suppression</span></small></footer>
+    <details class="orchestration-run-details" ${deletePending ? "open" : ""}>
+      <summary><span><i data-lucide="settings-2"></i><span><strong>Équipe et détails</strong><small>Comptes, validation, journal et sandboxes</small></span></span><i data-lucide="chevron-down"></i></summary>
+      <div class="orchestration-run-details-body">
+        ${renderOrchestrationTeam(run)}
+        ${run.planSummary ? `<section class="orchestration-plan-summary"><small>Plan de l’orchestrateur</small><p>${escapeHtml(run.planSummary)}</p></section>` : ""}
+        <dl class="orchestration-meta">
+          <div><dt>Orchestrateur</dt><dd>${escapeHtml(orchestrationAccountLabel(orchestrationOrchestratorAccountId(run)))}</dd></div>
+          <div><dt>Projet</dt><dd title="${escapeAttr(run.projectDir)}">${escapeHtml(workspaceBaseName(run.projectDir))}</dd></div>
+          <div><dt>Validation</dt><dd><code>${escapeHtml(run.testCommand)}</code></dd></div>
+          <div><dt>Isolation</dt><dd>${workerCount + 1} environnements</dd></div>
+        </dl>
+        <details class="orchestration-journal"><summary><span><i data-lucide="history"></i>Journal de contrôle</span><i data-lucide="chevron-down"></i></summary><ul>${events || "<li>Aucun événement</li>"}</ul></details>
+        <footer class="orchestration-run-details-footer"><small><i data-lucide="folder-open"></i><span title="${escapeAttr(run.sandboxRoot)}">Sandboxes privés conservés jusqu’à suppression</span></small>${deleteAction}</footer>
+      </div>
+    </details>
   </article>`;
 };
 
@@ -12162,9 +18049,6 @@ const renderOrchestrationPanel = (): string => {
     <span><b>W${index + 1}</b><span><strong>Worker ${index + 1}</strong><small>Adresse modifiable après création</small></span></span>
     <select data-orchestration-worker-draft="${index}" aria-label="Adresse e-mail ou compte du worker ${index + 1}" ${accountOptions ? "" : "disabled"}>${orchestrationAccountOptions(workerAccountId)}</select>
   </label>`).join("");
-  const activeCount = orchestrations.filter((run) => run.status === "active").length;
-  const completedCount = orchestrations.filter((run) => run.status === "completed").length;
-  const revisionCount = orchestrations.flatMap((run) => run.tasks).filter((task) => task.status === "revision_requested").length;
   const createOpen = orchestrationCreateOpen
     || (!orchestrationCreatePreferenceSet && orchestrationsLoaded && orchestrations.length === 0);
   const selectedRun = orchestrations.find((run) => run.id === orchestrationSelectedRunId)
@@ -12173,53 +18057,48 @@ const renderOrchestrationPanel = (): string => {
   if (selectedRun && orchestrationSelectedRunId !== selectedRun.id) {
     orchestrationSelectedRunId = selectedRun.id;
   }
-  const runRail = orchestrations.map((run) => {
+  const runOptions = orchestrations.map((run) => {
     const progress = orchestrationProgress(run);
     const selected = run.id === selectedRun?.id;
-    return `<button type="button" class="orchestration-run-entry status-${escapeAttr(run.status)} ${selected ? "active" : ""}" data-orchestration-select-run="${escapeAttr(run.id)}" aria-pressed="${selected}">
-      <span class="orchestration-run-entry-status"><i></i><b>${escapeHtml(orchestrationStatusLabel(run.status))}</b></span>
-      <strong>${escapeHtml(run.name)}</strong>
-      <small>${escapeHtml(orchestrationPhaseLabel(run.phase))}</small>
-      <span class="orchestration-run-entry-progress"><i style="width:${progress.percent}%"></i></span>
-      <span><b>${progress.accepted}/${progress.total || "–"}</b><small>${run.workerCount} worker${run.workerCount > 1 ? "s" : ""}</small></span>
-    </button>`;
+    return `<option value="${escapeAttr(run.id)}" ${selected ? "selected" : ""}>${escapeHtml(run.name)} · ${escapeHtml(orchestrationStatusLabel(run.status))} · ${progress.percent}%</option>`;
   }).join("");
   return `<div class="panel orchestration-panel">
     <header class="orchestration-page-head">
-      <div><span class="orchestration-page-mark"><i data-lucide="users"></i></span><span><small>Plan · travailleurs · preuves · revue</small><h2>Chats orchestrés</h2><p>Un orchestrateur découpe la feature, ouvre un chat isolé par tâche, vérifie chaque preuve dans son propre environnement puis rend le diff final.</p></span></div>
-      <button id="orchestrationNew" type="button" class="tool-button primary"><i data-lucide="plus"></i><span>Nouveau chat orchestré</span></button>
+      <div><span class="orchestration-page-mark"><i data-lucide="users"></i></span><span><h2>Chats orchestrés</h2><p>Décris le résultat attendu. L’orchestrateur organise le travail et contrôle le rendu.</p></span></div>
+      <button id="orchestrationNew" type="button" class="tool-button primary"><i data-lucide="plus"></i><span>Nouvelle orchestration</span></button>
     </header>
-    <section class="orchestration-overview">
-      <article><i data-lucide="users"></i><span><strong>${orchestrations.length}</strong><small>Orchestrations</small></span></article>
-      <article><i data-lucide="play"></i><span><strong>${activeCount}</strong><small>En cours</small></span></article>
-      <article><i data-lucide="reply"></i><span><strong>${revisionCount}</strong><small>Retours travailleurs</small></span></article>
-      <article><i data-lucide="shield-check"></i><span><strong>${completedCount}</strong><small>Rendus validés</small></span></article>
-    </section>
     <details id="orchestrationCreateShell" class="orchestration-create" ${createOpen ? "open" : ""}>
-      <summary><span><i data-lucide="target"></i><strong>Configurer une feature orchestrée</strong><small>Dépôt Git propre et commande de validation obligatoires.</small></span><i data-lucide="chevron-down"></i></summary>
+      <summary><span><i data-lucide="target"></i><strong>Nouvelle orchestration</strong><small>Objectif, projet et validation</small></span><i data-lucide="chevron-down"></i></summary>
       <form id="orchestrationCreateForm">
-        <label><span>Nom <small>optionnel</small></span><input id="orchestrationName" maxlength="120" value="${escapeAttr(orchestrationNameDraft)}" placeholder="Ex. Nouveau système de permissions" /></label>
-        <label class="orchestration-objective-field"><span>Objectif <small>obligatoire</small></span><textarea id="orchestrationObjective" maxlength="65536" required placeholder="Décris la feature complète et le résultat observable…">${escapeHtml(orchestrationObjectiveDraft)}</textarea></label>
-        <div class="orchestration-form-grid">
-          <label><span>Adresse e-mail / compte orchestrateur</span><select id="orchestrationAccount" required ${accountOptions ? "" : "disabled"}>${accountOptions || '<option value="">Aucun compte</option>'}</select></label>
-          <label><span>Dépôt Git propre</span><input id="orchestrationProjectDir" required value="${escapeAttr(orchestrationProjectDir)}" placeholder="C:/projets/mon-app" /></label>
-          <label class="orchestration-test-field"><span>Commande de validation réelle</span><input id="orchestrationTestCommand" required maxlength="8000" value="${escapeAttr(orchestrationTestCommandDraft)}" placeholder="npm test && npm run build" /></label>
-          <label><span>Workers <small>hors orchestrateur</small></span><span class="orchestration-worker-count"><input id="orchestrationWorkerCount" type="number" min="1" max="12" step="1" required value="${orchestrationWorkerCount}" /><small id="orchestrationTeamTotal">${orchestrationWorkerCount + 1} agents au total</small></span></label>
-          <label><span>Timeout</span><span class="orchestration-timeout"><input id="orchestrationTestTimeout" type="number" min="5" max="1800" value="${orchestrationTestTimeoutSeconds}" /><small>secondes</small></span></label>
+        <label class="orchestration-objective-field"><span>Que faut-il réaliser ?</span><textarea id="orchestrationObjective" maxlength="65536" required placeholder="Décris le résultat concret que tu veux obtenir…">${escapeHtml(orchestrationObjectiveDraft)}</textarea></label>
+        <div class="orchestration-required-grid">
+          <label><span>Projet</span><input id="orchestrationProjectDir" required value="${escapeAttr(orchestrationProjectDir)}" placeholder="Chemin du dépôt Git propre" /></label>
+          <label><span>Comment vérifier le résultat ?</span><input id="orchestrationTestCommand" required maxlength="8000" value="${escapeAttr(orchestrationTestCommandDraft)}" placeholder="npm test && npm run build" /></label>
         </div>
-        <section class="orchestration-create-team">
-          <header><span><small>Affectations initiales</small><strong>Choisir l'adresse de chaque worker</strong></span><button id="orchestrationWorkersUseOrchestrator" type="button" class="tool-button"><i data-lucide="copy-check"></i><span>Même compte pour tous</span></button></header>
-          <div>${workerDrafts}</div>
-        </section>
-        <aside><i data-lucide="shield-check"></i><span><strong>Publication prudente</strong><small>Le rendu n’est appliqué au dossier source que si son commit et son état sont restés inchangés. Les changements finaux restent non commités.</small></span></aside>
-        <footer><small><i data-lucide="circle-alert"></i>Les workers s’exécutent séquentiellement pour garantir une base d’intégration déterministe.</small><button type="submit" class="tool-button primary" ${accountOptions && orchestrationBusyId !== "create" ? "" : "disabled"}><i data-lucide="play"></i><span>${orchestrationBusyId === "create" ? "Création…" : "Créer l’orchestrateur"}</span></button></footer>
+        <details id="orchestrationCreateAdvanced" class="orchestration-create-advanced" ${orchestrationCreateAdvancedOpen ? "open" : ""}>
+          <summary><span><i data-lucide="settings-2"></i><span><strong>Options avancées</strong><small>Nom, comptes, workers et délai de validation</small></span></span><i data-lucide="chevron-down"></i></summary>
+          <div class="orchestration-create-advanced-body">
+            <div class="orchestration-form-grid">
+              <label><span>Nom <small>optionnel</small></span><input id="orchestrationName" maxlength="120" value="${escapeAttr(orchestrationNameDraft)}" placeholder="Ex. Nouveau système de permissions" /></label>
+              <label><span>Compte orchestrateur</span><select id="orchestrationAccount" required ${accountOptions ? "" : "disabled"}>${accountOptions || '<option value="">Aucun compte</option>'}</select></label>
+              <label><span>Workers <small>hors orchestrateur</small></span><span class="orchestration-worker-count"><input id="orchestrationWorkerCount" type="number" min="1" max="12" step="1" required value="${orchestrationWorkerCount}" /><small id="orchestrationTeamTotal">${orchestrationWorkerCount + 1} agents au total</small></span></label>
+              <label><span>Délai de validation</span><span class="orchestration-timeout"><input id="orchestrationTestTimeout" type="number" min="5" max="1800" value="${orchestrationTestTimeoutSeconds}" /><small>secondes</small></span></label>
+            </div>
+            <section class="orchestration-create-team">
+              <header><span><strong>Comptes des workers</strong></span><button id="orchestrationWorkersUseOrchestrator" type="button" class="tool-button"><i data-lucide="copy-check"></i><span>Même compte pour tous</span></button></header>
+              <div>${workerDrafts}</div>
+            </section>
+            <aside><i data-lucide="shield-check"></i><span><strong>Le projet source reste protégé</strong><small>Le rendu est appliqué seulement si le dépôt n’a pas changé pendant le travail.</small></span></aside>
+          </div>
+        </details>
+        <footer><small>${orchestrationWorkerCount + 1} agents · validation contrôlée</small><button type="submit" class="tool-button primary" ${accountOptions && orchestrationBusyId !== "create" ? "" : "disabled"}><i data-lucide="play"></i><span>${orchestrationBusyId === "create" ? "Création…" : "Lancer l’orchestration"}</span></button></footer>
       </form>
     </details>
     <section class="orchestration-runs orchestration-workbench">
-      <aside class="orchestration-run-rail">
-        <header><span><small>Centre de commande</small><strong>Orchestrations</strong></span><button id="orchestrationRefresh" type="button" class="icon-button" title="Actualiser"><i data-lucide="refresh-ccw"></i></button></header>
-        <div>${!orchestrationsLoaded ? `<div class="orchestration-run-loading"><i data-lucide="loader-circle"></i><span>Chargement…</span></div>` : runRail || `<div class="orchestration-run-loading"><i data-lucide="users"></i><span>Aucune orchestration</span></div>`}</div>
-      </aside>
+      <header class="orchestration-run-picker">
+        <label><span>Orchestration</span><select id="orchestrationRunSelect" aria-label="Choisir une orchestration" ${runOptions ? "" : "disabled"}>${runOptions || '<option value="">Aucune orchestration</option>'}</select></label>
+        <button id="orchestrationRefresh" type="button" class="icon-button" title="Actualiser"><i data-lucide="refresh-ccw"></i></button>
+      </header>
       <main class="orchestration-workbench-main">${!orchestrationsLoaded ? `<div class="orchestration-empty"><i data-lucide="loader-circle"></i><strong>Chargement…</strong></div>` : selectedRun ? renderOrchestrationCard(selectedRun) : `<div class="orchestration-empty"><i data-lucide="users"></i><strong>Aucun chat orchestré</strong><span>Crée une première feature pour lancer le planificateur.</span></div>`}</main>
     </section>
   </div>`;
@@ -12240,13 +18119,17 @@ const bindOrchestrationPanelUi = () => {
     orchestrationCreatePreferenceSet = true;
     orchestrationCreateOpen = createShell.open;
   });
+  const createAdvanced = document.querySelector<HTMLDetailsElement>("#orchestrationCreateAdvanced");
+  createAdvanced?.addEventListener("toggle", () => {
+    orchestrationCreateAdvancedOpen = createAdvanced.open;
+  });
   document.querySelector<HTMLButtonElement>("#orchestrationNew")?.addEventListener("click", () => {
     if (!createShell) return;
     createShell.open = true;
     orchestrationCreateOpen = true;
     orchestrationCreatePreferenceSet = true;
     createShell.scrollIntoView({ behavior: "smooth", block: "start" });
-    window.setTimeout(() => document.querySelector<HTMLInputElement>("#orchestrationName")?.focus(), 200);
+    window.setTimeout(() => document.querySelector<HTMLTextAreaElement>("#orchestrationObjective")?.focus(), 200);
   });
   document.querySelector<HTMLInputElement>("#orchestrationName")?.addEventListener("input", (event) => {
     orchestrationNameDraft = (event.currentTarget as HTMLInputElement).value;
@@ -12366,6 +18249,7 @@ const bindOrchestrationPanelUi = () => {
       orchestrationObjectiveDraft = "";
       orchestrationCreateOpen = false;
       orchestrationCreatePreferenceSet = true;
+      orchestrationCreateAdvancedOpen = false;
       statusText = "Orchestrateur créé ; planification démarrée";
     } catch (error) {
       statusText = String(error);
@@ -12377,6 +18261,10 @@ const bindOrchestrationPanelUi = () => {
   });
   document.querySelector<HTMLButtonElement>("#orchestrationRefresh")?.addEventListener("click", () => {
     void refreshOrchestrations(true);
+  });
+  document.querySelector<HTMLSelectElement>("#orchestrationRunSelect")?.addEventListener("change", (event) => {
+    orchestrationSelectedRunId = (event.currentTarget as HTMLSelectElement).value || null;
+    render();
   });
   document.querySelectorAll<HTMLButtonElement>("[data-orchestration-select-run]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -12949,6 +18837,8 @@ const bindDoctolibLabUi = (): void => {
 
 const appViewTitle = (view: AppView): string => {
   switch (view) {
+    case "tutorial":
+      return "Tuto · Découvrir Switch";
     case "terminal":
       return terminalFolderFilter
         ? `Terminaux · ${workspaceBaseName(terminalFolderFilter)}`
@@ -12965,16 +18855,26 @@ const appViewTitle = (view: AppView): string => {
       return "Limites";
     case "dashboard":
       return "Statistiques";
+    case "video":
+      return "Studio IA";
+    case "vps":
+      return "VPS";
     case "doctolib-lab":
       return "RDV Lab · expérimental";
     case "autonomous":
       return "Agents autonomes";
+    case "bug-report":
+      return "Signaler un bug";
     case "orchestration":
       return "Chats orchestrés";
-    case "kombai":
-      return "Kombai";
+    case "design":
+      return "Design";
+    case "forum":
+      return "Forum";
+    case "messaging":
+      return "Messagerie";
     case "discussions":
-      return "Toutes les conversations";
+      return "Historique";
     case "history":
       return "Historique";
     case "audit":
@@ -12990,7 +18890,7 @@ const appViewTitle = (view: AppView): string => {
 
 // Page « Paramètres » : regroupe la configuration de l'app. Les comptes
 // (anciennement dans la barre latérale) vivent désormais ici ; l'entrée latérale
-// affiche à la place « Discussions » (reprise d'une conversation dans un autre
+// affiche à la place « Historique » (reprise d'une conversation dans un autre
 // compte). Chaque carte ouvre la vue/modale dédiée existante.
 const keyboardShortcutBinding = (id: KeyboardShortcutId): string =>
   resolveKeyboardShortcuts(keyboardShortcutOverrides)[id];
@@ -12998,7 +18898,16 @@ const keyboardShortcutBinding = (id: KeyboardShortcutId): string =>
 const keyboardShortcutMatchesAction = (
   id: KeyboardShortcutId,
   event: KeyboardEvent,
-): boolean => keyboardShortcutMatches(event, keyboardShortcutBinding(id));
+): boolean => {
+  const binding = keyboardShortcutBinding(id);
+  if (!keyboardShortcutMatches(event, binding)) return false;
+  const target = event.target instanceof Element
+    ? event.target.closest("input, textarea, select, [contenteditable='true'], [contenteditable='plaintext-only']")
+    : null;
+  if (!target) return true;
+  const tokens = binding.split("+");
+  return tokens.includes("Mod") || tokens.includes("Alt");
+};
 
 const renderKeyboardShortcutKeycaps = (binding: string): string => {
   const parts = keyboardShortcutDisplayParts(binding);
@@ -13049,12 +18958,23 @@ const stopKeyboardShortcutCapture = (): void => {
 };
 
 const resetKeyboardShortcut = (id: KeyboardShortcutId): void => {
-  const next = { ...keyboardShortcutOverrides };
-  delete next[id];
+  const defaultBinding = DEFAULT_KEYBOARD_SHORTCUTS[id];
+  const conflict = keyboardShortcutConflict(id, defaultBinding, keyboardShortcutOverrides);
+  if (conflict) {
+    keyboardShortcutCaptureId = null;
+    keyboardShortcutFeedback = {
+      message: `Le raccourci par défaut « ${formatKeyboardShortcut(defaultBinding)} » est utilisé par « ${conflict.label} ».`,
+      tone: "error",
+    };
+    if (activeView === "settings") render();
+    return;
+  }
+  const next = withKeyboardShortcutOverride(keyboardShortcutOverrides, id, defaultBinding);
+  if (!next) return;
   keyboardShortcutCaptureId = null;
   commitKeyboardShortcutOverrides(
     next,
-    `« ${formatKeyboardShortcut(DEFAULT_KEYBOARD_SHORTCUTS[id])} » restauré pour cette action.`,
+    `« ${formatKeyboardShortcut(defaultBinding)} » restauré pour cette action.`,
   );
 };
 
@@ -13354,6 +19274,632 @@ const renderChatReadySoundSettings = (): string => {
   </section>`;
 };
 
+const connectedTelegramChannelId = (): string | null =>
+  telegramConnection?.connected && telegramConnection.paired && telegramConnection.channelId
+    ? telegramConnection.channelId
+    : null;
+
+const refreshTelegramConnection = async (announceError = false): Promise<void> => {
+  if (telegramConnectionInFlight) return;
+  telegramConnectionInFlight = true;
+  if (activeView === "settings" || activeView === "autonomous") render();
+  try {
+    [telegramConnection, telegramManager] = await Promise.all([
+      invoke<TelegramConnectionView>("telegram_connection"),
+      invoke<TelegramManagerView>("telegram_manager"),
+    ]);
+    telegramConnectionLoaded = true;
+  } catch (error) {
+    telegramConnection = null;
+    telegramManager = null;
+    telegramConnectionLoaded = true;
+    if (announceError) {
+      telegramConnectionFeedback = {
+        tone: "error",
+        message: String(error).replace(/^Error:\s*/i, ""),
+      };
+    }
+  } finally {
+    telegramConnectionInFlight = false;
+    if (activeView === "settings" || activeView === "autonomous") render();
+  }
+};
+
+const renderTelegramManagerSetup = (notificationBotConnected: boolean): string => {
+  const connected = Boolean(telegramManager?.connected && telegramManager?.managementEnabled);
+  const busy = telegramManagerAction !== null || telegramConnectionAction !== null;
+  const identity = telegramManager?.botUsername
+    ? `@${telegramManager.botUsername}`
+    : telegramManager?.botName || "Bot gestionnaire";
+  const prepareForm = `<form id="telegramManagedBotPrepareForm" class="whatsapp-connect-form telegram-managed-bot-form">
+    <div class="whatsapp-connect-grid telegram-managed-bot-grid">
+      <label><span>Nom public</span><input data-telegram-manager-draft="managedBotName" type="text" maxlength="64" required value="${escapeAttr(telegramManagerDraft.managedBotName)}" placeholder="Agent Codex" ${busy ? "disabled" : ""} /></label>
+      <label><span>@username unique <small>doit finir par bot</small></span><input data-telegram-manager-draft="managedBotUsername" type="text" minlength="5" maxlength="33" pattern="@?[A-Za-z0-9_]+[Bb][Oo][Tt]" required value="${escapeAttr(telegramManagerDraft.managedBotUsername)}" placeholder="MonAgentCodexBot" ${busy ? "disabled" : ""} /></label>
+    </div>
+    <p class="telegram-manager-security"><i data-lucide="shield-check"></i><span>Le bot sera limité à son propriétaire Telegram. Ne modifie pas le @username dans la fenêtre de confirmation.</span></p>
+    <div class="whatsapp-connect-actions"><button class="tool-button primary" type="submit" ${busy ? "disabled" : ""}><i data-lucide="bot"></i><span>${telegramManagerAction === "prepare" ? "Préparation…" : "Préparer la création"}</span></button></div>
+  </form>`;
+  const pending = connected && telegramManager?.creationUrl
+    ? `<div class="telegram-manager-pending">
+        <span><i data-lucide="circle"></i></span>
+        <div><strong>@${escapeHtml(telegramManager.pendingBotUsername || "bot")}</strong><small>${escapeHtml(telegramManager.pendingBotName || "Bot Telegram")} · confirmation Telegram requise</small></div>
+        <div class="telegram-pairing-actions"><a id="telegramManagedBotCreateOpen" class="tool-button primary" href="${escapeAttr(telegramManager.creationUrl)}" target="_blank" rel="noreferrer"><i data-lucide="external-link"></i><span>Confirmer dans Telegram</span></a><button id="telegramManagedBotCheck" type="button" ${busy ? "disabled" : ""}><i data-lucide="refresh-ccw"></i><span>J’ai confirmé</span></button></div>
+        <p><i data-lucide="clock-3"></i><span>Demande suivie jusqu’au ${escapeHtml(formatAutonomousTimestamp(telegramManager.pendingExpiresAt))}.</span></p>
+      </div>`
+    : "";
+  const managerError = telegramManager?.lastError
+    ? `<p class="whatsapp-feedback is-error" role="status">${escapeHtml(telegramManager.lastError)}</p>`
+    : "";
+
+  if (!connected) {
+    return `<section class="whatsapp-webhook-setup telegram-manager" aria-labelledby="telegramManagerTitle">
+      <header><span><i data-lucide="bot"></i></span><div><strong id="telegramManagerTitle">Automatisation avec un bot gestionnaire</strong><small>Une configuration initiale, puis l’application récupère seule les jetons des bots créés.</small></div></header>
+      <form id="telegramManagerConnectForm" class="whatsapp-connect-form telegram-manager-connect-form">
+        <div class="whatsapp-connect-grid"><label><span>Jeton du bot gestionnaire <small>stocké côté serveur uniquement</small></span><input data-telegram-manager-draft="botToken" type="password" autocomplete="off" maxlength="256" required value="${escapeAttr(telegramManagerDraft.botToken)}" placeholder="123456789:AA…" ${busy ? "disabled" : ""} /></label></div>
+        <ol class="telegram-setup-steps"><li>Crée une seule fois un bot dans BotFather.</li><li>Ouvre ses réglages dans la Mini App BotFather et active <b>Bot Management Mode</b>.</li><li>Colle son jeton ici. Aucun SMS, mot de passe ou numéro de téléphone n’est demandé.</li></ol>
+        <div class="whatsapp-connect-actions"><button class="tool-button primary" type="submit" ${busy ? "disabled" : ""}><i data-lucide="link"></i><span>${telegramManagerAction === "connect" ? "Vérification…" : "Lier le bot gestionnaire"}</span></button><a href="${escapeAttr(telegramManager?.botfatherUrl || "https://t.me/BotFather")}" target="_blank" rel="noreferrer"><i data-lucide="external-link"></i><span>Ouvrir BotFather</span></a></div>
+      </form>
+      ${managerError}
+    </section>`;
+  }
+
+  const creationControls = pending
+    ? `${pending}<details class="telegram-manager-replace"><summary>Choisir un autre @username</summary>${prepareForm}</details>`
+    : (notificationBotConnected
+      ? `<details class="telegram-manager-replace"><summary>Créer ou remplacer le bot de notification</summary>${prepareForm}</details>`
+      : prepareForm);
+  return `<section class="whatsapp-webhook-setup telegram-manager is-connected" aria-labelledby="telegramManagerTitle">
+    <header><span><i data-lucide="bot"></i></span><div><strong id="telegramManagerTitle">Bot gestionnaire actif</strong><small>${escapeHtml(identity)} · Bot Management Mode vérifié par Telegram</small></div></header>
+    ${creationControls}
+    <div class="whatsapp-connection-actions"><button id="telegramManagerDisconnect" type="button" class="danger" ${busy ? "disabled" : ""}><i data-lucide="unplug"></i><span>${telegramManagerAction === "disconnect" ? "Déconnexion…" : "Déconnecter le gestionnaire"}</span></button></div>
+    ${managerError}
+  </section>`;
+};
+
+const renderTelegramConnectionSettings = (): string => {
+  const connected = Boolean(telegramConnection?.connected && telegramConnection.channelId);
+  const paired = Boolean(connected && telegramConnection?.paired);
+  const busy = telegramConnectionAction !== null || telegramManagerAction !== null;
+  const feedback = telegramConnectionFeedback
+    ? `<p class="whatsapp-feedback is-${telegramConnectionFeedback.tone}" role="status">${escapeHtml(telegramConnectionFeedback.message)}</p>`
+    : "";
+  const loading = telegramConnectionInFlight && !telegramConnectionLoaded
+    ? `<div class="whatsapp-loading"><i data-lucide="loader-circle"></i><span>Lecture de la connexion Telegram…</span></div>`
+    : "";
+  const botTitle = telegramConnection?.botName?.trim()
+    || (telegramConnection?.botUsername ? `@${telegramConnection.botUsername}` : "Bot Telegram");
+  const disconnectActions = telegramDisconnectPending
+    ? `<button type="button" id="telegramDisconnectConfirm" class="danger" ${busy ? "disabled" : ""}><i data-lucide="unplug"></i><span>${telegramConnectionAction === "disconnect" ? "Déconnexion…" : "Confirmer"}</span></button><button type="button" id="telegramDisconnectCancel" ${busy ? "disabled" : ""}>Annuler</button>`
+    : `<button type="button" id="telegramDisconnect" class="danger" ${busy ? "disabled" : ""}><i data-lucide="unplug"></i><span>Déconnecter</span></button>`;
+  const summary = connected
+    ? `<div class="whatsapp-connection-summary">
+        <span class="whatsapp-connection-state"><i data-lucide="${paired ? "badge-check" : "link-2"}"></i></span>
+        <span><small>${paired ? "Appairé" : "Bot connecté"}</small><strong>${escapeHtml(botTitle)}</strong><em>${escapeHtml(telegramConnection?.botUsername ? `@${telegramConnection.botUsername}` : "Identité vérifiée par Telegram")}</em></span>
+        <dl>
+          <div><dt>Compte</dt><dd>${paired ? escapeHtml(telegramConnection?.userHint || "Appairé") : "À appairer"}</dd></div>
+          <div><dt>Prix</dt><dd>Gratuit</dd></div>
+          <div><dt>Conversation</dt><dd>${paired ? "Bidirectionnelle" : "En attente"}</dd></div>
+        </dl>
+      </div>`
+    : "";
+  const pairedActions = paired
+    ? `<div class="whatsapp-connection-actions">
+        <button type="button" id="telegramTest" ${busy ? "disabled" : ""}><i data-lucide="send"></i><span>${telegramConnectionAction === "test" ? "Envoi…" : "Envoyer un test"}</span></button>
+        <button type="button" id="telegramPairingRefresh" ${busy ? "disabled" : ""}><i data-lucide="settings-2"></i><span>Appairer un autre compte</span></button>
+        ${disconnectActions}
+      </div>`
+    : "";
+  const pairing = connected && !paired
+    ? `<section class="whatsapp-webhook-setup telegram-pairing" aria-labelledby="telegramPairingTitle">
+        <header><span><i data-lucide="send"></i></span><div><strong id="telegramPairingTitle">Appairer ton compte Telegram</strong><small>Ouvre le lien, puis appuie sur <b>Démarrer</b> dans la conversation avec le bot.</small></div></header>
+        ${telegramConnection?.pairingUrl
+          ? `<div class="telegram-pairing-actions"><a id="telegramPairingOpen" class="tool-button primary" href="${escapeAttr(telegramConnection.pairingUrl)}" target="_blank" rel="noreferrer"><i data-lucide="external-link"></i><span>Ouvrir Telegram</span></a><button type="button" id="telegramPairingCheck" ${busy ? "disabled" : ""}><i data-lucide="refresh-ccw"></i><span>J’ai appuyé sur Démarrer</span></button></div><p><i data-lucide="clock-3"></i><span>Lien valable jusqu’au ${escapeHtml(formatAutonomousTimestamp(telegramConnection.pairingExpiresAt))}.</span></p>`
+          : `<p class="whatsapp-webhook-warning"><i data-lucide="triangle-alert"></i><span>Le lien a expiré. Génère-en un nouveau.</span></p>`}
+        <div class="whatsapp-connection-actions"><button type="button" id="telegramPairingRefresh" ${busy ? "disabled" : ""}><i data-lucide="refresh-ccw"></i><span>${telegramConnectionAction === "pairing" ? "Génération…" : "Nouveau lien"}</span></button>${disconnectActions}</div>
+      </section>`
+    : "";
+  const form = !connected
+    ? `<details class="telegram-manual-fallback"><summary>Connexion manuelle d’un bot existant</summary><form id="telegramConnectForm" class="whatsapp-connect-form telegram-connect-form">
+        <div class="whatsapp-connect-grid">
+          <label><span>Jeton du bot <small>jamais renvoyé au navigateur</small></span><input data-telegram-draft="botToken" type="password" autocomplete="off" maxlength="256" required value="${escapeAttr(telegramConnectionDraft.botToken)}" placeholder="123456789:AA…" ${busy ? "disabled" : ""} /></label>
+        </div>
+        <ol class="telegram-setup-steps"><li>Ouvre BotFather et envoie <code>/newbot</code>.</li><li>Choisis le nom du bot, puis copie son jeton ici.</li><li>Après connexion, ouvre le lien d’appairage et appuie sur Démarrer.</li></ol>
+        <div class="whatsapp-connect-actions">
+          <button class="tool-button primary" type="submit" ${busy ? "disabled" : ""}><i data-lucide="link"></i><span>${telegramConnectionAction === "connect" ? "Connexion…" : "Lier le bot Telegram"}</span></button>
+          <a href="${escapeAttr(telegramConnection?.botfatherUrl || "https://t.me/BotFather")}" target="_blank" rel="noreferrer"><i data-lucide="external-link"></i><span>Ouvrir BotFather</span></a>
+        </div>
+      </form></details>`
+    : "";
+  const managerSetup = renderTelegramManagerSetup(connected);
+
+  return `<section id="telegramConnectionSettings" class="whatsapp-settings telegram-settings" aria-labelledby="telegramSettingsTitle">
+    <header class="whatsapp-settings-head">
+      <div class="appearance-settings-copy">
+        <span class="settings-card-icon"><i data-lucide="send"></i></span>
+        <span><strong id="telegramSettingsTitle">Messages Telegram</strong><small>Notifications et conversation bidirectionnelle avec les agents, sans abonnement ni numéro WhatsApp Business.</small></span>
+      </div>
+      <span class="whatsapp-api-pill telegram-api-pill">Recommandé · Gratuit</span>
+    </header>
+    ${loading}${managerSetup}${summary}${pairedActions}${pairing}${form}
+    ${telegramConnection?.note ? `<p class="whatsapp-connection-note"><i data-lucide="shield-check"></i><span>${escapeHtml(telegramConnection.note)}</span></p>` : ""}
+    ${feedback}
+  </section>`;
+};
+
+const bindTelegramConnectionUi = (): void => {
+  document.querySelectorAll<HTMLInputElement>("[data-telegram-manager-draft]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const field = input.dataset.telegramManagerDraft as keyof TelegramManagerDraft | undefined;
+      if (field) telegramManagerDraft[field] = input.value;
+    });
+  });
+  document.querySelector<HTMLFormElement>("#telegramManagerConnectForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (telegramManagerAction || telegramConnectionAction) return;
+    const form = event.currentTarget as HTMLFormElement;
+    if (!form.reportValidity()) return;
+    telegramManagerDraft.botToken = form.querySelector<HTMLInputElement>('[data-telegram-manager-draft="botToken"]')?.value || "";
+    telegramManagerAction = "connect";
+    telegramConnectionFeedback = null;
+    render();
+    try {
+      telegramManager = await invoke<TelegramManagerView>("connect_telegram_manager", {
+        request: { botToken: telegramManagerDraft.botToken },
+      });
+      telegramManagerDraft.botToken = "";
+      telegramConnectionFeedback = {
+        tone: "success",
+        message: "Bot gestionnaire vérifié. Tu peux maintenant préparer le bot de notification.",
+      };
+    } catch (error) {
+      telegramConnectionFeedback = { tone: "error", message: String(error).replace(/^Error:\s*/i, "") };
+    } finally {
+      telegramManagerAction = null;
+      render();
+    }
+  });
+  document.querySelector<HTMLFormElement>("#telegramManagedBotPrepareForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (telegramManagerAction || telegramConnectionAction) return;
+    const form = event.currentTarget as HTMLFormElement;
+    if (!form.reportValidity()) return;
+    telegramManagerDraft.managedBotName = form.querySelector<HTMLInputElement>('[data-telegram-manager-draft="managedBotName"]')?.value || "";
+    telegramManagerDraft.managedBotUsername = form.querySelector<HTMLInputElement>('[data-telegram-manager-draft="managedBotUsername"]')?.value || "";
+    telegramManagerAction = "prepare";
+    telegramConnectionFeedback = null;
+    render();
+    try {
+      telegramManager = await invoke<TelegramManagerView>("prepare_managed_telegram_bot", {
+        request: {
+          name: telegramManagerDraft.managedBotName,
+          username: telegramManagerDraft.managedBotUsername,
+        },
+      });
+      telegramConnectionFeedback = {
+        tone: "success",
+        message: "Création préparée. Confirme-la maintenant dans Telegram.",
+      };
+    } catch (error) {
+      telegramConnectionFeedback = { tone: "error", message: String(error).replace(/^Error:\s*/i, "") };
+    } finally {
+      telegramManagerAction = null;
+      render();
+    }
+  });
+  document.querySelector<HTMLAnchorElement>("#telegramManagedBotCreateOpen")?.addEventListener("click", () => {
+    window.setTimeout(() => void refreshTelegramConnection(), 2500);
+    window.setTimeout(() => void refreshTelegramConnection(), 7000);
+    window.setTimeout(() => void refreshTelegramConnection(), 15000);
+  });
+  document.querySelector<HTMLButtonElement>("#telegramManagedBotCheck")?.addEventListener("click", () => {
+    void refreshTelegramConnection(true);
+  });
+  document.querySelector<HTMLButtonElement>("#telegramManagerDisconnect")?.addEventListener("click", async () => {
+    if (telegramManagerAction || telegramConnectionAction) return;
+    telegramManagerAction = "disconnect";
+    telegramConnectionFeedback = null;
+    render();
+    try {
+      telegramManager = await invoke<TelegramManagerView>("disconnect_telegram_manager");
+      telegramManagerDraft.botToken = "";
+      telegramConnectionFeedback = {
+        tone: "success",
+        message: "Bot gestionnaire déconnecté. Le bot de notification reste actif.",
+      };
+    } catch (error) {
+      telegramConnectionFeedback = { tone: "error", message: String(error).replace(/^Error:\s*/i, "") };
+    } finally {
+      telegramManagerAction = null;
+      render();
+    }
+  });
+  document.querySelector<HTMLInputElement>('[data-telegram-draft="botToken"]')?.addEventListener("input", (event) => {
+    telegramConnectionDraft.botToken = (event.currentTarget as HTMLInputElement).value;
+  });
+  document.querySelector<HTMLFormElement>("#telegramConnectForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (telegramConnectionAction) return;
+    const form = event.currentTarget as HTMLFormElement;
+    if (!form.reportValidity()) return;
+    telegramConnectionDraft.botToken = form.querySelector<HTMLInputElement>('[data-telegram-draft="botToken"]')?.value || "";
+    telegramConnectionAction = "connect";
+    telegramConnectionFeedback = null;
+    render();
+    try {
+      telegramConnection = await invoke<TelegramConnectionView>("connect_telegram", {
+        request: { botToken: telegramConnectionDraft.botToken },
+      });
+      telegramConnectionLoaded = true;
+      telegramDisconnectPending = false;
+      telegramConnectionDraft.botToken = "";
+      telegramConnectionFeedback = {
+        tone: "success",
+        message: "Bot vérifié. Ouvre maintenant le lien Telegram et appuie sur Démarrer.",
+      };
+    } catch (error) {
+      telegramConnectionFeedback = {
+        tone: "error",
+        message: String(error).replace(/^Error:\s*/i, ""),
+      };
+    } finally {
+      telegramConnectionAction = null;
+      render();
+    }
+  });
+  const refreshPairing = async (): Promise<void> => {
+    if (telegramConnectionAction) return;
+    telegramConnectionAction = "pairing";
+    telegramConnectionFeedback = null;
+    render();
+    try {
+      telegramConnection = await invoke<TelegramConnectionView>("refresh_telegram_pairing");
+      telegramConnectionLoaded = true;
+      telegramConnectionFeedback = { tone: "success", message: "Nouveau lien d’appairage généré." };
+    } catch (error) {
+      telegramConnectionFeedback = { tone: "error", message: String(error).replace(/^Error:\s*/i, "") };
+    } finally {
+      telegramConnectionAction = null;
+      render();
+    }
+  };
+  document.querySelector<HTMLButtonElement>("#telegramPairingRefresh")?.addEventListener("click", () => {
+    void refreshPairing();
+  });
+  document.querySelector<HTMLButtonElement>("#telegramPairingCheck")?.addEventListener("click", () => {
+    void refreshTelegramConnection(true);
+  });
+  document.querySelector<HTMLAnchorElement>("#telegramPairingOpen")?.addEventListener("click", () => {
+    window.setTimeout(() => void refreshTelegramConnection(), 2500);
+    window.setTimeout(() => void refreshTelegramConnection(), 7000);
+  });
+  document.querySelector<HTMLButtonElement>("#telegramTest")?.addEventListener("click", async () => {
+    if (telegramConnectionAction) return;
+    telegramConnectionAction = "test";
+    telegramConnectionFeedback = null;
+    render();
+    try {
+      const result = await invoke<TelegramSendResult>("test_telegram");
+      telegramConnectionFeedback = { tone: "success", message: `Message test envoyé par Telegram (${result.messageId}).` };
+    } catch (error) {
+      telegramConnectionFeedback = { tone: "error", message: String(error).replace(/^Error:\s*/i, "") };
+    } finally {
+      telegramConnectionAction = null;
+      render();
+    }
+  });
+  document.querySelector<HTMLButtonElement>("#telegramDisconnect")?.addEventListener("click", () => {
+    telegramDisconnectPending = true;
+    telegramConnectionFeedback = null;
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#telegramDisconnectCancel")?.addEventListener("click", () => {
+    telegramDisconnectPending = false;
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#telegramDisconnectConfirm")?.addEventListener("click", async () => {
+    if (telegramConnectionAction) return;
+    telegramConnectionAction = "disconnect";
+    render();
+    try {
+      telegramConnection = await invoke<TelegramConnectionView>("disconnect_telegram");
+      telegramConnectionLoaded = true;
+      telegramDisconnectPending = false;
+      autonomousTelegramNotifications = false;
+      telegramConnectionDraft = { botToken: "" };
+      telegramConnectionFeedback = {
+        tone: "success",
+        message: "Telegram déconnecté. Tu peux relier ce bot ou un autre à tout moment.",
+      };
+    } catch (error) {
+      telegramConnectionFeedback = { tone: "error", message: String(error).replace(/^Error:\s*/i, "") };
+    } finally {
+      telegramConnectionAction = null;
+      render();
+    }
+  });
+};
+
+const connectedWhatsAppChannelId = (): string | null =>
+  whatsappConnection?.connected && whatsappConnection.channelId
+    ? whatsappConnection.channelId
+    : null;
+
+const refreshWhatsAppConnection = async (announceError = false): Promise<void> => {
+  if (whatsappConnectionInFlight) return;
+  whatsappConnectionInFlight = true;
+  if (activeView === "settings" || activeView === "autonomous") render();
+  try {
+    whatsappConnection = await invoke<WhatsAppConnectionView>("whatsapp_connection");
+    whatsappConnectionLoaded = true;
+  } catch (error) {
+    whatsappConnection = null;
+    whatsappConnectionLoaded = true;
+    if (announceError) {
+      whatsappConnectionFeedback = {
+        tone: "error",
+        message: String(error).replace(/^Error:\s*/i, ""),
+      };
+    }
+  } finally {
+    whatsappConnectionInFlight = false;
+    if (activeView === "settings" || activeView === "autonomous") render();
+  }
+};
+
+const renderWhatsAppConnectionSettings = (): string => {
+  const connected = Boolean(whatsappConnection?.connected && whatsappConnection.channelId);
+  const conversationEnabled = Boolean(
+    connected
+    && whatsappConnection?.conversationEnabled
+    && whatsappConnection.webhookVerifyToken,
+  );
+  const busy = whatsappConnectionAction !== null;
+  const showForm = !connected || whatsappConnectionEditing;
+  const connectionTitle = whatsappConnection?.verifiedName?.trim()
+    || whatsappConnection?.displayPhoneNumber?.trim()
+    || "Compte WhatsApp Business";
+  const delivery = whatsappConnection?.deliveryMode === "template"
+    ? `Modèle ${whatsappConnection.templateName} · ${whatsappConnection.templateLanguage || "fr"}`
+    : "Texte libre · fenêtre Meta de 24 h";
+  const feedback = whatsappConnectionFeedback
+    ? `<p class="whatsapp-feedback is-${whatsappConnectionFeedback.tone}" role="status">${escapeHtml(whatsappConnectionFeedback.message)}</p>`
+    : "";
+  const loading = whatsappConnectionInFlight && !whatsappConnectionLoaded
+    ? `<div class="whatsapp-loading"><i data-lucide="loader-circle"></i><span>Lecture de la connexion WhatsApp…</span></div>`
+    : "";
+  const webhookCallbackUrl = whatsappConnection?.webhookCallbackUrl?.trim() || "";
+  const webhookUsesHttps = webhookCallbackUrl.startsWith("https://");
+  const summary = connected
+    ? `<div class="whatsapp-connection-summary">
+        <span class="whatsapp-connection-state"><i data-lucide="badge-check"></i></span>
+        <span><small>Connecté</small><strong>${escapeHtml(connectionTitle)}</strong><em>${escapeHtml(whatsappConnection?.displayPhoneNumber || "Numéro vérifié par Meta")}</em></span>
+        <dl>
+          <div><dt>Destinataire</dt><dd>${escapeHtml(whatsappConnection?.recipientHint || "Configuré")}</dd></div>
+          <div><dt>Envoi</dt><dd>${escapeHtml(delivery)}</dd></div>
+          <div><dt>Conversation</dt><dd>${conversationEnabled ? "Activée" : "À configurer"}</dd></div>
+          ${whatsappConnection?.qualityRating ? `<div><dt>Qualité Meta</dt><dd>${escapeHtml(whatsappConnection.qualityRating)}</dd></div>` : ""}
+        </dl>
+      </div>
+      <div class="whatsapp-connection-actions">
+        <button type="button" id="whatsappTest" ${busy ? "disabled" : ""}><i data-lucide="send"></i><span>${whatsappConnectionAction === "test" ? "Envoi…" : "Envoyer un test"}</span></button>
+        <button type="button" id="whatsappReconfigure" ${busy ? "disabled" : ""}><i data-lucide="settings-2"></i><span>Reconfigurer</span></button>
+        ${whatsappDisconnectPending
+          ? `<button type="button" id="whatsappDisconnectConfirm" class="danger" ${busy ? "disabled" : ""}><i data-lucide="unplug"></i><span>${whatsappConnectionAction === "disconnect" ? "Déconnexion…" : "Confirmer"}</span></button><button type="button" id="whatsappDisconnectCancel" ${busy ? "disabled" : ""}>Annuler</button>`
+          : `<button type="button" id="whatsappDisconnect" class="danger" ${busy ? "disabled" : ""}><i data-lucide="unplug"></i><span>Déconnecter</span></button>`}
+      </div>`
+    : "";
+  const webhookSetup = connected && conversationEnabled
+    ? `<section class="whatsapp-webhook-setup ${webhookUsesHttps ? "" : "needs-https"}" aria-labelledby="whatsappWebhookTitle">
+        <header><span><i data-lucide="message-circle"></i></span><div><strong id="whatsappWebhookTitle">Parler aux agents depuis WhatsApp</strong><small>Dans Meta for Developers, configure ce webhook puis abonne l’application au champ <code>messages</code>.</small></div></header>
+        <div class="whatsapp-webhook-values">
+          <label><span>URL de rappel HTTPS</span><code>${escapeHtml(webhookCallbackUrl || "Configure CST_PUBLIC_BASE_URL avec ton domaine HTTPS")}</code><button type="button" data-whatsapp-copy-webhook="url" ${webhookCallbackUrl ? "" : "disabled"} aria-label="Copier l’URL du webhook"><i data-lucide="copy"></i></button></label>
+          <label><span>Jeton de vérification</span><code>${escapeHtml(whatsappConnection?.webhookVerifyToken || "Indisponible")}</code><button type="button" data-whatsapp-copy-webhook="token" aria-label="Copier le jeton de vérification"><i data-lucide="copy"></i></button></label>
+        </div>
+        ${webhookUsesHttps
+          ? `<p><i data-lucide="shield-check"></i><span>Seul le numéro destinataire configuré peut commander les agents. Réponds à une notification, ou écris <code>@NomAgent ton message</code>.</span></p>`
+          : `<p class="whatsapp-webhook-warning"><i data-lucide="triangle-alert"></i><span>Meta exige une URL publique HTTPS. Configure <code>CST_PUBLIC_BASE_URL</code> sur le serveur avant d’activer le webhook.</span></p>`}
+      </section>`
+    : "";
+  const form = showForm
+    ? `<form id="whatsappConnectForm" class="whatsapp-connect-form">
+        <div class="whatsapp-connect-grid">
+          <label><span>Jeton d’accès Meta <small>jamais renvoyé au navigateur</small></span><input data-whatsapp-draft="accessToken" type="password" autocomplete="off" maxlength="4096" required value="${escapeAttr(whatsappConnectionDraft.accessToken)}" placeholder="EAAB…" ${busy ? "disabled" : ""} /></label>
+          <label><span>Secret de l’application Meta <small>pour signer les messages reçus</small></span><input data-whatsapp-draft="appSecret" type="password" autocomplete="off" maxlength="512" required value="${escapeAttr(whatsappConnectionDraft.appSecret)}" placeholder="Secret affiché dans Paramètres de l’application" ${busy ? "disabled" : ""} /></label>
+          <label><span>ID du numéro WhatsApp Business</span><input data-whatsapp-draft="phoneNumberId" inputmode="numeric" maxlength="32" pattern="[0-9]+" required value="${escapeAttr(whatsappConnectionDraft.phoneNumberId)}" placeholder="123456789012345" ${busy ? "disabled" : ""} /></label>
+          <label><span>Ton numéro destinataire</span><input data-whatsapp-draft="recipientPhoneNumber" type="tel" maxlength="32" required value="${escapeAttr(whatsappConnectionDraft.recipientPhoneNumber)}" placeholder="+33612345678" ${busy ? "disabled" : ""} /></label>
+          <label><span>Modèle approuvé <small>optionnel</small></span><input data-whatsapp-draft="templateName" maxlength="512" pattern="[a-z0-9_]+" value="${escapeAttr(whatsappConnectionDraft.templateName)}" placeholder="agent_notification" ${busy ? "disabled" : ""} /></label>
+          <label><span>Langue du modèle</span><input data-whatsapp-draft="templateLanguage" maxlength="16" value="${escapeAttr(whatsappConnectionDraft.templateLanguage)}" placeholder="fr" ${whatsappConnectionDraft.templateName.trim() && !busy ? "" : "disabled"} /></label>
+        </div>
+        <p class="whatsapp-template-help"><i data-lucide="info"></i><span>Saisis le numéro au format international : un numéro français commençant par 06 devient +336. Pour les notifications hors de la fenêtre de 24 h, utilise un modèle Meta approuvé avec exactement une variable <code>{{1}}</code>.</span></p>
+        <div class="whatsapp-connect-actions">
+          <button class="tool-button primary" type="submit" ${busy ? "disabled" : ""}><i data-lucide="link"></i><span>${whatsappConnectionAction === "connect" ? "Connexion…" : connected ? "Enregistrer la nouvelle connexion" : "Lier WhatsApp Business"}</span></button>
+          ${connected ? `<button type="button" id="whatsappReconfigureCancel" class="tool-button" ${busy ? "disabled" : ""}>Annuler</button>` : ""}
+          <a href="${escapeAttr(whatsappConnection?.dashboardUrl || "https://developers.facebook.com/apps/")}" target="_blank" rel="noreferrer"><i data-lucide="external-link"></i><span>Ouvrir Meta for Developers</span></a>
+        </div>
+      </form>`
+    : "";
+
+  return `<section id="whatsappConnectionSettings" class="whatsapp-settings" aria-labelledby="whatsappSettingsTitle">
+    <header class="whatsapp-settings-head">
+      <div class="appearance-settings-copy">
+        <span class="settings-card-icon"><i data-lucide="message-circle"></i></span>
+        <span><strong id="whatsappSettingsTitle">Messages WhatsApp</strong><small>Notifications et conversation bidirectionnelle avec les agents autonomes via l’API officielle Meta.</small></span>
+      </div>
+      <span class="whatsapp-api-pill">Meta · ${escapeHtml(whatsappConnection?.graphApiVersion || "v25.0")}</span>
+    </header>
+    ${loading}${summary}${webhookSetup}${form}
+    ${whatsappConnection?.note ? `<p class="whatsapp-connection-note"><i data-lucide="shield-check"></i><span>${escapeHtml(whatsappConnection.note)}</span></p>` : ""}
+    ${feedback}
+  </section>`;
+};
+
+const bindWhatsAppConnectionUi = (): void => {
+  document.querySelectorAll<HTMLInputElement>("[data-whatsapp-draft]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const field = input.dataset.whatsappDraft as keyof WhatsAppConnectionDraft | undefined;
+      if (!field) return;
+      whatsappConnectionDraft[field] = input.value;
+      if (field === "templateName") {
+        const language = document.querySelector<HTMLInputElement>('[data-whatsapp-draft="templateLanguage"]');
+        if (language) language.disabled = !input.value.trim() || whatsappConnectionAction !== null;
+      }
+    });
+  });
+  document.querySelector<HTMLFormElement>("#whatsappConnectForm")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (whatsappConnectionAction) return;
+    const form = event.currentTarget as HTMLFormElement;
+    if (!form.reportValidity()) return;
+    form.querySelectorAll<HTMLInputElement>("[data-whatsapp-draft]").forEach((input) => {
+      const field = input.dataset.whatsappDraft as keyof WhatsAppConnectionDraft | undefined;
+      if (field) whatsappConnectionDraft[field] = input.value;
+    });
+    whatsappConnectionAction = "connect";
+    whatsappConnectionFeedback = null;
+    render();
+    try {
+      whatsappConnection = await invoke<WhatsAppConnectionView>("connect_whatsapp", {
+        request: {
+          accessToken: whatsappConnectionDraft.accessToken,
+          appSecret: whatsappConnectionDraft.appSecret,
+          phoneNumberId: whatsappConnectionDraft.phoneNumberId,
+          recipientPhoneNumber: whatsappConnectionDraft.recipientPhoneNumber,
+          templateName: whatsappConnectionDraft.templateName.trim() || null,
+          templateLanguage: whatsappConnectionDraft.templateName.trim()
+            ? whatsappConnectionDraft.templateLanguage.trim() || "fr"
+            : null,
+        },
+      });
+      whatsappConnectionLoaded = true;
+      whatsappConnectionEditing = false;
+      whatsappDisconnectPending = false;
+      whatsappConnectionDraft.accessToken = "";
+      whatsappConnectionDraft.appSecret = "";
+      whatsappConnectionDraft.recipientPhoneNumber = "";
+      whatsappConnectionFeedback = {
+        tone: "success",
+        message: "Compte WhatsApp Business lié. Tu peux maintenant activer les notifications dans un agent.",
+      };
+    } catch (error) {
+      whatsappConnectionEditing = true;
+      whatsappConnectionFeedback = {
+        tone: "error",
+        message: String(error).replace(/^Error:\s*/i, ""),
+      };
+    } finally {
+      whatsappConnectionAction = null;
+      render();
+    }
+  });
+  document.querySelector<HTMLButtonElement>("#whatsappReconfigure")?.addEventListener("click", () => {
+    whatsappConnectionEditing = true;
+    whatsappDisconnectPending = false;
+    whatsappConnectionFeedback = null;
+    whatsappConnectionDraft = {
+      accessToken: "",
+      appSecret: "",
+      phoneNumberId: whatsappConnection?.phoneNumberId || "",
+      recipientPhoneNumber: "",
+      templateName: whatsappConnection?.templateName || "",
+      templateLanguage: whatsappConnection?.templateLanguage || "fr",
+    };
+    render();
+    window.setTimeout(() => document.querySelector<HTMLInputElement>('[data-whatsapp-draft="accessToken"]')?.focus(), 0);
+  });
+  document.querySelector<HTMLButtonElement>("#whatsappReconfigureCancel")?.addEventListener("click", () => {
+    whatsappConnectionEditing = false;
+    whatsappConnectionDraft.accessToken = "";
+    whatsappConnectionDraft.appSecret = "";
+    whatsappConnectionDraft.recipientPhoneNumber = "";
+    render();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-whatsapp-copy-webhook]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const value = button.dataset.whatsappCopyWebhook === "token"
+        ? whatsappConnection?.webhookVerifyToken || ""
+        : whatsappConnection?.webhookCallbackUrl || "";
+      if (!value) return;
+      try {
+        await navigator.clipboard.writeText(value);
+        whatsappConnectionFeedback = {
+          tone: "success",
+          message: button.dataset.whatsappCopyWebhook === "token"
+            ? "Jeton de vérification copié."
+            : "URL du webhook copiée.",
+        };
+      } catch {
+        whatsappConnectionFeedback = {
+          tone: "error",
+          message: "Copie impossible. Sélectionne la valeur manuellement.",
+        };
+      }
+      render();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#whatsappTest")?.addEventListener("click", async () => {
+    if (whatsappConnectionAction) return;
+    whatsappConnectionAction = "test";
+    whatsappConnectionFeedback = null;
+    render();
+    try {
+      const result = await invoke<WhatsAppSendResult>("test_whatsapp");
+      whatsappConnectionFeedback = {
+        tone: "success",
+        message: `Meta a accepté le message test (${result.messageId.slice(-12)}).`,
+      };
+    } catch (error) {
+      whatsappConnectionFeedback = {
+        tone: "error",
+        message: String(error).replace(/^Error:\s*/i, ""),
+      };
+    } finally {
+      whatsappConnectionAction = null;
+      render();
+    }
+  });
+  document.querySelector<HTMLButtonElement>("#whatsappDisconnect")?.addEventListener("click", () => {
+    whatsappDisconnectPending = true;
+    whatsappConnectionFeedback = null;
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#whatsappDisconnectCancel")?.addEventListener("click", () => {
+    whatsappDisconnectPending = false;
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#whatsappDisconnectConfirm")?.addEventListener("click", async () => {
+    if (whatsappConnectionAction) return;
+    whatsappConnectionAction = "disconnect";
+    render();
+    try {
+      whatsappConnection = await invoke<WhatsAppConnectionView>("disconnect_whatsapp");
+      whatsappConnectionLoaded = true;
+      whatsappConnectionEditing = false;
+      whatsappDisconnectPending = false;
+      autonomousWhatsAppNotifications = false;
+      whatsappConnectionDraft = {
+        accessToken: "",
+        appSecret: "",
+        phoneNumberId: "",
+        recipientPhoneNumber: "",
+        templateName: "",
+        templateLanguage: "fr",
+      };
+      whatsappConnectionFeedback = {
+        tone: "success",
+        message: "WhatsApp déconnecté. Les agents existants conserveront leur choix et reprendront après une reconnexion.",
+      };
+    } catch (error) {
+      whatsappConnectionFeedback = {
+        tone: "error",
+        message: String(error).replace(/^Error:\s*/i, ""),
+      };
+    } finally {
+      whatsappConnectionAction = null;
+      render();
+    }
+  });
+};
+
 const renderSettingsPanel = (): string => {
   const accountCount = settings?.accounts.length ?? 0;
   return `
@@ -13386,7 +19932,7 @@ const renderSettingsPanel = (): string => {
           <span class="settings-card-icon"><i data-lucide="layout-grid"></i></span>
           <span>
             <strong id="chatDisplaySettingsTitle">Affichage de la fenêtre principale</strong>
-            <small>En mode Disponibles, un chat disparaît pendant sa tâche puis revient automatiquement à la fin.</small>
+            <small>En mode Disponibles, les chats en cours sont masqués, mais un clic dans la liste permet de les afficher temporairement.</small>
           </span>
         </div>
         <div class="theme-choice-group chat-display-choice-group" role="group" aria-label="Chats affichés dans la fenêtre principale">
@@ -13398,12 +19944,157 @@ const renderSettingsPanel = (): string => {
           </button>
         </div>
       </section>
+      <section class="appearance-settings chat-status-display-settings" aria-labelledby="chatStatusDisplaySettingsTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="activity"></i></span>
+          <span>
+            <strong id="chatStatusDisplaySettingsTitle">Statut dans le bandeau</strong>
+            <small>Affiche soit un point coloré compact, soit les mots Disponible, En cours ou Question.</small>
+          </span>
+        </div>
+        <div class="theme-choice-group" role="group" aria-label="Affichage du statut dans le bandeau des chats">
+          <button type="button" data-chat-status-display-mode="dot" class="${chatTurnStatusDisplayMode === "dot" ? "active" : ""}" aria-pressed="${chatTurnStatusDisplayMode === "dot"}">
+            <i data-lucide="circle"></i><span>Point coloré</span>
+          </button>
+          <button type="button" data-chat-status-display-mode="label" class="${chatTurnStatusDisplayMode === "label" ? "active" : ""}" aria-pressed="${chatTurnStatusDisplayMode === "label"}">
+            <i data-lucide="type"></i><span>Texte</span>
+          </button>
+        </div>
+      </section>
+      <section class="appearance-settings chat-sidebar-priority-settings" aria-labelledby="chatSidebarPrioritySettingsTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="list-filter"></i></span>
+          <span>
+            <strong id="chatSidebarPrioritySettingsTitle">Priorité dans « Chats de cet environnement »</strong>
+            <small>Le groupe choisi remonte en tête, sans changer l’ordre des autres chats.</small>
+          </span>
+        </div>
+        <div class="theme-choice-group" role="group" aria-label="Chats prioritaires dans la liste de l’environnement">
+          <button type="button" data-chat-sidebar-priority="recent" class="${chatSidebarPriorityMode === "recent" ? "active" : ""}" aria-pressed="${chatSidebarPriorityMode === "recent"}">
+            <i data-lucide="clock-3"></i><span>Récents</span>
+          </button>
+          <button type="button" data-chat-sidebar-priority="question" class="${chatSidebarPriorityMode === "question" ? "active" : ""}" aria-pressed="${chatSidebarPriorityMode === "question"}">
+            <i data-lucide="message-circle-question"></i><span>Questions</span>
+          </button>
+          <button type="button" data-chat-sidebar-priority="available" class="${chatSidebarPriorityMode === "available" ? "active" : ""}" aria-pressed="${chatSidebarPriorityMode === "available"}">
+            <i data-lucide="circle-check"></i><span>Verts</span>
+          </button>
+        </div>
+      </section>
+      <section class="appearance-settings chat-sidebar-running-settings" aria-labelledby="chatSidebarRunningSettingsTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="eye-off"></i></span>
+          <span>
+            <strong id="chatSidebarRunningSettingsTitle">Chats orange dans cette liste</strong>
+            <small>Les masquer ne les arrête pas : ils continuent leur tâche et réapparaissent quand leur statut change.</small>
+          </span>
+        </div>
+        <div class="theme-choice-group" role="group" aria-label="Affichage des chats orange dans la liste de l’environnement">
+          <button type="button" data-chat-sidebar-running="show" class="${chatSidebarHideRunning ? "" : "active"}" aria-pressed="${!chatSidebarHideRunning}">
+            <i data-lucide="eye"></i><span>Afficher</span>
+          </button>
+          <button type="button" data-chat-sidebar-running="hide" class="${chatSidebarHideRunning ? "active" : ""}" aria-pressed="${chatSidebarHideRunning}">
+            <i data-lucide="eye-off"></i><span>Masquer</span>
+          </button>
+        </div>
+      </section>
+      <section class="appearance-settings chat-context-tasks-settings" aria-labelledby="chatContextTasksSettingsTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="list-checks"></i></span>
+          <span>
+            <strong id="chatContextTasksSettingsTitle">Tâches dans la colonne de droite</strong>
+            <small>Garder les tâches à faire visibles sous les outils, avec la possibilité de les terminer directement.</small>
+          </span>
+        </div>
+        <div class="appearance-settings-options" role="group" aria-label="Afficher les tâches dans la colonne de droite">
+          <button type="button" data-chat-context-tasks="show" class="${chatContextTasksVisible ? "active" : ""}" aria-pressed="${chatContextTasksVisible}">
+            Afficher
+          </button>
+          <button type="button" data-chat-context-tasks="hide" class="${chatContextTasksVisible ? "" : "active"}" aria-pressed="${!chatContextTasksVisible}">
+            Masquer
+          </button>
+        </div>
+      </section>
+      <section class="appearance-settings chat-history-fullscreen-settings" aria-labelledby="chatHistoryFullscreenSettingsTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="maximize-2"></i></span>
+          <span>
+            <strong id="chatHistoryFullscreenSettingsTitle">Ouvrir l’historique en plein écran</strong>
+            <small>Affiche automatiquement l’historique dès qu’un chat est agrandi.</small>
+          </span>
+        </div>
+        <div class="theme-choice-group" role="group" aria-label="Ouverture automatique de l’historique en plein écran">
+          <button type="button" data-chat-history-open-fullscreen="off" class="${expertChatHistoryOpenOnFullscreen ? "" : "active"}" aria-pressed="${!expertChatHistoryOpenOnFullscreen}">
+            <i data-lucide="circle"></i><span>Non</span>
+          </button>
+          <button type="button" data-chat-history-open-fullscreen="on" class="${expertChatHistoryOpenOnFullscreen ? "active" : ""}" aria-pressed="${expertChatHistoryOpenOnFullscreen}">
+            <i data-lucide="history"></i><span>Oui</span>
+          </button>
+        </div>
+      </section>
+      <section class="appearance-settings chat-history-compact-settings" aria-labelledby="chatHistoryCompactSettingsTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="minimize-2"></i></span>
+          <span>
+            <strong id="chatHistoryCompactSettingsTitle">Fermer l’historique en vue réduite</strong>
+            <small>Referme automatiquement l’historique quand le chat revient dans la grille.</small>
+          </span>
+        </div>
+        <div class="theme-choice-group" role="group" aria-label="Fermeture automatique de l’historique en vue réduite">
+          <button type="button" data-chat-history-close-compact="off" class="${expertChatHistoryCloseOnCompact ? "" : "active"}" aria-pressed="${!expertChatHistoryCloseOnCompact}">
+            <i data-lucide="circle"></i><span>Non</span>
+          </button>
+          <button type="button" data-chat-history-close-compact="on" class="${expertChatHistoryCloseOnCompact ? "active" : ""}" aria-pressed="${expertChatHistoryCloseOnCompact}">
+            <i data-lucide="x"></i><span>Oui</span>
+          </button>
+        </div>
+      </section>
+      <section class="appearance-settings chat-selector-settings" aria-labelledby="chatSelectorSettingsTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="sliders-horizontal"></i></span>
+          <span>
+            <strong id="chatSelectorSettingsTitle">Sélecteurs dans les chats</strong>
+            <small>Verrouille le modèle, l’intensité et le mode Construire/Planifier. Les valeurs actuelles restent visibles.</small>
+          </span>
+        </div>
+        <div class="theme-choice-group" role="group" aria-label="Modification du modèle, de l’intensité et du mode dans les chats">
+          <button type="button" data-chat-composer-selectors="enabled" class="${chatComposerSelectorsEnabled ? "active" : ""}" aria-pressed="${chatComposerSelectorsEnabled}">
+            <i data-lucide="lock-open"></i><span>Modifiables</span>
+          </button>
+          <button type="button" data-chat-composer-selectors="disabled" class="${chatComposerSelectorsEnabled ? "" : "active"}" aria-pressed="${!chatComposerSelectorsEnabled}">
+            <i data-lucide="lock"></i><span>Verrouillés</span>
+          </button>
+        </div>
+      </section>
       ${renderKeyboardShortcutSettings()}
       ${renderChatReadySoundSettings()}
+      ${renderTelegramConnectionSettings()}
+      ${renderWhatsAppConnectionSettings()}
       <section id="voiceRuntimeStatus" class="voice-runtime-card" aria-live="polite">
         ${renderVoiceRuntimeStatusContent()}
       </section>
       <div class="settings-cards">
+        ${hasMobileSettings() ? `<button type="button" id="settingsMobileConnection" class="settings-card">
+          <span class="settings-card-icon"><i data-lucide="settings-2"></i></span>
+          <span class="settings-card-copy">
+            <strong>Connexion mobile</strong>
+            <small>${escapeHtml(remoteBaseUrl())}</small>
+          </span>
+        </button>` : ""}
+        ${hasMobilePaymentSettings() ? `<button type="button" id="settingsMobilePayments" class="settings-card">
+          <span class="settings-card-icon"><i data-lucide="bell-ring"></i></span>
+          <span class="settings-card-copy">
+            <strong>Notifications mobiles</strong>
+            <small>Rapports d’agents · alertes · paiements</small>
+          </span>
+        </button>` : ""}
+        ${hasMobileGooglePaySettings() ? `<button type="button" id="settingsMobileGooglePay" class="settings-card">
+          <span class="settings-card-icon"><i data-lucide="wallet-cards"></i></span>
+          <span class="settings-card-copy">
+            <strong>Compte Google Pay</strong>
+            <small>Vérifier et gérer le compte dans Google Wallet</small>
+          </span>
+        </button>` : ""}
         <button type="button" id="settingsAccounts" class="settings-card">
           <span class="settings-card-icon"><i data-lucide="users"></i></span>
           <span class="settings-card-copy">
@@ -13431,6 +20122,9 @@ const currentTaskEnvironment = (): TaskEnvironment | null => {
   return { path, label: workspace?.label ?? workspaceBaseName(path) };
 };
 
+const currentTaskAccountId = (): string | null =>
+  authenticatedUser()?.id ?? null;
+
 const scheduledChatsPanelOptions = (): ScheduledChatsPanelOptions => ({
   environments: knownWorkspaces().map((workspace) => ({
     path: workspace.path,
@@ -13446,32 +20140,54 @@ const scheduledChatsPanelOptions = (): ScheduledChatsPanelOptions => ({
 
 const renderActiveAppPanel = (): string => {
   switch (activeView) {
+    case "tutorial":
+      return tutorialModule?.renderTutorialPanel() ?? "";
     case "terminal":
       return renderExpertTerminalGrid();
     case "pool":
       return renderAccountsAndPool();
     case "tasks":
-      return renderTasksPanel(undefined, currentTaskEnvironment());
+      return tasksViewModule?.renderTasksPanel(
+        undefined,
+        currentTaskEnvironment(),
+        currentTaskAccountId(),
+      ) ?? "";
     case "prompts":
-      return renderPromptLibraryPanel();
+      return promptLibraryModule?.renderPromptLibraryPanel() ?? "";
     case "scheduled-chat":
-      return renderScheduledChatsPanel(scheduledChatsPanelOptions());
+      return scheduledChatsViewModule?.renderScheduledChatsPanel(scheduledChatsPanelOptions()) ?? "";
     case "limits":
       return renderLimitsPanel();
     case "dashboard":
       return renderDashboardPanel();
+    case "video":
+      return videoModule?.renderVideoPanel() ?? "";
+    case "vps":
+      return vpsModule?.renderVpsPanel() ?? "";
     case "doctolib-lab":
       return renderDoctolibLabPanel(doctolibLab, { remoteMode: isRemoteMode() });
     case "autonomous":
       return renderAutonomousPanel();
+    case "bug-report":
+      return renderBugReportPanel();
     case "orchestration":
       return renderOrchestrationPanel();
-    case "kombai":
-      return renderKombaiPanel();
+    case "design":
+      return designModule?.renderDesignPanel({
+        activeTool: activeDesignTool,
+        projectDir: currentProjectDir(),
+        claudeStudio: claudeDesignStudioModel(),
+        kombaiPanelHtml: activeDesignTool === "kombai" ? renderKombaiPanel() : "",
+        kombaiRunning: kombaiStatus?.running ?? false,
+      }) ?? "";
+    case "forum":
+      return forumModule?.renderForumPanel() ?? "";
+    case "messaging":
+      return messagingModule?.renderMessagingPanel() ?? "";
     case "discussions":
       return renderDiscussionsPanel();
     case "history":
-      return renderPromptHistoryPanel();
+      return promptHistoryViewModule?.renderPromptHistoryPanel(promptHistoryPanelModel()) ?? "";
     case "audit":
       return renderAuditPanel();
     case "skills":
@@ -13483,11 +20199,48 @@ const renderActiveAppPanel = (): string => {
   }
 };
 
+const renderWorkspaceAccessPanel = (): string => {
+  if (!isRemoteMode()) return "";
+  const selected = workspaceAccessTargetId
+    ? workspaceAccess.find((environment) => environment.id === workspaceAccessTargetId) ?? null
+    : null;
+  const pendingCount = workspaceAccess.reduce(
+    (total, environment) => total + (environment.role === "owner" ? environment.requests.length : 0),
+    0,
+  );
+  const disabled = workspaceAccessBusyKey ? "disabled" : "";
+  const requestForm = `<form id="workspaceAccessRequestForm" class="workspace-access-request-form">
+    <label for="workspaceShareCode"><span>Rejoindre un environnement</span><small>Le propriétaire devra accepter la demande.</small></label>
+    <div><input id="workspaceShareCode" name="shareCode" autocomplete="off" maxlength="24" placeholder="ABCD-EF12-3456-7890" required ${disabled} /><button type="submit" class="tool-button primary" ${disabled}><i data-lucide="send"></i><span>Demander l'accès</span></button></div>
+  </form>`;
+  const selectedContent = selected?.role === "owner"
+    ? `<div class="workspace-access-owner">
+        <header><span><strong>${escapeHtml(selected.label)}</strong><small>Espace privé dont vous êtes propriétaire</small></span><button type="button" class="icon-button" data-close-workspace-access aria-label="Fermer la gestion des accès"><i data-lucide="x"></i></button></header>
+        <label class="workspace-share-code"><span>Code de partage</span><small>Ce code permet seulement d'envoyer une demande.</small><div><input id="workspaceShareCodeValue" readonly value="${escapeAttr(selected.shareCode ?? "")}" /><button type="button" class="tool-button" id="copyWorkspaceShareCode" ${selected.shareCode ? "" : "disabled"}><i data-lucide="copy"></i><span>Copier</span></button></div></label>
+        <section class="workspace-access-requests"><header><strong>Demandes en attente</strong><small>${selected.requests.length}</small></header>
+          ${selected.requests.map((request) => `<article><span><strong>${escapeHtml(request.username)}</strong><small>Demande reçue ${escapeHtml(formatTimestamp(request.createdAt))}</small></span><div><button type="button" class="tool-button primary" data-workspace-access-accept="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(request.userId)}" ${disabled}><i data-lucide="check"></i><span>Accepter</span></button><button type="button" class="tool-button" data-workspace-access-reject="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(request.userId)}" ${disabled}><i data-lucide="x"></i><span>Refuser</span></button></div></article>`).join("") || `<p>Aucune demande. Les documents restent accessibles uniquement à votre compte.</p>`}
+        </section>
+        <section class="workspace-access-members"><header><strong>Comptes autorisés</strong><small>${selected.members.length}</small></header>
+          ${selected.members.map((member) => `<article><span><strong>${escapeHtml(member.username)}</strong><small>Accès accordé ${escapeHtml(formatTimestamp(member.createdAt))}</small></span><button type="button" class="tool-button danger" data-workspace-access-revoke="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(member.userId)}" ${disabled}><i data-lucide="user-x"></i><span>Révoquer</span></button></article>`).join("") || `<p>Aucun autre compte n'a accès à cet environnement.</p>`}
+        </section>
+      </div>`
+    : selected
+      ? `<div class="workspace-access-owner workspace-access-member"><header><span><strong>${escapeHtml(selected.label)}</strong><small>Partagé par ${escapeHtml(selected.ownerUsername)}</small></span><button type="button" class="icon-button" data-close-workspace-access aria-label="Fermer"><i data-lucide="x"></i></button></header><p><i data-lucide="shield-check"></i>Le propriétaire a autorisé votre compte. Vous pouvez accéder aux documents de cet environnement tant que cette autorisation reste active.</p></div>`
+      : `<div class="workspace-access-summary"><span class="terminal-environment-memory-icon"><i data-lucide="shield-check"></i></span><span><strong>Vos environnements sont privés</strong><small>Chaque dossier est lié à votre compte. Un autre compte n'y accède qu'après votre acceptation.</small></span>${pendingCount ? `<button type="button" class="tool-button primary" data-open-pending-workspace-access><i data-lucide="user-check"></i><span>${pendingCount} demande${pendingCount > 1 ? "s" : ""}</span></button>` : ""}</div>`;
+
+  return `<section class="workspace-access-panel" aria-label="Accès aux environnements">
+    ${workspaceAccessError ? `<div class="workspace-access-error" role="alert"><i data-lucide="circle-alert"></i><span>${escapeHtml(workspaceAccessError)}</span></div>` : ""}
+    ${workspaceAccessLoading && !workspaceAccessLoaded ? `<div class="workspace-access-loading"><i data-lucide="loader-circle" class="is-spinning"></i><span>Chargement des droits d'accès…</span></div>` : selectedContent}
+    ${requestForm}
+  </section>`;
+};
+
 const renderTerminalEnvironmentMenu = (): string => {
   if (!terminalEnvironmentMenuOpen) return "";
   const activePath = userEnvironmentPath(currentWorkspace());
   const activeId = activePath ? workspaceIdForPath(activePath) : null;
   const workspacesById = new Map(knownWorkspaces().map((workspace) => [workspace.id, workspace]));
+  const executionTargets = remoteChatExecutionTargets();
   const memoryWorkspace = environmentMemoryTargetId
     ? workspacesById.get(environmentMemoryTargetId) ?? null
     : null;
@@ -13546,8 +20299,21 @@ const renderTerminalEnvironmentMenu = (): string => {
       ]);
       const chatCount = discussionCount + draftPanes.length;
       const deleting = workspaceClosingId === id;
-      const hasMemory = !!workspacesById.get(id)?.memory.trim();
-      return `<div class="terminal-environment-menu-row">
+      const workspace = workspacesById.get(id) ?? null;
+      const access = workspaceAccessForPath(group.path);
+      const accessRequestCount = access?.role === "owner" ? access.requests.length : 0;
+      const hasMemory = !!workspace?.memory.trim();
+      const executionTargetId = normalizeWorkspaceExecutionTargetId(workspace?.executionTargetId);
+      const executionTargetConfigured = !executionTargetId
+        || executionTargets.some((target) => target.id === executionTargetId);
+      const executionTargetOptions = executionTargets.length
+        ? `<option value="" ${executionTargetId ? "" : "selected"}>Automatique</option>
+          ${executionTargets.map((target) => `<option value="${escapeAttr(target.id)}" ${executionTargetId === target.id ? "selected" : ""}>${escapeHtml(target.label)}${target.primary ? " · connexion active" : ""}</option>`).join("")}
+          ${executionTargetId && !executionTargetConfigured
+            ? `<option value="${escapeAttr(executionTargetId)}" selected>VPS non configuré</option>`
+            : ""}`
+        : "";
+      return `<div class="terminal-environment-menu-row ${executionTargets.length ? "has-vps-routing" : ""} ${isRemoteMode() ? "has-access-control" : ""}">
         <button
           type="button"
           class="terminal-environment-menu-item ${active ? "active" : ""}"
@@ -13566,6 +20332,17 @@ const renderTerminalEnvironmentMenu = (): string => {
           </span>
           <i data-lucide="chevron-right"></i>
         </button>
+        ${executionTargets.length ? `<label
+          class="terminal-environment-menu-vps ${executionTargetId ? "is-fixed" : ""}"
+          title="VPS utilisé par les nouveaux chats et terminaux de ${escapeAttr(group.label)}"
+        >
+          <i data-lucide="server"></i>
+          <select
+            data-environment-execution-target-id="${escapeAttr(id)}"
+            aria-label="VPS de l'environnement ${escapeAttr(group.label)}"
+            ${environmentExecutionTargetSavingId === id ? "disabled" : ""}
+          >${executionTargetOptions}</select>
+        </label>` : ""}
         <button
           type="button"
           class="terminal-environment-menu-memory ${hasMemory ? "has-memory" : ""} ${environmentMemoryTargetId === id ? "active" : ""}"
@@ -13576,6 +20353,14 @@ const renderTerminalEnvironmentMenu = (): string => {
         >
           <i data-lucide="brain-circuit"></i><span>Mémoire</span>
         </button>
+        ${isRemoteMode() ? `<button
+          type="button"
+          class="terminal-environment-menu-access ${accessRequestCount ? "has-request" : ""} ${workspaceAccessTargetId === access?.id ? "active" : ""}"
+          data-manage-workspace-access="${escapeAttr(access?.id ?? "")}"
+          title="${access?.role === "member" ? `Accès accordé par ${escapeAttr(access.ownerUsername)}` : accessRequestCount ? `${accessRequestCount} demande(s) à examiner` : "Gérer les accès à cet environnement"}"
+          aria-label="Gérer les accès à ${escapeAttr(group.label)}"
+          ${access ? "" : "disabled"}
+        ><i data-lucide="${access?.role === "member" ? "users" : accessRequestCount ? "user-check" : "shield"}"></i>${accessRequestCount ? `<b>${accessRequestCount}</b>` : ""}</button>` : ""}
         <button
           type="button"
           class="terminal-environment-menu-delete"
@@ -13604,22 +20389,29 @@ const renderTerminalEnvironmentMenu = (): string => {
         </button>
       </header>
       <div class="terminal-environment-menu-list">
+        ${renderWorkspaceAccessPanel()}
         ${memoryEditor}
-        ${environments || `<div class="terminal-environment-menu-empty"><i data-lucide="folder-open"></i><strong>Aucun environnement</strong><small>Parcourez les dossiers pour choisir votre premier environnement.</small></div>`}
+        ${environments || `<div class="terminal-environment-menu-empty"><i data-lucide="folder-open"></i><strong>Aucun environnement</strong><small>Choisissez un dossier ou importez directement un projet Git.</small></div>`}
       </div>
       <footer class="terminal-environment-menu-actions">
-        <span><i data-lucide="folder-open"></i>Selectionnez un dossier existant sur votre machine</span>
-        <button type="button" class="tool-button primary" id="createEnvironmentFromMenu" title="Afficher les dossiers et parcourir l'arborescence">
-          <i data-lucide="folder-open"></i><span>Parcourir les dossiers</span>
-        </button>
+        <span><i data-lucide="folder-open"></i>Dossier existant ou nouveau projet depuis un lien Git</span>
+        <div class="terminal-environment-menu-create-actions">
+          <button type="button" class="tool-button" id="createGitDockerEnvironmentFromMenu" title="Cloner un depot Git et preparer son image Docker">
+            <i data-lucide="container"></i><span>Depuis Git / Docker</span>
+          </button>
+          <button type="button" class="tool-button primary" id="createEnvironmentFromMenu" title="Afficher les dossiers et parcourir l'arborescence">
+            <i data-lucide="folder-open"></i><span>Parcourir les dossiers</span>
+          </button>
+        </div>
       </footer>
     </section>
   </div>`;
 };
 
 const renderExpertTerminalGrid = () => {
-  const folderPath = userEnvironmentPath(terminalFolderFilter);
-  if (!folderPath) {
+  const loginSession = activeLoginTerminal();
+  const folderPath = userWorkspacePath(terminalFolderFilter);
+  if (!folderPath && !loginSession) {
     return `<section class="terminal-environment-gate" data-folder-terminal-view="unselected">
       <div class="terminal-environment-gate-card">
         <span class="terminal-environment-gate-icon"><i data-lucide="folders"></i></span>
@@ -13632,11 +20424,13 @@ const renderExpertTerminalGrid = () => {
     </section>`;
   }
 
-  const sessions = expertTerminalSessions();
+  const sessions = loginSession ? [loginSession] : expertTerminalSessions();
   const folderProfile = folderPath
     ? knownWorkspaces().find((workspace) => workspace.id === workspaceIdForPath(folderPath))
     : null;
-  const folderLabel = folderProfile?.label ?? workspaceBaseName(folderPath);
+  const folderLabel = loginSession
+    ? `Connexion · ${loginSession.title}`
+    : folderProfile?.label ?? workspaceBaseName(folderPath ?? "Terminal");
   const agentCounts = new Map<string, number>();
   sessions.forEach((session) => {
     agentCounts.set(session.agentId, (agentCounts.get(session.agentId) ?? 0) + 1);
@@ -13647,14 +20441,16 @@ const renderExpertTerminalGrid = () => {
   if (expertTerminalFullscreenKey && !sessions.some((session) => session.key === expertTerminalFullscreenKey)) {
     expertTerminalFullscreenKey = null;
   }
-  const slotCount = Math.max(2, sessions.length);
-  const columns = expertGridColumnCount(slotCount);
+  const slotCount = loginSession ? 1 : Math.max(2, sessions.length);
+  const columns = loginSession ? 1 : expertGridColumnCount(slotCount);
   const rows = Math.ceil(slotCount / columns);
   const chatSidebarHidden = displayedChatSidebarWidth() === 0;
   const panes = sessions
     .map((session, index) => {
       const sessionAgentLabel = agentById(session.agentId)?.label ?? session.agentId;
-      const workspaceDetail = session.workspacePath ?? session.folderPath ?? "Dossier en preparation";
+      const workspaceDetail = session.loginOnly
+        ? "Authentification isolee du compte"
+        : session.workspacePath ?? session.folderPath ?? "Dossier en preparation";
       const workspaceLabel = workspaceBaseName(workspaceDetail);
       return `
         <article class="expert-terminal-pane ${session.key === activeTerminalKey ? "active" : ""} ${session.running ? "running" : ""} ${session.key === expertTerminalFullscreenKey ? "is-fullscreen" : ""}" data-expert-terminal-pane="${escapeAttr(session.key)}">
@@ -13683,7 +20479,7 @@ const renderExpertTerminalGrid = () => {
       `;
     })
     .join("");
-  const emptySlots = Array.from({ length: Math.max(0, columns * rows - sessions.length) }, (_, index) => `
+  const emptySlots = loginSession ? "" : Array.from({ length: Math.max(0, columns * rows - sessions.length) }, (_, index) => `
     <button type="button" class="expert-terminal-empty" data-add-expert-terminal ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
       <span class="expert-empty-icon"><i data-lucide="plus"></i></span>
       <strong>${sessions.length === 0 && index === 0 ? "Ouvrir le premier terminal" : "Ajouter un terminal"}</strong>
@@ -13692,23 +20488,25 @@ const renderExpertTerminalGrid = () => {
   `).join("");
 
   return `
-    <section class="folder-terminal-panel" data-folder-terminal-view="${escapeAttr(folderPath)}">
+    <section class="folder-terminal-panel" data-folder-terminal-view="${escapeAttr(loginSession ? "login" : folderPath ?? "")}">
       <header class="folder-terminal-head">
-        <span class="folder-terminal-mark"><i data-lucide="folder-open"></i></span>
+        <span class="folder-terminal-mark"><i data-lucide="${loginSession ? "log-in" : "folder-open"}"></i></span>
         <span class="folder-terminal-copy">
           <strong>${escapeHtml(folderLabel)}</strong>
-          <small>${escapeHtml(folderPath ?? "Tous les environnements ouverts")}</small>
+          <small>${escapeHtml(loginSession ? "Aucun dossier projet requis" : folderPath ?? "Tous les environnements ouverts")}</small>
         </span>
         <span class="folder-terminal-stats">
           <b>${sessions.length}</b> terminaux · <b>${agentCounts.size}</b> agents
         </span>
         <span class="folder-terminal-actions">
-          <button type="button" id="folderNewChat" class="tool-button" title="Nouvelle conversation dans cet environnement"><i data-lucide="messages-square"></i><span>Chat</span></button>
-          <button type="button" id="folderNewTerminal" class="tool-button primary" title="Nouveau terminal dans ${escapeAttr(folderLabel)}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}><i data-lucide="square-terminal"></i><span>Terminal</span></button>
+          ${loginSession
+            ? `<span class="folder-isolation-chip"><i data-lucide="shield-check"></i>Terminal temporaire</span>`
+            : `<button type="button" id="folderNewChat" class="tool-button" title="Nouvelle conversation dans cet environnement"><i data-lucide="messages-square"></i><span>Chat</span></button>
+              <button type="button" id="folderNewTerminal" class="tool-button primary" title="Nouveau terminal dans ${escapeAttr(folderLabel)}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}><i data-lucide="square-terminal"></i><span>Terminal</span></button>`}
         </span>
       </header>
       <div class="folder-agent-summary">
-        <span class="folder-isolation-chip"><i data-lucide="folder-open"></i>Environnement actif</span>
+        <span class="folder-isolation-chip"><i data-lucide="${loginSession ? "key-round" : "folder-open"}"></i>${loginSession ? "Connexion du compte" : "Environnement actif"}</span>
         ${agentChips}
       </div>
       <div class="expert-terminal-wall" style="--expert-columns: ${columns}; --expert-rows: ${rows}" aria-label="Mur de ${sessions.length} terminaux">
@@ -13718,9 +20516,76 @@ const renderExpertTerminalGrid = () => {
   `;
 };
 
+const expertChatGlobalUsageView = () => {
+  const displayedAccounts = deduplicateQuotaAccountsForDisplay(limitStatus);
+  const configuredAccountCount = deduplicateQuotaAccountsForDisplay(settings?.accounts ?? []).length;
+  const totalAccountCount = Math.max(configuredAccountCount, displayedAccounts.length);
+
+  if (!limitStatusLoaded) {
+    return {
+      state: "loading",
+      percent: null,
+      value: "Lecture…",
+      caption: totalAccountCount > 0
+        ? `${totalAccountCount} compte${totalAccountCount > 1 ? "s" : ""}`
+        : "Quotas des comptes",
+      detail: "Lecture de l’utilisation cumulée de tous les comptes.",
+    };
+  }
+
+  const combined = combinedQuotaUsage(displayedAccounts);
+  if (combined.usedPercent === null) {
+    return {
+      state: "unavailable",
+      percent: null,
+      value: "—",
+      caption: "Aucun quota lisible",
+      detail: "L’utilisation globale sera affichée dès qu’un compte exposera son quota.",
+    };
+  }
+
+  const roundedPercent = Math.round(combined.usedPercent);
+  const missingAccountCount = Math.max(0, totalAccountCount - combined.measuredAccountCount);
+  const accountLabel = `${combined.measuredAccountCount} compte${combined.measuredAccountCount > 1 ? "s" : ""} combiné${combined.measuredAccountCount > 1 ? "s" : ""}`;
+  const caption = missingAccountCount > 0
+    ? `${accountLabel} · ${missingAccountCount} sans quota`
+    : accountLabel;
+  const state = roundedPercent >= 90 ? "critical" : roundedPercent >= 70 ? "warning" : "healthy";
+  return {
+    state,
+    percent: roundedPercent,
+    value: `${roundedPercent} % utilisé`,
+    caption,
+    detail: `Utilisation globale : ${roundedPercent} % sur ${accountLabel}. Moyenne du quota limitant de chaque compte.${missingAccountCount > 0 ? ` ${missingAccountCount} compte${missingAccountCount > 1 ? "s" : ""} sans quota lisible exclu${missingAccountCount > 1 ? "s" : ""}.` : ""}`,
+  };
+};
+
+const renderExpertChatGlobalUsage = (): string => {
+  const usage = expertChatGlobalUsageView();
+  const progressAttributes = usage.percent === null
+    ? `aria-busy="${usage.state === "loading"}"`
+    : `role="progressbar" aria-label="Utilisation globale des comptes" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${usage.percent}"`;
+  return `
+    <section class="expert-chat-global-usage is-${usage.state}" data-expert-chat-global-usage title="${escapeAttr(usage.detail)}" aria-label="${escapeAttr(`${usage.value}, ${usage.caption}`)}">
+      <span class="expert-chat-global-usage-head">
+        <span><strong>Utilisation globale</strong><small>${escapeHtml(usage.caption)}</small></span>
+        <b>${escapeHtml(usage.value)}</b>
+      </span>
+      <span class="expert-chat-global-usage-track" ${progressAttributes}>
+        <i style="width: ${usage.percent ?? 0}%"></i>
+      </span>
+    </section>`;
+};
+
+const syncExpertChatGlobalUsageUi = () => {
+  const current = document.querySelector<HTMLElement>("[data-expert-chat-global-usage]");
+  if (current) current.outerHTML = renderExpertChatGlobalUsage();
+};
+
 const renderExpertChatGrid = () => {
   const environmentPath = userEnvironmentPath(currentWorkspace());
   if (!environmentPath) {
+    renderedExpertChatLayoutSignature = "environment-gate";
     return `<section class="chat-environment-gate">
       <span><i data-lucide="folders"></i></span>
       <h2>Choisissez un environnement</h2>
@@ -13734,14 +20599,24 @@ const renderExpertChatGrid = () => {
   const environmentPanes = displayedExpertChatPanesForCurrentEnvironment();
   const totalCount = allEnvironmentPanes.length;
   const count = environmentPanes.length;
-  expertChatPage = clampExpertChatPage(expertChatPage, count, expertChatPageSizeMode);
+  const visibleBusyCount = environmentPanes.filter(expertChatPaneHasBusyTurn).length;
+  const hiddenBusyCount = totalCount - count;
+  const filteredCountTitle = [
+    `${count - visibleBusyCount} chat${count - visibleBusyCount > 1 ? "s" : ""} disponible${count - visibleBusyCount > 1 ? "s" : ""}`,
+    visibleBusyCount
+      ? `${visibleBusyCount} en cours affiché${visibleBusyCount > 1 ? "s" : ""}`
+      : "",
+    hiddenBusyCount
+      ? `${hiddenBusyCount} en cours masqué${hiddenBusyCount > 1 ? "s" : ""}`
+      : "",
+  ].filter(Boolean).join(" · ");
+  const effectivePageSizeMode = effectiveExpertChatPageSizeMode();
+  expertChatPage = clampExpertChatPage(expertChatPage, count, effectivePageSizeMode);
   const totalPages = expertChatPageTotal();
   const pagePanes = visibleExpertChatPanes();
-  const pageSize = resolveExpertChatPageSize(expertChatPageSizeMode);
-  const { columns, rows } = expertChatGridDimensions(
-    pagePanes.length,
-    expertChatPageSizeMode,
-  );
+  const pageSize = resolveExpertChatPageSize(effectivePageSizeMode);
+  const { columns, rows } = responsiveExpertChatGridDimensions(pagePanes.length);
+  renderedExpertChatLayoutSignature = expertChatLayoutSignature(pagePanes.length);
   const firstVisible = count ? expertChatPage * pageSize + 1 : 0;
   const lastVisible = expertChatPage * pageSize + pagePanes.length;
   const environment = knownWorkspaces().find(
@@ -13783,7 +20658,7 @@ const renderExpertChatGrid = () => {
           ? `<button type="button" data-open-discussions class="tool-button"><i data-lucide="list"></i><span>Voir toutes les discussions</span></button>`
           : ""}
       </div>
-      <small class="expert-chat-empty-hint"><kbd>Ctrl</kbd><kbd>N</kbd> ouvre aussi un nouveau chat.</small>
+      <small class="expert-chat-empty-hint">${renderKeyboardShortcutKeycaps(keyboardShortcutBinding("new-chat"))} ouvre aussi un nouveau chat.</small>
     </div>`;
   const allChatsWorkingState = `
     <div class="expert-chat-environment-empty expert-chat-availability-empty">
@@ -13791,7 +20666,7 @@ const renderExpertChatGrid = () => {
       <div class="expert-chat-empty-copy">
         <span class="expert-chat-empty-eyebrow">${totalCount} chat${totalCount > 1 ? "s" : ""} en cours</span>
         <h1>Tous les chats travaillent</h1>
-        <p>Ils réapparaîtront automatiquement ici dès que leur tâche sera terminée.</p>
+        <p>Ils réapparaîtront automatiquement à la fin. Vous pouvez aussi en ouvrir un depuis la liste pour le suivre.</p>
       </div>
       <div class="expert-chat-empty-actions">
         ${hasAccounts
@@ -13805,7 +20680,7 @@ const renderExpertChatGrid = () => {
       ? allChatsWorkingState
       : emptyState;
   return `
-    <section class="expert-chat-workspace${expertChatToolbarHidden ? " is-toolbar-hidden" : ""}" aria-label="${count} chats affichés sur ${totalCount}, page ${expertChatPage + 1} sur ${totalPages}" title="Dans un chat : Retour arrière : fermer · Suppr : fermer avec la discussion">
+    <section class="expert-chat-workspace${expertChatToolbarHidden ? " is-toolbar-hidden" : ""}" aria-label="${count} chats affichés sur ${totalCount}, page ${expertChatPage + 1} sur ${totalPages}" title="Dans un chat : ${escapeAttr(formatKeyboardShortcut(keyboardShortcutBinding("toggle-pane-fullscreen")))} : agrandir/réduire · ${escapeAttr(formatKeyboardShortcut(keyboardShortcutBinding("close-chat")))} : fermer · ${escapeAttr(formatKeyboardShortcut(keyboardShortcutBinding("close-chat-and-discussion")))} : fermer avec la discussion">
       <header id="expertChatToolbar" class="expert-chat-toolbar" aria-hidden="${expertChatToolbarHidden}">
         <div>
           <button type="button" class="icon-button chat-sidebar-expand" data-toggle-chat-sidebar title="Afficher la barre latérale" aria-label="Afficher la barre latérale" aria-controls="chatAppSidebar">
@@ -13814,17 +20689,12 @@ const renderExpertChatGrid = () => {
           <span class="expert-chat-toolbar-mark"><i data-lucide="folder-open"></i></span>
           <span><strong>${escapeHtml(environmentLabel)}</strong><small>${escapeHtml(environmentPath)}</small></span>
         </div>
+        ${renderExpertChatGlobalUsage()}
         <div class="expert-chat-toolbar-actions">
-          <span class="expert-chat-count" title="${expertChatDisplayMode === "available" ? `${totalCount - count} chat${totalCount - count > 1 ? "s" : ""} en cours masqué${totalCount - count > 1 ? "s" : ""}` : `${totalCount} chat${totalCount > 1 ? "s" : ""} ouvert${totalCount > 1 ? "s" : ""}`}"><strong>${count}</strong> ${expertChatDisplayMode === "available" ? `disponible${count > 1 ? "s" : ""}` : `chat${count > 1 ? "s" : ""}`}</span>
-          <label class="expert-grid-control expert-page-size-control" title="Adapter la taille des chats ouverts ou choisir une grille fixe">
-            <span><i data-lucide="app-window"></i><small>Affichage</small></span>
-            <select id="expertChatPageSize" aria-label="Mode de disposition des chats">
-              <option value="auto" ${expertChatPageSizeMode === "auto" ? "selected" : ""}>Auto</option>
-              <option value="6" ${expertChatPageSizeMode === 6 ? "selected" : ""}>6 chats</option>
-              <option value="9" ${expertChatPageSizeMode === 9 ? "selected" : ""}>9 chats</option>
-              <option value="12" ${expertChatPageSizeMode === 12 ? "selected" : ""}>12 chats</option>
-              <option value="16" ${expertChatPageSizeMode === 16 ? "selected" : ""}>16 chats</option>
-            </select>
+          <span class="expert-chat-count" title="${expertChatDisplayMode === "available" ? filteredCountTitle : `${totalCount} chat${totalCount > 1 ? "s" : ""} ouvert${totalCount > 1 ? "s" : ""}`}"><strong>${count}</strong> ${expertChatDisplayMode === "available" ? `affiché${count > 1 ? "s" : ""}` : `chat${count > 1 ? "s" : ""}`}</span>
+          <label class="expert-grid-control expert-page-size-control" title="Saisissez le nombre de chats par page. Laissez le champ vide pour le mode automatique.">
+            <span><i data-lucide="app-window"></i><small>Chats/page</small></span>
+            <input id="expertChatPageSize" type="number" min="1" step="1" inputmode="numeric" autocomplete="off" value="${expertChatPageSizeMode === "auto" ? "" : expertChatPageSizeMode}" placeholder="Auto" aria-label="Nombre de chats par page" />
           </label>
           <nav class="expert-chat-pagination" aria-label="Pages de chats">
             <button id="expertChatPrevPage" type="button" ${expertChatPage === 0 ? "disabled" : ""} title="Page precedente" aria-label="Page precedente">
@@ -13849,26 +20719,86 @@ const renderExpertChatGrid = () => {
       <button id="expertChatToolbarShow" type="button" class="expert-chat-toolbar-restore" title="Afficher le bandeau supérieur" aria-label="Afficher le bandeau supérieur" aria-controls="expertChatToolbar" aria-hidden="${!expertChatToolbarHidden}" tabindex="${expertChatToolbarHidden ? "0" : "-1"}">
         <i data-lucide="chevron-down"></i>
       </button>
-      <div class="expert-chat-wall" style="--expert-chat-columns: ${columns}; --expert-chat-rows: ${rows}" aria-label="Chats ${firstVisible} a ${lastVisible}">
+      <div class="expert-chat-wall" style="--expert-chat-columns: ${columns}; --expert-chat-rows: ${rows}" data-responsive-page-size="${pageSize}" aria-label="Chats ${firstVisible} a ${lastVisible}">
         ${pagePanes.map(renderExpertChatPane).join("") || wallEmptyState}
       </div>
     </section>`;
 };
 
+const renderChatContextTasks = (tasks: readonly TaskItem[]): string => {
+  const visibleTasks = tasks.slice(0, 4);
+  const remainingCount = tasks.length - visibleTasks.length;
+  return `<section class="chat-context-tasks" id="chatContextTasks" aria-labelledby="chatContextTasksTitle">
+    <header>
+      <span><i data-lucide="list-checks"></i><strong id="chatContextTasksTitle">À faire</strong><b>${tasks.length}</b></span>
+      <button type="button" id="chatContextTasksOpenAll" title="Ouvrir toutes les tâches">Tout voir</button>
+    </header>
+    ${visibleTasks.length
+      ? `<ul>${visibleTasks.map((task) => {
+          const dueLabel = task.dueDate
+            ? new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "short" })
+                .format(new Date(`${task.dueDate}T12:00:00`))
+            : "";
+          return `<li class="priority-${task.priority}">
+            <label title="Marquer comme terminée : ${escapeAttr(task.title)}">
+              <input type="checkbox" data-context-task-toggle="${escapeAttr(task.id)}" aria-label="Terminer : ${escapeAttr(task.title)}" />
+              <span aria-hidden="true"><i data-lucide="check"></i></span>
+              <span class="chat-context-task-copy"><strong>${escapeHtml(task.title)}</strong>${dueLabel ? `<small><i data-lucide="calendar-clock"></i>${escapeHtml(dueLabel)}</small>` : ""}</span>
+            </label>
+          </li>`;
+        }).join("")}</ul>${remainingCount > 0 ? `<button type="button" class="chat-context-tasks-more" id="chatContextTasksMore">+ ${remainingCount} autre${remainingCount > 1 ? "s" : ""}</button>` : ""}`
+      : `<button type="button" class="chat-context-tasks-empty" id="chatContextTasksEmpty"><i data-lucide="circle-check"></i><span>Aucune tâche à faire</span></button>`}
+  </section>`;
+};
+
 const renderChatFirstShell = () => {
   const isChat = activeView === "chat";
-  const activeTaskCount = taskStats(
-    taskItemsForEnvironment(loadTaskItems(), currentWorkspace()),
-  ).active;
+  const tutorialNeedsAttention = !tutorialHasStarted();
+  const contextTasks = taskItemsForEnvironment(
+    loadTaskItems(undefined, currentTaskAccountId()),
+    currentWorkspace(),
+  )
+    .filter((task) => !task.completed)
+    .sort((left, right) => {
+      if (left.dueDate && right.dueDate && left.dueDate !== right.dueDate) {
+        return left.dueDate.localeCompare(right.dueDate);
+      }
+      if (left.dueDate !== right.dueDate) return left.dueDate ? -1 : 1;
+      const priorityRank = { high: 0, normal: 1, low: 2 } as const;
+      const priorityDifference = priorityRank[left.priority] - priorityRank[right.priority];
+      return priorityDifference || right.createdAt - left.createdAt;
+    });
+  const activeTaskCount = contextTasks.length;
   const scheduledChatCount = scheduledChatPendingCount(loadScheduledChatItems());
+  const bugReportAttentionCount = bugReportAgents().filter(
+    (agent) => agent.status === "needs_attention" || !!agent.pendingReview,
+  ).length;
+  const autonomousUnreadReportCount = autonomousReportDeliveries(true).length;
+  const privateMessageUnreadCount = messagingModule?.messagingUnreadCount() ?? 0;
+  const chatSideMoreActive = chatSideMoreViews.has(activeView);
   const visibleSidebarWidth = displayedChatSidebarWidth();
-  const sidebarMaxWidth = chatSidebarMaxWidth(window.innerWidth);
+  const sidebarMaxWidth = chatSidebarMaxWidth(chatSidebarAvailableViewportWidth());
+  const visibleContextSidebarWidth = displayedChatContextSidebarWidth();
+  const contextSidebarMax = chatContextSidebarMaxWidth(
+    window.innerWidth,
+    leftSidebarWidthReservedForContext(window.innerWidth),
+  );
+  const contextSidebarMobile =
+    window.innerWidth <= CHAT_CONTEXT_SIDEBAR_MOBILE_BREAKPOINT;
+  const contextSidebarCompact = chatContextSidebarIsCompact(
+    visibleContextSidebarWidth,
+  );
   captureAllExpertChatScroll();
   document.querySelector(".m-chrome")?.remove();
-  document.body.classList.remove("m-drawer-open", "m-sheet-open", "chat-sidebar-resizing");
+  document.body.classList.remove(
+    "m-drawer-open",
+    "m-sheet-open",
+    "chat-sidebar-resizing",
+    "chat-context-sidebar-resizing",
+  );
 
   app.innerHTML = `
-    <div class="layout chat-app-layout ${isChat ? "is-chat" : "is-admin"} ${activeView === "autonomous" ? "is-autonomous" : ""} ${activeView === "orchestration" ? "is-orchestration" : ""} ${visibleSidebarWidth === 0 ? "is-sidebar-collapsed" : ""}" style="--chat-sidebar-width: ${visibleSidebarWidth}px">
+    <div class="layout chat-app-layout ${isChat ? "is-chat" : "is-admin"} ${activeView === "tutorial" ? "is-tutorial" : ""} ${activeView === "autonomous" ? "is-autonomous" : ""} ${activeView === "bug-report" ? "is-bug-report" : ""} ${activeView === "orchestration" ? "is-orchestration" : ""} ${visibleSidebarWidth === 0 ? "is-sidebar-collapsed" : ""} ${visibleContextSidebarWidth === CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH ? "is-context-sidebar-collapsed" : ""} ${contextSidebarCompact ? "is-context-sidebar-compact" : ""}" style="--chat-sidebar-width: ${visibleSidebarWidth}px; --chat-context-sidebar-width: ${visibleContextSidebarWidth}px">
       <aside class="sidebar chat-app-sidebar" id="chatAppSidebar">
         <header class="chat-side-brand">
           <button type="button" id="chatHome" class="chat-brand-button" title="Accueil des conversations">
@@ -13889,35 +20819,25 @@ const renderChatFirstShell = () => {
         </label>
         <nav class="chat-side-conversations" id="chatSideConversations" aria-label="Chats de l'environnement actif">${renderChatSidebarConversations()}</nav>
 
-        <nav class="chat-side-tools" aria-label="Outils">
-          <button type="button" id="tasksToggle" class="${activeView === "tasks" ? "active" : ""}" title="Gérer les tâches" ${activeView === "tasks" ? 'aria-current="page"' : ""}><i data-lucide="list-checks"></i><span>Tâches</span><b class="chat-side-task-count" data-task-nav-count ${activeTaskCount ? "" : "hidden"} aria-label="${activeTaskCount} tâche${activeTaskCount > 1 ? "s" : ""} à faire">${activeTaskCount > 99 ? "99+" : activeTaskCount}</b></button>
-          <button type="button" id="scheduledChatToggle" class="${activeView === "scheduled-chat" ? "active" : ""}" title="Programmer une tâche dans un chat" ${activeView === "scheduled-chat" ? 'aria-current="page"' : ""}><i data-lucide="calendar-clock"></i><span>Chat planifié</span><b class="chat-side-task-count" data-scheduled-chat-nav-count ${scheduledChatCount ? "" : "hidden"} aria-label="${scheduledChatCount} chat${scheduledChatCount === 1 ? "" : "s"} planifié${scheduledChatCount === 1 ? "" : "s"}">${scheduledChatCount > 99 ? "99+" : scheduledChatCount}</b></button>
-          <button type="button" id="promptsToggle" class="${activeView === "prompts" ? "active" : ""}" title="Bibliothèque de prompts" ${activeView === "prompts" ? 'aria-current="page"' : ""}><i data-lucide="message-square-text"></i><span>Prompts</span></button>
-          <button type="button" id="autonomousToggle" class="chat-side-autonomous-entry ${activeView === "autonomous" ? "active" : ""}" title="Créer et suivre des agents autonomes persistants" ${activeView === "autonomous" ? 'aria-current="page"' : ""}>
-            <span class="chat-side-autonomous-mark"><i data-lucide="bot"></i></span>
-            <span class="chat-side-autonomous-copy"><strong>Agents autonomes</strong><small>Création et suivi continu</small></span>
-            <b>24/7</b>
-          </button>
-          <button type="button" id="orchestrationToggle" class="chat-side-orchestration-entry ${activeView === "orchestration" ? "active" : ""}" title="Construire une feature avec un orchestrateur et des chats travailleurs isolés" ${activeView === "orchestration" ? 'aria-current="page"' : ""}>
-            <span class="chat-side-orchestration-mark"><i data-lucide="users"></i></span>
-            <span class="chat-side-orchestration-copy"><strong>Chats orchestrés</strong><small>Plan, preuves et revue</small></span>
-            <b>Bêta</b>
-          </button>
-          <button id="sideDiscussions" class="${activeView === "discussions" ? "active" : ""}" title="Discussions — reprendre une conversation dans un autre compte"><i data-lucide="messages-square"></i><span>Discussions</span></button>
-          <button id="dashboardToggle" class="${activeView === "dashboard" ? "active" : ""}" title="Statistiques"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
-          <button id="limitsToggle" class="${activeView === "limits" ? "active" : ""}" title="Limites"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
-          <button id="skillsToggle" class="${activeView === "skills" ? "active" : ""}" title="Skills"><i data-lucide="library"></i><span>Skills</span></button>
+        <nav class="chat-left-tools" aria-label="Chats, agents et organisation visuelle">
+          <span class="chat-left-tools-label">Organiser</span>
+          <div class="chat-left-tool-grid">
+            <button type="button" id="chatOverviewToggle" class="${activeView === "chat" ? "active" : ""}" title="Afficher la mosaïque des chats" ${activeView === "chat" ? 'aria-current="page"' : ""}>
+              <span><i data-lucide="layout-grid"></i></span><strong>Mosaïque</strong><small>Vue des chats</small>
+            </button>
+            <button type="button" id="autonomousToggle" class="chat-side-autonomous-entry chat-left-agent-entry ${activeView === "autonomous" ? "active" : ""}" title="Créer et suivre des agents autonomes persistants" aria-label="Agents autonomes${autonomousUnreadReportCount ? `, ${autonomousUnreadReportCount} nouveau${autonomousUnreadReportCount > 1 ? "x" : ""} résultat${autonomousUnreadReportCount > 1 ? "s" : ""}` : ""}" ${activeView === "autonomous" ? 'aria-current="page"' : ""}>
+              <span><i data-lucide="bot"></i></span><strong>Agents</strong><small>Suivi 24/7</small><b class="${autonomousUnreadReportCount ? "has-results" : ""}">${autonomousUnreadReportCount || "24/7"}</b>
+            </button>
+            <button type="button" id="orchestrationToggle" class="${activeView === "orchestration" ? "active" : ""}" title="Organiser plusieurs chats autour d'un même objectif" ${activeView === "orchestration" ? 'aria-current="page"' : ""}>
+              <span><i data-lucide="users"></i></span><strong>Orchestrer</strong><small>Équipe de chats</small>
+            </button>
+            <button type="button" id="designToggle" data-open-design class="${activeView === "design" ? "active" : ""}" title="Créer avec Claude Design ou Kombai" ${activeView === "design" ? 'aria-current="page"' : ""}>
+              <span><i data-lucide="layout-template"></i></span><strong>Design</strong><small>Organisation visuelle</small>
+            </button>
+          </div>
         </nav>
 
-        <footer class="chat-side-footer">
-          ${renderUserAccountButton()}
-          <button id="settingsToggle" class="${activeView === "settings" ? "active" : ""}" title="Paramètres (comptes, pool, agents)"><i data-lucide="settings"></i><span>Paramètres</span></button>
-          <button id="themeToggle" class="theme-quick-toggle" title="${activeTheme === "dark" ? "Activer le mode clair" : "Activer le mode sombre"}" aria-label="${activeTheme === "dark" ? "Activer le mode clair" : "Activer le mode sombre"}" aria-pressed="${activeTheme === "light"}">
-            <i class="theme-toggle-icon theme-toggle-icon-light" data-lucide="sun"></i>
-            <i class="theme-toggle-icon theme-toggle-icon-dark" data-lucide="moon"></i>
-            <span class="theme-toggle-label">${activeTheme === "light" ? "Mode clair" : "Mode sombre"}</span>
-          </button>
-        </footer>
+        <footer class="chat-left-footer"><i data-lucide="list-tree"></i><span>Glissez les chats pour les réorganiser</span></footer>
       </aside>
       <div
         id="chatSidebarResizer"
@@ -13945,15 +20865,106 @@ const renderChatFirstShell = () => {
               <button type="button" id="adminBackChat" class="icon-button" title="Retour aux chats" aria-label="Retour aux chats"><i data-lucide="arrow-left" aria-hidden="true"></i></button>
               <div><strong>${escapeHtml(appViewTitle(activeView))}</strong><span>${escapeHtml(statusText)}</span></div>
               <div class="chat-admin-actions">
-                ${activeView !== "discussions" ? `<button id="discussionsToggle" type="button" data-open-discussions class="tool-button" title="Choisir une discussion a reprendre"><i data-lucide="messages-square"></i><span>Reprendre une discussion</span></button>` : ""}
-                <button id="kombaiToggle" class="icon-button" title="Kombai"><i data-lucide="bot"></i></button>
-                <button id="historyToggle" class="icon-button" title="Historique"><i data-lucide="history"></i></button>
-                <button id="auditToggle" class="icon-button" title="Audit"><i data-lucide="scan-eye"></i></button>
+                ${activeView !== "discussions" && activeView !== "tutorial" ? `<button id="discussionsToggle" type="button" data-open-discussions class="tool-button" title="Choisir une discussion a reprendre"><i data-lucide="messages-square"></i><span>Reprendre une discussion</span></button>` : ""}
               </div>
             </header>
             <section class="terminal-shell chat-admin-panel">${renderActiveAppPanel()}</section>`}
         <div class="chat-status-toast" aria-live="polite">${escapeHtml(statusText)}</div>
       </main>
+
+      <button type="button" id="chatContextSidebarExpand" class="icon-button chat-context-sidebar-expand" data-toggle-chat-context-sidebar title="Afficher la barre de droite" aria-label="Afficher la barre de droite" aria-controls="chatContextSidebar">
+        <i data-lucide="panel-right-open" aria-hidden="true"></i>
+      </button>
+
+      <div
+        id="chatContextSidebarResizer"
+        class="chat-context-sidebar-resizer"
+        role="separator"
+        tabindex="0"
+        aria-label="Redimensionner le menu droit"
+        aria-orientation="vertical"
+        aria-controls="chatContextSidebar chatMainWorkspace"
+        aria-valuemin="${CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH}"
+        aria-valuemax="${contextSidebarMax}"
+        aria-valuenow="${visibleContextSidebarWidth}"
+        aria-valuetext="${contextSidebarMobile ? "Menu masqué sur mobile" : visibleContextSidebarWidth === CHAT_CONTEXT_SIDEBAR_COLLAPSED_WIDTH ? "Barre de droite masquée" : `${visibleContextSidebarWidth} pixels`}"
+        title="Faire glisser pour redimensionner ou masquer · Double-cliquer pour réinitialiser"
+      ></div>
+
+      <aside class="chat-context-sidebar" id="chatContextSidebar" aria-label="Messages, tâches et outils de l'application">
+        <header class="chat-context-head">
+          <span class="chat-context-mark"><i data-lucide="panel-right-open"></i></span>
+          <span class="chat-context-head-copy"><strong>Centre d'activité</strong><small>Messages et outils</small></span>
+          <button type="button" id="chatContextSidebarCollapse" class="icon-button chat-context-sidebar-collapse" data-toggle-chat-context-sidebar title="Masquer la barre de droite" aria-label="Masquer la barre de droite" aria-controls="chatContextSidebar">
+            <i data-lucide="panel-right-close" aria-hidden="true"></i>
+          </button>
+        </header>
+
+        <nav class="chat-side-tools" aria-label="Menu droit">
+          <span class="chat-context-section-label">Activité</span>
+          <button type="button" id="messagingToggle" class="${activeView === "messaging" ? "active" : ""}" title="Messages privés entre utilisateurs" ${activeView === "messaging" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="mail"></i></span><span class="chat-context-copy"><strong>Messages</strong><small><span>Messagerie</span> privée</small></span><b class="chat-side-task-count messaging-nav-count" ${privateMessageUnreadCount ? "" : "hidden"} aria-label="${privateMessageUnreadCount} message${privateMessageUnreadCount === 1 ? "" : "s"} non lu${privateMessageUnreadCount === 1 ? "" : "s"}">${privateMessageUnreadCount > 99 ? "99+" : privateMessageUnreadCount}</b>
+          </button>
+          <button type="button" id="tasksToggle" class="${activeView === "tasks" ? "active" : ""}" title="Gérer les tâches" ${activeView === "tasks" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="list-checks"></i></span><span class="chat-context-copy"><strong>Tâches</strong><small>À faire et priorités</small></span><b class="chat-side-task-count" data-task-nav-count ${activeTaskCount ? "" : "hidden"} aria-label="${activeTaskCount} tâche${activeTaskCount > 1 ? "s" : ""} à faire">${activeTaskCount > 99 ? "99+" : activeTaskCount}</b>
+          </button>
+          <button type="button" id="scheduledChatToggle" class="${activeView === "scheduled-chat" ? "active" : ""}" title="Gérer les chats planifiés" ${activeView === "scheduled-chat" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="calendar-clock"></i></span><span class="chat-context-copy"><strong>Planifiés</strong><small>Chats à venir</small></span><b class="chat-side-task-count" data-scheduled-chat-nav-count ${scheduledChatCount ? "" : "hidden"} aria-label="${scheduledChatCount} chat${scheduledChatCount === 1 ? "" : "s"} planifié${scheduledChatCount === 1 ? "" : "s"}">${scheduledChatCount > 99 ? "99+" : scheduledChatCount}</b>
+          </button>
+
+          <span class="chat-context-section-label">Ressources</span>
+          <button type="button" id="tutorialToggle" class="${activeView === "tutorial" ? "active" : ""}" title="Découvrir le fonctionnement de Switch" ${activeView === "tutorial" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="compass"></i></span><span class="chat-context-copy"><strong>Tuto</strong><small>Parcours guidé</small></span>
+            ${tutorialNeedsAttention ? '<b class="tutorial-nav-badge" aria-label="Nouveau parcours">Nouveau</b>' : ""}
+          </button>
+          <button type="button" id="promptsToggle" class="${activeView === "prompts" ? "active" : ""}" title="Bibliothèque de prompts" ${activeView === "prompts" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="message-square-text"></i></span><span class="chat-context-copy"><strong>Prompts</strong><small>Bibliothèque personnelle</small></span>
+          </button>
+          <button type="button" id="sideDiscussions" class="${activeView === "discussions" ? "active" : ""}" title="Historique — reprendre une conversation dans un autre compte" ${activeView === "discussions" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="history"></i></span><span class="chat-context-copy"><strong>Historique</strong><small>Reprendre une discussion</small></span>
+          </button>
+
+          <span class="chat-context-section-label">Suivi</span>
+          <button type="button" id="dashboardToggle" class="${activeView === "dashboard" ? "active" : ""}" title="Statistiques d'utilisation" ${activeView === "dashboard" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="bar-chart-3"></i></span><span class="chat-context-copy"><strong>Stats</strong><small>Usage et activité</small></span>
+          </button>
+          <button type="button" id="limitsToggle" class="${activeView === "limits" ? "active" : ""}" title="Limites des comptes" ${activeView === "limits" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="calendar-clock"></i></span><span class="chat-context-copy"><strong>Limites</strong><small>Quotas et réinitialisations</small></span>
+          </button>
+
+          <span class="chat-context-section-label">Application</span>
+          <div class="chat-side-more${chatSideMoreMenuOpen ? " is-open" : ""}">
+            <button type="button" id="chatSideMoreToggle" class="${chatSideMoreActive ? "active" : ""}" title="Plus d'outils" aria-label="Plus d'outils${chatSideMoreActive ? `, ${mobileViewLabel(activeView)} actif` : ""}" aria-haspopup="menu" aria-expanded="${chatSideMoreMenuOpen}" aria-controls="chatSideMoreMenu">
+              <span class="chat-context-icon"><i data-lucide="layout-grid"></i></span><span class="chat-context-copy"><strong>Plus d'outils</strong><small>Studio, comptes, audit…</small></span><i class="chat-context-chevron" data-lucide="chevron-left"></i>
+            </button>
+            <div class="chat-side-more-menu" id="chatSideMoreMenu" role="menu" aria-labelledby="chatSideMoreToggle" aria-orientation="vertical" ${chatSideMoreMenuOpen ? "" : "hidden"}>
+              <button type="button" role="menuitem" id="bugReportToggle" class="chat-side-bug-report-entry ${activeView === "bug-report" ? "active" : ""}" title="Signaler un bug et lancer automatiquement un agent de correction" ${activeView === "bug-report" ? 'aria-current="page"' : ""}>
+                <span class="chat-side-bug-report-mark"><i data-lucide="bug"></i></span>
+                <span class="chat-side-bug-report-copy"><strong>Signaler un bug</strong><small>Correction automatique en fond</small></span>
+                <b data-bug-report-nav-badge class="${bugReportAttentionCount ? "has-attention" : ""}">${bugReportAttentionCount ? (bugReportAttentionCount > 9 ? "9+" : bugReportAttentionCount) : "Auto"}</b>
+              </button>
+              <button type="button" role="menuitem" id="poolToggle" class="${activeView === "pool" ? "active" : ""}" title="Gérer les comptes" ${activeView === "pool" ? 'aria-current="page"' : ""}><i data-lucide="users"></i><span>Comptes</span></button>
+              <button type="button" role="menuitem" id="videoToggle" class="${activeView === "video" ? "active" : ""}" title="Générer des images et vidéos avec l’IA" ${activeView === "video" ? 'aria-current="page"' : ""}><i data-lucide="wand-sparkles"></i><span>Studio IA</span></button>
+              <button type="button" role="menuitem" id="forumToggle" class="${activeView === "forum" ? "active" : ""}" title="Forum communautaire — sujets et réponses" ${activeView === "forum" ? 'aria-current="page"' : ""}><i data-lucide="messages-square"></i><span>Forum</span></button>
+              <button type="button" role="menuitem" id="auditToggle" class="${activeView === "audit" ? "active" : ""}" title="Audit de l'interface" ${activeView === "audit" ? 'aria-current="page"' : ""}><i data-lucide="scan-eye"></i><span>Audit</span></button>
+              <button type="button" role="menuitem" id="skillsToggle" class="${activeView === "skills" ? "active" : ""}" title="Skills" ${activeView === "skills" ? 'aria-current="page"' : ""}><i data-lucide="library"></i><span>Skills</span></button>
+              ${isRemoteMode() ? `<button type="button" role="menuitem" id="vpsToggle" class="${activeView === "vps" ? "active" : ""}" title="Déployer et suivre les nœuds VPS" ${activeView === "vps" ? 'aria-current="page"' : ""}><i data-lucide="server"></i><span>VPS</span></button>` : ""}
+            </div>
+          </div>
+        </nav>
+
+        ${chatContextTasksVisible ? renderChatContextTasks(contextTasks) : ""}
+
+        <footer class="chat-side-footer">
+          <button type="button" id="settingsToggle" class="${activeView === "settings" ? "active" : ""}" title="Paramètres (comptes, pool, agents)" ${activeView === "settings" ? 'aria-current="page"' : ""}><i data-lucide="settings"></i><span>Paramètres</span></button>
+          ${renderUserAccountButton()}
+          <button type="button" id="themeToggle" class="theme-quick-toggle" title="${activeTheme === "dark" ? "Activer le mode clair" : "Activer le mode sombre"}" aria-label="${activeTheme === "dark" ? "Activer le mode clair" : "Activer le mode sombre"}" aria-pressed="${activeTheme === "light"}">
+            <i class="theme-toggle-icon theme-toggle-icon-light" data-lucide="sun"></i>
+            <i class="theme-toggle-icon theme-toggle-icon-dark" data-lucide="moon"></i>
+            <span class="theme-toggle-label">${activeTheme === "light" ? "Mode clair" : "Mode sombre"}</span>
+          </button>
+        </footer>
+      </aside>
     </div>
     ${renderAutonomousMonitor()}
     ${renderDiscussionArchiveModal()}
@@ -13965,6 +20976,7 @@ const renderChatFirstShell = () => {
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
     ${renderTerminalEnvironmentMenu()}
+    ${renderGitDockerEnvironmentModal()}
     ${renderCodexModelSuggestions()}
     ${renderUserProfileModal()}
   `;
@@ -13980,12 +20992,15 @@ const renderChatFirstShell = () => {
 };
 
 const render = () => {
+  if (activeView !== "forum") forumModule?.stopForumPolling();
+  messagingModule?.setMessagingVisible(activeView === "messaging");
   if (draggedChatSessionId) clearChatDragUi();
   if (!settings) {
     app.innerHTML = `<main class="boot">Chargement</main>`;
     return;
   }
 
+  const expertChatPromptFocus = captureFocusedExpertChatPrompt();
   captureChatFeedScroll();
 
   // Plusieurs raccourcis ouvrent directement un chat sans passer par
@@ -14014,6 +21029,11 @@ const render = () => {
   });
 
   renderChatFirstShell();
+  restoreFocusedExpertChatPrompt(expertChatPromptFocus);
+
+  if (activeView === "design" && activeDesignTool === "claude") {
+    void loadClaudeDesignTranscriptIfNeeded();
+  }
 
   if (adminScrollTop > 0) {
     const restoredAdminPanel = document.querySelector<HTMLElement>(".chat-admin-panel");
@@ -14188,21 +21208,25 @@ const renderLegacyTerminalShell = () => {
               <i data-lucide="bar-chart-3"></i>
               <span>Stats</span>
             </button>
-            <button id="kombaiToggle" class="tool-button ${activeView === "kombai" ? "primary" : ""}" title="Kombai (VS Code embarque)">
-              <i data-lucide="bot"></i>
-              <span>Kombai</span>
+            ${isRemoteMode() ? `<button id="vpsToggle" class="tool-button ${activeView === "vps" ? "primary" : ""}" title="Déployer les chats sur un VPS via SSH">
+              <i data-lucide="server"></i>
+              <span>VPS</span>
+            </button>` : ""}
+            <button id="designToggle" data-open-design class="tool-button ${activeView === "design" ? "primary" : ""}" title="Design · Claude ou Kombai">
+              <i data-lucide="layout-template"></i>
+              <span>Design</span>
             </button>
             <button id="discussionsToggle" data-open-discussions class="tool-button ${activeView === "discussions" ? "primary" : ""}" title="Choisir une discussion a reprendre">
               <i data-lucide="messages-square"></i>
               <span>Reprendre une discussion</span>
             </button>
-            <button id="historyToggle" class="tool-button ${activeView === "history" ? "primary" : ""}" title="Historique des demandes (recherche)">
-              <i data-lucide="history"></i>
-              <span>Historique</span>
-            </button>
             <button id="promptsToggle" class="tool-button ${activeView === "prompts" ? "primary" : ""}" title="Bibliothèque de prompts">
               <i data-lucide="message-square-text"></i>
               <span>Prompts</span>
+            </button>
+            <button id="videoToggle" class="tool-button ${activeView === "video" ? "primary" : ""}" title="Studio de génération d’images et de vidéos">
+              <i data-lucide="wand-sparkles"></i>
+              <span>Studio IA</span>
             </button>
             <button id="auditToggle" class="tool-button ${activeView === "audit" ? "primary" : ""}" title="Audit design de la vue affichée (détecteur Impeccable)">
               <i data-lucide="scan-eye"></i>
@@ -14254,16 +21278,26 @@ const renderLegacyTerminalShell = () => {
                 ? renderLimitsPanel()
                 : activeView === "dashboard"
                   ? renderDashboardPanel()
-                  : activeView === "kombai"
-                    ? renderKombaiPanel()
+                  : activeView === "video"
+                    ? videoModule?.renderVideoPanel() ?? ""
+                    : activeView === "vps"
+                      ? vpsModule?.renderVpsPanel() ?? ""
+                    : activeView === "design"
+                      ? designModule?.renderDesignPanel({
+                          activeTool: activeDesignTool,
+                          projectDir: currentProjectDir(),
+                          claudeStudio: claudeDesignStudioModel(),
+                          kombaiPanelHtml: activeDesignTool === "kombai" ? renderKombaiPanel() : "",
+                          kombaiRunning: kombaiStatus?.running ?? false,
+                        }) ?? ""
                     : activeView === "discussions"
                       ? renderDiscussionsPanel()
-                      : activeView === "history"
-                        ? renderPromptHistoryPanel()
-                        : activeView === "scheduled-chat"
-                          ? renderScheduledChatsPanel(scheduledChatsPanelOptions())
+                    : activeView === "history"
+                      ? promptHistoryViewModule?.renderPromptHistoryPanel(promptHistoryPanelModel()) ?? ""
+                      : activeView === "scheduled-chat"
+                          ? scheduledChatsViewModule?.renderScheduledChatsPanel(scheduledChatsPanelOptions()) ?? ""
                           : activeView === "prompts"
-                            ? renderPromptLibraryPanel()
+                            ? promptLibraryModule?.renderPromptLibraryPanel() ?? ""
                         : activeView === "audit"
                             ? renderAuditPanel()
                             : activeView === "skills"
@@ -14286,6 +21320,7 @@ const renderLegacyTerminalShell = () => {
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
     ${renderTerminalEnvironmentMenu()}
+    ${renderGitDockerEnvironmentModal()}
     ${renderCodexModelSuggestions()}
   `;
 
@@ -14303,12 +21338,12 @@ const renderAccountsPanel = () => {
   const accounts = settings.accounts
     .map((item) => {
       const provider = accountProvider(item);
-      const providerName = providerLabel(provider);
+      const providerName = accountProviderLabel(item);
       return `
         <article class="simple-account-card ${item.id === selectedAccountId ? "active" : ""}">
           <div class="simple-account-identity">
             <span class="simple-account-provider-icon ${provider}" aria-hidden="true">
-              <i data-lucide="${provider === "claude" ? "sparkles" : "cpu"}"></i>
+              <i data-lucide="${provider === "claude" ? "sparkles" : provider === "opencode" ? "bot" : "cpu"}"></i>
             </span>
             <span class="simple-account-copy">
               <strong>${escapeHtml(item.label)}</strong>
@@ -14352,7 +21387,13 @@ const renderAccountsPanel = () => {
               <input type="radio" name="newAccountProvider" value="claude" />
               <span><i data-lucide="sparkles"></i>Claude</span>
             </label>
+            ${OPENCODE_PROVIDER_OPTIONS.map((option) => `
+              <label>
+                <input type="radio" name="newAccountProvider" value="opencode:${escapeAttr(option.id)}" />
+                <span><i data-lucide="bot"></i>${escapeHtml(option.label)}</span>
+              </label>`).join("")}
           </div>
+          <small>Les fournisseurs annexes nécessitent OpenCode dans le PATH (<code>npm install -g opencode-ai</code>). La clé API reste uniquement dans le home isolé du compte.</small>
         </fieldset>
         <button id="addAccount" type="submit" class="tool-button primary">
           <i data-lucide="user-plus"></i><span>Ajouter et se connecter</span>
@@ -14434,6 +21475,7 @@ const renderNewChatModal = () => {
 
   const accounts = settings.accounts;
   const account = accountById(newChatAccountId) ?? accounts[0] ?? null;
+  const automaticRouting = newChatRoutingMode === "automatic";
   const provider = accountProvider(account);
   const environmentPath = userEnvironmentPath(newChatPendingWorkspace ?? currentWorkspace());
   const environmentLabel = environmentPath
@@ -14442,25 +21484,32 @@ const renderNewChatModal = () => {
     : null;
   const modelValue = newChatModel || accountModel(account);
   const pendingTaskTitle = newChatPendingTaskTitle;
+  const executionTargets = remoteChatExecutionTargets();
+  const selectedExecutionTarget = executionTargets.some(
+    (target) => target.id === newChatExecutionTargetId,
+  )
+    ? newChatExecutionTargetId
+    : null;
 
   const accountOptions = accounts
     .map((item) => {
-      const selected = item.id === account?.id;
+      const selected = !automaticRouting && item.id === account?.id;
       const usage = newChatAccountUsageFor(item);
       return `<button
         type="button"
         class="new-chat-account-option ${selected ? "selected" : ""}"
         data-new-chat-account="${escapeAttr(item.id)}"
+        data-new-chat-routing-option
         role="radio"
         aria-checked="${selected}"
-        aria-label="${escapeAttr(`${item.label}, ${providerLabel(accountProvider(item))}, ${usage.announcement}`)}"
+        aria-label="${escapeAttr(`${item.label}, ${accountProviderLabel(item)}, ${usage.announcement}`)}"
         tabindex="${selected ? "0" : "-1"}"
         title="${escapeAttr(`${item.label} · ${usage.detail}`)}"
       >
         <span class="new-chat-account-dot" aria-hidden="true"></span>
         <span class="new-chat-account-copy">
           <strong>${escapeHtml(item.label)}</strong>
-          <small>${escapeHtml(providerLabel(accountProvider(item)))} · ${escapeHtml(accountModel(item))}</small>
+          <small>${escapeHtml(accountProviderLabel(item))} · ${escapeHtml(accountModel(item))}</small>
         </span>
         <span
           class="new-chat-account-usage ${usage.state}"
@@ -14471,7 +21520,7 @@ const renderNewChatModal = () => {
           <strong>${escapeHtml(usage.value)}</strong>
           <small>${escapeHtml(usage.caption)}</small>
         </span>
-        <i data-lucide="${accountProvider(item) === "claude" ? "sparkles" : "cpu"}"></i>
+        <i data-lucide="${accountProvider(item) === "claude" ? "sparkles" : accountProvider(item) === "opencode" ? "bot" : "cpu"}"></i>
       </button>`;
     })
     .join("");
@@ -14483,10 +21532,10 @@ const renderNewChatModal = () => {
           <div>
             <h2 id="newChatModalTitle">${pendingTaskTitle ? "Exécuter une tâche" : "Nouveau chat"}</h2>
             <p>${pendingTaskTitle
-              ? `Choisis l’agent qui exécutera cette tâche dans <strong>${escapeHtml(environmentLabel ?? "cet environnement")}</strong>.`
+              ? `L’exécution sera préparée automatiquement dans <strong>${escapeHtml(environmentLabel ?? "cet environnement")}</strong>.`
               : environmentLabel
-                ? `Compte, modele et mode pour ce chat dans <strong>${escapeHtml(environmentLabel)}</strong>.`
-                : "Choisis le compte, le modele et le mode de ce chat."}</p>
+                ? `La conversation sera ouverte dans <strong>${escapeHtml(environmentLabel)}</strong>.`
+                : "La conversation est prête à être ouverte."}</p>
           </div>
           <button class="icon-button" id="closeNewChatModal" title="Fermer" aria-label="Fermer">
             <i data-lucide="x"></i>
@@ -14499,20 +21548,27 @@ const renderNewChatModal = () => {
             <div><small>Tâche à exécuter</small><strong>${escapeHtml(pendingTaskTitle)}</strong></div>
           </aside>` : ""}
           <section class="modal-section">
-            <span class="new-chat-field-title">Compte / agent</span>
-            ${accounts.length
-              ? `<div class="new-chat-account-options" role="radiogroup" aria-label="Compte du nouveau chat">${accountOptions}</div>`
-              : `<div class="empty">Aucun compte agent : ajoutez-en un dans les parametres.</div>`}
             <span id="newChatAccountStatus" class="visually-hidden" role="status" aria-live="polite"></span>
-            <p class="new-chat-auto-status" id="newChatAutoStatus" role="status" aria-live="polite">
-              <i data-lucide="sparkles"></i>
-              <span>${newChatBestQuotaInFlight
-                ? "Lecture des quotas disponibles…"
-                : `Le choix automatique ajoute ${OPEN_CHAT_QUOTA_RESERVATION_PERCENT} % d’utilisation par chat déjà ouvert sur le compte.`}</span>
-            </p>
+            <aside class="new-chat-routing-summary ${automaticRouting ? "is-automatic" : "is-manual"}">
+              <span class="new-chat-routing-icon" aria-hidden="true"><i data-lucide="sparkles"></i></span>
+              <div>
+                <small>Continuité automatique</small>
+                <strong id="newChatRoutingTitle">${newChatBestQuotaInFlight
+                  ? "Préparation en cours…"
+                  : !account ? "Ajoutez un agent pour démarrer"
+                    : automaticRouting ? "Agent prêt automatiquement" : "Préférence personnalisée"}</strong>
+                <p id="newChatAutoStatus" role="status" aria-live="polite"><span>${newChatBestQuotaInFlight
+                  ? "Recherche de la meilleure capacité disponible…"
+                  : !account ? "La conversation s’ouvrira automatiquement dès qu’un agent sera configuré."
+                    : automaticRouting
+                    ? "L’application utilisera silencieusement l’accès compatible le plus disponible."
+                    : "Votre préférence sera utilisée pour cette conversation."}</span></p>
+              </div>
+            </aside>
+            ${accounts.length ? "" : `<div class="empty">Ajoutez un agent dans les paramètres pour démarrer.</div>`}
             <label>
               <span>Modele</span>
-              <input id="newChatModel" list="codexModelSuggestions" value="${escapeAttr(modelValue)}" placeholder="${escapeAttr(providerDefaultModel(provider))}" autocomplete="off" spellcheck="false" maxlength="160" ${account ? "" : "disabled"} />
+              <input id="newChatModel" list="codexModelSuggestions" value="${escapeAttr(modelValue)}" placeholder="${escapeAttr(providerDefaultModel(provider, accountInferenceProvider(account)))}" autocomplete="off" spellcheck="false" maxlength="160" ${account ? "" : "disabled"} />
             </label>
             <label>
               <span>Mode</span>
@@ -14522,26 +21578,51 @@ const renderNewChatModal = () => {
                 <option value="ask" ${newChatMode === "ask" ? "selected" : ""}>Question</option>
               </select>
             </label>
+            ${executionTargets.length
+              ? `<label>
+                  <span>Machine d’exécution</span>
+                  <select id="newChatExecutionTarget" ${account ? "" : "disabled"}>
+                    <option value="" ${selectedExecutionTarget ? "" : "selected"}>Automatique · nœud disponible</option>
+                    ${executionTargets.map((target) => `
+                      <option value="${escapeAttr(target.id)}" ${selectedExecutionTarget === target.id ? "selected" : ""}>
+                        ${escapeHtml(target.label)}${target.primary ? " · connexion active" : ""}
+                      </option>`).join("")}
+                  </select>
+                </label>`
+              : ""}
+            ${accounts.length > 1
+              ? `<details class="new-chat-routing-details">
+                  <summary>
+                    <span><i data-lucide="sliders-horizontal"></i><span><strong>Attribution de l’agent</strong><small id="newChatRoutingModeLabel">${automaticRouting ? "Automatique" : "Personnalisée"}</small></span></span>
+                    <i data-lucide="chevron-down" aria-hidden="true"></i>
+                  </summary>
+                  <div class="new-chat-account-options" role="radiogroup" aria-label="Préférence d’agent pour ce chat">
+                    <button
+                      type="button"
+                      class="new-chat-account-option new-chat-routing-auto-option ${automaticRouting ? "selected" : ""}"
+                      data-new-chat-routing-auto
+                      data-new-chat-routing-option
+                      role="radio"
+                      aria-checked="${automaticRouting}"
+                      tabindex="${automaticRouting ? "0" : "-1"}"
+                    >
+                      <span class="new-chat-account-dot" aria-hidden="true"></span>
+                      <span class="new-chat-account-copy"><strong>Automatique</strong><small>Meilleure disponibilité, sans interruption</small></span>
+                      <span class="new-chat-routing-badge">Recommandé</span>
+                      <i data-lucide="sparkles"></i>
+                    </button>
+                    ${accountOptions}
+                  </div>
+                </details>`
+              : ""}
           </section>
         </div>
 
         <footer class="modal-actions">
           <button class="tool-button" id="cancelNewChat">Annuler</button>
-          <button
-            class="tool-button new-chat-best-quota"
-            id="confirmBestQuotaNewChat"
-            aria-describedby="newChatAutoStatus"
-            title="Choisir le quota restant le plus élevé, avec 20 % d’utilisation ajoutée par chat déjà ouvert"
-            ${account && environmentPath && !newChatBestQuotaInFlight ? "" : "disabled"}
-          >
-            <i data-lucide="sparkles"></i>
-            <span>${newChatBestQuotaInFlight
-              ? "Recherche…"
-              : pendingTaskTitle ? "Lancer avec le plus de tokens" : "Ouvrir avec le plus de tokens"}</span>
-          </button>
-          <button class="tool-button primary" id="confirmNewChat" ${account && environmentPath ? "" : "disabled"}>
-            <i data-lucide="${pendingTaskTitle ? "play" : "plus"}"></i>
-            <span>${pendingTaskTitle ? "Lancer l’exécution" : "Ouvrir le chat"}</span>
+          <button class="tool-button primary new-chat-confirm" id="confirmNewChat" aria-describedby="newChatAutoStatus" ${account && environmentPath && !newChatBestQuotaInFlight ? "" : "disabled"}>
+            <i data-lucide="${newChatBestQuotaInFlight ? "loader-circle" : pendingTaskTitle ? "play" : "plus"}"></i>
+            <span>${newChatBestQuotaInFlight ? "Préparation…" : pendingTaskTitle ? "Lancer l’exécution" : "Ouvrir le chat"}</span>
           </button>
         </footer>
       </section>
@@ -14632,15 +21713,53 @@ const syncNewChatAccountUsageUi = () => {
     button.title = `${account.label} · ${usage.detail}`;
     button.setAttribute(
       "aria-label",
-      `${account.label}, ${providerLabel(accountProvider(account))}, ${usage.announcement}`,
+      `${account.label}, ${accountProviderLabel(account)}, ${usage.announcement}`,
     );
   });
 };
 
-// La selection d'un compte ne touche qu'aux controles de la modale. L'ancien
-// chemin rappelait render(), demontait toute l'application (chats, terminaux,
-// focus), puis reconstruisait exactement le meme ecran autour de la modale.
-const selectNewChatAccount = (accountId: string | null) => {
+const syncNewChatRoutingUi = () => {
+  const automatic = newChatRoutingMode === "automatic";
+  const automaticButton = document.querySelector<HTMLButtonElement>("[data-new-chat-routing-auto]");
+  automaticButton?.classList.toggle("selected", automatic);
+  automaticButton?.setAttribute("aria-checked", String(automatic));
+  if (automaticButton) automaticButton.tabIndex = automatic ? 0 : -1;
+
+  document.querySelectorAll<HTMLButtonElement>("[data-new-chat-account]").forEach((button) => {
+    const selected = !automatic && button.dataset.newChatAccount === newChatAccountId;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-checked", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+
+  const summary = document.querySelector<HTMLElement>(".new-chat-routing-summary");
+  summary?.classList.toggle("is-automatic", automatic);
+  summary?.classList.toggle("is-manual", !automatic);
+  const title = document.querySelector<HTMLElement>("#newChatRoutingTitle");
+  if (title) title.textContent = automatic ? "Agent prêt automatiquement" : "Préférence personnalisée";
+  const modeLabel = document.querySelector<HTMLElement>("#newChatRoutingModeLabel");
+  if (modeLabel) modeLabel.textContent = automatic ? "Automatique" : "Personnalisée";
+  const routingStatus = document.querySelector<HTMLElement>("#newChatAutoStatus span");
+  if (routingStatus) {
+    routingStatus.textContent = automatic
+      ? "L’application utilisera silencieusement l’accès compatible le plus disponible."
+      : "Votre préférence sera utilisée pour cette conversation.";
+  }
+};
+
+const selectNewChatAutomaticRouting = () => {
+  newChatRoutingMode = "automatic";
+  syncNewChatRoutingUi();
+  const status = document.querySelector<HTMLElement>("#newChatAccountStatus");
+  if (status) status.textContent = "Attribution automatique activée";
+};
+
+// Le routage automatique comme le choix avance ne mettent a jour que les
+// controles de la modale. Aucun des deux ne reconstruit l'application autour.
+const selectNewChatAccount = (
+  accountId: string | null,
+  options: { automatic?: boolean } = {},
+) => {
   const account = accountById(accountId);
   if (!account) return;
 
@@ -14652,19 +21771,17 @@ const selectNewChatAccount = (accountId: string | null) => {
   if (modeSelect) newChatMode = (modeSelect.value as ChatMode) || newChatMode;
 
   newChatAccountId = account.id;
+  newChatRoutingMode = options.automatic ? "automatic" : "manual";
   newChatModel = newChatModelDrafts.get(account.id) ?? accountModel(account);
   newChatModelDrafts.set(account.id, newChatModel);
-
-  document.querySelectorAll<HTMLButtonElement>("[data-new-chat-account]").forEach((button) => {
-    const selected = button.dataset.newChatAccount === account.id;
-    button.classList.toggle("selected", selected);
-    button.setAttribute("aria-checked", String(selected));
-    button.tabIndex = selected ? 0 : -1;
-  });
+  syncNewChatRoutingUi();
 
   if (modelInput) {
     modelInput.value = newChatModel;
-    modelInput.placeholder = providerDefaultModel(accountProvider(account));
+    modelInput.placeholder = providerDefaultModel(
+      accountProvider(account),
+      accountInferenceProvider(account),
+    );
     modelInput.disabled = false;
     modelInput.setCustomValidity("");
   }
@@ -14675,7 +21792,9 @@ const selectNewChatAccount = (accountId: string | null) => {
   const status = document.querySelector<HTMLElement>("#newChatAccountStatus");
   if (status) {
     const usage = newChatAccountUsageFor(account);
-    status.textContent = `${account.label} sélectionné · ${usage.announcement} · modèle ${newChatModel}`;
+    status.textContent = options.automatic
+      ? `Agent affecté automatiquement · ${usage.announcement}`
+      : `${account.label} utilisé pour cette conversation · ${usage.announcement} · modèle ${newChatModel}`;
   }
   void loadChatModelCatalog(account.id);
 };
@@ -15141,9 +22260,7 @@ const renderAutonomousChatEditor = (): string => {
   const account = accountById(state.accountId);
   const provider = accountProvider(account);
   const catalog = account ? chatModelCatalogs.get(account.id) : undefined;
-  const modelSuggestions = (provider === "claude"
-    ? CLAUDE_MODEL_SUGGESTIONS
-    : catalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS)
+  const modelSuggestions = modelSuggestionsForAccount(account, catalog)
     .map((model) => `<option value="${escapeAttr(model)}"></option>`)
     .join("");
   const effortOptions = provider === "codex"
@@ -15190,10 +22307,10 @@ const renderAutonomousChatEditor = (): string => {
               </div>
               <div class="autonomous-chat-model-grid">
                 <label><span>Compte d'exécution</span><select id="autonomousChatAccount" required ${settings?.accounts.length && !state.busy ? "" : "disabled"}>${orchestrationAccountOptions(state.accountId)}</select></label>
-                <label><span>Modèle</span><input id="autonomousChatModel" list="autonomousChatModels" maxlength="160" required value="${escapeAttr(state.model)}" placeholder="${provider === "claude" ? "sonnet" : DEFAULT_CODEX_MODEL}" ${state.busy ? "disabled" : ""} /><datalist id="autonomousChatModels">${modelSuggestions}</datalist></label>
+                <label><span>Modèle</span><input id="autonomousChatModel" list="autonomousChatModels" maxlength="160" required value="${escapeAttr(state.model)}" placeholder="${escapeAttr(providerDefaultModel(provider, accountInferenceProvider(account)))}" ${state.busy ? "disabled" : ""} /><datalist id="autonomousChatModels">${modelSuggestions}</datalist></label>
                 ${provider === "codex"
                   ? `<label><span>Effort de raisonnement</span><select id="autonomousChatReasoningEffort" ${state.busy ? "disabled" : ""}>${effortOptions.map((option) => `<option value="${escapeAttr(option.value)}" ${option.value === state.reasoningEffort ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select></label>`
-                  : `<label><span>Effort de raisonnement</span><input value="Géré par Claude Code" disabled /></label>`}
+                  : `<label><span>Effort de raisonnement</span><input value="Géré par ${escapeAttr(accountProviderLabel(account))}" disabled /></label>`}
               </div>
               <label><span>Objectif autonome</span><textarea id="autonomousChatObjective" maxlength="32768" required placeholder="Décris le résultat durable à poursuivre…" ${state.busy ? "disabled" : ""}>${escapeHtml(state.objective)}</textarea></label>
               <div class="autonomous-chat-runtime-grid">
@@ -15487,15 +22604,7 @@ const openOrchestrationConversion = (pane: ExpertChatPane): void => {
     setActiveView("orchestration");
     return;
   }
-  if (
-    chatTurnIsBusy(pane.turn?.status)
-    || (pane.discussion ? discussionHasRunningTurn(pane.discussion) : false)
-  ) {
-    statusText = "Attends la fin du message en cours avant d'orchestrer ce chat";
-    refreshExpertChatPane(pane);
-    return;
-  }
-  if (pane.queueDrainInFlight || pane.queuedSubmissions.length > 0) {
+  if (expertChatOrchestrationQueueIsBusy(pane)) {
     statusText = "Envoie ou annule les messages en attente avant d'orchestrer ce chat";
     refreshExpertChatPane(pane);
     return;
@@ -15528,7 +22637,9 @@ const openOrchestrationConversion = (pane: ExpertChatPane): void => {
     testTimeoutSeconds: Math.max(5, Math.min(1800, orchestrationTestTimeoutSeconds)),
     busy: false,
   };
-  statusText = "Configurer l'équipe orchestrée";
+  statusText = expertChatSourceTurnIsBusy(pane)
+    ? "Configurer l'équipe pendant que la réponse se termine"
+    : "Configurer l'équipe orchestrée";
   render();
 };
 
@@ -15547,6 +22658,7 @@ const renderOrchestrationConversionModal = () => {
   if (!pane) return "";
   const account = expertChatSelectedAccount(pane);
   const sessionId = expertChatResumeSessionId(pane);
+  const sourceTurnBusy = expertChatSourceTurnIsBusy(pane);
   const chatTitle = pane.discussion?.title?.trim() || "Conversation actuelle";
 
   return `
@@ -15555,7 +22667,7 @@ const renderOrchestrationConversionModal = () => {
         <header class="modal-head">
           <div>
             <h2 id="orchestrationConvertTitle">Transformer en chat orchestré</h2>
-            <p><strong>${escapeHtml(chatTitle)}</strong> devient l’orchestrateur et conserve tout son contexte.</p>
+            <p><strong>${escapeHtml(chatTitle)}</strong> devient l’orchestrateur et conserve tout son contexte.${sourceTurnBusy ? " Sa réponse en cours continue normalement." : ""}</p>
           </div>
           <button type="button" class="icon-button" id="closeOrchestrationConvert" title="Fermer" aria-label="Fermer" ${state.busy ? "disabled" : ""}>
             <i data-lucide="x"></i>
@@ -15576,14 +22688,14 @@ const renderOrchestrationConversionModal = () => {
                 <label><span>Workers <small>hors orchestrateur</small></span><span class="orchestration-worker-count"><input id="orchestrationConvertWorkerCount" type="number" min="1" max="12" step="1" required value="${state.workerCount}" ${state.busy ? "disabled" : ""} /><small id="orchestrationConvertTeamTotal">${state.workerCount + 1} agents au total</small></span></label>
                 <label><span>Timeout des tests</span><span class="orchestration-timeout"><input id="orchestrationConvertTimeout" type="number" min="5" max="1800" required value="${state.testTimeoutSeconds}" ${state.busy ? "disabled" : ""} /><small>secondes</small></span></label>
               </div>
-              <aside class="orchestration-convert-note"><i data-lucide="users"></i><span><strong>Les fenêtres workers s’ouvriront ici</strong><small>Le chat actuel sera piloté par le moteur d’orchestration pendant le plan, les revues et la validation. Son compositeur sera verrouillé pour éviter deux commandes concurrentes.</small></span></aside>
+              <aside class="orchestration-convert-note"><i data-lucide="users"></i><span><strong>${sourceTurnBusy ? "L’équipe peut être lancée sans interrompre la réponse" : "Les fenêtres workers s’ouvriront ici"}</strong><small>${sourceTurnBusy ? "La planification démarrera automatiquement dès que la session actuelle sera libre. Le verrou de session évite deux commandes concurrentes." : "Le chat actuel sera piloté par le moteur d’orchestration pendant le plan, les revues et la validation. Son compositeur sera verrouillé pour éviter deux commandes concurrentes."}</small></span></aside>
             </section>
           </div>
           <footer class="modal-actions">
             <button type="button" class="tool-button" id="cancelOrchestrationConvert" ${state.busy ? "disabled" : ""}>Annuler</button>
             <button type="submit" class="tool-button primary" ${account && sessionId && !state.busy ? "" : "disabled"}>
               <i data-lucide="${state.busy ? "loader-circle" : "users"}"></i>
-              <span>${state.busy ? "Création de l’équipe…" : "Créer les workers"}</span>
+              <span>${state.busy ? "Création de l’équipe…" : "Lancer l’orchestration"}</span>
             </button>
           </footer>
         </form>
@@ -15649,15 +22761,7 @@ const bindOrchestrationConversionUi = (): void => {
       render();
       return;
     }
-    if (
-      chatTurnIsBusy(pane.turn?.status)
-      || (pane.discussion ? discussionHasRunningTurn(pane.discussion) : false)
-    ) {
-      statusText = "Le chat a repris du travail ; attends sa fin avant de l'orchestrer";
-      closeOrchestrationConversion();
-      return;
-    }
-    if (pane.queueDrainInFlight || pane.queuedSubmissions.length > 0) {
+    if (expertChatOrchestrationQueueIsBusy(pane)) {
       statusText = "Des messages sont encore en attente dans ce chat";
       closeOrchestrationConversion();
       return;
@@ -15735,7 +22839,7 @@ const bindOrchestrationConversionUi = (): void => {
       orchestrationConversion = null;
       syncOrchestrationChatPanes();
       persistExpertChats();
-      statusText = "Chat transformé en orchestrateur ; workers en préparation";
+      statusText = "Orchestration lancée ; la planification démarre dès que le chat est disponible";
       render();
       startAllExpertChatWork();
       startOrchestrationsPoll();
@@ -15852,11 +22956,19 @@ const renderNewTerminalModal = () => {
                   <select id="newAccountProvider">
                     <option value="codex" ${newTerminalAccountProvider === "codex" ? "selected" : ""}>Codex (ChatGPT)</option>
                     <option value="claude" ${newTerminalAccountProvider === "claude" ? "selected" : ""}>Claude Code</option>
+                    ${OPENCODE_PROVIDER_OPTIONS.map((option) => {
+                      const value = `opencode:${option.id}`;
+                      const selected = value === providerChoiceValue(
+                        newTerminalAccountProvider,
+                        newTerminalInferenceProvider,
+                      );
+                      return `<option value="${escapeAttr(value)}" ${selected ? "selected" : ""}>${escapeHtml(option.label)} (OpenCode)</option>`;
+                    }).join("")}
                   </select>
                 </label>
                 <label>
                   <span>Modele par defaut</span>
-                  <input id="newAccountModel" list="codexModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${DEFAULT_CODEX_MODEL} / sonnet" />
+                  <input id="newAccountModel" list="codexModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${escapeAttr(providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider))}" />
                 </label>
                 <label title="Intensite de raisonnement : Codex uniquement (ignoree pour Claude)">
                   <span>Intensite (Codex)</span>
@@ -15875,7 +22987,7 @@ const renderNewTerminalModal = () => {
 
           <section id="newTerminalAccountDetails" class="modal-section new-terminal-account-details">
             <label>
-              <span>CODEX_HOME</span>
+              <span>Home isolé du compte</span>
               <input id="newTerminalCodexHome" value="${escapeAttr(account?.codexHome ?? "")}" placeholder="%USERPROFILE%\\.codex-perso" ${account ? "" : "disabled"} />
             </label>
             <label>
@@ -16063,6 +23175,107 @@ const renderAgentsModal = () => {
   `;
 };
 
+const renderGitDockerEnvironmentModal = () => {
+  if (!gitDockerEnvironmentModalOpen) return "";
+  const draft = gitDockerEnvironmentDraft;
+  const disabled = gitDockerEnvironmentSubmitting ? "disabled" : "";
+  const modeHint = draft.mode === "analyze"
+    ? "Clone le projet, detecte sa technologie et genere les fichiers sans exiger Docker."
+    : draft.mode === "build"
+      ? "Construit l'image sur cette machine et cree un paquet portable image.tar.gz."
+      : "Construit nativement sur le VPS, lance le conteneur puis verifie son etat.";
+
+  return `
+    <div class="modal-backdrop git-docker-environment-backdrop" id="gitDockerEnvironmentBackdrop">
+      <section class="modal git-docker-environment-modal" role="dialog" aria-modal="true" aria-labelledby="gitDockerEnvironmentTitle" tabindex="-1">
+        <header class="modal-head">
+          <div class="git-docker-environment-title">
+            <span><i data-lucide="container"></i></span>
+            <div>
+              <h2 id="gitDockerEnvironmentTitle">Nouvel environnement Git / Docker</h2>
+              <p>Un lien Git suffit pour creer le dossier projet et preparer son lancement.</p>
+            </div>
+          </div>
+          <button class="icon-button" type="button" id="closeGitDockerEnvironment" title="Fermer" aria-label="Fermer" ${disabled}>
+            <i data-lucide="x"></i>
+          </button>
+        </header>
+        <form id="gitDockerEnvironmentForm" class="git-docker-environment-form">
+          <div class="modal-body git-docker-environment-body">
+            <label class="git-docker-field git-docker-field-wide">
+              <span>Lien du depot Git <b>requis</b></span>
+              <input id="gitDockerRepositoryUrl" value="${escapeAttr(draft.repositoryUrl)}" placeholder="https://github.com/organisation/projet.git" inputmode="url" autocomplete="off" maxlength="2048" required ${disabled} />
+              <small>HTTPS ou SSH. Les tokens integres dans l'URL sont refuses.</small>
+            </label>
+            <div class="git-docker-form-grid">
+              <label class="git-docker-field">
+                <span>Branche, tag ou commit <small>facultatif</small></span>
+                <input id="gitDockerRef" value="${escapeAttr(draft.refName)}" placeholder="main" autocomplete="off" maxlength="200" ${disabled} />
+              </label>
+              <label class="git-docker-field">
+                <span>Action Docker</span>
+                <select id="gitDockerMode" ${disabled}>
+                  <option value="analyze" ${draft.mode === "analyze" ? "selected" : ""}>Analyser et preparer</option>
+                  <option value="build" ${draft.mode === "build" ? "selected" : ""}>Construire et exporter l'image</option>
+                  <option value="deploy" ${draft.mode === "deploy" ? "selected" : ""}>Deployer et lancer sur un VPS</option>
+                </select>
+              </label>
+            </div>
+            <div class="git-docker-mode-hint" aria-live="polite">
+              <i data-lucide="info"></i><span>${escapeHtml(modeHint)}</span>
+            </div>
+            <fieldset class="git-docker-ports">
+              <legend>Ports <small>facultatifs, detection automatique sinon</small></legend>
+              <label class="git-docker-field">
+                <span>Port du conteneur</span>
+                <input id="gitDockerContainerPort" type="number" min="1" max="65535" step="1" value="${escapeAttr(draft.containerPort)}" placeholder="3000" ${disabled} />
+              </label>
+              <label class="git-docker-field">
+                <span>Port public</span>
+                <input id="gitDockerHostPort" type="number" min="1" max="65535" step="1" value="${escapeAttr(draft.hostPort)}" placeholder="8080" ${disabled} />
+              </label>
+            </fieldset>
+            ${draft.mode === "deploy" ? `
+              <fieldset class="git-docker-vps-fields">
+                <legend>Connexion VPS</legend>
+                <div class="git-docker-form-grid">
+                  <label class="git-docker-field">
+                    <span>Cible SSH <b>requise</b></span>
+                    <input id="gitDockerDeployTarget" value="${escapeAttr(draft.deployTarget)}" placeholder="ubuntu@203.0.113.10" autocomplete="off" maxlength="255" required ${disabled} />
+                  </label>
+                  <label class="git-docker-field git-docker-ssh-port">
+                    <span>Port SSH</span>
+                    <input id="gitDockerSshPort" type="number" min="1" max="65535" step="1" value="${escapeAttr(draft.sshPort)}" required ${disabled} />
+                  </label>
+                </div>
+                <label class="git-docker-field git-docker-field-wide">
+                  <span>Chemin de la cle SSH <small>facultatif si l'agent SSH est actif</small></span>
+                  <input id="gitDockerSshKey" value="${escapeAttr(draft.sshKey)}" placeholder="C:\\Users\\moi\\.ssh\\id_ed25519" autocomplete="off" ${disabled} />
+                </label>
+                <div class="git-docker-checks">
+                  <label><input id="gitDockerInstallDocker" type="checkbox" ${draft.installDocker ? "checked" : ""} ${disabled} /><span>Installer Docker si absent <small>Debian/Ubuntu avec sudo sans mot de passe</small></span></label>
+                  <label><input id="gitDockerAcceptHostKey" type="checkbox" ${draft.acceptNewHostKey ? "checked" : ""} ${disabled} /><span>Accepter une nouvelle empreinte SSH <small>uniquement apres verification chez l'hebergeur</small></span></label>
+                </div>
+              </fieldset>` : ""}
+            <div class="git-docker-safety-note">
+              <i data-lucide="shield-check"></i>
+              <span><strong>Environnement isole</strong><small>Le depot est clone dans SwitchProjects. Ses commandes ne s'executent que pendant le build Docker.</small></span>
+            </div>
+            ${gitDockerEnvironmentError ? `<div class="git-docker-error" role="alert"><i data-lucide="triangle-alert"></i><span>${escapeHtml(gitDockerEnvironmentError)}</span></div>` : ""}
+            ${gitDockerEnvironmentSubmitting ? `<div class="git-docker-progress" role="status"><i data-lucide="loader-circle"></i><span>Clonage, analyse et preparation en cours. Cette operation peut prendre plusieurs minutes.</span></div>` : ""}
+          </div>
+          <footer class="modal-actions">
+            <button class="tool-button" type="button" id="cancelGitDockerEnvironment" ${disabled}>Annuler</button>
+            <button class="tool-button primary" type="submit" ${disabled}>
+              <i data-lucide="${gitDockerEnvironmentSubmitting ? "loader-circle" : "folder-git-2"}"></i>
+              <span>${gitDockerEnvironmentSubmitting ? "Creation en cours..." : "Creer l'environnement"}</span>
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>`;
+};
+
 const renderWorkspaceModal = () => {
   if (!workspaceModalOpen) return "";
 
@@ -16141,7 +23354,9 @@ const renderWorkspaceModal = () => {
           ${workspaceBrowseLoading ? `<div class="ws-hint">Chargement...</div>` : ""}
           ${workspaceBrowseError ? `<div class="ws-error">${escapeHtml(workspaceBrowseError)}</div>` : ""}
           ${data?.path && !selectableBrowsePath ? `<div class="ws-error">Ce dossier appartient au runtime temporaire des agents. Il ne peut pas devenir un environnement.</div>` : ""}
-          <div class="ws-list">${list || (workspaceBrowseLoading ? "" : `<div class="empty">Aucun sous-dossier</div>`)}</div>
+          ${list || !workspaceBrowseLoading
+            ? `<div class="ws-list">${list || `<div class="empty">Aucun sous-dossier</div>`}</div>`
+            : ""}
           <div class="empty ws-search-empty" id="workspaceSearchEmpty" hidden>Aucun dossier ne correspond a la recherche.</div>
         </div>
 
@@ -16325,10 +23540,47 @@ const renderPoolPanel = () => {
   `;
 };
 
+const limitAccountsForDisplay = (): AccountLimitView[] =>
+  accountLimitRowsForDisplay(settings?.accounts, limitStatus, (account) => ({
+    id: account.id,
+    label: account.label,
+    provider: accountProvider(account),
+    codexHome: account.codexHome,
+    hasTokens: false,
+    connectedAt: account.limits?.connectedAt ?? null,
+    sessionResetAt: null,
+    weeklyResetAt: null,
+    sessionRemainingSecs: null,
+    weeklyRemainingSecs: null,
+    sessionUsedPercent: null,
+    weeklyUsedPercent: null,
+    buckets: [],
+    refreshedAt: null,
+    source: "not-received",
+    refreshing: false,
+    error: null,
+  }));
+
+const limitWindowIsAvailable = (
+  usedPercent?: number | null,
+  resetAt?: number | null,
+  remainingSeconds?: number | null,
+): boolean => [usedPercent, resetAt, remainingSeconds]
+  .some((value) => typeof value === "number" && Number.isFinite(value));
+
+const accountHasFiveHourWindow = (account: AccountLimitView): boolean =>
+  limitWindowIsAvailable(
+    account.sessionUsedPercent,
+    account.sessionResetAt,
+    account.sessionRemainingSecs,
+  );
+
 const renderLimitsPanel = () => {
-  const displayedAccounts = deduplicateQuotaAccountsForDisplay(limitStatus);
+  const displayedAccounts = limitAccountsForDisplay();
+  const refreshing = displayedAccounts.some((account) => account.refreshing === true);
+  const hasFiveHourWindow = displayedAccounts.some(accountHasFiveHourWindow);
   const connected = displayedAccounts.filter((account) => account.hasTokens).length;
-  const configuredCount = deduplicateQuotaAccountsForDisplay(settings?.accounts ?? []).length;
+  const configuredCount = settings?.accounts.length ?? displayedAccounts.length;
   const nextSession = nextLimitTimestamp("sessionResetAt");
   const nextWeekly = nextLimitTimestamp("weeklyResetAt");
   const availableCount = displayedAccounts.filter(
@@ -16341,15 +23593,14 @@ const renderLimitsPanel = () => {
         <div class="limits-page-copy">
           <span class="limits-eyebrow"><i data-lucide="gauge"></i> Suivi des quotas</span>
           <h2>Limites</h2>
-          <p>Les quotas sont consultés ici. Les connexions se gèrent uniquement depuis la page Comptes.</p>
         </div>
-        <button id="refreshLimits" class="tool-button limits-refresh" title="Actualiser les limites serveur">
-          <i data-lucide="refresh-ccw"></i>
-          <span>Actualiser</span>
+        <button id="refreshLimits" class="tool-button limits-refresh" title="Actualiser les limites serveur" aria-busy="${refreshing}" ${refreshing ? "disabled" : ""}>
+          <i data-lucide="refresh-ccw" class="${refreshing ? "is-spinning" : ""}"></i>
+          <span>${refreshing ? "Actualisation…" : "Actualiser"}</span>
         </button>
       </header>
 
-      <div class="limits-overview" aria-label="Résumé des limites">
+      <div class="limits-overview${hasFiveHourWindow ? "" : " without-five-hour-window"}" aria-label="Résumé des limites">
         <div class="limits-overview-card">
           <span class="limits-overview-icon"><i data-lucide="badge-check"></i></span>
           <span><small>Comptes actifs</small><strong>${connected}<em>/ ${configuredCount}</em></strong></span>
@@ -16358,10 +23609,10 @@ const renderLimitsPanel = () => {
           <span class="limits-overview-icon"><i data-lucide="gauge"></i></span>
           <span><small>Quotas lisibles</small><strong>${availableCount}</strong></span>
         </div>
-        <div class="limits-overview-card">
+        ${hasFiveHourWindow ? `<div class="limits-overview-card">
           <span class="limits-overview-icon"><i data-lucide="clock-3"></i></span>
           <span><small>Prochain reset 5 h</small><strong>${formatTimestamp(nextSession)}</strong></span>
-        </div>
+        </div>` : ""}
         <div class="limits-overview-card">
           <span class="limits-overview-icon"><i data-lucide="calendar-clock"></i></span>
           <span><small>Prochain reset hebdo</small><strong>${formatTimestamp(nextWeekly)}</strong></span>
@@ -16372,11 +23623,11 @@ const renderLimitsPanel = () => {
         <header>
           <div>
             <strong id="limitsAccountsTitle">Comptes</strong>
-            <span>État et consommation de chaque compte</span>
+            <span>Consommation de chaque compte</span>
           </div>
           <b>${displayedAccounts.length}</b>
         </header>
-        <div class="limit-card-grid" aria-live="polite">${renderLimitCards()}</div>
+        <div class="limit-card-grid" role="list" aria-live="polite">${renderLimitCards()}</div>
       </section>
     </section>
   `;
@@ -16387,7 +23638,7 @@ const renderLimitCards = () => {
     return `<div class="limit-cards-state"><i data-lucide="loader-circle" class="is-spinning"></i><strong>Chargement des limites</strong><span>Lecture des quotas serveur…</span></div>`;
   }
 
-  const displayedAccounts = deduplicateQuotaAccountsForDisplay(limitStatus);
+  const displayedAccounts = limitAccountsForDisplay();
   if (displayedAccounts.length === 0) {
     return `<div class="limit-cards-state"><i data-lucide="gauge"></i><strong>Aucune limite disponible</strong><span>Les comptes configurés apparaîtront ici.</span></div>`;
   }
@@ -16404,11 +23655,14 @@ const limitRowProvider = (account: AccountLimitView): Provider => {
     ? accountProvider(configured)
     : account.provider === "claude"
       ? "claude"
-      : "codex";
+      : account.provider === "opencode"
+        ? "opencode"
+        : "codex";
 };
 
 const renderLimitMeter = (
   label: string,
+  windowClass: "session" | "weekly",
   usedPercent?: number | null,
   resetAt?: number | null,
   remainingSeconds?: number | null,
@@ -16426,7 +23680,7 @@ const renderLimitMeter = (
     ? ""
     : `role="progressbar" aria-label="${escapeAttr(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${roundedRemaining}"`;
   return `
-    <section class="limit-meter ${tone}">
+    <section class="limit-meter limit-meter-${windowClass} ${tone}">
       <div class="limit-meter-head">
         <span>${escapeHtml(label)}</span>
         <strong>${roundedRemaining === null ? "Non exposé" : `${roundedRemaining} % restant`}</strong>
@@ -16443,35 +23697,43 @@ const renderLimitMeter = (
 
 const renderLimitCard = (account: AccountLimitView) => {
   const provider = limitRowProvider(account);
-  const providerName = provider === "claude" ? "Claude" : "Codex";
-  const buckets = provider === "codex" && account.buckets.length > 0
-    ? `<div class="limit-card-buckets"><span>Fenêtres détectées</span><div class="limit-buckets">${renderLimitBuckets(account.buckets)}</div></div>`
+  const hasFiveHourWindow = accountHasFiveHourWindow(account);
+  const hasWeeklyWindow = limitWindowIsAvailable(
+    account.weeklyUsedPercent,
+    account.weeklyResetAt,
+    account.weeklyRemainingSecs,
+  );
+  const configured = accountById(account.id);
+  const providerName = configured ? accountProviderLabel(configured) : providerLabel(provider);
+  const rowTitle = account.error && provider === "codex"
+    ? ` title="${escapeAttr(account.error)}"`
     : "";
-  const quotaContent = provider === "claude"
-    ? `<div class="limit-card-unavailable"><i data-lucide="sparkles"></i><span><strong>Quotas non exposés</strong><small>Claude ne transmet pas encore ses fenêtres de consommation.</small></span></div>`
-    : `<div class="limit-card-meters">
-         ${renderLimitMeter("Fenêtre 5 h", account.sessionUsedPercent, account.sessionResetAt, account.sessionRemainingSecs)}
-         ${renderLimitMeter("Fenêtre hebdomadaire", account.weeklyUsedPercent, account.weeklyResetAt, account.weeklyRemainingSecs)}
-       </div>`;
+  const quotaContent = provider !== "codex"
+    ? `<div class="limit-card-unavailable"><i data-lucide="${provider === "claude" ? "sparkles" : "bot"}"></i><span><strong>Quotas non exposés</strong><small>${escapeHtml(providerName)} ne transmet pas ses fenêtres de consommation à l’application.</small></span></div>`
+    : account.refreshing && !hasFiveHourWindow && !hasWeeklyWindow
+      ? `<div class="limit-card-unavailable"><i data-lucide="loader-circle" class="is-spinning"></i><span><strong>Actualisation en cours</strong><small>Le dernier quota serveur arrive en arrière-plan.</small></span></div>`
+      : `${hasFiveHourWindow
+      ? renderLimitMeter("Fenêtre 5 h", "session", account.sessionUsedPercent, account.sessionResetAt, account.sessionRemainingSecs)
+      : ""}
+       ${renderLimitMeter("Fenêtre hebdomadaire", "weekly", account.weeklyUsedPercent, account.weeklyResetAt, account.weeklyRemainingSecs)}`;
   return `
-    <article class="limit-card ${limitBadgeClass(account)}">
-      <header class="limit-card-head">
-        <div class="limit-card-identity">
-          <span class="limit-card-provider ${provider}"><i data-lucide="${provider === "claude" ? "sparkles" : "cpu"}"></i></span>
-          <span><strong>${escapeHtml(account.label)}</strong><small>${providerName}</small></span>
-        </div>
-        <span class="limit-badge ${limitBadgeClass(account)}">${escapeHtml(limitSourceLabel(account))}</span>
-      </header>
-      ${account.error && provider === "codex" ? `<p class="limit-error"><i data-lucide="circle-alert"></i><span>${escapeHtml(account.error)}</span></p>` : ""}
+    <article class="limit-card ${limitBadgeClass(account)} ${hasFiveHourWindow ? "has-five-hour-window" : "without-five-hour-window"}" role="listitem"${rowTitle}>
+      <div class="limit-card-identity">
+        <span class="limit-card-provider ${provider}"><i data-lucide="${provider === "claude" ? "sparkles" : provider === "opencode" ? "bot" : "cpu"}"></i></span>
+        <span><strong>${escapeHtml(account.label)}</strong><small>${escapeHtml(providerName)}</small></span>
+      </div>
       ${quotaContent}
-      ${buckets}
-      <footer class="limit-card-foot"><span><i data-lucide="refresh-ccw"></i> Actualisé ${escapeHtml(formatTimestamp(account.refreshedAt))}</span></footer>
+      <footer class="limit-card-foot"><span><i data-lucide="refresh-ccw" class="${account.refreshing ? "is-spinning" : ""}"></i> ${account.refreshing ? "Actualisation en cours" : `Actualisé ${escapeHtml(formatTimestamp(account.refreshedAt))}`}</span></footer>
     </article>`;
 };
 
 const limitBadgeClass = (account: AccountLimitView) => {
+  if (account.source === "not-received") return "empty";
   if (!account.hasTokens) return "missing";
-  if (limitRowProvider(account) === "claude") return "connected";
+  if (limitRowProvider(account) !== "codex") return "connected";
+  if (account.refreshing) {
+    return account.buckets.length > 0 ? "connected" : "empty";
+  }
   if (account.error && AUTH_LIMIT_ERROR.test(account.error)) return "error";
   if (
     account.source === "server" ||
@@ -16482,45 +23744,10 @@ const limitBadgeClass = (account: AccountLimitView) => {
   return "error";
 };
 
-const limitSourceLabel = (account: AccountLimitView) => {
-  if (!account.hasTokens) return "non connecte";
-  if (limitRowProvider(account) === "claude") return "connecte";
-  if (account.error && AUTH_LIMIT_ERROR.test(account.error)) return "session expiree";
-  if (account.source === "authenticated") return "connecte";
-  if (account.source === "server") return "serveur";
-  if (account.source === "session") return "session Codex";
-  if (account.source === "server-empty") return "vide";
-  return "erreur";
-};
-
 // Un token revoque/invalide (`token_invalidated`, `refresh_token_invalidated`,
 // 401...) laisse un compte « connecte » cote fichier mais illisible cote serveur.
 const AUTH_LIMIT_ERROR =
   /token[_ ]?invalidat|refresh[_ ]?token|revoked|revoqu|\b401\b|unauthor|authentication|session (?:has )?ended|sign(?:ing)? ?in again|log ?in again|not logged in|connexion requise|authentication required/i;
-
-const renderLimitBuckets = (buckets: AccountRateLimitBucketView[]) => {
-  if (buckets.length === 0) return `<span class="limit-empty">aucun bucket</span>`;
-
-  return buckets
-    .map(
-      (bucket) => `
-        <span class="limit-bucket" title="${escapeAttr(`${bucket.limitId} ${bucket.bucket}`)}">
-          ${escapeHtml(formatWindow(bucket.windowDurationMins))}
-          ${escapeHtml(formatPercent(bucket.usedPercent))}
-          <small>${escapeHtml(formatTimestamp(bucket.resetsAt))}</small>
-        </span>
-      `,
-    )
-    .join("");
-};
-
-const formatWindow = (minutes: number) => {
-  if (minutes === 300) return "5h";
-  if (minutes === 10080) return "hebdo";
-  if (minutes % 1440 === 0) return `${minutes / 1440}j`;
-  if (minutes % 60 === 0) return `${minutes / 60}h`;
-  return `${minutes}min`;
-};
 
 const formatPercent = (value?: number | null) => {
   if (value === null || value === undefined || !Number.isFinite(value)) return "n/a";
@@ -16576,6 +23803,59 @@ const STATS_ACCOUNT_COLORS = [
   "#c6a4e8",
   "#79c2e2",
 ];
+const OPENCODE_PROVIDER_OPTIONS: ReadonlyArray<{
+  id: OpenCodeInferenceProvider;
+  label: string;
+  defaultModel: string;
+  models: readonly string[];
+}> = [
+  {
+    id: "zai",
+    label: "Z.ai",
+    defaultModel: "zai/glm-5.2",
+    models: ["zai/glm-5.2", "zai/glm-5-turbo", "zai/glm-5"],
+  },
+  {
+    id: "zai-coding-plan",
+    label: "Z.ai Coding Plan",
+    defaultModel: "zai-coding-plan/glm-5.2",
+    models: ["zai-coding-plan/glm-5.2", "zai-coding-plan/glm-5.1"],
+  },
+  {
+    id: "minimax",
+    label: "MiniMax",
+    defaultModel: "minimax/MiniMax-M3",
+    models: ["minimax/MiniMax-M3", "minimax/MiniMax-M2.7"],
+  },
+  {
+    id: "minimax-coding-plan",
+    label: "MiniMax Coding Plan",
+    defaultModel: "minimax-coding-plan/MiniMax-M3",
+    models: ["minimax-coding-plan/MiniMax-M3", "minimax-coding-plan/MiniMax-M2.7"],
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    defaultModel: "deepseek/deepseek-v4-pro",
+    models: [
+      "deepseek/deepseek-v4-pro",
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-chat",
+      "deepseek/deepseek-reasoner",
+    ],
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    defaultModel: "openrouter/deepseek/deepseek-v4-pro",
+    models: [
+      "openrouter/deepseek/deepseek-v4-pro",
+      "openrouter/z-ai/glm-5.2",
+      "openrouter/minimax/minimax-m3",
+    ],
+  },
+];
+const OPENCODE_MODEL_SUGGESTIONS = OPENCODE_PROVIDER_OPTIONS.flatMap((item) => item.models);
 
 const STATS_ACCOUNT_COLORS_LIGHT = [
   "#27312a",
@@ -16593,8 +23873,8 @@ const statsAccountColorStyle = (index: number): string =>
   `--stats-account-color-light:${STATS_ACCOUNT_COLORS_LIGHT[index % STATS_ACCOUNT_COLORS_LIGHT.length]}`;
 
 const statsSourceLabel = (source: AccountUsageView["usageSource"]) => {
-  if (source === "codex-account") return "Compte Codex · toutes surfaces";
-  if (source === "local-sessions") return "Historique local";
+  if (source === "codex-account") return "Ancienne source globale";
+  if (source === "local-sessions") return "Historique local vérifié";
   return "Indisponible";
 };
 
@@ -16613,6 +23893,51 @@ const renderStatsTabs = () => `
   </nav>
 `;
 
+const renderStatsAutonomousTokenUsage = () => {
+  const agents = autonomousAgents
+    .map((agent) => ({ agent, usage: autonomousTokenUsageFor(agent) }))
+    .sort((left, right) =>
+      right.usage.totalTokens - left.usage.totalTokens
+      || (left.agent.name || left.agent.objective).localeCompare(right.agent.name || right.agent.objective, "fr"),
+    );
+  const total = autonomousTokenUsageTotal(autonomousAgents);
+
+  return `
+    <section class="stats-api-card stats-autonomous-token-card">
+      <div class="stats-card-head stats-api-head">
+        <div>
+          <span class="stats-card-kicker">Agents autonomes</span>
+          <strong>Consommation détaillée par agent</strong>
+          <small>Cumul persistant des cycles autonomes terminés, échoués ou interrompus.</small>
+        </div>
+        <div class="stats-api-total">
+          <span>Total des agents</span>
+          <strong>${escapeHtml(formatTokens(total.totalTokens))}</strong>
+          <small>${agents.length} agent${agents.length > 1 ? "s" : ""}</small>
+        </div>
+      </div>
+      <div class="stats-api-table-wrap">
+        <table class="stats-api-table">
+          <thead><tr><th>Agent autonome</th><th>Entrée</th><th>Cache</th><th>Sortie</th><th>Raisonnement</th><th>Total</th></tr></thead>
+          <tbody>
+            ${agents.map(({ agent, usage }) => `
+              <tr>
+                <td><div class="stats-api-model"><strong>${escapeHtml(agent.name || agent.objective)}</strong><small>${escapeHtml(autonomousStatusLabel(agent.status))} · ${agent.runCount} tour${agent.runCount > 1 ? "s" : ""}</small></div></td>
+                <td>${escapeHtml(formatTokens(usage.inputTokens))}</td>
+                <td>${escapeHtml(formatTokens(usage.cachedInputTokens))}</td>
+                <td>${escapeHtml(formatTokens(usage.outputTokens))}</td>
+                <td>${escapeHtml(formatTokens(usage.reasoningOutputTokens))}</td>
+                <td><strong>${escapeHtml(formatTokens(usage.totalTokens))}</strong></td>
+              </tr>
+            `).join("") || `<tr><td colspan="6" class="stats-api-empty">Aucun agent autonome.</td></tr>`}
+          </tbody>
+          <tfoot><tr><th>Total</th><th>${escapeHtml(formatTokens(total.inputTokens))}</th><th>${escapeHtml(formatTokens(total.cachedInputTokens))}</th><th>${escapeHtml(formatTokens(total.outputTokens))}</th><th>${escapeHtml(formatTokens(total.reasoningOutputTokens))}</th><th>${escapeHtml(formatTokens(total.totalTokens))}</th></tr></tfoot>
+        </table>
+      </div>
+    </section>
+  `;
+};
+
 const renderDashboardPanel = () => {
   if (statsActiveTab === "work-time") {
     return renderWorkTimeDashboardPanel();
@@ -16622,8 +23947,8 @@ const renderDashboardPanel = () => {
       <section class="dashboard-panel stats-dashboard stats-loading" aria-busy="true">
         ${renderStatsTabs()}
         <div class="stats-loading-mark"><i data-lucide="gauge"></i></div>
-        <strong>Synchronisation des comptes</strong>
-        <span>Lecture de l’usage Codex quotidien, toutes surfaces confondues…</span>
+        <strong>Analyse des sessions locales</strong>
+        <span>Lecture et déduplication des compteurs Codex vérifiables…</span>
       </section>
     `;
   }
@@ -16667,12 +23992,6 @@ const renderDashboardPanel = () => {
   const selectedUsage = sumTokenUsage(selectedDays);
   const selectedRange =
     STATS_RANGE_OPTIONS.find((range) => range.days === statsRangeDays) ?? STATS_RANGE_OPTIONS[2];
-  const globalAccountCount = data.accounts.filter(
-    (account) => account.usageSource === "codex-account",
-  ).length;
-  const fallbackAccountCount = data.accounts.filter(
-    (account) => account.usageSource === "local-sessions",
-  ).length;
   const profileCount =
     data.profileCount ||
     data.accounts.reduce(
@@ -16686,8 +24005,8 @@ const renderDashboardPanel = () => {
       <header class="stats-hero">
         <div class="stats-hero-copy">
           <span class="stats-eyebrow"><i data-lucide="sparkles"></i> Statistiques d’usage</span>
-          <h1>Vos tokens, compte par compte.</h1>
-          <p>${globalAccountCount} compte(s) synchronisé(s) avec Codex${fallbackAccountCount > 0 ? ` · ${fallbackAccountCount} en repli local` : ""}. Les profils liés au même compte sont regroupés pour éviter les doublons.</p>
+          <h1>Vos tokens observés, compte par compte.</h1>
+          <p>${data.accounts.length} compte(s) mesuré(s) depuis les sessions locales. Les profils liés et les copies d’un même rollout sont regroupés pour éviter les doublons.</p>
         </div>
         <div class="stats-hero-actions">
           <span class="stats-freshness"><i data-lucide="server"></i> ${profileCount} profil(s) · mis à jour ${escapeHtml(formatTimestamp(data.generatedAt))}</span>
@@ -16696,10 +24015,10 @@ const renderDashboardPanel = () => {
       </header>
 
       <div class="stats-metric-grid">
-        ${renderStatsMetric("Aujourd’hui", todayUsage.totalTokens, "Tous les comptes", "calendar-clock")}
+        ${renderStatsMetric("Aujourd’hui", todayUsage.totalTokens, (todayUsage.models?.length ?? 0) > 0 ? `${formatApiUsd(todayUsage.costUsd)} d’équivalent API` : "Tous les comptes", "calendar-clock")}
         ${renderStatsMetric("7 derniers jours", last7DaysUsage.totalTokens, `${formatTokens(last7DaysUsage.totalTokens / 7)} / jour`, "scan-eye")}
-        ${renderStatsMetric("30 derniers jours", last30DaysUsage.totalTokens, `${data.accounts.length} compte(s) réel(s)`, "bar-chart-3")}
-        ${renderStatsMetric("Cumul des comptes", data.totalTokens, "Valeur à vie remontée par Codex", "gauge")}
+        ${renderStatsMetric("30 derniers jours", last30DaysUsage.totalTokens, (last30DaysUsage.models?.length ?? 0) > 0 ? `${formatApiUsd(last30DaysUsage.costUsd)} d’équivalent API` : `${data.accounts.length} compte(s) réel(s)`, "bar-chart-3")}
+        ${renderStatsMetric("Cumul local", data.totalTokens, (data.models?.length ?? 0) > 0 ? `${formatApiUsd(data.totalCostUsd)} d’équivalent API` : "Sessions locales dédupliquées", "gauge")}
       </div>
 
       <section class="stats-timeline-card">
@@ -16724,12 +24043,14 @@ const renderDashboardPanel = () => {
         ${renderStatsPointChart(selectedDays, selectedDate)}
         <div class="stats-timeline-caption">
           <span><i data-lucide="target"></i> Cliquez sur un point pour ouvrir sa répartition.</span>
-          <span>Source prioritaire : usage du compte Codex, même hors de cette application.</span>
+          <span>Source : compteurs cumulés des rollouts locaux, sans estimation distante.</span>
         </div>
       </section>
 
+      ${renderStatsApiEquivalent(selectedUsage.models ?? [], selectedRange.label, data.pricingAsOf, selectedUsage.totalTokens)}
       ${renderStatsDayDetail(selectedDay, dayAccounts)}
       ${renderStatsAccountOverview(data.accounts)}
+      ${renderStatsAutonomousTokenUsage()}
     </section>
   `;
 };
@@ -16744,6 +24065,104 @@ const renderStatsMetric = (label: string, value: number, detail: string, icon: s
     </div>
   </article>
 `;
+
+const OPENAI_API_PRICING_URL = "https://developers.openai.com/api/docs/pricing";
+
+const formatApiRate = (value: number | null | undefined) =>
+  value === null || value === undefined
+    ? "—"
+    : `$${new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 3 }).format(value)}`;
+
+const renderStatsApiEquivalent = (
+  models: ApiModelTokenUsage[],
+  rangeLabel: string,
+  pricingAsOf?: string,
+  observedTokens = 0,
+) => {
+  const hasBreakdown = models.length > 0;
+  const pricedModels = models.filter((model) => model.priced);
+  const totalApiEquivalent = pricedModels.reduce(
+    (total, model) => total + model.apiEquivalentUsd,
+    0,
+  );
+  const unpricedTokens = models
+    .filter((model) => !model.priced)
+    .reduce((total, model) => total + model.totalTokens, 0);
+  const pricingDate = pricingAsOf ? formatFullDayLabel(pricingAsOf) : "date non fournie";
+
+  return `
+    <section class="stats-api-card">
+      <div class="stats-card-head stats-api-head">
+        <div>
+          <span class="stats-card-kicker">Équivalent API OpenAI</span>
+          <strong>Jetons et coût public par modèle</strong>
+          <small>${escapeHtml(rangeLabel)} · traitement Standard · tarifs vérifiés au ${escapeHtml(pricingDate)}</small>
+        </div>
+        <div class="stats-api-total">
+          <span>Total estimé</span>
+          <strong>${hasBreakdown ? escapeHtml(formatApiUsd(totalApiEquivalent)) : "—"}</strong>
+          <small>${hasBreakdown ? `${pricedModels.length}/${models.length} modèle(s) tarifé(s)` : "ventilation non fournie"}</small>
+        </div>
+      </div>
+      <div class="stats-api-table-wrap">
+        <table class="stats-api-table">
+          <thead>
+            <tr>
+              <th>Modèle</th>
+              <th>Entrée</th>
+              <th>Cache</th>
+              <th>Sortie</th>
+              <th>Total</th>
+              <th>Prix public / 1 M</th>
+              <th>Équivalent API</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              models
+                .map((model) => {
+                  const pricingAlias =
+                    model.pricingModel && model.pricingModel !== model.model
+                      ? `Tarif ${model.pricingModel}`
+                      : "Tarif du modèle";
+                  const standardRates = model.priced
+                    ? `E ${formatApiRate(model.inputPricePerMillion)} · C ${formatApiRate(model.cachedInputPricePerMillion)} · S ${formatApiRate(model.outputPricePerMillion)}`
+                    : "Tarif public indisponible";
+                  const longRates =
+                    model.longContextRequests > 0
+                      ? `<small>Long : E ${escapeHtml(formatApiRate(model.longInputPricePerMillion))} · C ${escapeHtml(formatApiRate(model.longCachedInputPricePerMillion))} · S ${escapeHtml(formatApiRate(model.longOutputPricePerMillion))} · ${escapeHtml(formatTokens(model.longContextRequests))} tour(s)</small>`
+                      : "";
+                  return `
+                    <tr class="${model.priced ? "" : "is-unpriced"}">
+                      <td>
+                        <div class="stats-api-model">
+                          <code>${escapeHtml(model.model)}</code>
+                          <small>${escapeHtml(pricingAlias)}</small>
+                        </div>
+                      </td>
+                      <td>${escapeHtml(formatTokens(model.inputTokens))}</td>
+                      <td>${escapeHtml(formatTokens(model.cachedInputTokens))}</td>
+                      <td>${escapeHtml(formatTokens(model.outputTokens))}</td>
+                      <td><strong>${escapeHtml(formatTokens(model.totalTokens))}</strong></td>
+                      <td><div class="stats-api-rates"><span>${escapeHtml(standardRates)}</span>${longRates}</div></td>
+                      <td class="stats-api-price">${model.priced ? escapeHtml(formatApiUsd(model.apiEquivalentUsd)) : "—"}</td>
+                    </tr>
+                  `;
+                })
+                .join("") ||
+              `<tr><td colspan="7" class="stats-api-empty">${observedTokens > 0 ? "Le serveur ne fournit pas encore la ventilation par modèle." : "Aucun jeton observé sur cette période."}</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+      <footer class="stats-api-note">
+        <span><i data-lucide="calculator"></i> Entrée facturable = entrée totale − cache. Les jetons de raisonnement sont déjà inclus dans la sortie.</span>
+        <span>${unpricedTokens > 0 ? `${escapeHtml(formatTokens(unpricedTokens))} jetons sans tarif public · ` : ""}hors outils, stockage, région et modes Batch/Flex/Priority.</span>
+        <a href="${OPENAI_API_PRICING_URL}" target="_blank" rel="noreferrer">Tarifs publics OpenAI <i data-lucide="external-link"></i></a>
+      </footer>
+    </section>
+  `;
+};
 
 const formatWorkDuration = (seconds: number, compact = false) => {
   const totalMinutes = Math.max(0, Math.round(seconds / 60));
@@ -17102,7 +24521,7 @@ const renderStatsAccountOverview = (accounts: AccountUsageView[]) => `
       <div>
         <span class="stats-card-kicker">Vue d’ensemble</span>
         <strong>Cumul par compte</strong>
-        <small>Le cumul à vie est fourni par le compte Codex quand il est disponible.</small>
+        <small>Le cumul provient uniquement des sessions locales lisibles et dédupliquées.</small>
       </div>
     </div>
     <div class="stats-account-grid">
@@ -17443,6 +24862,16 @@ const formatCompactTokens = (value: number) =>
     maximumFractionDigits: 1,
   }).format(Math.max(0, Math.round(value)));
 
+const formatApiUsd = (value: number) => {
+  const safeValue = Number.isFinite(value) ? Math.max(0, value) : 0;
+  return new Intl.NumberFormat("fr-FR", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: safeValue > 0 && safeValue < 0.01 ? 6 : safeValue < 1 ? 4 : 2,
+    maximumFractionDigits: safeValue > 0 && safeValue < 0.01 ? 6 : safeValue < 1 ? 4 : 2,
+  }).format(safeValue);
+};
+
 const formatUsd = (value: number) =>
   new Intl.NumberFormat("fr-FR", {
     style: "currency",
@@ -17480,11 +24909,12 @@ const defaultCodexHomeForLabel = (label: string, provider: Provider = "codex") =
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "") || "account";
   if (isRemoteMode()) {
-    return `${userHomeHint()}/${provider === "claude" ? "claude-" : ""}${slug}`;
+    const prefix = provider === "claude" ? "claude-" : provider === "opencode" ? "opencode-" : "";
+    return `${userHomeHint()}/${prefix}${slug}`;
   }
   // Home isole par compte : `.codex-<slug>` (CODEX_HOME) ou `.claude-<slug>`
   // (CLAUDE_CONFIG_DIR).
-  const prefix = provider === "claude" ? ".claude-" : ".codex-";
+  const prefix = provider === "claude" ? ".claude-" : provider === "opencode" ? ".opencode-" : ".codex-";
   return `${userHomeHint()}\\${prefix}${slug}`;
 };
 
@@ -17505,6 +24935,7 @@ const uniqueCodexHomeForLabel = (label: string, provider: Provider = "codex") =>
 
 type NewAccountPreferences = {
   provider?: Provider;
+  inferenceProvider?: string | null;
   bypass?: boolean;
   model?: string | null;
   reasoningEffort?: string | null;
@@ -17518,17 +24949,21 @@ const newAccountProfile = (
   preferences: NewAccountPreferences = {},
 ): AccountProfile => {
   const provider = preferences.provider ?? "codex";
+  const inferenceProvider = provider === "opencode"
+    ? preferences.inferenceProvider?.trim() || OPENCODE_PROVIDER_OPTIONS[0].id
+    : null;
   return {
     id: uid("account"),
     label,
     createdAt: Math.floor(Date.now() / 1_000),
     provider,
+    inferenceProvider,
     codexHome: codexHome ?? defaultCodexHomeForLabel(label, provider),
     projectDir,
     proxyId,
     startupCommand: null,
     bypass: preferences.bypass ?? settings?.codexBypass ?? true,
-    model: preferences.model?.trim() || providerDefaultModel(provider),
+    model: preferences.model?.trim() || providerDefaultModel(provider, inferenceProvider),
     // L'intensite de raisonnement ne concerne que Codex ; on la laisse par
     // defaut pour Claude (le backend l'ignore).
     reasoningEffort: normalizeCodexReasoningEffort(preferences.reasoningEffort),
@@ -17607,13 +25042,19 @@ const addPoolAccount = async () => {
 const startNewChatWithPrompt = async (
   pane: ExpertChatPane,
   prompt: string,
-): Promise<void> => {
+  submission: QueuedChatSubmission | null = null,
+): Promise<boolean> => {
   let root = expertChatPaneRoot(pane);
   if (!root) {
     await waitForFrame();
     root = expertChatPaneRoot(pane);
   }
-  if (root && await sendExpertChatMessage(pane, root, prompt)) return;
+  if (root) {
+    const sent = submission
+      ? await sendExpertChatMessage(pane, root, prompt, "message", submission)
+      : await sendExpertChatMessage(pane, root, prompt);
+    if (sent) return true;
+  }
 
   // En cas de rendu tardif ou d'indisponibilité ponctuelle du compte, ne pas
   // perdre la tâche : elle reste prête dans le compositeur du nouveau chat.
@@ -17621,6 +25062,7 @@ const startNewChatWithPrompt = async (
   persistExpertChats();
   if (activeView === "chat") refreshExpertChatPane(pane);
   focusExpertChatPrompt(pane);
+  return false;
 };
 
 const executeScheduledChatItem = async (item: ScheduledChatItem): Promise<void> => {
@@ -17642,7 +25084,9 @@ const executeScheduledChatItem = async (item: ScheduledChatItem): Promise<void> 
     pendingWorkspace: environmentPath,
   });
   if (!pane) throw new Error("Le nouveau chat n’a pas pu être créé.");
-  await startNewChatWithPrompt(pane, item.prompt);
+  if (!await startNewChatWithPrompt(pane, item.prompt)) {
+    throw new Error("Le chat a été créé, mais la tâche n’a pas pu être envoyée automatiquement.");
+  }
 };
 
 const stopScheduledChatScheduler = (): void => {
@@ -17735,18 +25179,38 @@ const cancelNewChatBestQuotaRequest = () => {
 };
 
 const setNewChatBestQuotaButtonBusy = (busy: boolean) => {
-  const button = document.querySelector<HTMLButtonElement>("#confirmBestQuotaNewChat");
+  const button = document.querySelector<HTMLButtonElement>("#confirmNewChat");
   if (!button) return;
   button.disabled = busy
     || !settings?.accounts.length
     || !userEnvironmentPath(newChatPendingWorkspace ?? currentWorkspace());
   button.setAttribute("aria-busy", String(busy));
+  button.querySelector("svg")?.classList.toggle("is-spinning", busy);
+  document
+    .querySelectorAll<HTMLInputElement | HTMLSelectElement>(
+      "#newChatModel, #newChatMode, #newChatExecutionTarget",
+    )
+    .forEach((control) => {
+      control.disabled = busy || !newChatAccountId;
+    });
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-new-chat-routing-option]")
+    .forEach((control) => {
+      control.disabled = busy;
+    });
   const label = button.querySelector<HTMLElement>("span");
   if (label) {
     label.textContent = busy
-      ? "Recherche…"
-      : newChatPendingTaskTitle ? "Lancer avec le plus de tokens" : "Ouvrir avec le plus de tokens";
+      ? "Préparation…"
+      : newChatPendingTaskTitle ? "Lancer l’exécution" : "Ouvrir le chat";
   }
+  const title = document.querySelector<HTMLElement>("#newChatRoutingTitle");
+  if (title) {
+    title.textContent = busy
+      ? "Préparation en cours…"
+      : newChatRoutingMode === "automatic" ? "Agent prêt automatiquement" : "Préférence personnalisée";
+  }
+  if (!busy) syncNewChatRoutingUi();
 };
 
 const setNewChatAutoStatus = (message: string) => {
@@ -17759,37 +25223,26 @@ const confirmNewChatWithBestQuota = async (): Promise<void> => {
   const requestId = ++newChatBestQuotaRequestId;
   newChatBestQuotaInFlight = true;
   setNewChatBestQuotaButtonBusy(true);
-  setNewChatAutoStatus("Lecture des quotas disponibles…");
+  setNewChatAutoStatus("Préparation de la conversation…");
 
   try {
-    await refreshLimitStatus(true);
-    if (
-      requestId !== newChatBestQuotaRequestId
-      || !newChatModalOpen
-      || !settings
-    ) {
-      return;
-    }
-
+    // La modale actualise deja les quotas en arriere-plan. La validation utilise
+    // leur dernier instantane disponible et ne bloque jamais l'ouverture sur un
+    // appel reseau ; la reprise automatique prendra le relais si necessaire.
+    const currentAccount = accountById(newChatAccountId);
+    const currentProvider = accountProvider(currentAccount);
+    const compatibleAccountIds = settings.accounts
+      .filter((account) => accountProvider(account) === currentProvider)
+      .map((account) => account.id);
     const best = bestQuotaAccountForNewChat(
       limitStatus,
-      settings.accounts.map((account) => account.id),
+      compatibleAccountIds,
       openChatAccountIdsForQuotaSelection(),
     );
-    if (!best) {
-      const message = "Aucun compte connecté n’expose assez de quota pour un choix automatique.";
-      statusText = message;
-      setNewChatAutoStatus(message);
-      return;
+    if (best) {
+      selectNewChatAccount(best.account.id, { automatic: true });
     }
-
-    selectNewChatAccount(best.account.id);
-    const reservation = best.openChatCount > 0
-      ? ` après ${Math.round(best.reservedPercent)} % réservés pour ${best.openChatCount} chat${best.openChatCount > 1 ? "s" : ""} ouvert${best.openChatCount > 1 ? "s" : ""}`
-      : "";
-    setNewChatAutoStatus(
-      `${best.account.label} sélectionné : ${Math.round(best.effectiveRemainingPercent)} % disponibles${reservation}.`,
-    );
+    setNewChatAutoStatus("Ouverture de la conversation…");
     confirmNewChatModal();
   } finally {
     if (requestId === newChatBestQuotaRequestId) {
@@ -17817,12 +25270,19 @@ const openNewChatModal = (
   }
   newChatPendingWorkspace = environmentPath;
   const requestedAccountId = accountById(options.accountId)?.id ?? null;
+  newChatRoutingMode = requestedAccountId ? "manual" : "automatic";
   newChatAccountId = requestedAccountId ??
     selectedAccountId ?? settings.defaultAccountId ?? settings.accounts[0]?.id ?? null;
   newChatModel = accountModel(accountById(newChatAccountId));
   newChatModelDrafts.clear();
   if (newChatAccountId) newChatModelDrafts.set(newChatAccountId, newChatModel);
   newChatMode = "build";
+  const executionTargets = remoteChatExecutionTargets();
+  const preferredExecutionTargetId = workspaceExecutionTargetIdForPath(environmentPath);
+  newChatExecutionTargetId = preferredExecutionTargetId
+    && executionTargets.some((target) => target.id === preferredExecutionTargetId)
+    ? preferredExecutionTargetId
+    : executionTargets.length === 1 ? executionTargets[0].id : null;
   newChatPendingTaskTitle = options.task?.title.trim() || null;
   const storedPrompt = options.prompt?.trim() || null;
   newChatPendingPrompt = storedPrompt ?? (newChatPendingTaskTitle
@@ -17832,10 +25292,10 @@ const openNewChatModal = (
   rememberDialogTrigger("new-chat", null);
   newChatModalOpen = true;
   statusText = newChatPendingTaskTitle
-    ? "Choisis le compte, le modèle et le mode pour exécuter cette tâche"
+    ? "Exécution prête à être lancée"
     : storedPrompt
-      ? "Choisis le compte, le modèle et le mode pour utiliser ce prompt"
-    : "Choisis le compte, le modele et le mode de ce chat";
+      ? "Prompt prêt dans une nouvelle conversation"
+    : "Nouvelle conversation prête";
   render();
   void refreshLimitStatus(true);
   if (!window.matchMedia("(max-width: 860px)").matches) {
@@ -17853,6 +25313,8 @@ const closeNewChatModal = () => {
   newChatPendingTaskTitle = null;
   newChatPendingPrompt = null;
   newChatPendingPromptAutoSend = false;
+  newChatExecutionTargetId = null;
+  newChatRoutingMode = "automatic";
   newChatModelDrafts.clear();
   render();
   restoreDialogTrigger(returnFocus);
@@ -17860,7 +25322,6 @@ const closeNewChatModal = () => {
 
 const confirmNewChatModal = () => {
   if (!settings) return;
-  cancelNewChatBestQuotaRequest();
   const account = accountById(newChatAccountId) ?? settings.accounts[0] ?? null;
   if (!account) {
     statusText = "Ajoute d'abord un compte agent";
@@ -17869,6 +25330,7 @@ const confirmNewChatModal = () => {
   }
   const modelInput = document.querySelector<HTMLInputElement>("#newChatModel");
   const modeSelect = document.querySelector<HTMLSelectElement>("#newChatMode");
+  const executionTargetSelect = document.querySelector<HTMLSelectElement>("#newChatExecutionTarget");
   const requestedModel = (modelInput?.value ?? newChatModel).trim();
   if (requestedModel.length > 160 || /\s/.test(requestedModel)) {
     modelInput?.setCustomValidity(
@@ -17879,8 +25341,16 @@ const confirmNewChatModal = () => {
     return;
   }
   const mode = (modeSelect?.value as ChatMode) || newChatMode;
+  const requestedExecutionTargetId = executionTargetSelect?.value.trim().toLowerCase()
+    || newChatExecutionTargetId;
+  const executionTargetId = remoteChatExecutionTargets().some(
+    (target) => target.id === requestedExecutionTargetId,
+  )
+    ? requestedExecutionTargetId
+    : null;
   const previousModel = accountModel(account);
   const nextModel = requestedModel || previousModel;
+  cancelNewChatBestQuotaRequest();
   if (nextModel !== previousModel) {
     account.model = nextModel;
     persistChatPreferences(account.id);
@@ -17894,8 +25364,14 @@ const confirmNewChatModal = () => {
   newChatPendingTaskTitle = null;
   newChatPendingPrompt = null;
   newChatPendingPromptAutoSend = false;
+  newChatExecutionTargetId = null;
+  newChatRoutingMode = "automatic";
   newChatModelDrafts.clear();
-  const pane = addExpertChatPane(account.id, { mode, pendingWorkspace });
+  const pane = addExpertChatPane(account.id, {
+    mode,
+    pendingWorkspace,
+    executionTargetId,
+  });
   if (pane && pendingPrompt) {
     if (pendingPromptAutoSend) {
       void startNewChatWithPrompt(pane, pendingPrompt);
@@ -17921,6 +25397,8 @@ const openNewTerminalModal = (folderPath: string | null | undefined = undefined)
   newTerminalWorkspacePath =
     folderPath === undefined ? null : userEnvironmentPath(folderPath);
   newTerminalAccountLabel = "";
+  newTerminalAccountProvider = "codex";
+  newTerminalInferenceProvider = null;
   newTerminalAccountBypass = settings.codexBypass ?? true;
   newTerminalAccountModel = DEFAULT_CODEX_MODEL;
   newTerminalAccountReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
@@ -18050,14 +25528,20 @@ const readNewTerminalAccountDraft = () => {
     document.querySelector<HTMLInputElement>("#newTerminalAccountLabel")?.value.trim() ??
     newTerminalAccountLabel;
   const providerValue = document.querySelector<HTMLSelectElement>("#newAccountProvider")?.value;
-  newTerminalAccountProvider = providerValue === "claude" ? "claude" : "codex";
+  const previousDefault = providerDefaultModel(
+    newTerminalAccountProvider,
+    newTerminalInferenceProvider,
+  );
+  const choice = parseProviderChoice(providerValue);
+  newTerminalAccountProvider = choice.provider;
+  newTerminalInferenceProvider = choice.inferenceProvider;
   newTerminalAccountBypass =
     document.querySelector<HTMLInputElement>("#newAccountBypass")?.checked ??
     newTerminalAccountBypass;
-  newTerminalAccountModel =
-    document.querySelector<HTMLInputElement>("#newAccountModel")?.value.trim() ||
-    newTerminalAccountModel ||
-    DEFAULT_CODEX_MODEL;
+  const modelDraft = document.querySelector<HTMLInputElement>("#newAccountModel")?.value.trim() ?? "";
+  newTerminalAccountModel = !modelDraft || modelDraft === previousDefault
+    ? providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider)
+    : modelDraft;
   newTerminalAccountReasoningEffort = normalizeCodexReasoningEffort(
     document.querySelector<HTMLSelectElement>("#newAccountReasoningEffort")?.value ??
       newTerminalAccountReasoningEffort,
@@ -18074,17 +25558,11 @@ const addAccountFromModal = () => {
     return;
   }
 
-  // Si l'utilisateur passe en Claude sans toucher au champ modele (encore sur le
-  // defaut Codex), on laisse le defaut Claude s'appliquer plutot que d'heriter
-  // d'un modele Codex incoherent.
-  const model =
-    newTerminalAccountProvider === "claude" && newTerminalAccountModel === DEFAULT_CODEX_MODEL
-      ? null
-      : newTerminalAccountModel;
   const account = newAccountProfile(label, undefined, null, null, {
     provider: newTerminalAccountProvider,
+    inferenceProvider: newTerminalInferenceProvider,
     bypass: newTerminalAccountBypass,
-    model,
+    model: newTerminalAccountModel,
     reasoningEffort: newTerminalAccountReasoningEffort,
   });
   settings.accounts.push(account);
@@ -18092,9 +25570,13 @@ const addAccountFromModal = () => {
   selectedAccountId = account.id;
   newTerminalAccountId = account.id;
   newTerminalAccountLabel = "";
-  const providerNote = providerLabel(accountProvider(account));
+  const providerNote = accountProviderLabel(account);
   const loginHint =
-    account.provider === "claude" ? " — lance-le puis tape /login pour t'authentifier" : "";
+    account.provider === "claude"
+      ? " — lance-le puis tape /login pour t'authentifier"
+      : account.provider === "opencode"
+        ? " — connecte ensuite la clé API dans OpenCode"
+        : "";
   statusText = `Compte ${providerNote} ajoute (${account.bypass ? "bypass" : "sandbox"}, ${account.model})${loginHint}`;
   render();
 };
@@ -18112,16 +25594,19 @@ const addAccountAndLogin = async () => {
   const providerValue = document.querySelector<HTMLInputElement>(
     'input[name="newAccountProvider"]:checked',
   )?.value;
-  const provider: Provider = providerValue === "claude" ? "claude" : "codex";
+  const { provider, inferenceProvider } = parseProviderChoice(providerValue);
   const requestedLabel =
     document.querySelector<HTMLInputElement>("#newAccountLabel")?.value.trim() ?? "";
-  const label = requestedLabel || `Nouveau compte ${providerLabel(provider)}`;
+  const serviceLabel = provider === "opencode"
+    ? openCodeProviderOption(inferenceProvider)?.label ?? "OpenCode"
+    : providerLabel(provider);
+  const label = requestedLabel || `Nouveau compte ${serviceLabel}`;
   const account = newAccountProfile(
     label,
     uniqueCodexHomeForLabel(label, provider),
     null,
     null,
-    { provider },
+    { provider, inferenceProvider },
   );
   settings.accounts.push(account);
   selectedAccountId = account.id;
@@ -18189,22 +25674,162 @@ const deleteSelectedAccount = async () => {
   render();
 };
 
+let chatSideMoreMenuController: AbortController | null = null;
+
+const bindChatSideMoreMenu = (): void => {
+  chatSideMoreMenuController?.abort();
+  chatSideMoreMenuController = null;
+
+  const wrapper = document.querySelector<HTMLElement>(".chat-side-more");
+  const trigger = document.querySelector<HTMLButtonElement>("#chatSideMoreToggle");
+  const menu = document.querySelector<HTMLElement>("#chatSideMoreMenu");
+  if (!wrapper || !trigger || !menu) return;
+
+  const controller = new AbortController();
+  const { signal } = controller;
+  chatSideMoreMenuController = controller;
+  const items = [...menu.querySelectorAll<HTMLButtonElement>("[role='menuitem']")];
+  const positionMenu = (): void => {
+    if (menu.hidden) return;
+    const viewportPadding = 8;
+    const menuGap = 10;
+    const viewportWidth = document.documentElement.clientWidth;
+    const viewportHeight = document.documentElement.clientHeight;
+    const menuWidth = Math.min(258, Math.max(180, viewportWidth - viewportPadding * 2));
+    const triggerRect = trigger.getBoundingClientRect();
+
+    menu.style.width = `${menuWidth}px`;
+    menu.style.maxHeight = `${Math.max(120, viewportHeight - viewportPadding * 2)}px`;
+    menu.style.right = "auto";
+    menu.style.bottom = "auto";
+    const measuredHeight = menu.getBoundingClientRect().height;
+    const preferredLeft = triggerRect.left - menuWidth - menuGap;
+    const fallbackLeft = triggerRect.right + menuGap;
+    const left = preferredLeft >= viewportPadding
+      ? preferredLeft
+      : Math.min(fallbackLeft, viewportWidth - menuWidth - viewportPadding);
+    const top = Math.min(
+      Math.max(viewportPadding, triggerRect.bottom - measuredHeight),
+      Math.max(viewportPadding, viewportHeight - measuredHeight - viewportPadding),
+    );
+    menu.style.left = `${Math.max(viewportPadding, left)}px`;
+    menu.style.top = `${top}px`;
+  };
+  const setOpen = (open: boolean, focusIndex: number | null = null): void => {
+    chatSideMoreMenuOpen = open;
+    trigger.setAttribute("aria-expanded", String(open));
+    menu.hidden = !open;
+    wrapper.classList.toggle("is-open", open);
+    if (open) positionMenu();
+    if (open && focusIndex !== null) {
+      items[focusIndex]?.focus();
+    }
+  };
+  setOpen(chatSideMoreMenuOpen);
+
+  trigger.addEventListener("click", () => {
+    setOpen(trigger.getAttribute("aria-expanded") !== "true");
+  }, { signal });
+  trigger.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      setOpen(true, event.key === "ArrowUp" ? items.length - 1 : 0);
+    } else if (event.key === "Escape" && trigger.getAttribute("aria-expanded") === "true") {
+      event.preventDefault();
+      setOpen(false);
+    }
+  }, { signal });
+  menu.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setOpen(false);
+      trigger.focus();
+      return;
+    }
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    let next: number | null = null;
+    if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = items.length - 1;
+    else if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+      next = current < 0 ? 0 : (current + 1) % items.length;
+    } else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+      next = current <= 0 ? items.length - 1 : current - 1;
+    }
+    if (next === null) return;
+    event.preventDefault();
+    items[next]?.focus();
+  }, { signal });
+  menu.addEventListener("click", () => setOpen(false), { capture: true, signal });
+  wrapper.addEventListener("focusout", (event) => {
+    if (!wrapper.isConnected) return;
+    const next = event.relatedTarget;
+    if (!(next instanceof Node) || !wrapper.contains(next)) setOpen(false);
+  }, { signal });
+  document.addEventListener("pointerdown", (event) => {
+    if (trigger.getAttribute("aria-expanded") !== "true") return;
+    const target = event.target;
+    if (!(target instanceof Node) || !wrapper.contains(target)) setOpen(false);
+  }, { capture: true, signal });
+  window.addEventListener("resize", positionMenu, { signal });
+  wrapper.closest(".chat-side-tools")?.addEventListener("scroll", positionMenu, {
+    passive: true,
+    signal,
+  });
+};
+
 const bindUi = () => {
   bindChatSidebarResizer();
+  bindChatContextSidebarResizer();
+  bindChatSideMoreMenu();
   bindDoctolibLabUi();
-  mountTasksPanel({
+  tutorialModule?.bindTutorialUi({
+    currentView: activeView,
+    navigate: setActiveView,
+    rerender: render,
+    renderIcons,
+  });
+  vpsModule?.bindVpsPanel(render);
+  videoModule?.bindVideoPanel(render, renderIcons);
+  forumModule?.bindForumUi({
+    rerender: render,
+    setStatus: (message) => {
+      statusText = message;
+    },
+  });
+  messagingModule?.bindMessagingUi({
+    rerender: render,
+    setStatus: (message) => {
+      statusText = message;
+    },
+  });
+  tasksViewModule?.mountTasksPanel({
     renderIcons,
     environment: currentTaskEnvironment(),
+    accountId: currentTaskAccountId(),
+    onItemsChanged: () => {
+      if (chatContextTasksVisible) render();
+    },
     onExecuteTask: (task) => {
       if (!task.environmentPath) return;
       openNewChatModal({ workspacePath: task.environmentPath, task });
     },
   });
-  mountPromptLibraryPanel({
+  promptLibraryModule?.mountPromptLibraryPanel({
     renderIcons,
     onUsePrompt: useLibraryPromptInChat,
   });
-  mountScheduledChatsPanel({
+  promptHistoryViewModule?.mountPromptHistoryPanel({
+    getModel: promptHistoryPanelModel,
+    onRefresh: () => {
+      promptHistoryLoaded = false;
+      void refreshPromptHistory();
+    },
+    onOpenDiscussion: openDiscussionForSession,
+    renderIcons,
+    rerender: render,
+  });
+  scheduledChatsViewModule?.mountScheduledChatsPanel({
     ...scheduledChatsPanelOptions(),
     renderIcons,
     onItemsChanged: () => armScheduledChatTimer(),
@@ -18226,6 +25851,83 @@ const bindUi = () => {
       if (!group) return;
       void selectEnvironment(group.path);
     });
+  });
+  document
+    .querySelectorAll<HTMLSelectElement>("[data-environment-execution-target-id]")
+    .forEach((select) => {
+      select.addEventListener("change", () => {
+        const workspaceId = select.dataset.environmentExecutionTargetId;
+        if (!workspaceId) return;
+        void saveEnvironmentExecutionTarget(workspaceId, select.value || null);
+      });
+    });
+  document.querySelectorAll<HTMLButtonElement>("[data-manage-workspace-access]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const environmentId = button.dataset.manageWorkspaceAccess;
+      if (!environmentId) return;
+      workspaceAccessTargetId = workspaceAccessTargetId === environmentId ? null : environmentId;
+      workspaceAccessError = "";
+      render();
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-close-workspace-access]").forEach((button) => {
+    button.addEventListener("click", () => {
+      workspaceAccessTargetId = null;
+      workspaceAccessError = "";
+      render();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("[data-open-pending-workspace-access]")?.addEventListener("click", () => {
+    const environment = workspaceAccess.find(
+      (candidate) => candidate.role === "owner" && candidate.requests.length > 0,
+    );
+    if (!environment) return;
+    workspaceAccessTargetId = environment.id;
+    render();
+  });
+  document.querySelector<HTMLFormElement>("#workspaceAccessRequestForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitWorkspaceAccessRequest(event.currentTarget as HTMLFormElement);
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-workspace-access-accept]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const environmentId = button.dataset.workspaceAccessAccept;
+      const userId = button.dataset.workspaceAccessUser;
+      if (environmentId && userId) void updateWorkspaceAccessDecision("accept", environmentId, userId);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-workspace-access-reject]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const environmentId = button.dataset.workspaceAccessReject;
+      const userId = button.dataset.workspaceAccessUser;
+      if (environmentId && userId) void updateWorkspaceAccessDecision("reject", environmentId, userId);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-workspace-access-revoke]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const environmentId = button.dataset.workspaceAccessRevoke;
+      const userId = button.dataset.workspaceAccessUser;
+      if (!environmentId || !userId) return;
+      if (window.confirm("Révoquer l'accès de ce compte à tous les documents de l'environnement ?")) {
+        void updateWorkspaceAccessDecision("revoke", environmentId, userId);
+      }
+    });
+  });
+  document.querySelector<HTMLButtonElement>("#copyWorkspaceShareCode")?.addEventListener("click", () => {
+    const input = document.querySelector<HTMLInputElement>("#workspaceShareCodeValue");
+    if (!input?.value) return;
+    const copy = navigator.clipboard?.writeText(input.value);
+    if (copy) {
+      void copy.then(() => {
+        statusText = "Code de partage copié";
+      }).catch(() => {
+        input.select();
+        document.execCommand("copy");
+      });
+    } else {
+      input.select();
+      document.execCommand("copy");
+    }
   });
   document.querySelectorAll<HTMLButtonElement>("[data-view-environment-memory-id]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -18274,6 +25976,30 @@ const bindUi = () => {
       void openWorkspacePicker("active");
     });
   document
+    .querySelector<HTMLButtonElement>("#createGitDockerEnvironmentFromMenu")
+    ?.addEventListener("click", openGitDockerEnvironmentModal);
+  document
+    .querySelector<HTMLFormElement>("#gitDockerEnvironmentForm")
+    ?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void submitGitDockerEnvironment(event.currentTarget as HTMLFormElement);
+    });
+  document.querySelector<HTMLSelectElement>("#gitDockerMode")?.addEventListener("change", () => {
+    readGitDockerEnvironmentForm();
+    render();
+  });
+  document
+    .querySelector<HTMLButtonElement>("#closeGitDockerEnvironment")
+    ?.addEventListener("click", closeGitDockerEnvironmentModal);
+  document
+    .querySelector<HTMLButtonElement>("#cancelGitDockerEnvironment")
+    ?.addEventListener("click", closeGitDockerEnvironmentModal);
+  document
+    .querySelector<HTMLDivElement>("#gitDockerEnvironmentBackdrop")
+    ?.addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) closeGitDockerEnvironmentModal();
+    });
+  document
     .querySelector<HTMLDivElement>("#terminalEnvironmentMenuBackdrop")
     ?.addEventListener("click", (event) => {
       if (event.target === event.currentTarget) closeTerminalEnvironmentMenu();
@@ -18287,10 +26013,10 @@ const bindUi = () => {
     render();
   });
 
-  document.querySelector<HTMLSelectElement>("#expertChatPageSize")?.addEventListener("change", (event) => {
+  document.querySelector<HTMLInputElement>("#expertChatPageSize")?.addEventListener("change", (event) => {
     captureAllExpertChatScroll();
     expertChatPageSizeMode = normalizeExpertChatPageSizeMode(
-      (event.currentTarget as HTMLSelectElement).value,
+      (event.currentTarget as HTMLInputElement).value,
     );
     localStorage.setItem(EXPERT_CHATS_PER_PAGE_STORAGE_KEY, String(expertChatPageSizeMode));
     reconcileExpertChatPage();
@@ -18465,13 +26191,7 @@ const bindUi = () => {
 
   document.querySelectorAll<HTMLButtonElement>("[data-toggle-chat-sidebar]").forEach((button) => {
     button.addEventListener("click", () => {
-      const sidebarWasHidden = displayedChatSidebarWidth() === 0;
-      if (sidebarWasHidden) {
-        setChatSidebarWidth(defaultChatSidebarWidth(window.innerWidth));
-      } else {
-        setChatSidebarWidth(0);
-      }
-      fitAndResizeVisibleTerminals();
+      toggleChatSidebar();
       const focusTarget = button.classList.contains("chat-sidebar-collapse")
         ? ".chat-sidebar-expand"
         : button.classList.contains("chat-sidebar-expand")
@@ -18482,6 +26202,18 @@ const bindUi = () => {
           document.querySelector<HTMLButtonElement>(focusTarget)?.focus(),
         );
       }
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-toggle-chat-context-sidebar]").forEach((button) => {
+    button.addEventListener("click", () => {
+      toggleChatContextSidebar();
+      const focusTarget = button.classList.contains("chat-context-sidebar-collapse")
+        ? "#chatContextSidebarExpand"
+        : "#chatContextSidebarCollapse";
+      window.requestAnimationFrame(() =>
+        document.querySelector<HTMLButtonElement>(focusTarget)?.focus(),
+      );
     });
   });
 
@@ -18685,11 +26417,18 @@ const bindUi = () => {
     if (event.target === event.currentTarget) closeNewChatModal();
   });
   const newChatAccountButtons = Array.from(
-    document.querySelectorAll<HTMLButtonElement>("[data-new-chat-account]"),
+    document.querySelectorAll<HTMLButtonElement>("[data-new-chat-routing-option]"),
   );
   newChatAccountButtons.forEach((button, index) => {
-    button.addEventListener("click", () => {
+    const selectRoutingOption = () => {
+      if (button.hasAttribute("data-new-chat-routing-auto")) {
+        selectNewChatAutomaticRouting();
+        return;
+      }
       selectNewChatAccount(button.dataset.newChatAccount || null);
+    };
+    button.addEventListener("click", () => {
+      selectRoutingOption();
     });
     button.addEventListener("keydown", (event) => {
       if (!["ArrowDown", "ArrowRight", "ArrowUp", "ArrowLeft", "Home", "End"].includes(event.key)) {
@@ -18706,7 +26445,11 @@ const bindUi = () => {
             : (index - 1 + newChatAccountButtons.length) % newChatAccountButtons.length;
       const next = newChatAccountButtons[nextIndex];
       next?.focus();
-      selectNewChatAccount(next?.dataset.newChatAccount || null);
+      if (next?.hasAttribute("data-new-chat-routing-auto")) {
+        selectNewChatAutomaticRouting();
+      } else {
+        selectNewChatAccount(next?.dataset.newChatAccount || null);
+      }
     });
   });
   const newChatModelInput = document.querySelector<HTMLInputElement>("#newChatModel");
@@ -18718,11 +26461,15 @@ const bindUi = () => {
   document.querySelector<HTMLSelectElement>("#newChatMode")?.addEventListener("change", (event) => {
     newChatMode = (event.currentTarget as HTMLSelectElement).value as ChatMode;
   });
-  document.querySelector<HTMLButtonElement>("#confirmBestQuotaNewChat")?.addEventListener("click", () => {
-    void confirmNewChatWithBestQuota();
+  document.querySelector<HTMLSelectElement>("#newChatExecutionTarget")?.addEventListener("change", (event) => {
+    newChatExecutionTargetId = (event.currentTarget as HTMLSelectElement).value.trim().toLowerCase() || null;
   });
   document.querySelector<HTMLButtonElement>("#confirmNewChat")?.addEventListener("click", () => {
-    confirmNewChatModal();
+    if (newChatRoutingMode === "automatic") {
+      void confirmNewChatWithBestQuota();
+    } else {
+      confirmNewChatModal();
+    }
   });
 
   document.querySelector<HTMLButtonElement>("#closeNewTerminalModal")?.addEventListener("click", () => {
@@ -18796,16 +26543,6 @@ const bindUi = () => {
       render();
       return;
     }
-    const environmentPath = userEnvironmentPath(newTerminalWorkspacePath);
-    if (!environmentPath) {
-      statusText = "Choisis un environnement avant d'ouvrir le terminal de connexion";
-      render();
-      return;
-    }
-    newTerminalWorkspacePath = environmentPath;
-    setCurrentWorkspace(environmentPath);
-    terminalFolderFilter = environmentPath;
-    void upsertWorkspaceRegistry(environmentPath);
     const agent = newTerminalAgent();
     if (!agent?.loginCommand) {
       statusText = "Cet agent n'a pas de commande de login";
@@ -18820,7 +26557,7 @@ const bindUi = () => {
       reconnectCommandForAccount(account, agent),
       agent.id,
       null,
-      newTerminalWorkspacePath,
+      null,
       true,
     );
   });
@@ -18841,11 +26578,23 @@ const bindUi = () => {
     setActiveView("autonomous");
   });
 
+  document.querySelector<HTMLButtonElement>("#bugReportToggle")?.addEventListener("click", () => {
+    setActiveView("bug-report");
+  });
+
   document.querySelector<HTMLButtonElement>("#orchestrationToggle")?.addEventListener("click", () => {
     setActiveView("orchestration");
   });
 
-  // Barre latérale : « Discussions » (à la place de l'ancien « Comptes ») ouvre
+  document.querySelector<HTMLButtonElement>("#forumToggle")?.addEventListener("click", () => {
+    setActiveView("forum");
+  });
+
+  document.querySelector<HTMLButtonElement>("#messagingToggle")?.addEventListener("click", () => {
+    setActiveView("messaging");
+  });
+
+  // Barre latérale : « Historique » (à la place de l'ancien « Comptes ») ouvre
   // la liste des conversations avec le sélecteur de compte de reprise.
   document.querySelector<HTMLButtonElement>("#sideDiscussions")?.addEventListener("click", () => {
     setActiveView("discussions");
@@ -18857,9 +26606,20 @@ const bindUi = () => {
   document.querySelector<HTMLButtonElement>("#settingsAccounts")?.addEventListener("click", () => {
     setActiveView("pool");
   });
+  document.querySelector<HTMLButtonElement>("#settingsMobileConnection")?.addEventListener("click", () => {
+    openMobileSettings();
+  });
+  document.querySelector<HTMLButtonElement>("#settingsMobilePayments")?.addEventListener("click", () => {
+    openMobilePaymentSettings();
+  });
+  document.querySelector<HTMLButtonElement>("#settingsMobileGooglePay")?.addEventListener("click", () => {
+    openMobileGooglePaySettings();
+  });
   document.querySelector<HTMLButtonElement>("#settingsAgents")?.addEventListener("click", () => {
     openAgentsModal();
   });
+  bindTelegramConnectionUi();
+  bindWhatsAppConnectionUi();
   document.querySelector<HTMLButtonElement>("#themeToggle")?.addEventListener("click", () => {
     setAppTheme(oppositeTheme(activeTheme));
   });
@@ -18895,6 +26655,49 @@ const bindUi = () => {
       setExpertChatDisplayMode(
         normalizeExpertChatDisplayMode(button.dataset.chatDisplayMode),
       );
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-status-display-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setChatTurnStatusDisplayMode(
+        normalizeChatTurnStatusDisplayMode(button.dataset.chatStatusDisplayMode),
+      );
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-sidebar-priority]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setChatSidebarPriorityMode(
+        normalizeChatSidebarPriorityMode(button.dataset.chatSidebarPriority),
+      );
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-sidebar-running]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setChatSidebarHideRunning(button.dataset.chatSidebarRunning === "hide");
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-context-tasks]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setChatContextTasksVisible(button.dataset.chatContextTasks === "show");
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-history-open-fullscreen]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setExpertChatHistoryOpenOnFullscreen(
+        button.dataset.chatHistoryOpenFullscreen === "on",
+      );
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-history-close-compact]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setExpertChatHistoryCloseOnCompact(
+        button.dataset.chatHistoryCloseCompact === "on",
+      );
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-chat-composer-selectors]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setChatComposerSelectorsEnabled(button.dataset.chatComposerSelectors === "enabled");
     });
   });
   document.querySelector<HTMLInputElement>("#chatReadySoundEnabled")?.addEventListener("change", (event) => {
@@ -18949,6 +26752,7 @@ const bindUi = () => {
   });
   bindVoiceRuntimeRefresh();
 
+  bindBugReportPanelUi();
   bindAutonomousPanelUi();
   bindOrchestrationPanelUi();
   bindAutonomousOrchestrationPromotionUi();
@@ -18961,15 +26765,43 @@ const bindUi = () => {
   });
 
   document.querySelector<HTMLButtonElement>("#refreshLimits")?.addEventListener("click", () => {
-    void refreshLimitStatus();
+    void refreshLimitStatus(false, true);
   });
 
   document.querySelector<HTMLButtonElement>("#dashboardToggle")?.addEventListener("click", () => {
     setActiveView("dashboard");
   });
 
+  document.querySelector<HTMLButtonElement>("#vpsToggle")?.addEventListener("click", () => {
+    setActiveView("vps");
+  });
+
   document.querySelector<HTMLButtonElement>("#tasksToggle")?.addEventListener("click", () => {
     setActiveView("tasks");
+  });
+  document.querySelectorAll<HTMLButtonElement>(
+    "#chatContextTasksOpenAll, #chatContextTasksMore, #chatContextTasksEmpty",
+  ).forEach((button) => {
+    button.addEventListener("click", () => setActiveView("tasks"));
+  });
+  document.querySelectorAll<HTMLInputElement>("[data-context-task-toggle]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const id = input.dataset.contextTaskToggle;
+      if (!id) return;
+      const accountId = currentTaskAccountId();
+      const next = setTaskCompleted(loadTaskItems(undefined, accountId), id, input.checked);
+      if (!persistTaskItems(next, undefined, accountId)) {
+        statusText = "Impossible d’enregistrer les tâches sur cet appareil";
+        input.checked = false;
+        return;
+      }
+      statusText = "Tâche terminée";
+      render();
+    });
+  });
+
+  document.querySelector<HTMLButtonElement>("#tutorialToggle")?.addEventListener("click", () => {
+    setActiveView("tutorial");
   });
 
   document.querySelector<HTMLButtonElement>("#scheduledChatToggle")?.addEventListener("click", () => {
@@ -18978,6 +26810,10 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#promptsToggle")?.addEventListener("click", () => {
     setActiveView("prompts");
+  });
+
+  document.querySelector<HTMLButtonElement>("#videoToggle")?.addEventListener("click", () => {
+    setActiveView("video");
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-stats-tab]").forEach((button) => {
@@ -19046,10 +26882,94 @@ const bindUi = () => {
     void refreshUsageDashboard();
     void refreshAccountUsage();
     void refreshWorkTimeDashboard();
+    void refreshAutonomousAgents();
   });
 
-  document.querySelector<HTMLButtonElement>("#kombaiToggle")?.addEventListener("click", () => {
-    setActiveView("kombai");
+  document.querySelectorAll<HTMLButtonElement>("[data-open-design]").forEach((button) => {
+    button.addEventListener("click", () => setActiveView("design"));
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-design-tool-choice]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectDesignTool(normalizeDesignToolPreference(button.dataset.designToolChoice));
+    });
+  });
+
+  document.querySelector<HTMLButtonElement>("#designClaudeConfigure")?.addEventListener("click", () => {
+    setActiveView("pool");
+  });
+
+  document.querySelector<HTMLSelectElement>("#claudeDesignAccount")?.addEventListener("change", (event) => {
+    selectClaudeDesignAccount((event.currentTarget as HTMLSelectElement).value);
+  });
+
+  document.querySelector<HTMLButtonElement>("#claudeDesignNew")?.addEventListener("click", () => {
+    resetClaudeDesignSession();
+  });
+
+  document.querySelector<HTMLButtonElement>("#claudeDesignStop")?.addEventListener("click", () => {
+    void stopClaudeDesignTurn();
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-claude-design-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      selectClaudeDesignMode(normalizeClaudeDesignModePreference(button.dataset.claudeDesignMode));
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-design-starter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      designClaudeMode = normalizeClaudeDesignModePreference(button.dataset.designStarterMode);
+      localStorage.setItem(DESIGN_CLAUDE_MODE_STORAGE_KEY, designClaudeMode);
+      designClaudeDraft = button.dataset.designStarter ?? "";
+      render();
+      window.requestAnimationFrame(() => {
+        const prompt = document.querySelector<HTMLTextAreaElement>("#claudeDesignPrompt");
+        prompt?.focus();
+        prompt?.setSelectionRange(prompt.value.length, prompt.value.length);
+      });
+    });
+  });
+
+  const claudeDesignPrompt = document.querySelector<HTMLTextAreaElement>("#claudeDesignPrompt");
+  const resizeClaudeDesignPrompt = () => {
+    if (!claudeDesignPrompt) return;
+    claudeDesignPrompt.style.height = "0px";
+    claudeDesignPrompt.style.height = `${Math.min(claudeDesignPrompt.scrollHeight, 132)}px`;
+  };
+  claudeDesignPrompt?.addEventListener("input", () => {
+    designClaudeDraft = claudeDesignPrompt.value;
+    claudeDesignPrompt.setCustomValidity("");
+    resizeClaudeDesignPrompt();
+  });
+  claudeDesignPrompt?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      void sendClaudeDesignMessage();
+    }
+  });
+  resizeClaudeDesignPrompt();
+
+  document.querySelector<HTMLFormElement>("#claudeDesignComposer")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendClaudeDesignMessage();
+  });
+
+  document.querySelector<HTMLElement>("#claudeDesignFeed")?.addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>(".chat-code-copy, [data-chat-copy]");
+    if (!button) return;
+    const content = button.matches(".chat-code-copy")
+      ? button.closest(".chat-code")?.querySelector("code")?.textContent ?? ""
+      : button.closest("[data-chat-copy-source]")?.textContent ?? "";
+    if (!content) return;
+    void navigator.clipboard.writeText(content).then(() => {
+      button.classList.add("copied");
+      window.setTimeout(() => button.classList.remove("copied"), 1200);
+    });
+  });
+
+  document.querySelector<HTMLButtonElement>("#designCopyProjectPath")?.addEventListener("click", () => {
+    void copyDesignProjectPath();
   });
 
   document.querySelector<HTMLButtonElement>("#auditToggle")?.addEventListener("click", () => {
@@ -19073,6 +26993,14 @@ const bindUi = () => {
     void refreshSkills();
   });
 
+  document.querySelector<HTMLButtonElement>("#skillsAdd")?.addEventListener("click", () => {
+    openSkillEditor();
+  });
+
+  document.querySelector<HTMLButtonElement>("[data-skill-create]")?.addEventListener("click", () => {
+    openSkillEditor();
+  });
+
   document.querySelector<HTMLDivElement>("#skillsList")?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement;
     const chatButtonEl = target.closest<HTMLElement>("[data-skill-chat-button]");
@@ -19086,7 +27014,17 @@ const bindUi = () => {
       return;
     }
     const copyEl = target.closest<HTMLElement>("[data-skill-copy]");
-    if (copyEl?.dataset.skillCopy) void copySkill(copyEl.dataset.skillCopy);
+    if (copyEl?.dataset.skillCopy) {
+      void copySkill(copyEl.dataset.skillCopy);
+      return;
+    }
+    const editEl = target.closest<HTMLElement>("[data-skill-edit]");
+    if (editEl?.dataset.skillEdit) {
+      openSkillEditor(editEl.dataset.skillEdit);
+      return;
+    }
+    const deleteEl = target.closest<HTMLElement>("[data-skill-delete]");
+    if (deleteEl?.dataset.skillDelete) void deleteCustomSkill(deleteEl.dataset.skillDelete);
   });
 
   document.querySelector<HTMLButtonElement>("#kombaiStart")?.addEventListener("click", () => {
@@ -19121,6 +27059,7 @@ const bindUi = () => {
     render();
   };
   document.querySelector<HTMLButtonElement>("#chatHome")?.addEventListener("click", returnToChat);
+  document.querySelector<HTMLButtonElement>("#chatOverviewToggle")?.addEventListener("click", returnToChat);
   document.querySelector<HTMLButtonElement>("#adminBackChat")?.addEventListener("click", returnToChat);
   document.querySelector<HTMLButtonElement>("#chatSidebarClose")?.addEventListener("click", () => {
     closeMobileOverlays();
@@ -19175,6 +27114,7 @@ const bindUi = () => {
         window.setTimeout(() => message?.classList.remove("chat-msg--located"), 1400);
       };
       if (window.matchMedia("(max-width: 760px)").matches) {
+        chatVisibleTurnLimit = null;
         chatHistoryOpen = false;
         render();
         window.requestAnimationFrame(reveal);
@@ -19198,7 +27138,18 @@ const bindUi = () => {
   document.querySelector<HTMLButtonElement>("#chatGoal")?.addEventListener("click", () => {
     void sendChatMessage("goal");
   });
+  document.querySelector<HTMLButtonElement>("#chatPrompts")?.addEventListener("click", () => {
+    openMainChatPromptQuickPicker();
+  });
   const mainChatPanel = document.querySelector<HTMLElement>("#chatPanel");
+  mainChatPanel
+    ?.querySelectorAll<HTMLButtonElement>("[data-chat-action='favorite-prompt']")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        const promptId = button.dataset.chatPromptId;
+        if (promptId) insertFavoritePromptInMainChat(promptId);
+      });
+    });
   mainChatPanel
     ?.querySelectorAll<HTMLButtonElement>("[data-chat-action='toggle-agent-tool']")
     .forEach((button) => {
@@ -19214,11 +27165,38 @@ const bindUi = () => {
     });
   mainChatPanel?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
+    if (target?.closest("[data-chat-action='show-older-turns']")) {
+      event.preventDefault();
+      chatVisibleTurnLimit = (chatVisibleTurnLimit ?? 0) + chatTurnBatchForViewport();
+      refreshChatFeed();
+      return;
+    }
+    if (target?.closest("[data-chat-action='compact']")) {
+      event.preventDefault();
+      void compactCurrentChatContext();
+      return;
+    }
     if (!target?.closest("[data-chat-action='focus-prompt']")) return;
     document.querySelector<HTMLTextAreaElement>("#chatPrompt")?.focus();
   });
 
   const chatPrompt = document.querySelector<HTMLTextAreaElement>("#chatPrompt");
+  const mainImageAttachmentBinding: ChatImageAttachmentBinding = {
+    current: () => chatImageAttachments,
+    update: (images) => {
+      chatImageAttachments = images;
+    },
+    refresh: () => render(),
+    focus: () => focusMainChatPrompt(),
+  };
+  mainChatPanel
+    ?.querySelectorAll<HTMLButtonElement>("[data-chat-action='remove-image']")
+    .forEach((button) => {
+      button.addEventListener("click", () => {
+        const imageId = button.dataset.chatImageId;
+        if (imageId) removeChatImageAttachment(imageId, mainImageAttachmentBinding);
+      });
+    });
   const resizeChatPrompt = () => {
     if (!chatPrompt) return;
     chatPrompt.style.height = "0px";
@@ -19234,6 +27212,9 @@ const bindUi = () => {
       event.preventDefault();
       void sendChatMessage();
     }
+  });
+  chatPrompt?.addEventListener("paste", (event) => {
+    void attachPastedChatImages(event, mainImageAttachmentBinding);
   });
   resizeChatPrompt();
   if (mainChatPanel) bindVoiceComposer(mainChatPanel);
@@ -19309,22 +27290,6 @@ const bindUi = () => {
   });
 
   bindDiscussionRowUi();
-
-  document.querySelector<HTMLButtonElement>("#historyToggle")?.addEventListener("click", () => {
-    setActiveView("history");
-  });
-
-  document.querySelector<HTMLButtonElement>("#refreshPromptHistory")?.addEventListener("click", () => {
-    promptHistoryLoaded = false;
-    void refreshPromptHistory();
-  });
-
-  document.querySelector<HTMLInputElement>("#promptSearch")?.addEventListener("input", (event) => {
-    promptSearch = (event.currentTarget as HTMLInputElement).value;
-    refreshPromptList();
-  });
-
-  bindPromptRowUi();
 
   document.querySelector<HTMLButtonElement>("#accountUsageRefresh")?.addEventListener("click", () => {
     void refreshAccountUsage();
@@ -19576,10 +27541,11 @@ const createTerminalSession = async (
   account: AccountProfile,
   proxy: ProxyProfile | null,
   agentId: string,
-  folderPath: string,
+  folderPath: string | null,
+  loginOnly = false,
 ): Promise<TerminalSession> => {
-  const capturedEnvironment = userEnvironmentPath(folderPath);
-  if (!capturedEnvironment) {
+  const capturedEnvironment = userWorkspacePath(folderPath);
+  if (!loginOnly && !capturedEnvironment) {
     throw new Error("Environnement terminal obligatoire");
   }
   const { createTerminalRuntime } = await loadTerminalRuntime();
@@ -19591,8 +27557,8 @@ const createTerminalSession = async (
     accountId: account.id,
     agentId,
     title: account.label,
-    loginOnly: false,
-    folderPath: capturedEnvironment,
+    loginOnly,
+    folderPath: loginOnly ? null : capturedEnvironment,
     workspaceId: null,
     workspacePath: null,
     projectDir: account.projectDir?.trim() || null,
@@ -19636,7 +27602,8 @@ const mountExpertTerminals = () => {
     newTerminalModalOpen ||
     agentsModalOpen ||
     workspaceModalOpen ||
-    terminalEnvironmentMenuOpen;
+    terminalEnvironmentMenuOpen ||
+    gitDockerEnvironmentModalOpen;
   const focusKey = requestTerminalFocusKey ?? focusedTerminalKeyBeforeRender;
   if (!modalOpen && focusKey) sessionByKey.get(focusKey)?.terminal.focus();
   requestTerminalFocusKey = null;
@@ -19653,8 +27620,8 @@ const createNewTerminalOnce = async (
   loginOnly = false,
 ) => {
   if (!settings) return null;
-  const environmentPath = userEnvironmentPath(folderPath);
-  if (!environmentPath) {
+  const environmentPath = loginOnly ? null : userWorkspacePath(folderPath);
+  if (!loginOnly && !environmentPath) {
     statusText = "Creation bloquee: choisis d'abord un environnement";
     render();
     return null;
@@ -19730,8 +27697,8 @@ const createNewTerminalOnce = async (
     proxyForAccount(savedAccount),
     chosenAgentId,
     environmentPath,
+    loginOnly,
   );
-  session.loginOnly = loginOnly;
   session.resumeSessionId = resumeSessionId;
   if (resumeSessionId) {
     session.codexSessionId = resumeSessionId;
@@ -19777,6 +27744,22 @@ const createNewTerminal = async (
 
   if (!loginOnly || !accountId) return create();
 
+  const existingLogin = terminalSessions.find(
+    (session) =>
+      session.loginOnly &&
+      session.accountId === accountId &&
+      session.ptyId !== null &&
+      session.status !== "Ferme",
+  );
+  if (existingLogin) {
+    activateTerminalSession(existingLogin);
+    activeView = "terminal";
+    requestTerminalFocusKey = existingLogin.key;
+    statusText = "Connexion deja ouverte dans le terminal affiche";
+    render();
+    return existingLogin;
+  }
+
   const inFlightLogin = loginTerminalCreations.get(accountId);
   if (inFlightLogin) {
     statusText = "Connexion deja en cours dans le terminal ouvert";
@@ -19802,7 +27785,10 @@ const startTerminalSession = async (
   renderProgress = true,
 ) => {
   if (!settings) return;
-  const folder = userEnvironmentPath(session.folderPath);
+  const startedAccount = settings.accounts.find((candidate) => candidate.id === session.accountId) ?? null;
+  const folder = loginOnly
+    ? userEnvironmentPath(startedAccount?.codexHome)
+    : userWorkspacePath(session.folderPath);
   if (!folder) {
     session.running = false;
     session.status = "Bloque";
@@ -19839,8 +27825,8 @@ const startTerminalSession = async (
     const started = await invoke<number | TerminalStartResponse>("start_terminal", {
       id: requestedId,
       accountId: session.accountId,
-      repoUrl: isRemoteMode() ? session.projectDir ?? "" : undefined,
-      workspacePath: isRemoteMode() ? folder ?? undefined : undefined,
+      repoUrl: isRemoteMode() && !loginOnly ? session.projectDir ?? "" : undefined,
+      workspacePath: isRemoteMode() && !loginOnly ? folder ?? undefined : undefined,
       projectDir: !isRemoteMode() ? folder ?? undefined : undefined,
       branch: null,
       cols: session.terminal.cols,
@@ -19848,13 +27834,14 @@ const startTerminalSession = async (
       command: commandOverride ?? autoRunCommand,
       agentId: session.agentId,
       loginOnly,
+      targetNodeId: isRemoteMode() ? workspaceExecutionTargetIdForPath(folder) : undefined,
     });
     const ptyId = typeof started === "number" ? started : started.id;
     if (ptyId !== requestedId) terminalSessionsByPtyId.delete(requestedId);
     session.ptyId = ptyId;
     terminalSessionsByPtyId.set(ptyId, session);
-    session.workspaceId = typeof started === "number" ? null : started.workspaceId;
-    session.workspacePath = typeof started === "number" ? null : started.workspacePath;
+    session.workspaceId = loginOnly || typeof started === "number" ? null : started.workspaceId;
+    session.workspacePath = loginOnly || typeof started === "number" ? null : started.workspacePath;
     session.running = true;
     session.status = "Actif";
     statusText = "Terminal actif";
@@ -19864,7 +27851,6 @@ const startTerminalSession = async (
       void launchIde(sessionAgent, session.workspacePath ?? session.folderPath ?? session.projectDir);
     }
     persistTerminalSessions();
-    const startedAccount = settings.accounts.find((candidate) => candidate.id === session.accountId) ?? null;
     const effectiveCommand = commandOverride ?? autoRunCommand ?? startedAccount?.startupCommand ?? null;
     if (
       !loginOnly &&
@@ -20060,8 +28046,19 @@ const setupEvents = async () => {
       void refreshAccountUsage();
       void refreshWorkTimeDashboard();
     }
-    if (activeView === "kombai") void refreshKombaiStatus();
-    if (activeView === "settings") void refreshVoiceRuntimeStatus();
+    if (activeView === "vps") void vpsModule?.refreshVpsPanel(render, true);
+    if (activeView === "video") void videoModule?.refreshVideoPanel(render, true);
+    if (activeView === "design" && activeDesignTool === "kombai") void refreshKombaiStatus();
+    if (
+      activeView === "design" && activeDesignTool === "claude" &&
+      chatTurnIsBusy(designClaudeTurn?.status)
+    ) {
+      void pollClaudeDesignTurn();
+    }
+    if (activeView === "settings") {
+      void refreshVoiceRuntimeStatus();
+      void refreshWhatsAppConnection();
+    }
     void refreshAutonomousAgents();
     if (activeView === "orchestration") void refreshOrchestrations();
     if (activeView === "chat") {
@@ -20113,7 +28110,7 @@ const setupEvents = async () => {
     // app.innerHTML et rechargerait l'editeur embarque (perte de l'etat). L'etat
     // terminal est deja a jour en memoire ; la sidebar se rafraichit au prochain
     // render (changement de vue, clic terminal...).
-    if (!(activeView === "kombai" && (kombaiStatus?.running ?? false))) {
+    if (!(activeView === "design" && activeDesignTool === "kombai" && (kombaiStatus?.running ?? false))) {
       render();
     }
     persistTerminalSessions();
@@ -20121,15 +28118,21 @@ const setupEvents = async () => {
   });
 
   window.addEventListener("resize", () => {
+    syncChatContextSidebarWidthDom();
     syncChatSidebarWidthDom();
     fitAndResizeVisibleTerminals();
+    syncAutonomousMonitorPositionUi(true);
+    scheduleExpertChatResponsiveRender();
   });
 
   window.addEventListener("keydown", (event) => {
     if (!keyboardShortcutMatchesAction("toggle-environments", event) || !settings) return;
     if (
       !terminalEnvironmentMenuOpen &&
-      (newTerminalModalOpen || agentsModalOpen || workspaceModalOpen)
+      (newTerminalModalOpen ||
+        agentsModalOpen ||
+        workspaceModalOpen ||
+        gitDockerEnvironmentModalOpen)
     ) {
       return;
     }
@@ -20179,6 +28182,13 @@ const setupEvents = async () => {
   }, true);
 
   window.addEventListener("keydown", (event) => {
+    if (keyboardShortcutMatchesAction("toggle-sidebar", event)) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toggleChatSidebar();
+      return;
+    }
+
     if (keyboardShortcutMatchesAction("new-chat", event)) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -20231,6 +28241,12 @@ const setupEvents = async () => {
     if (event.key === "Escape" && discussionArchiveCandidate) {
       event.preventDefault();
       closeDiscussionArchiveModal();
+      return;
+    }
+
+    if (event.key === "Escape" && gitDockerEnvironmentModalOpen) {
+      event.preventDefault();
+      closeGitDockerEnvironmentModal();
       return;
     }
 
@@ -20300,7 +28316,11 @@ const setupEvents = async () => {
   });
 };
 
+const isRepairableConnectionError = (error: string | null) =>
+  Boolean(error && /failed to fetch|networkerror|network request failed|fetch failed|load failed/i.test(error));
+
 const renderRemoteLogin = (error: string | null = null) => {
+  const repairable = isRepairableConnectionError(error);
   app.innerHTML = `
     <main class="remote-login">
       <section class="remote-login-panel">
@@ -20312,6 +28332,17 @@ const renderRemoteLogin = (error: string | null = null) => {
           </div>
         </div>
         ${error ? `<div class="remote-login-error">${escapeHtml(error)}</div>` : ""}
+        ${repairable ? `
+          <div class="remote-login-repair">
+            <strong>La connexion peut etre reparee automatiquement.</strong>
+            <p>Le bouton remet l'API sur cette adresse, conserve vos identifiants et nettoie le cache obsolete.</p>
+            <button id="remoteRepairConnection" class="tool-button primary" type="button">
+              <i data-lucide="wrench"></i>
+              <span>Reparer la connexion</span>
+            </button>
+            <small id="remoteRepairStatus" role="status" aria-live="polite"></small>
+          </div>
+        ` : ""}
         <form id="remoteLoginForm" class="remote-login-form">
           <label>
             <span>Serveur</span>
@@ -20322,7 +28353,7 @@ const renderRemoteLogin = (error: string | null = null) => {
             <input id="remoteToken" type="password" autocomplete="current-password" />
           </label>
           <label>
-            <span>Noeuds terminaux auto</span>
+            <span>Pool VPS · chats et terminaux</span>
             <textarea id="remoteNodes" placeholder="PC fixe|http://100.x.x.x:8080||0&#10;Oracle free|http://100.y.y.y:8080||20">${escapeHtml(remoteNodesText())}</textarea>
           </label>
           <button class="tool-button primary" type="submit">
@@ -20334,6 +28365,24 @@ const renderRemoteLogin = (error: string | null = null) => {
     </main>
   `;
   renderIcons(app);
+  document.querySelector<HTMLButtonElement>("#remoteRepairConnection")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget as HTMLButtonElement;
+    const label = button.querySelector("span");
+    const status = document.querySelector<HTMLElement>("#remoteRepairStatus");
+    button.disabled = true;
+    if (label) label.textContent = "Reparation en cours...";
+    if (status) status.textContent = `Test de ${window.location.origin}...`;
+
+    try {
+      const repaired = await repairRemoteConnection();
+      if (status) status.textContent = `Serveur joignable (${repaired.baseUrl}). Reconnexion...`;
+      await boot();
+    } catch (repairError) {
+      if (status) status.textContent = String(repairError);
+      button.disabled = false;
+      if (label) label.textContent = "Reessayer la reparation";
+    }
+  });
   document.querySelector<HTMLFormElement>("#remoteLoginForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const baseUrl = document.querySelector<HTMLInputElement>("#remoteBaseUrl")?.value.trim() || remoteBaseUrl();
@@ -20398,23 +28447,51 @@ const boot = async () => {
   expertGridLayout = loadExpertGridLayout();
   expertChatPageSizeMode = loadExpertChatPageSizeMode();
   expertChatDisplayMode = loadExpertChatDisplayMode();
+  chatComposerSelectorsEnabled = loadChatComposerSelectorsEnabled();
+  chatTurnStatusDisplayMode = loadChatTurnStatusDisplayMode();
+  chatSidebarPriorityMode = loadChatSidebarPriorityMode();
+  chatSidebarHideRunning = loadChatSidebarHideRunning();
+  chatContextTasksVisible = loadChatContextTasksVisible();
+  expertChatHistoryOpenOnFullscreen = loadExpertChatHistoryOpenOnFullscreen();
+  expertChatHistoryCloseOnCompact = loadExpertChatHistoryCloseOnCompact();
   expertChatToolbarHidden = loadExpertChatToolbarHidden();
   chatSidebarWidth = loadChatSidebarWidth();
+  chatContextSidebarWidthPreference = loadChatContextSidebarWidthPreference();
   const [fullscreen] = await Promise.all([
     appWindow.isFullscreen().catch(() => false),
     setupEvents(),
     syncWorkspaceRegistry(),
   ]);
   isFullscreen = fullscreen;
+  const recoveredLazyView = consumeRecoveredLazyView();
   activeView = "chat";
   render();
-  void refreshSkills();
+  unlistenMobileAutonomousAgentHandoff?.();
+  unlistenMobileAutonomousAgentHandoff = installMobileAutonomousAgentHandoffListener((handoff) => {
+    void openMobileAutonomousAgentHandoff(handoff);
+  });
+  unlistenMobilePaymentHandoff?.();
+  unlistenMobilePaymentHandoff = installMobilePaymentHandoffListener((handoff) => {
+    void openMobilePaymentHandoff(handoff);
+  });
+  if (recoveredLazyView && recoveredLazyView !== "chat") {
+    setActiveView(recoveredLazyView);
+  }
+  if (isRemoteMode()) {
+    scheduleIdleTask(() => {
+      void loadMessagingModule()
+        .then((module) => {
+          module.startMessagingPolling(render);
+          return module.refreshMessaging(render, { silent: true });
+        })
+        .catch(() => undefined);
+    });
+  }
+  startRuntimeSync();
   startAutonomousAgentsPoll();
-  void refreshAutonomousAgents();
   initDesktopUpdaterDeferred();
   startChatRuntimeClock();
   startLimitPoll();
-  void refreshLimitStatus(true);
   startDiscussionsPoll();
   void refreshDiscussions().then(() => {
     restoreExpertChats();
@@ -20423,6 +28500,15 @@ const boot = async () => {
       startAllExpertChatWork();
     }
     expertChatPanes.forEach((pane) => void loadChatModelCatalog(pane.accountId));
+    startScheduledChatScheduler();
+  });
+  // Le chat et sa liste de discussions constituent le chemin critique. Les
+  // catalogues secondaires et le quota attendent une fenetre idle afin de ne
+  // pas disputer le premier rendu et le chargement du transcript sur mobile.
+  scheduleIdleTask(() => {
+    void refreshSkills();
+    void refreshAutonomousAgents();
+    void refreshLimitStatus(true);
   });
 };
 
@@ -20430,9 +28516,12 @@ window.addEventListener("beforeunload", () => {
   persistTerminalSessions();
   persistExpertChats();
   unlistenData?.();
+  unlistenMobileAutonomousAgentHandoff?.();
+  unlistenMobilePaymentHandoff?.();
   unlistenExit?.();
   stopPoolPoll();
   stopLimitPoll();
+  stopLimitRefreshFollowup();
   stopUnconnectedAccountCleanup();
   stopUsagePoll();
   stopKombaiPoll();
@@ -20440,9 +28529,13 @@ window.addEventListener("beforeunload", () => {
   stopAutonomousMonitorTurnPoll();
   stopOrchestrationsPoll();
   stopDiscussionsPoll();
+  stopRuntimeSync();
+  forumModule?.stopForumPolling();
+  messagingModule?.stopMessagingPolling();
   stopChatSync();
   stopChatTurnPoll();
   stopChatRuntimeClock();
+  stopScheduledChatScheduler();
   stopAllExpertChatWork();
   // Le navigateur web ne possede pas le code-server partage du noeud : fermer
   // un onglet ne doit jamais arreter Kombai pour les autres clients. En desktop
@@ -20460,5 +28553,9 @@ window.addEventListener("beforeunload", () => {
 initPwaSupport();
 
 void boot().catch((error) => {
+  if (isRemoteMode()) {
+    renderRemoteLogin(String(error));
+    return;
+  }
   app.innerHTML = `<main class="boot error">${escapeHtml(String(error))}</main>`;
 });

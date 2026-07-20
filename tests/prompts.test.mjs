@@ -14,12 +14,17 @@ import {
   persistPromptItems,
   promptCategories,
   promptLibraryStats,
+  recordPromptUse,
   removePromptItem,
   renderPromptLibraryPanel,
   searchPromptItems,
   togglePromptFavorite,
   updatePromptItem,
 } from "../src/prompts.ts";
+import {
+  favoritePromptShortcutsFromValue,
+  loadFavoritePromptShortcuts,
+} from "../src/prompt-shortcuts.ts";
 
 const memoryStorage = () => {
   const values = new Map();
@@ -134,9 +139,45 @@ test("persiste la bibliothèque et résiste à un stockage corrompu", () => {
   assert.equal(persistPromptItems(prompts, storage), true);
   assert.deepEqual(loadPromptItems(storage), prompts);
   assert.ok(storage.values.has(PROMPTS_STORAGE_KEY));
+  assert.equal(recordPromptUse("persisted", storage, 4_500), true);
+  assert.equal(loadPromptItems(storage)[0].useCount, 1);
+  assert.equal(loadPromptItems(storage)[0].lastUsedAt, 4_500);
 
   storage.values.set(PROMPTS_STORAGE_KEY, "{json-invalide");
   assert.deepEqual(loadPromptItems(storage), []);
+});
+
+test("expose chaque prompt favori comme raccourci de chat", () => {
+  const storage = memoryStorage();
+  storage.setItem(PROMPTS_STORAGE_KEY, JSON.stringify([
+    {
+      id: "favori-recent",
+      title: "  Relecture   finale  ",
+      content: "Relis ce texte.",
+      favorite: true,
+      updatedAt: 2_000,
+    },
+    {
+      id: "ordinaire",
+      title: "Sans étoile",
+      content: "Ne doit pas apparaître.",
+      favorite: false,
+      updatedAt: 3_000,
+    },
+    {
+      id: "favori-ancien",
+      title: "Plan détaillé",
+      content: "Prépare un plan.",
+      favorite: true,
+      updatedAt: 1_000,
+    },
+  ]));
+
+  assert.deepEqual(loadFavoritePromptShortcuts(storage), [
+    { id: "favori-recent", title: "Relecture finale", content: "Relis ce texte." },
+    { id: "favori-ancien", title: "Plan détaillé", content: "Prépare un plan." },
+  ]);
+  assert.deepEqual(favoritePromptShortcutsFromValue({ prompts: [] }), []);
 });
 
 test("importe les sauvegardes, crée les identifiants absents et fusionne par date", () => {
@@ -193,14 +234,62 @@ test("échappe le contenu utilisateur dans le panneau", () => {
 test("la bibliothèque est reliée aux navigations desktop et mobile", () => {
   const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
   const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+  const promptView = readFileSync(new URL("../src/prompts-view.ts", import.meta.url), "utf8");
+  const promptStyle = readFileSync(new URL("../src/prompts.css", import.meta.url), "utf8");
 
   assert.match(main, /\| "prompts"/);
   assert.match(main, /id="promptsToggle"/);
   assert.match(main, /role="menuitem" data-view="prompts"/);
-  assert.match(main, /case "prompts":\s*return renderPromptLibraryPanel\(\);/);
-  assert.match(main, /mountPromptLibraryPanel\(\{[\s\S]*?onUsePrompt: useLibraryPromptInChat/);
+  assert.match(main, /import type \{ PromptLibraryItem \} from "\.\/prompts";/);
+  assert.match(main, /promptLibraryModulePromise = import\("\.\/prompts-view"\)/);
+  assert.match(main, /if \(view === "prompts" && !promptLibraryModule\)/);
+  assert.match(main, /case "prompts":\s*return promptLibraryModule\?\.renderPromptLibraryPanel\(\) \?\? "";/);
+  assert.match(main, /promptLibraryModule\?\.mountPromptLibraryPanel\(\{[\s\S]*?onUsePrompt: useLibraryPromptInChat/);
   assert.match(main, /prompt\?: string \| null/);
   assert.match(main, /pane\.draft = pendingPrompt/);
-  assert.match(style, /\.prompt-library-panel/);
-  assert.match(style, /@media \(max-width: 520px\)[\s\S]*?\.prompt-library-hero-actions/);
+  assert.match(promptView, /import "\.\/prompts\.css";/);
+  assert.match(promptView, /renderPromptLibraryPanel/);
+  assert.doesNotMatch(style, /\.prompt-library-panel/);
+  assert.match(promptStyle, /\.prompt-library-panel/);
+  assert.match(promptStyle, /@media \(max-width: 520px\)[\s\S]*?\.prompt-library-hero-actions/);
+});
+
+test("le composeur ouvre un sélecteur rapide et insère le prompt sans l'envoyer", () => {
+  const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  const view = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
+  const prompts = readFileSync(new URL("../src/prompts.ts", import.meta.url), "utf8");
+  const promptView = readFileSync(new URL("../src/prompts-view.ts", import.meta.url), "utf8");
+  const promptStyle = readFileSync(new URL("../src/prompts.css", import.meta.url), "utf8");
+  const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
+
+  assert.match(view, /data-chat-action="prompts"/);
+  assert.match(view, /class="chat-prompt-button"/);
+  assert.match(promptView, /openPromptQuickPicker/);
+  assert.match(prompts, /export const openPromptQuickPicker/);
+  assert.match(prompts, /id = "promptQuickPicker"/);
+  assert.match(prompts, /data-prompt-quick-use/);
+  assert.match(prompts, /markPromptUsed\(items, item\.id\)/);
+  assert.match(main, /openMainChatPromptQuickPicker/);
+  assert.match(main, /openExpertChatPromptQuickPicker\(pane, root\)/);
+  assert.match(main, /insertPromptAtComposerSelection/);
+  assert.match(main, /currentInput\.dispatchEvent\(new Event\("input"/);
+  assert.match(view, /model\.favoritePrompts\.length/);
+  assert.match(view, /data-chat-action="favorite-prompt"/);
+  assert.match(main, /favoritePrompts: loadFavoritePromptShortcuts\(\)/);
+  assert.match(main, /insertFavoritePromptInMainChat/);
+  assert.match(main, /insertFavoritePromptInExpertChat/);
+  assert.match(main, /recordPromptShortcutUse/);
+  assert.match(style, /\.chat-favorite-prompts/);
+  assert.match(style, /\.chat-favorite-prompt-button/);
+  assert.doesNotMatch(
+    prompts.match(/export const openPromptQuickPicker[\s\S]*?type PromptFocusTarget/)?.[0] ?? "",
+    /sendChatMessage|sendExpertChatMessage|requestSubmit/,
+  );
+  assert.match(promptStyle, /\.prompt-quick-picker::backdrop/);
+  assert.match(promptStyle, /\.prompt-quick-results \{[^}]*min-height: 0;[^}]*overflow-y: auto;/);
+  assert.match(promptStyle, /--prompt-quick-max-height: min\(84dvh, 720px\)/);
+  assert.match(promptStyle, /padding-right: env\(safe-area-inset-right\)/);
+  assert.match(promptStyle, /padding-left: env\(safe-area-inset-left\)/);
+  assert.match(promptStyle, /padding-bottom: max\(9px, env\(safe-area-inset-bottom\)\)/);
+  assert.match(promptStyle, /@media \(max-width: 700px\)[\s\S]*?\.prompt-quick-picker/);
 });

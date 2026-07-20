@@ -21,7 +21,10 @@ if (-not $env:CST_ADMIN_TOKEN) { throw "CST_ADMIN_TOKEN absent de $EnvFile." }
 
 $env:CST_DATA_DIR = $DataDir
 $env:CST_STATIC_DIR = $CurrentDist
-if (-not $env:CST_BIND) { $env:CST_BIND = "127.0.0.1:$Port" }
+# Le port passe au demarreur de la tache planifiee doit rester prioritaire sur
+# un CST_BIND partage avec une autre instance locale (par exemple le portable
+# sur 8081). Ce noeud Tailscale reste volontairement lie au loopback.
+$env:CST_BIND = "127.0.0.1:$Port"
 # Un noeud Tailscale tourne sans operateur devant l'ecran. Le sandbox Codex
 # eleve relance sinon son setup UAC a chaque nouveau workspace/chat.
 if (-not $env:CST_CODEX_WINDOWS_SANDBOX) {
@@ -32,4 +35,36 @@ if (-not (Test-Path $CurrentExe)) {
   throw "Release active introuvable: $CurrentExe (lance d'abord update-node.ps1)."
 }
 
-& $CurrentExe
+$LogDir = Join-Path $DataDir "logs"
+$SupervisorLog = Join-Path $LogDir "server-supervisor.log"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+function Write-SupervisorLog {
+  param([string]$Message)
+
+  $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  Add-Content -LiteralPath $SupervisorLog -Value "[$timestamp] $Message" -Encoding UTF8
+}
+
+# La tache planifiee surveille ce script, pas directement cst-server.exe.
+# Sans cette boucle, un abort natif (par exemple une allocation memoire refusee)
+# laisse PowerShell terminer avec succes et Windows ne declenche aucun restart.
+while ($true) {
+  if (-not (Test-Path $CurrentExe)) {
+    Write-SupervisorLog "Release active absente; nouvelle tentative dans 5 secondes."
+    Start-Sleep -Seconds 5
+    continue
+  }
+
+  Write-SupervisorLog "Demarrage du noeud sur $env:CST_BIND."
+  & $CurrentExe
+  $exitCode = $LASTEXITCODE
+
+  if ($exitCode -eq 0) {
+    Write-SupervisorLog "Arret normal du noeud."
+    exit 0
+  }
+
+  Write-SupervisorLog "Arret inattendu du noeud (code $exitCode); redemarrage dans 5 secondes."
+  Start-Sleep -Seconds 5
+}

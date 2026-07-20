@@ -29,6 +29,26 @@ export type WorkTimeBucket = {
   activeDays: number;
 };
 
+export type ApiModelTokenUsage = {
+  model: string;
+  pricingModel?: string | null;
+  priced: boolean;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  apiEquivalentUsd: number;
+  inputPricePerMillion?: number | null;
+  cachedInputPricePerMillion?: number | null;
+  outputPricePerMillion?: number | null;
+  longContextThresholdTokens?: number | null;
+  longInputPricePerMillion?: number | null;
+  longCachedInputPricePerMillion?: number | null;
+  longOutputPricePerMillion?: number | null;
+  longContextRequests: number;
+};
+
 export type DailyTokenUsage = {
   date: string;
   inputTokens: number;
@@ -36,6 +56,7 @@ export type DailyTokenUsage = {
   outputTokens: number;
   totalTokens: number;
   costUsd: number;
+  models?: ApiModelTokenUsage[];
 };
 
 export type AccountTokenUsageSource = {
@@ -69,15 +90,66 @@ const emptyDailyTokenUsage = (date: string): DailyTokenUsage => ({
   outputTokens: 0,
   totalTokens: 0,
   costUsd: 0,
+  models: [],
 });
+
+export const aggregateApiModelUsage = (
+  usages: ReadonlyArray<ApiModelTokenUsage>,
+): ApiModelTokenUsage[] => {
+  const byModel = new Map<string, ApiModelTokenUsage>();
+
+  for (const usage of usages) {
+    const model = usage.model?.trim().toLocaleLowerCase("en-US") || "modele-inconnu";
+    const current = byModel.get(model) ?? {
+      ...usage,
+      model,
+      priced: Boolean(usage.priced),
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+      totalTokens: 0,
+      apiEquivalentUsd: 0,
+      longContextRequests: 0,
+    };
+    current.priced ||= Boolean(usage.priced);
+    current.inputTokens += Number.isFinite(usage.inputTokens) ? usage.inputTokens : 0;
+    current.cachedInputTokens += Number.isFinite(usage.cachedInputTokens)
+      ? usage.cachedInputTokens
+      : 0;
+    current.outputTokens += Number.isFinite(usage.outputTokens) ? usage.outputTokens : 0;
+    current.reasoningOutputTokens += Number.isFinite(usage.reasoningOutputTokens)
+      ? usage.reasoningOutputTokens
+      : 0;
+    current.totalTokens += Number.isFinite(usage.totalTokens) ? usage.totalTokens : 0;
+    current.apiEquivalentUsd += Number.isFinite(usage.apiEquivalentUsd)
+      ? usage.apiEquivalentUsd
+      : 0;
+    current.longContextRequests += Number.isFinite(usage.longContextRequests)
+      ? usage.longContextRequests
+      : 0;
+    byModel.set(model, current);
+  }
+
+  return [...byModel.values()].sort(
+    (left, right) =>
+      right.totalTokens - left.totalTokens || left.model.localeCompare(right.model, "fr"),
+  );
+};
 
 const accountUsageIdentityKey = (
   account: AccountTokenUsageSource["accounts"][number],
 ): string => {
-  const normalizedHome = account.codexHome
-    ?.trim()
-    .replace(/\\/g, "/")
-    .replace(/\/+$/, "");
+  const rawHome = account.codexHome?.trim();
+  let normalizedHome = rawHome?.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (
+    normalizedHome &&
+    (rawHome?.includes("\\") ||
+      /^[a-z]:\//i.test(normalizedHome) ||
+      /^%cst_data_dir%\//i.test(normalizedHome))
+  ) {
+    normalizedHome = normalizedHome.toLocaleLowerCase("en-US");
+  }
   return normalizedHome ? `home:${normalizedHome}` : `profile:${account.id}`;
 };
 
@@ -162,7 +234,7 @@ export const aggregateAccountTokenDays = (
 ): Map<string, DailyTokenUsage> => {
   const byDate = new Map<string, DailyTokenUsage>();
 
-  for (const account of data.accounts) {
+  for (const account of deduplicateAccountTokenAccounts(data.accounts)) {
     for (const day of account.days) {
       const total = byDate.get(day.date) ?? emptyDailyTokenUsage(day.date);
       total.inputTokens += day.inputTokens;
@@ -170,6 +242,7 @@ export const aggregateAccountTokenDays = (
       total.outputTokens += day.outputTokens;
       total.totalTokens += day.totalTokens;
       total.costUsd += day.costUsd;
+      total.models = aggregateApiModelUsage([...(total.models ?? []), ...(day.models ?? [])]);
       byDate.set(day.date, total);
     }
   }
@@ -247,7 +320,7 @@ export const accountTokenUsageForDate = (
   data: AccountTokenUsageSource,
   date: string,
 ): DailyAccountTokenUsage[] => {
-  const rows = data.accounts.map((account) => ({
+  const rows = deduplicateAccountTokenAccounts(data.accounts).map((account) => ({
     accountId: account.id,
     label: account.label,
     profileLabels: account.profileLabels ?? [account.label],
@@ -281,6 +354,7 @@ export const sumTokenUsage = (days: ReadonlyArray<DailyTokenUsage>): DailyTokenU
       outputTokens: total.outputTokens + day.outputTokens,
       totalTokens: total.totalTokens + day.totalTokens,
       costUsd: total.costUsd + day.costUsd,
+      models: aggregateApiModelUsage([...(total.models ?? []), ...(day.models ?? [])]),
     }),
     emptyDailyTokenUsage(days.length > 0 ? days[days.length - 1].date : ""),
   );

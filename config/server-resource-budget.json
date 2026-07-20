@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "windows-native-codex-equivalent-load-v1",
+  "reference": {
+    "label": "native-codex-live-load-2026-07-15",
+    "evidence": "docs/server-load-spawn-optimization-2026-07-15.md",
+    "codexInitialCount": 7,
+    "codexFinalCount": 5,
+    "aggregatePeak": {
+      "processCount": 31,
+      "workingSetMiB": 864.45,
+      "privateMemoryMiB": 884.29,
+      "threadCount": 491,
+      "handleCount": 9056
+    }
+  },
+  "scenario": {
+    "captureSchemaVersion": 2,
+    "labelPrefix": "native-codex-equivalent-load-",
+    "rootProcessName": "cst-server",
+    "requestedDurationSeconds": 12,
+    "sampleIntervalMilliseconds": 1000,
+    "processTreeRefreshMilliseconds": 4000,
+    "minimumSampleCount": 6,
+    "provider": {
+      "processName": "codex",
+      "initialCount": {
+        "minimum": 6,
+        "maximum": 7
+      },
+      "maximumPeakCount": 7,
+      "requireEveryInitialProcessAsRootChild": true
+    },
+    "persistentTerminal": {
+      "processName": "powershell",
+      "minimumInitialCount": 1,
+      "requireDirectRootChild": true
+    },
+    "forbiddenObservedProcessNames": [
+      "node",
+      "cmd"
+    ]
+  },
+  "resources": {
+    "aggregatePeak": {
+      "processCount": 36,
+      "workingSetMiB": 1100,
+      "privateMemoryMiB": 1100,
+      "threadCount": 600,
+      "handleCount": 11000
+    },
+    "rootProcessPeak": {
+      "processCount": 1,
+      "workingSetMiB": 64,
+      "privateMemoryMiB": 64,
+      "threadCount": 32,
+      "handleCount": 512
+    },
+    "forbiddenRootChildProcessNames": [
+      "node",
+      "cmd"
+    ]
+  }
+}

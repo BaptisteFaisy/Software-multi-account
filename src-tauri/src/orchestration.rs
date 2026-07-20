@@ -25,6 +25,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(feature = "desktop")]
 use tauri::State;
 use uuid::Uuid;
 
@@ -1512,6 +1513,19 @@ fn start_chat_turn(
     mode: ChatTurnMode,
     prompt: String,
 ) {
+    if let Some(session_id) = session_id.as_deref() {
+        match inner.chat.session_is_busy(&account_id, session_id) {
+            // Un chat normal peut être promu pendant sa réponse courante. Le
+            // run reste actif et prêt à démarrer ; le worker le réévaluera dès
+            // que la session sera libre, sans annuler la réponse de l'utilisateur.
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                mark_needs_attention(inner, &run.id, error);
+                return;
+            }
+        }
+    }
     let (prompt, handoff_file_to_clear) =
         match prompt_with_pending_handoff(run, kind, task_id.as_deref(), prompt) {
             Ok(value) => value,
@@ -1553,6 +1567,7 @@ fn start_chat_turn(
         account_id: account_id.clone(),
         session_id,
         prompt,
+        image_attachments: Vec::new(),
         project_dir: Some(project_dir),
         mode,
         model: (account_id == run.account_id)
@@ -3509,6 +3524,7 @@ fn persist_store(path: &Path, store: &OrchestrationStore) -> Result<(), String> 
     fs_util::atomic_write(path, content).map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn list_orchestrations(
     state: State<'_, OrchestrationManager>,
@@ -3516,6 +3532,7 @@ pub fn list_orchestrations(
     state.list()
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn create_orchestration(
     state: State<'_, OrchestrationManager>,
@@ -3524,6 +3541,7 @@ pub fn create_orchestration(
     state.create(request)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn promote_autonomous_agent_to_orchestration(
     orchestration: State<'_, OrchestrationManager>,
@@ -3534,6 +3552,7 @@ pub fn promote_autonomous_agent_to_orchestration(
     orchestration.promote_autonomous_agent(&autonomous, &id, request)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn control_orchestration(
     state: State<'_, OrchestrationManager>,
@@ -3543,6 +3562,7 @@ pub fn control_orchestration(
     state.control(&id, action)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn reassign_orchestration_account(
     state: State<'_, OrchestrationManager>,
@@ -3552,6 +3572,7 @@ pub fn reassign_orchestration_account(
     state.reassign_account(&id, request)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn delete_orchestration(
     state: State<'_, OrchestrationManager>,

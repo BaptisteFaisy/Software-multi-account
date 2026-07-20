@@ -5,13 +5,16 @@ import test from "node:test";
 import {
   CHAT_SIDEBAR_MAX_WIDTH,
   CHAT_SIDEBAR_MIN_WIDTH,
+  DEFAULT_CHAT_SIDEBAR_PRIORITY_MODE,
   activeChatTurnForDiscussion,
+  arrangeChatSidebarItems,
   chatSidebarStatus,
   chatSidebarStatusLabel,
   chatSidebarMaxWidth,
   clampChatSidebarWidth,
   defaultChatSidebarWidth,
   discussionForSession,
+  normalizeChatSidebarPriorityMode,
   orderChatSidebarDiscussions,
 } from "../src/chat/sidebar.ts";
 
@@ -53,6 +56,12 @@ test("des boutons explicites permettent de masquer puis restaurer la barre later
   assert.match(main, /setChatSidebarWidth\(defaultChatSidebarWidth\(window\.innerWidth\)\)/);
 });
 
+test("Ctrl+B masque et restaure la barre laterale via un raccourci configurable", () => {
+  assert.match(main, /const toggleChatSidebar = \(\): void =>/);
+  assert.match(main, /keyboardShortcutMatchesAction\("toggle-sidebar", event\)/);
+  assert.match(main, /toggleChatSidebar\(\)/);
+});
+
 test("la poignee reste collee au bord gauche quand la barre est masquee", () => {
   assert.match(
     style,
@@ -72,9 +81,47 @@ test("les pastilles de la colonne de gauche suivent le statut du chat", () => {
   assert.equal(chatSidebarStatus("finalizing", true), "question");
   assert.equal(chatSidebarStatus("finalizing", false), "running");
   assert.equal(chatSidebarStatus("completed", false), "idle");
+  assert.equal(
+    chatSidebarStatus("completed", false, "running"),
+    "running",
+    "un snapshot local terminal ne doit pas masquer un tour encore actif cote serveur",
+  );
+  assert.equal(chatSidebarStatus("idle", false, "finalizing"), "running");
   assert.equal(chatSidebarStatusLabel("running"), "En cours");
   assert.equal(chatSidebarStatusLabel("question"), "Question");
   assert.equal(chatSidebarStatusLabel("idle"), "Disponible");
+});
+
+test("le mode Disponibles tient compte du catalogue serveur actif", () => {
+  const availability = main.slice(
+    main.indexOf("const expertChatPaneHasBusyTurn ="),
+    main.indexOf("const pinExplicitlyOpenedBusyExpertChat ="),
+  );
+
+  assert.match(
+    availability,
+    /expertChatPaneIsAvailable[\s\S]*?!expertChatPaneHasBusyTurn\(pane\)/,
+  );
+  assert.match(
+    availability,
+    /activeChatTurnForDiscussion\(activeChatTurns, pane\.discussion\) !== null/,
+  );
+});
+
+test("le titre semantique est affiche et rafraichi dans la colonne de gauche", () => {
+  const renderer = main.slice(
+    main.indexOf("const renderChatSidebarConversations ="),
+    main.indexOf("const activeChatTurnsStatusSignature ="),
+  );
+  const snapshot = main.slice(
+    main.indexOf("const applyDiscussionsSnapshot ="),
+    main.indexOf("const refreshDiscussions ="),
+  );
+
+  assert.match(renderer, /const title = discussion\.title\?\.trim\(\) \|\| "Conversation sans titre"/);
+  assert.match(renderer, /<strong>\$\{escapeHtml\(title\)\}<\/strong>/);
+  assert.match(snapshot, /host\.innerHTML = renderChatSidebarConversations\(\)/);
+  assert.match(main, /chatSidebarRefreshPending[\s\S]*requestAnimationFrame\(refreshChatSidebarConversations\)/);
 });
 
 test("un tour serveur actif est retrouve apres reload et a travers un fork", () => {
@@ -156,6 +203,69 @@ test("l'activite d'un chat ne change jamais sa place dans l'environnement", () =
     discussions.map(({ sessionId }) => sessionId),
     ["ancien", "recent-b", "recent-a"],
     "le tri ne doit pas muter le snapshot recu",
+  );
+});
+
+test("la priorite de la liste remonte les questions ou les chats verts de facon stable", () => {
+  const items = [
+    { id: "orange-a", status: "running" },
+    { id: "vert-a", status: "idle" },
+    { id: "question-a", status: "question" },
+    { id: "vert-b", status: "idle" },
+    { id: "question-b", status: "question" },
+    { id: "orange-b", status: "running" },
+  ];
+
+  assert.equal(DEFAULT_CHAT_SIDEBAR_PRIORITY_MODE, "recent");
+  assert.equal(normalizeChatSidebarPriorityMode("invalid"), "recent");
+  assert.deepEqual(
+    arrangeChatSidebarItems(items, "question", false).map(({ id }) => id),
+    ["question-a", "question-b", "orange-a", "vert-a", "vert-b", "orange-b"],
+  );
+  assert.deepEqual(
+    arrangeChatSidebarItems(items, "available", false).map(({ id }) => id),
+    ["vert-a", "vert-b", "orange-a", "question-a", "question-b", "orange-b"],
+  );
+  assert.deepEqual(
+    items.map(({ id }) => id),
+    ["orange-a", "vert-a", "question-a", "vert-b", "question-b", "orange-b"],
+    "le tableau source ne doit pas etre mute",
+  );
+});
+
+test("les chats orange peuvent etre masques sans disparaitre de la source", () => {
+  const items = [
+    { id: "orange", status: "running" },
+    { id: "question", status: "question" },
+    { id: "vert", status: "idle" },
+  ];
+
+  assert.deepEqual(
+    arrangeChatSidebarItems(items, "question", true).map(({ id }) => id),
+    ["question", "vert"],
+  );
+  assert.equal(items.length, 3);
+});
+
+test("les preferences de tri et de masquage sont disponibles dans Parametres", () => {
+  for (const marker of [
+    'data-chat-sidebar-priority="question"',
+    'data-chat-sidebar-priority="available"',
+    'data-chat-sidebar-running="hide"',
+    "CHAT_SIDEBAR_PRIORITY_STORAGE_KEY",
+    "CHAT_SIDEBAR_HIDE_RUNNING_STORAGE_KEY",
+    "chatSidebarPriorityMode = loadChatSidebarPriorityMode()",
+    "chatSidebarHideRunning = loadChatSidebarHideRunning()",
+  ]) {
+    assert.ok(main.includes(marker), `preference manquante: ${marker}`);
+  }
+  assert.match(
+    main,
+    /arrangeChatSidebarItems\(\s*\[\.\.\.draftItems, \.\.\.conversationItems\],\s*chatSidebarPriorityMode,\s*chatSidebarHideRunning,/,
+  );
+  assert.match(
+    main,
+    /previousStatus !== status[\s\S]*?chatSidebarPriorityMode !== "recent" \|\| chatSidebarHideRunning[\s\S]*?refreshChatSidebarConversations\(\)/,
   );
 });
 

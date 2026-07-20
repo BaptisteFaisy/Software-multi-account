@@ -5,6 +5,17 @@ export const CHAT_SIDEBAR_MAX_WIDTH = 420;
 
 export type ChatSidebarStatus = "idle" | "running" | "question";
 
+export const DEFAULT_CHAT_SIDEBAR_PRIORITY_MODE = "recent" as const;
+
+export type ChatSidebarPriorityMode =
+  | typeof DEFAULT_CHAT_SIDEBAR_PRIORITY_MODE
+  | "question"
+  | "available";
+
+export type ChatSidebarPrioritizableItem = {
+  status: ChatSidebarStatus;
+};
+
 export type ChatSidebarDiscussionIdentity = {
   accountId: string;
   sessionId: string;
@@ -58,6 +69,41 @@ export const orderChatSidebarDiscussions = <T extends ChatSidebarOrderedDiscussi
   right.startedAt - left.startedAt || left.sessionId.localeCompare(right.sessionId),
 );
 
+export const normalizeChatSidebarPriorityMode = (
+  value: unknown,
+): ChatSidebarPriorityMode =>
+  value === "question" || value === "available"
+    ? value
+    : DEFAULT_CHAT_SIDEBAR_PRIORITY_MODE;
+
+/**
+ * Applique les preferences visuelles de la liste d'environnement sans modifier
+ * l'ordre de base entre deux chats de meme priorite. Les chats masques restent
+ * actifs : seule leur rangee orange disparait de la barre laterale.
+ */
+export const arrangeChatSidebarItems = <T extends ChatSidebarPrioritizableItem>(
+  items: readonly T[],
+  priorityMode: ChatSidebarPriorityMode,
+  hideRunning: boolean,
+): T[] => {
+  const visibleItems = hideRunning
+    ? items.filter((item) => item.status !== "running")
+    : [...items];
+  if (priorityMode === "recent") return visibleItems;
+
+  const preferredStatus: ChatSidebarStatus = priorityMode === "question"
+    ? "question"
+    : "idle";
+  return visibleItems
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) =>
+      Number(right.item.status === preferredStatus)
+      - Number(left.item.status === preferredStatus)
+      || left.index - right.index,
+    )
+    .map(({ item }) => item);
+};
+
 /**
  * Retrouve le tour serveur actif d'une discussion, y compris apres une reprise
  * Codex ou le rollout courant differe de l'identite logique de la discussion.
@@ -86,9 +132,15 @@ export const activeChatTurnForDiscussion = <T extends ChatSidebarTurnIdentity>(
 export const chatSidebarStatus = (
   turnStatus: string | null | undefined,
   waitingForUser: boolean,
+  serverTurnStatus?: string | null,
 ): ChatSidebarStatus => {
   if (waitingForUser) return "question";
-  if (turnStatus === "running" || turnStatus === "finalizing") return "running";
+  if (
+    turnStatus === "running"
+    || turnStatus === "finalizing"
+    || serverTurnStatus === "running"
+    || serverTurnStatus === "finalizing"
+  ) return "running";
   return "idle";
 };
 

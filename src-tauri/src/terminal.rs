@@ -203,10 +203,9 @@ pub fn start_terminal(
     let mut builder = shell_command(&settings);
     // Isolation multi-comptes : Codex lit CODEX_HOME, Claude lit
     // CLAUDE_CONFIG_DIR. Voir `provider::Provider::home_env_var`.
-    builder.env(
-        provider.home_env_var(),
-        account_home.to_string_lossy().to_string(),
-    );
+    for (key, value) in provider.home_env(&account_home) {
+        builder.env(key, value);
+    }
     builder.env("TERM", "xterm-256color");
     builder.env("COLORTERM", "truecolor");
     builder.cwd(project_dir.as_os_str());

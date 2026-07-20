@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -24,6 +24,40 @@ const collect = (child) =>
     });
   });
 
+const waitForReady = (child) => new Promise((resolve, reject) => {
+  let stdout = "";
+  let stderr = "";
+  const timeout = setTimeout(() => {
+    reject(new Error(`target readiness timeout: ${stderr}`));
+  }, 15_000);
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    if (stdout.includes("ready")) {
+      clearTimeout(timeout);
+      resolve();
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  child.once("error", (error) => {
+    clearTimeout(timeout);
+    reject(error);
+  });
+  child.once("close", (code) => {
+    clearTimeout(timeout);
+    reject(new Error(`target exited before readiness (${code}): ${stderr}`));
+  });
+});
+
+const killTree = (pid) => {
+  if (!pid) return;
+  spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+    stdio: "ignore",
+    windowsHide: true,
+  });
+};
+
 test(
   "le sampler produit une baseline JSON sans se compter lui-meme",
   { skip: process.platform !== "win32", timeout: 45_000 },
@@ -32,13 +66,19 @@ test(
     // machine ou lorsque l'antivirus inspecte le compilateur C#. La cible doit
     // rester vivante pendant ce cout de demarrage, qui precede volontairement
     // la fenetre mesuree.
-    const target = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], {
-      stdio: "ignore",
+    const target = spawn(process.execPath, ["-e", [
+      'const { spawn } = require("node:child_process");',
+      'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore", windowsHide: true });',
+      'child.once("spawn", () => process.stdout.write("ready\\n"));',
+      "setTimeout(() => {}, 120000);",
+    ].join("\n")], {
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
 
     try {
       assert.ok(target.pid);
+      await waitForReady(target);
       const sampler = spawn(
         "powershell.exe",
         [
@@ -60,7 +100,7 @@ test(
       );
 
       const result = JSON.parse(await collect(sampler));
-      assert.equal(result.schemaVersion, 1);
+      assert.equal(result.schemaVersion, 2);
       assert.equal(result.label, "automated-test");
       assert.equal(result.root.processId, target.pid);
       assert.equal(result.window.endedEarly, false);
@@ -71,7 +111,7 @@ test(
         result.window.processTreeRefreshCount <= result.window.sampleCount,
       );
       assert.ok(result.window.observedDurationSeconds >= 2);
-      assert.ok(result.aggregate.processCount.initial >= 1);
+      assert.ok(result.aggregate.processCount.initial >= 2);
       assert.ok(
         result.aggregate.processCount.peak >= result.aggregate.processCount.initial,
       );
@@ -92,8 +132,15 @@ test(
       assert.ok(node.threadCount.peak > 0);
       assert.ok(node.handleCount.peak > 0);
       assert.ok(node.cpuSeconds >= 0);
+
+      const directNode = result.topology.rootChildrenByProcessName.find(
+        (entry) => entry.processName === "node",
+      );
+      assert.ok(directNode);
+      assert.ok(directNode.processCount.initial >= 1);
+      assert.ok(directNode.processCount.peak >= directNode.processCount.initial);
     } finally {
-      target.kill();
+      killTree(target.pid);
     }
   },
 );

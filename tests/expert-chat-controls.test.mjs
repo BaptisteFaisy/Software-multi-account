@@ -19,9 +19,28 @@ test("les controles appellent les actions de plein ecran et de fermeture", () =>
   assert.match(main, /\[data-chat-action='close'\][\s\S]*closeExpertChatPane\(pane\)/);
 });
 
+test("le plein ecran conserve le DOM du chat et anime seulement son panneau", () => {
+  const toggleStart = main.indexOf("const toggleExpertChatFullscreen =");
+  const toggleEnd = main.indexOf("\nconst closeExpertChatPane", toggleStart);
+  const toggle = main.slice(toggleStart, toggleEnd);
+
+  assert.ok(toggleStart >= 0 && toggleEnd > toggleStart);
+  assert.doesNotMatch(toggle, /\brender\(\)/);
+  assert.match(toggle, /syncExpertChatFullscreenPanelUi\(root, nextFullscreen\)/);
+  assert.match(main, /root\.animate\([\s\S]*duration:\s*220/);
+  assert.match(style, /\.chat-panel--expert\.is-fullscreen-transitioning\s*\{[^}]*will-change:\s*transform, opacity/);
+});
+
 test("les controles restent visibles dans le bandeau des chats inactifs", () => {
   assert.match(style, /\.expert-chat-pane-controls\s*\{[\s\S]*display:\s*flex/);
   assert.doesNotMatch(style, /chat-panel--expert:not\(\.active\)[^{]*\.expert-chat-pane-controls\s*\{[^}]*display:\s*none/);
+});
+
+test("le nombre de chats par page utilise une surface lisible dans les deux themes", () => {
+  assert.match(
+    style,
+    /\.expert-page-size-control input\s*\{[^}]*color:\s*var\(--chat-text\);[^}]*background:\s*var\(--chat-surface-2\);/,
+  );
 });
 
 test("l'historique reste accessible sans mettre le chat en plein ecran", () => {
@@ -39,11 +58,11 @@ test("l'historique reste accessible sans mettre le chat en plein ecran", () => {
 });
 
 test("le plein ecran mobile reste dans la coque avec un compositeur compact", () => {
-  const rdvLabIndex = style.indexOf("/* RDV Lab");
-  const mobileChatIndex = style.lastIndexOf("@media (max-width: 860px) {", rdvLabIndex);
-  const mobileChatStyle = style.slice(mobileChatIndex, rdvLabIndex);
+  const autonomousChatsIndex = style.indexOf("/* --- Chats autonomes");
+  const mobileChatIndex = style.lastIndexOf("@media (max-width: 860px) {", autonomousChatsIndex);
+  const mobileChatStyle = style.slice(mobileChatIndex, autonomousChatsIndex);
 
-  assert.ok(mobileChatIndex >= 0 && rdvLabIndex > mobileChatIndex);
+  assert.ok(mobileChatIndex >= 0 && autonomousChatsIndex > mobileChatIndex);
   assert.match(
     mobileChatStyle,
     /\.chat-app-layout \.expert-chat-wall \.chat-panel--expert\.is-fullscreen\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;[^}]*height:\s*100%;[^}]*max-height:\s*100%/,

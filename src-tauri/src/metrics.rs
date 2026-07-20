@@ -1,3 +1,4 @@
+#[cfg(feature = "desktop")]
 use crate::terminal::TerminalManager;
 use chrono::{Datelike, Local, TimeZone};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(feature = "desktop")]
 use tauri::State;
 
 static USAGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -123,12 +125,53 @@ pub struct ApiUsageRecord {
     pub tokens_estimated: bool,
 }
 
-struct ModelRates {
-    input_per_million: f64,
-    cached_input_per_million: f64,
-    output_per_million: f64,
+pub const API_PRICING_SOURCE_URL: &str = "https://developers.openai.com/api/docs/pricing";
+pub const API_PRICING_AS_OF: &str = "2026-07-15";
+
+/// Tarifs publics de l'API OpenAI standard, en USD par million de tokens.
+///
+/// Les modeles a grand contexte appliquent leurs tarifs longs a toute la
+/// requete lorsque l'entree depasse `long_context_threshold_tokens`. Les
+/// rollouts Codex livrent un compteur par tour, ce qui permet de conserver
+/// cette distinction avant l'agregation par jour ou par modele.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelRates {
+    pub pricing_model: &'static str,
+    pub input_per_million: f64,
+    pub cached_input_per_million: f64,
+    pub output_per_million: f64,
+    pub long_context_threshold_tokens: Option<u64>,
+    pub long_input_per_million: Option<f64>,
+    pub long_cached_input_per_million: Option<f64>,
+    pub long_output_per_million: Option<f64>,
 }
 
+impl ModelRates {
+    pub fn is_long_context(self, input_tokens: u64) -> bool {
+        self.long_context_threshold_tokens
+            .is_some_and(|threshold| input_tokens > threshold)
+    }
+
+    fn effective_rates(self, input_tokens: u64) -> (f64, f64, f64) {
+        if self.is_long_context(input_tokens) {
+            return (
+                self.long_input_per_million
+                    .unwrap_or(self.input_per_million),
+                self.long_cached_input_per_million
+                    .unwrap_or(self.cached_input_per_million),
+                self.long_output_per_million
+                    .unwrap_or(self.output_per_million),
+            );
+        }
+        (
+            self.input_per_million,
+            self.cached_input_per_million,
+            self.output_per_million,
+        )
+    }
+}
+
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn usage_dashboard(terminal: State<'_, TerminalManager>) -> Result<UsageDashboard, String> {
     load_usage_dashboard(terminal.inner().active_agent_runs())
@@ -178,13 +221,22 @@ pub fn cost_for_usage(
     cached_input_tokens: u64,
     output_tokens: u64,
 ) -> f64 {
-    let rates = rates_for_model(model);
+    let Some(rates) = public_rates_for_model(model) else {
+        // Un modele inconnu reste visible dans la ventilation, mais ne recoit
+        // jamais un tarif arbitraire qui fausserait l'equivalent API.
+        return 0.0;
+    };
     let cached = cached_input_tokens.min(input_tokens);
     let billable_input = input_tokens.saturating_sub(cached);
-    (billable_input as f64 * rates.input_per_million
-        + cached as f64 * rates.cached_input_per_million
-        + output_tokens as f64 * rates.output_per_million)
+    let (input_rate, cached_rate, output_rate) = rates.effective_rates(input_tokens);
+    (billable_input as f64 * input_rate
+        + cached as f64 * cached_rate
+        + output_tokens as f64 * output_rate)
         / 1_000_000.0
+}
+
+pub fn usage_uses_long_context(model: &str, input_tokens: u64) -> bool {
+    public_rates_for_model(model).is_some_and(|rates| rates.is_long_context(input_tokens))
 }
 
 pub fn record_api_usage(record: ApiUsageRecord) -> Result<(), String> {
@@ -415,29 +467,147 @@ fn day_key(timestamp: i64) -> String {
         .to_string()
 }
 
-fn rates_for_model(model: &str) -> ModelRates {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("codex") {
-        return ModelRates {
-            input_per_million: 1.75,
-            cached_input_per_million: 0.175,
-            output_per_million: 14.0,
-        };
-    }
-
-    if lower.contains("chat-latest") {
-        return ModelRates {
-            input_per_million: 5.0,
-            cached_input_per_million: 0.5,
-            output_per_million: 30.0,
-        };
-    }
-
+fn short_rates(
+    pricing_model: &'static str,
+    input_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+) -> ModelRates {
     ModelRates {
-        input_per_million: 2.5,
-        cached_input_per_million: 0.25,
-        output_per_million: 15.0,
+        pricing_model,
+        input_per_million,
+        cached_input_per_million,
+        output_per_million,
+        long_context_threshold_tokens: None,
+        long_input_per_million: None,
+        long_cached_input_per_million: None,
+        long_output_per_million: None,
     }
+}
+
+fn long_rates(
+    pricing_model: &'static str,
+    short: (f64, f64, f64),
+    long: (f64, f64, f64),
+) -> ModelRates {
+    ModelRates {
+        pricing_model,
+        input_per_million: short.0,
+        cached_input_per_million: short.1,
+        output_per_million: short.2,
+        long_context_threshold_tokens: Some(272_000),
+        long_input_per_million: Some(long.0),
+        long_cached_input_per_million: Some(long.1),
+        long_output_per_million: Some(long.2),
+    }
+}
+
+/// Retourne uniquement un tarif explicitement publie par OpenAI. Les alias et
+/// snapshots d'une meme famille partagent la carte tarifaire du modele canonique.
+pub fn public_rates_for_model(model: &str) -> Option<ModelRates> {
+    let lower = model.trim().to_ascii_lowercase();
+    let model = lower.as_str();
+
+    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
+        return Some(long_rates(
+            "gpt-5.6-sol",
+            (5.0, 0.5, 30.0),
+            (10.0, 1.0, 45.0),
+        ));
+    }
+    if model.starts_with("gpt-5.6-terra") {
+        return Some(long_rates(
+            "gpt-5.6-terra",
+            (2.5, 0.25, 15.0),
+            (5.0, 0.5, 22.5),
+        ));
+    }
+    if model.starts_with("gpt-5.6-luna") {
+        return Some(long_rates("gpt-5.6-luna", (1.0, 0.1, 6.0), (2.0, 0.2, 9.0)));
+    }
+    if model.starts_with("gpt-5.5-cyber") {
+        return None;
+    }
+    if model.starts_with("gpt-5.5-pro") {
+        // Les variantes Pro n'offrent pas de remise sur l'entree en cache.
+        return Some(long_rates(
+            "gpt-5.5-pro",
+            (30.0, 30.0, 180.0),
+            (60.0, 60.0, 270.0),
+        ));
+    }
+    if model.starts_with("gpt-5.5") {
+        return Some(long_rates("gpt-5.5", (5.0, 0.5, 30.0), (10.0, 1.0, 45.0)));
+    }
+    if model.starts_with("gpt-5.4-cyber") {
+        return None;
+    }
+    if model.starts_with("gpt-5.4-mini") {
+        return Some(short_rates("gpt-5.4-mini", 0.75, 0.075, 4.5));
+    }
+    if model.starts_with("gpt-5.4-nano") {
+        return Some(short_rates("gpt-5.4-nano", 0.2, 0.02, 1.25));
+    }
+    if model.starts_with("gpt-5.4-pro") {
+        return Some(long_rates(
+            "gpt-5.4-pro",
+            (30.0, 30.0, 180.0),
+            (60.0, 60.0, 270.0),
+        ));
+    }
+    if model.starts_with("gpt-5.4") {
+        return Some(long_rates("gpt-5.4", (2.5, 0.25, 15.0), (5.0, 0.5, 22.5)));
+    }
+    // Spark est encore une research preview sans prix public final.
+    if model.starts_with("gpt-5.3-codex-spark") {
+        return None;
+    }
+    if model.starts_with("gpt-5.3-codex") {
+        return Some(short_rates("gpt-5.3-codex", 1.75, 0.175, 14.0));
+    }
+    if model.starts_with("gpt-5.2-pro") {
+        return Some(short_rates("gpt-5.2-pro", 21.0, 21.0, 168.0));
+    }
+    if model.starts_with("gpt-5.2") {
+        return Some(short_rates("gpt-5.2", 1.75, 0.175, 14.0));
+    }
+    if model.starts_with("gpt-5.1-codex-mini") {
+        return Some(short_rates("gpt-5.1-codex-mini", 0.25, 0.025, 2.0));
+    }
+    if model.starts_with("gpt-5.1") {
+        return Some(short_rates("gpt-5.1-codex", 1.25, 0.125, 10.0));
+    }
+    if model.starts_with("gpt-5-mini") {
+        return Some(short_rates("gpt-5-mini", 0.25, 0.025, 2.0));
+    }
+    if model.starts_with("gpt-5-nano") {
+        return Some(short_rates("gpt-5-nano", 0.05, 0.005, 0.4));
+    }
+    let is_gpt5_snapshot = model
+        .strip_prefix("gpt-5-")
+        .and_then(|suffix| suffix.as_bytes().first())
+        .is_some_and(u8::is_ascii_digit);
+    let is_codex_snapshot = model
+        .strip_prefix("gpt-5-codex-")
+        .and_then(|suffix| suffix.as_bytes().first())
+        .is_some_and(u8::is_ascii_digit);
+    if model == "gpt-5-chat-latest" {
+        return Some(short_rates("gpt-5-chat-latest", 1.25, 0.125, 10.0));
+    }
+    if model == "gpt-5" || is_gpt5_snapshot {
+        return Some(short_rates("gpt-5", 1.25, 0.125, 10.0));
+    }
+    if model == "gpt-5-codex" || is_codex_snapshot {
+        return Some(short_rates("gpt-5-codex", 1.25, 0.125, 10.0));
+    }
+    if model == "codex-mini-latest" || model.starts_with("codex-mini-") {
+        return Some(short_rates("codex-mini-latest", 1.5, 0.375, 6.0));
+    }
+    if model == "chat-latest" || model.ends_with("chat-latest") {
+        return Some(short_rates("chat-latest", 5.0, 0.5, 30.0));
+    }
+
+    None
 }
 
 fn number_at_any(value: &serde_json::Value, keys: &[&str]) -> u64 {
@@ -476,4 +646,55 @@ fn json_u64(value: &serde_json::Value) -> Option<u64> {
         .as_u64()
         .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
         .or_else(|| value.as_f64().map(|number| number.max(0.0) as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_rate_card_covers_the_models_offered_by_the_app() {
+        let expected = [
+            ("gpt-5.6-sol", 5.0, 0.5, 30.0),
+            ("gpt-5.6-terra", 2.5, 0.25, 15.0),
+            ("gpt-5.6-luna", 1.0, 0.1, 6.0),
+            ("gpt-5.5", 5.0, 0.5, 30.0),
+            ("gpt-5.4", 2.5, 0.25, 15.0),
+            ("gpt-5.4-mini", 0.75, 0.075, 4.5),
+        ];
+
+        for (model, input, cached, output) in expected {
+            let rates = public_rates_for_model(model).expect("public rate");
+            assert_eq!(rates.input_per_million, input, "{model}");
+            assert_eq!(rates.cached_input_per_million, cached, "{model}");
+            assert_eq!(rates.output_per_million, output, "{model}");
+        }
+        assert!(public_rates_for_model("gpt-5.3-codex-spark").is_none());
+        assert!(public_rates_for_model("provider/model-without-public-rate").is_none());
+    }
+
+    #[test]
+    fn api_equivalent_subtracts_cached_tokens_from_full_price_input() {
+        // (600 * $5 + 400 * $0.50 + 100 * $30) / 1M
+        let cost = cost_for_usage("gpt-5.6-sol", 1_000, 400, 100);
+        assert!((cost - 0.0062).abs() < 1e-12);
+    }
+
+    #[test]
+    fn api_equivalent_applies_the_public_long_context_rate_per_request() {
+        // >272K input : (200K * $10 + 100K * $1 + 50K * $45) / 1M
+        let cost = cost_for_usage("gpt-5.6-sol", 300_000, 100_000, 50_000);
+        assert!((cost - 4.35).abs() < 1e-12);
+        assert!(usage_uses_long_context("gpt-5.6-sol", 300_000));
+        assert!(!usage_uses_long_context("gpt-5.6-sol", 272_000));
+    }
+
+    #[test]
+    fn legacy_codex_uses_its_own_public_rate_instead_of_a_generic_codex_rate() {
+        let rates = public_rates_for_model("gpt-5-codex").expect("public rate");
+        assert_eq!(rates.pricing_model, "gpt-5-codex");
+        assert_eq!(rates.input_per_million, 1.25);
+        assert_eq!(rates.cached_input_per_million, 0.125);
+        assert_eq!(rates.output_per_million, 10.0);
+    }
 }

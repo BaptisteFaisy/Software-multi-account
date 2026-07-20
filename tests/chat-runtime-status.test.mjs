@@ -3,7 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  chatMessageHasVisibleContent,
   chatMessagesEqual,
+  chatPartHasVisibleContent,
+  chatTextHasVisibleContent,
   chatTurnIsBusy,
   collapseRepeatedWaitParts,
   conversationWaitsForUser,
@@ -13,11 +16,37 @@ import {
   reconcileChatMessages,
   shouldAdoptActiveChatTurn,
 } from "../src/chat/runtime.ts";
-
 const view = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 const chatBackend = readFileSync(new URL("../src-tauri/src/chat.rs", import.meta.url), "utf8");
+
+test("les contenus sans glyphe visible ne creent plus de bulle vide", () => {
+  const invisible = " \n\t\u00a0\u200b\ufeff\u2800";
+
+  assert.equal(chatTextHasVisibleContent(invisible), false);
+  assert.equal(chatTextHasVisibleContent("..."), true, "la ponctuation reste un contenu volontaire");
+  assert.equal(
+    chatMessageHasVisibleContent({ role: "user", text: invisible, timestamp: 1 }),
+    false,
+  );
+  assert.equal(
+    chatMessageHasVisibleContent({
+      role: "assistant",
+      text: "",
+      timestamp: 2,
+      parts: [{ id: "empty", kind: "text", status: "complete", text: invisible }],
+    }),
+    false,
+  );
+  assert.equal(
+    chatPartHasVisibleContent({ id: "tool", kind: "tool", status: "running" }),
+    true,
+    "une carte d'outil sans texte reste informative",
+  );
+  assert.match(view, /if \(!visible\.length\) return "";/);
+  assert.match(view, /if \(!chatMessageHasVisibleContent\(message\)\) return;/);
+});
 
 test("un transcript en retard ne retire jamais le dernier message envoye", () => {
   const persisted = [

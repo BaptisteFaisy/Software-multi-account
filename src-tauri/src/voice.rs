@@ -260,7 +260,7 @@ fn default_language() -> String {
     "fr".to_string()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn process_voice_input(
     audio_base64: String,
     mime_type: Option<String>,
@@ -394,7 +394,7 @@ pub async fn process_voice_request(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn voice_runtime_status() -> Result<VoiceRuntimeStatus, String> {
     let voice_home = voice_home()?;
     let config = load_voice_config(&voice_home)?;

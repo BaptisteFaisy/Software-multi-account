@@ -1,4 +1,4 @@
-//! Abstraction multi-fournisseur (Codex / Claude Code).
+//! Abstraction multi-fournisseur (Codex / Claude Code / OpenCode).
 //!
 //! Centralise tout ce qui differe entre les CLI geres par l'app : variable
 //! d'environnement du "home" isole, presence de credentials, ecriture de la
@@ -15,6 +15,16 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Variables qui isolent integralement le store OpenCode d'un compte. OpenCode
+/// ajoute lui-meme le sous-dossier `opencode` dans chacun de ces emplacements.
+const OPENCODE_HOME_ENV: [&str; 5] = [
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "OPENCODE_CONFIG_DIR",
+];
+
 impl Provider {
     /// Variable d'environnement qui redirige le "home" isole du CLI (le
     /// mecanisme d'isolation multi-comptes). Codex=`CODEX_HOME`,
@@ -23,6 +33,32 @@ impl Provider {
         match self {
             Provider::Codex => "CODEX_HOME",
             Provider::Claude => "CLAUDE_CONFIG_DIR",
+            // Variable principale affichee dans les bannieres. Le lancement
+            // applique aussi toutes les autres variables avec `home_env`.
+            Provider::OpenCode => "XDG_DATA_HOME",
+        }
+    }
+
+    /// Environnement complet d'isolation du runtime pour un compte.
+    pub fn home_env(self, home: &Path) -> Vec<(&'static str, PathBuf)> {
+        match self {
+            Provider::Codex | Provider::Claude => {
+                vec![(self.home_env_var(), home.to_path_buf())]
+            }
+            Provider::OpenCode => OPENCODE_HOME_ENV
+                .into_iter()
+                .map(|key| {
+                    let suffix = match key {
+                        "XDG_DATA_HOME" => "data",
+                        "XDG_CACHE_HOME" => "cache",
+                        "XDG_CONFIG_HOME" => "config",
+                        "XDG_STATE_HOME" => "state",
+                        "OPENCODE_CONFIG_DIR" => "config/opencode",
+                        _ => unreachable!(),
+                    };
+                    (key, home.join(suffix))
+                })
+                .collect(),
         }
     }
 
@@ -31,6 +67,7 @@ impl Provider {
         match self {
             Provider::Codex => "--dangerously-bypass-approvals-and-sandbox",
             Provider::Claude => "--dangerously-skip-permissions",
+            Provider::OpenCode => "--auto",
         }
     }
 
@@ -39,6 +76,7 @@ impl Provider {
         match self {
             Provider::Codex => "gpt-5.6-sol",
             Provider::Claude => "sonnet",
+            Provider::OpenCode => "",
         }
     }
 
@@ -49,6 +87,7 @@ impl Provider {
         match self {
             Provider::Codex => home.join("sessions"),
             Provider::Claude => home.join("projects"),
+            Provider::OpenCode => home.join("data").join("opencode"),
         }
     }
 
@@ -58,6 +97,7 @@ impl Provider {
         match self {
             Provider::Codex => format!("{cli} resume {session_id}"),
             Provider::Claude => format!("{cli} --resume {session_id}"),
+            Provider::OpenCode => format!("{cli} --session {session_id}"),
         }
     }
 
@@ -71,14 +111,23 @@ impl Provider {
             Provider::Claude => {
                 name == ".claude" || name.starts_with(".claude-") || name.starts_with(".claude_")
             }
+            // Les homes OpenCode sont toujours crees explicitement par l'UI :
+            // ne jamais importer par hasard un dossier XDG utilisateur.
+            Provider::OpenCode => {
+                name.starts_with(".opencode-")
+                    || name.starts_with(".opencode_")
+                    || name.starts_with("opencode-")
+                    || name.starts_with("opencode_")
+            }
         }
     }
 
     /// Vrai si le compte possede des credentials exploitables dans `home`.
-    pub fn has_auth(self, home: &Path) -> bool {
+    pub fn has_auth(self, home: &Path, inference_provider: Option<&str>) -> bool {
         match self {
             Provider::Codex => codex_has_auth(home),
             Provider::Claude => claude_has_auth(home),
+            Provider::OpenCode => opencode_has_auth(home, inference_provider),
         }
     }
 
@@ -96,6 +145,7 @@ impl Provider {
                 settings::ensure_codex_account_config(home, bypass, model, reasoning_effort)
             }
             Provider::Claude => ensure_claude_account_config(home, bypass, model),
+            Provider::OpenCode => ensure_opencode_account_home(home),
         }
     }
 }
@@ -129,6 +179,37 @@ fn claude_has_auth(home: &Path) -> bool {
                 .map(|token| !token.is_empty())
         })
         .unwrap_or(false)
+}
+
+/// OpenCode : `<XDG_DATA_HOME>/opencode/auth.json` est un objet indexe par
+/// identifiant de provider. On ne lit jamais la cle elle-meme au-dela du test
+/// de presence et elle n'est jamais recopiee dans les reglages de l'app.
+fn opencode_has_auth(home: &Path, inference_provider: Option<&str>) -> bool {
+    let Some(provider) = inference_provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(entry) = read_json(&home.join("data").join("opencode").join("auth.json"))
+        .and_then(|value| value.get(provider).cloned())
+    else {
+        return false;
+    };
+    match entry {
+        Value::Object(object) => ["key", "access", "token"]
+            .into_iter()
+            .filter_map(|field| object.get(field).and_then(Value::as_str))
+            .any(|value| !value.trim().is_empty()),
+        _ => false,
+    }
+}
+
+fn ensure_opencode_account_home(home: &Path) -> io::Result<()> {
+    for directory in ["data", "cache", "config/opencode", "state"] {
+        fs::create_dir_all(home.join(directory))?;
+    }
+    Ok(())
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -245,6 +326,8 @@ mod tests {
             Provider::Claude.bypass_flag(),
             "--dangerously-skip-permissions"
         );
+        assert!(Provider::OpenCode.is_home_like_dir(".opencode-deepseek"));
+        assert!(Provider::OpenCode.is_home_like_dir("opencode-deepseek"));
     }
 
     #[test]
@@ -257,6 +340,10 @@ mod tests {
             Provider::Claude.resume_command("claude", "abc"),
             "claude --resume abc"
         );
+        assert_eq!(
+            Provider::OpenCode.resume_command("opencode", "ses_abc"),
+            "opencode --session ses_abc"
+        );
     }
 
     #[test]
@@ -264,6 +351,9 @@ mod tests {
         let home = Path::new("/home/x");
         assert!(Provider::Codex.sessions_root(home).ends_with("sessions"));
         assert!(Provider::Claude.sessions_root(home).ends_with("projects"));
+        assert!(Provider::OpenCode
+            .sessions_root(home)
+            .ends_with(Path::new("data/opencode")));
     }
 
     #[test]
@@ -281,25 +371,53 @@ mod tests {
     fn has_auth_reads_provider_specific_credential_files() {
         let home = scratch("auth");
 
-        assert!(!Provider::Codex.has_auth(&home));
-        assert!(!Provider::Claude.has_auth(&home));
+        assert!(!Provider::Codex.has_auth(&home, None));
+        assert!(!Provider::Claude.has_auth(&home, None));
 
         fs::write(
             home.join("auth.json"),
             "{\"tokens\":{\"access_token\":\"xyz\"}}",
         )
         .unwrap();
-        assert!(Provider::Codex.has_auth(&home));
+        assert!(Provider::Codex.has_auth(&home, None));
         // Un auth.json Codex ne vaut PAS une auth Claude.
-        assert!(!Provider::Claude.has_auth(&home));
+        assert!(!Provider::Claude.has_auth(&home, None));
 
         fs::write(
             home.join(".credentials.json"),
             "{\"claudeAiOauth\":{\"accessToken\":\"tok\"}}",
         )
         .unwrap();
-        assert!(Provider::Claude.has_auth(&home));
+        assert!(Provider::Claude.has_auth(&home, None));
 
+        let opencode_auth = home.join("data").join("opencode");
+        fs::create_dir_all(&opencode_auth).unwrap();
+        fs::write(
+            opencode_auth.join("auth.json"),
+            r#"{"deepseek":{"type":"api","key":"sk-test"},"zai-coding-plan":{"type":"oauth","access":"access-test"}}"#,
+        )
+        .unwrap();
+        assert!(Provider::OpenCode.has_auth(&home, Some("deepseek")));
+        assert!(Provider::OpenCode.has_auth(&home, Some("zai-coding-plan")));
+        assert!(!Provider::OpenCode.has_auth(&home, Some("openrouter")));
+        assert!(!Provider::OpenCode.has_auth(&home, None));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn opencode_home_is_fully_isolated_with_xdg_directories() {
+        let home = scratch("opencode-home");
+        Provider::OpenCode
+            .write_account_config(&home, true, Some("deepseek/deepseek-chat"), None)
+            .unwrap();
+        let environment = Provider::OpenCode.home_env(&home);
+        assert_eq!(environment.len(), 5);
+        for (key, path) in environment {
+            assert!(key.starts_with("XDG_") || key == "OPENCODE_CONFIG_DIR");
+            assert!(path.starts_with(&home));
+            assert!(path.is_dir());
+        }
         let _ = fs::remove_dir_all(&home);
     }
 

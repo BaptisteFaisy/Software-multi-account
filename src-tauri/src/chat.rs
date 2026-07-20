@@ -1,17 +1,23 @@
 //! Moteur de conversations sans terminal visible.
 //!
-//! Chaque message lance le provider en mode non interactif (`codex exec` ou
-//! `claude --print`). Les sessions restent celles des CLI : les JSONL existants
-//! continuent donc d'alimenter l'historique et le WebSocket de discussions.
+//! Chaque message lance le provider en mode non interactif (`codex exec`,
+//! `claude --print` ou `opencode run`). Les sessions restent celles des CLI.
 
 use crate::{
     chat_model_tools::{
-        ChatModelToolServerConfig, AUTONOMOUS_AGENT_TOOL_NAME, MCP_BEARER_ENV, MCP_SERVER_NAME,
+        ChatModelToolServerConfig, ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME,
+        APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME,
+        MCP_BEARER_ENV, MCP_SERVER_NAME, PAUSE_AUTONOMOUS_AGENT_TOOL_NAME,
+        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
     },
     chat_tools::{chat_skills_document, chat_tool_instructions, ChatAgentSkill, ChatAgentTool},
+    discussions::{self, DiscussionContextUsage},
     metrics,
+    runtime_sync::{RuntimeSync, RuntimeSyncTopic},
     settings::{self, AccountProfile, AppSettings, Provider},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -21,16 +27,21 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
+#[cfg(feature = "desktop")]
 use tauri::State;
 use uuid::Uuid;
 
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_CHAT_IMAGES: usize = 4;
+const MAX_CHAT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CHAT_IMAGE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+pub(crate) const MAX_CHAT_TURN_REQUEST_BYTES: usize = 28 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 24 * 1024;
 const MAX_ACTIVITIES: usize = 32;
 const MAX_THOUGHTS: usize = 32;
@@ -40,6 +51,8 @@ const MAX_PART_DETAIL_CHARS: usize = 12_000;
 const MAX_MODEL_CHARS: usize = 160;
 const MAX_RETAINED_TURNS: usize = 500;
 const PROVIDER_EXIT_GRACE: Duration = Duration::from_secs(2);
+const COMPACT_TIMEOUT: Duration = Duration::from_secs(180);
+const RESPONSE_QUALITY_INSTRUCTIONS: &str = "Avant toute réponse finale destinée à l'utilisateur, effectue une relecture silencieuse. Corrige les fautes de grammaire, de syntaxe, d'orthographe, d'accord et de ponctuation, puis vérifie que les phrases sont naturelles et non ambiguës dans la langue de l'utilisateur, sauf demande contraire. Pour le code, les commandes et les formats structurés, préserve les éléments littéraux et vérifie que la syntaxe ainsi que tous les délimiteurs et blocs sont complets. Ne modifie pas les citations ou les contenus demandés mot pour mot et ne mentionne pas cette relecture.";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -50,7 +63,16 @@ pub enum ChatTurnMode {
     Ask,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ChatFilesystemScope {
+    #[default]
+    Default,
+    /// Conserve le projet source en lecture seule pendant une review humaine,
+    /// mais autorise les captures temporaires sous `.codex-proof/`.
+    ReviewProofArtifacts,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatTurnStatus {
     Running,
@@ -60,7 +82,7 @@ pub enum ChatTurnStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatActivity {
     pub id: String,
@@ -70,7 +92,7 @@ pub struct ChatActivity {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatThought {
     pub id: String,
@@ -84,7 +106,7 @@ pub struct ChatThought {
 /// `reasoning`, `text` et `tool` partagent volontairement une seule liste :
 /// l'interface peut ainsi conserver l'ordre exact dans lequel le provider a
 /// raisonne, explique sa progression, appele un outil puis repris sa reponse.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatPart {
     pub id: String,
@@ -104,7 +126,7 @@ pub struct ChatPart {
     pub output: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatTurnSnapshot {
     pub id: u64,
@@ -117,6 +139,12 @@ pub struct ChatTurnSnapshot {
     pub activities: Vec<ChatActivity>,
     pub thoughts: Vec<ChatThought>,
     pub parts: Vec<ChatPart>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactChatSessionResult {
+    pub context_usage: Option<DiscussionContextUsage>,
 }
 
 /// Etat leger destine au polling global : la timeline complete reste sur
@@ -150,11 +178,21 @@ impl ChatAppConnector {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChatImageAttachmentRequest {
+    pub name: String,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StartChatTurnRequest {
     pub account_id: String,
     #[serde(default)]
     pub session_id: Option<String>,
     pub prompt: String,
+    #[serde(default)]
+    pub image_attachments: Vec<ChatImageAttachmentRequest>,
     #[serde(default)]
     pub project_dir: Option<String>,
     #[serde(default)]
@@ -183,8 +221,11 @@ pub struct StartChatTurnRequest {
 
 struct ChatTurn {
     snapshot: Mutex<ChatTurnSnapshot>,
+    archived_snapshot: Mutex<Option<Vec<u8>>>,
+    output_closed: AtomicBool,
     child: Mutex<Option<Child>>,
     provider_terminal: Mutex<Option<ProviderTerminalEvent>>,
+    runtime_sync: RuntimeSync,
 }
 
 struct TemporaryChatSkillsFile {
@@ -215,6 +256,101 @@ impl TemporaryChatSkillsFile {
 impl Drop for TemporaryChatSkillsFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct TemporaryChatImages {
+    paths: Vec<PathBuf>,
+}
+
+impl TemporaryChatImages {
+    fn create(turn_id: u64, attachments: &[ChatImageAttachmentRequest]) -> Result<Self, String> {
+        if attachments.len() > MAX_CHAT_IMAGES {
+            return Err(format!(
+                "Un message peut contenir au maximum {MAX_CHAT_IMAGES} images"
+            ));
+        }
+        let directory = env::temp_dir()
+            .join("codex-switch-terminal")
+            .join("chat-images");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("Preparation des images impossible : {error}"))?;
+        let mut images = Self { paths: Vec::new() };
+        let mut total_bytes = 0_usize;
+
+        for (index, attachment) in attachments.iter().enumerate() {
+            let label = attachment.name.trim();
+            if label.chars().count() > 160 || label.chars().any(char::is_control) {
+                return Err(format!("Nom de l'image {} invalide", index + 1));
+            }
+            let encoded = attachment.data_base64.trim();
+            let max_encoded_bytes = ((MAX_CHAT_IMAGE_BYTES + 2) / 3) * 4;
+            if encoded.is_empty() || encoded.len() > max_encoded_bytes {
+                return Err(format!("L'image {} depasse 8 Mo", index + 1));
+            }
+            let bytes = BASE64_STANDARD
+                .decode(encoded)
+                .map_err(|_| format!("Donnees de l'image {} invalides", index + 1))?;
+            if bytes.is_empty() || bytes.len() > MAX_CHAT_IMAGE_BYTES {
+                return Err(format!("L'image {} depasse 8 Mo", index + 1));
+            }
+            total_bytes = total_bytes.saturating_add(bytes.len());
+            if total_bytes > MAX_CHAT_IMAGE_TOTAL_BYTES {
+                return Err("Les images d'un message depassent 20 Mo au total".to_string());
+            }
+            let extension = validated_chat_image_extension(&attachment.mime_type, &bytes)
+                .ok_or_else(|| format!("Format de l'image {} invalide", index + 1))?;
+            let path = directory.join(format!(
+                "turn-{turn_id}-{}-{index}.{extension}",
+                Uuid::new_v4()
+            ));
+            std::fs::write(&path, bytes)
+                .map_err(|error| format!("Enregistrement de l'image impossible : {error}"))?;
+            images.paths.push(path);
+        }
+        Ok(images)
+    }
+
+    fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+
+    fn instructions(&self) -> Option<String> {
+        if self.paths.is_empty() {
+            return None;
+        }
+        let paths = self
+            .paths
+            .iter()
+            .map(|path| format!("- `{}`", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(format!(
+            "L'utilisateur a joint une ou plusieurs images a ce tour. Lis chaque fichier avec l'outil de lecture d'images avant de repondre :\n{paths}"
+        ))
+    }
+}
+
+impl Drop for TemporaryChatImages {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn validated_chat_image_extension(mime_type: &str, bytes: &[u8]) -> Option<&'static str> {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => Some("png"),
+        "image/jpeg" if bytes.starts_with(&[0xff, 0xd8, 0xff]) => Some("jpg"),
+        "image/webp"
+            if bytes.len() >= 12
+                && bytes.starts_with(b"RIFF")
+                && bytes.get(8..12) == Some(b"WEBP") =>
+        {
+            Some("webp")
+        }
+        _ => None,
     }
 }
 
@@ -277,11 +413,27 @@ impl Drop for ChatTurn {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ChatTurnManager {
     turns: Arc<Mutex<HashMap<u64, Arc<ChatTurn>>>>,
+    /// Proprietaire SaaS de chaque tour. Absent pour les executions desktop ou
+    /// administratives internes, qui ne sont jamais exposees a un autre compte.
+    owners: Arc<Mutex<HashMap<u64, String>>>,
     claims: Arc<Mutex<HashSet<String>>>,
     next_id: Arc<AtomicU64>,
+    runtime_sync: RuntimeSync,
+}
+
+impl Default for ChatTurnManager {
+    fn default() -> Self {
+        Self {
+            turns: Arc::new(Mutex::new(HashMap::new())),
+            owners: Arc::new(Mutex::new(HashMap::new())),
+            claims: Arc::new(Mutex::new(HashSet::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
+            runtime_sync: RuntimeSync::default(),
+        }
+    }
 }
 
 struct ChatClaim {
@@ -290,6 +442,57 @@ struct ChatClaim {
 }
 
 impl ChatTurnManager {
+    pub(crate) fn runtime_sync(&self) -> RuntimeSync {
+        self.runtime_sync.clone()
+    }
+
+    pub(crate) fn notify_autonomous_agents_changed(&self) {
+        self.runtime_sync.notify(RuntimeSyncTopic::AutonomousAgents);
+    }
+
+    pub(crate) fn assign_owner(&self, id: u64, owner_id: &str) -> Result<(), String> {
+        if !self
+            .turns
+            .lock()
+            .map_err(|_| "Etat des conversations verrouille".to_string())?
+            .contains_key(&id)
+        {
+            return Err("Tour de conversation introuvable".to_string());
+        }
+        self.owners
+            .lock()
+            .map_err(|_| "Proprietaires des conversations verrouilles".to_string())?
+            .insert(id, owner_id.to_string());
+        Ok(())
+    }
+
+    pub(crate) fn is_owned_by(&self, id: u64, owner_id: &str) -> Result<bool, String> {
+        Ok(self
+            .owners
+            .lock()
+            .map_err(|_| "Proprietaires des conversations verrouilles".to_string())?
+            .get(&id)
+            .is_some_and(|owner| owner == owner_id))
+    }
+
+    pub(crate) fn active_for_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<ActiveChatTurnSummary>, String> {
+        let visible = self
+            .owners
+            .lock()
+            .map_err(|_| "Proprietaires des conversations verrouilles".to_string())?
+            .iter()
+            .filter_map(|(id, owner)| (owner == owner_id).then_some(*id))
+            .collect::<HashSet<_>>();
+        Ok(self
+            .active()?
+            .into_iter()
+            .filter(|snapshot| visible.contains(&snapshot.id))
+            .collect())
+    }
+
     pub fn start(&self, request: StartChatTurnRequest) -> Result<ChatTurnSnapshot, String> {
         self.start_with_model_tools(request, None)
     }
@@ -299,19 +502,35 @@ impl ChatTurnManager {
         request: StartChatTurnRequest,
         model_tool_server: Option<ChatModelToolServerConfig>,
     ) -> Result<ChatTurnSnapshot, String> {
+        self.start_with_scope(request, model_tool_server, ChatFilesystemScope::Default)
+    }
+
+    pub(crate) fn start_review_planning(
+        &self,
+        request: StartChatTurnRequest,
+    ) -> Result<ChatTurnSnapshot, String> {
+        self.start_with_scope(request, None, ChatFilesystemScope::ReviewProofArtifacts)
+    }
+
+    fn start_with_scope(
+        &self,
+        request: StartChatTurnRequest,
+        model_tool_server: Option<ChatModelToolServerConfig>,
+        filesystem_scope: ChatFilesystemScope,
+    ) -> Result<ChatTurnSnapshot, String> {
         self.prune_finished_turns();
         let prompt = request.prompt.trim().to_string();
-        if prompt.is_empty() {
+        if prompt.is_empty() && request.image_attachments.is_empty() {
             return Err("Le message est vide".to_string());
         }
+        let prompt = if prompt.is_empty() {
+            "Image jointe.".to_string()
+        } else {
+            prompt
+        };
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err("Le message est trop volumineux".to_string());
         }
-        if let Some(session_id) = request.session_id.as_deref() {
-            Uuid::parse_str(session_id)
-                .map_err(|_| "Identifiant de conversation invalide".to_string())?;
-        }
-
         let app_settings = settings::load_settings_for_terminal()?;
         let account = app_settings
             .accounts
@@ -319,6 +538,9 @@ impl ChatTurnManager {
             .find(|candidate| candidate.id == request.account_id)
             .cloned()
             .ok_or_else(|| "Compte introuvable".to_string())?;
+        if let Some(session_id) = request.session_id.as_deref() {
+            validate_session_id(account.provider, session_id)?;
+        }
         if !settings::account_has_auth_tokens(&account) {
             return Err(format!(
                 "Compte non authentifie : {}. Ouvre un terminal de connexion pour ce compte avant de lancer un chat.",
@@ -334,10 +556,19 @@ impl ChatTurnManager {
 
         let claim = self.reserve_turn(&request)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let image_files = TemporaryChatImages::create(id, &request.image_attachments)?;
 
         let canonical_home = settings::expand_home(&account.codex_home)?;
         std::fs::create_dir_all(&canonical_home).map_err(|error| error.to_string())?;
         let project_dir = resolve_project_dir(&account, request.project_dir.as_deref())?;
+        let proof_workspace =
+            review_proof_workspace(account.provider, project_dir.as_deref(), filesystem_scope)?;
+        let execution_dir = proof_workspace.as_deref().or(project_dir.as_deref());
+        let effective_filesystem_scope = if proof_workspace.is_some() {
+            filesystem_scope
+        } else {
+            ChatFilesystemScope::Default
+        };
         account
             .provider
             .write_account_config(
@@ -352,6 +583,11 @@ impl ChatTurnManager {
             .as_deref()
             .and_then(|path| settings::workspace_memory_for_path(&app_settings, path))
             .map(environment_memory_instructions);
+        let image_instructions = if account.provider == Provider::Codex {
+            None
+        } else {
+            image_files.instructions()
+        };
         let tool_instructions = chat_tool_instructions(
             &request.agent_tools,
             request.question_tool,
@@ -381,8 +617,21 @@ impl ChatTurnManager {
             selected_agent_instructions.as_deref(),
         );
         let turn_instructions = merge_turn_instructions(
+            Some(RESPONSE_QUALITY_INSTRUCTIONS),
             environment_instructions.as_deref(),
-            agent_instructions.as_deref(),
+        );
+        let turn_instructions =
+            merge_turn_instructions(turn_instructions.as_deref(), agent_instructions.as_deref());
+        let turn_instructions =
+            merge_turn_instructions(turn_instructions.as_deref(), image_instructions.as_deref());
+        let proof_workspace_instructions = proof_workspace.as_deref().and_then(|proof_dir| {
+            project_dir
+                .as_deref()
+                .map(|project_dir| review_proof_workspace_instructions(project_dir, proof_dir))
+        });
+        let turn_instructions = merge_turn_instructions(
+            turn_instructions.as_deref(),
+            proof_workspace_instructions.as_deref(),
         );
         let provider_instructions = turn_instructions.as_deref().map(|instructions| {
             if account.provider == Provider::Codex {
@@ -392,20 +641,18 @@ impl ChatTurnManager {
             }
         });
 
-        let program = resolve_provider_program(
+        let mut command = resolved_provider_command(
             &settings::command_for_provider(&app_settings, account.provider),
             account.provider,
         )?;
-        let mut command = Command::new(&program.executable);
         configure_environment(
             &mut command,
             &app_settings,
             &account,
             &canonical_home,
-            project_dir.as_deref(),
+            execution_dir,
         );
-        configure_resolved_program_environment(&mut command, &program);
-        configure_provider_command(
+        configure_provider_command_with_images_and_scope(
             &mut command,
             &account,
             request.session_id.as_deref(),
@@ -417,6 +664,8 @@ impl ChatTurnManager {
             provider_instructions.as_deref(),
             model_tool_server.as_ref(),
             model_tool_file.as_ref().map(|file| file.path.as_path()),
+            image_files.paths(),
+            effective_filesystem_scope,
         );
         command
             .stdin(Stdio::piped())
@@ -452,8 +701,11 @@ impl ChatTurnManager {
         };
         let turn = Arc::new(ChatTurn {
             snapshot: Mutex::new(snapshot.clone()),
+            archived_snapshot: Mutex::new(None),
+            output_closed: AtomicBool::new(false),
             child: Mutex::new(None),
             provider_terminal: Mutex::new(None),
+            runtime_sync: self.runtime_sync.clone(),
         });
 
         let mut child = match command.spawn() {
@@ -477,8 +729,21 @@ impl ChatTurnManager {
             .map_err(|_| "Etat des conversations verrouillé".to_string())?
             .insert(id, turn.clone());
         claim.commit();
+        self.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
 
         if let Some(mut writer) = stdin.take() {
+            let prompt = if account.provider == Provider::OpenCode {
+                provider_instructions
+                    .as_deref()
+                    .map(|instructions| {
+                        format!(
+                            "Instructions de ce tour :\n{instructions}\n\nDemande utilisateur :\n{prompt}"
+                        )
+                    })
+                    .unwrap_or(prompt)
+            } else {
+                prompt
+            };
             if let Err(error) = writer
                 .write_all(prompt.as_bytes())
                 .and_then(|_| writer.write_all(b"\n"))
@@ -496,6 +761,8 @@ impl ChatTurnManager {
                     apply_provider_event(&output_turn, provider, &line);
                 }
             }
+            output_turn.output_closed.store(true, Ordering::Release);
+            archive_finished_snapshot(&output_turn);
         });
 
         let error_buffer = Arc::new(Mutex::new(String::new()));
@@ -518,6 +785,7 @@ impl ChatTurnManager {
             // automatiquement supprimé, succès, erreur ou annulation compris.
             let _skill_file = skill_file;
             let _model_tool_file = model_tool_file;
+            let _image_files = image_files;
             let exit = wait_for_child(&supervisor_turn);
             // Un evenement terminal est la derniere sortie utile du provider.
             // Ne pas attendre indefiniment la fermeture de pipes herites par un
@@ -558,9 +826,40 @@ impl ChatTurnManager {
         let snapshot = turn
             .snapshot
             .lock()
-            .map_err(|_| "Etat du tour verrouillé".to_string())?
-            .clone();
-        Ok(snapshot)
+            .map_err(|_| "Etat du tour verrouillé".to_string())?;
+        let archived = turn
+            .archived_snapshot
+            .lock()
+            .map_err(|_| "Archive du tour verrouillée".to_string())?;
+        if let Some(compressed) = archived.as_deref() {
+            decode_archived_snapshot(compressed)
+        } else {
+            Ok(snapshot.clone())
+        }
+    }
+
+    /// Nombre de tours visibles qui consomment actuellement une place sur le
+    /// noeud. Cette valeur alimente le repartiteur multi-VPS.
+    pub fn active_count(&self) -> usize {
+        self.turns
+            .lock()
+            .map(|turns| {
+                turns
+                    .values()
+                    .filter(|turn| {
+                        turn.snapshot
+                            .lock()
+                            .map(|snapshot| {
+                                matches!(
+                                    snapshot.status,
+                                    ChatTurnStatus::Running | ChatTurnStatus::Finalizing
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     pub fn active(&self) -> Result<Vec<ActiveChatTurnSummary>, String> {
@@ -592,6 +891,32 @@ impl ChatTurnManager {
         Ok(snapshots)
     }
 
+    /// Indique si une session fournisseur est encore occupée par un tour.
+    /// Les moteurs autonomes l'utilisent pour différer leur reprise sans
+    /// interrompre la réponse visible ni lancer deux commandes concurrentes.
+    pub(crate) fn session_is_busy(
+        &self,
+        account_id: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        let turns = self
+            .turns
+            .lock()
+            .map_err(|_| "Etat des conversations verrouillé".to_string())?;
+        Ok(turns.values().any(|turn| {
+            turn.snapshot
+                .lock()
+                .map(|snapshot| {
+                    matches!(
+                        snapshot.status,
+                        ChatTurnStatus::Running | ChatTurnStatus::Finalizing
+                    ) && snapshot.account_id == account_id
+                        && snapshot.session_id.as_deref() == Some(session_id)
+                })
+                .unwrap_or(false)
+        }))
+    }
+
     pub fn stop(&self, id: u64) -> Result<ChatTurnSnapshot, String> {
         let turn = self
             .turns
@@ -601,7 +926,9 @@ impl ChatTurnManager {
             .cloned()
             .ok_or_else(|| "Tour de conversation introuvable".to_string())?;
 
+        let mut active_catalog_changed = false;
         if let Ok(mut snapshot) = turn.snapshot.lock() {
+            let before = active_turn_signal_state(&snapshot);
             if snapshot.status == ChatTurnStatus::Running {
                 snapshot.status = ChatTurnStatus::Cancelled;
                 snapshot.finished_at = Some(metrics::now_ts());
@@ -610,6 +937,10 @@ impl ChatTurnManager {
                 complete_running_thoughts(&mut snapshot, "cancelled");
                 complete_running_parts(&mut snapshot, "cancelled");
             }
+            active_catalog_changed = before != active_turn_signal_state(&snapshot);
+        }
+        if active_catalog_changed {
+            self.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
         }
         if let Ok(mut child) = turn.child.lock() {
             if let Some(child) = child.as_mut() {
@@ -618,6 +949,41 @@ impl ChatTurnManager {
             }
         }
         self.status(id)
+    }
+
+    pub fn compact(
+        &self,
+        account_id: String,
+        session_id: String,
+    ) -> Result<CompactChatSessionResult, String> {
+        let app_settings = settings::load_settings_for_terminal()?;
+        let account = app_settings
+            .accounts
+            .iter()
+            .find(|candidate| candidate.id == account_id)
+            .cloned()
+            .ok_or_else(|| "Compte introuvable".to_string())?;
+        if account.provider != Provider::Codex {
+            return Err("La commande /compact est disponible uniquement avec Codex".to_string());
+        }
+        validate_session_id(account.provider, &session_id)?;
+        if !settings::account_has_auth_tokens(&account) {
+            return Err(format!(
+                "Compte non authentifie : {}. Reconnecte ce compte avant de compacter.",
+                account.label
+            ));
+        }
+
+        // Conserve la reservation pendant tout le tour de compaction. Un
+        // message normal visant la meme session est ainsi refuse proprement.
+        let _claim = self.reserve_session(&account_id, &session_id)?;
+        let context_usage =
+            run_codex_compaction(&app_settings, &account, &session_id)?.or_else(|| {
+                discussions::context_usage_for_account(&account_id, &session_id)
+                    .ok()
+                    .flatten()
+            });
+        Ok(CompactChatSessionResult { context_usage })
     }
 
     fn reserve_turn(&self, request: &StartChatTurnRequest) -> Result<ChatClaim, String> {
@@ -630,7 +996,11 @@ impl ChatTurnManager {
                 key: None,
             });
         };
-        let key = format!("{}\0{session_id}", request.account_id);
+        self.reserve_session(&request.account_id, session_id)
+    }
+
+    fn reserve_session(&self, account_id: &str, session_id: &str) -> Result<ChatClaim, String> {
+        let key = format!("{account_id}\0{session_id}");
         let mut claims = self
             .claims
             .lock()
@@ -638,23 +1008,7 @@ impl ChatTurnManager {
         if claims.contains(&key) {
             return Err("Une réponse est déjà en cours dans cette conversation".to_string());
         }
-        let turns = self
-            .turns
-            .lock()
-            .map_err(|_| "Etat des conversations verrouillé".to_string())?;
-        let duplicate = turns.values().any(|turn| {
-            turn.snapshot
-                .lock()
-                .map(|snapshot| {
-                    matches!(
-                        snapshot.status,
-                        ChatTurnStatus::Running | ChatTurnStatus::Finalizing
-                    ) && snapshot.account_id == request.account_id
-                        && snapshot.session_id == request.session_id
-                })
-                .unwrap_or(false)
-        });
-        if duplicate {
+        if self.session_is_busy(account_id, session_id)? {
             Err("Une réponse est déjà en cours dans cette conversation".to_string())
         } else {
             claims.insert(key.clone());
@@ -685,6 +1039,9 @@ impl ChatTurnManager {
         let remove = turns.len().saturating_sub(MAX_RETAINED_TURNS);
         for (id, _) in finished.into_iter().take(remove) {
             turns.remove(&id);
+            if let Ok(mut owners) = self.owners.lock() {
+                owners.remove(&id);
+            }
         }
     }
 }
@@ -706,12 +1063,14 @@ impl Drop for ChatClaim {
     }
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn start_chat_turn(
     state: State<'_, ChatTurnManager>,
     account_id: String,
     session_id: Option<String>,
     prompt: String,
+    image_attachments: Option<Vec<ChatImageAttachmentRequest>>,
     project_dir: Option<String>,
     mode: Option<ChatTurnMode>,
     model: Option<String>,
@@ -726,6 +1085,7 @@ pub fn start_chat_turn(
         account_id,
         session_id,
         prompt,
+        image_attachments: image_attachments.unwrap_or_default(),
         project_dir,
         mode: mode.unwrap_or_default(),
         model,
@@ -740,6 +1100,7 @@ pub fn start_chat_turn(
     })
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn chat_turn_status(
     state: State<'_, ChatTurnManager>,
@@ -748,6 +1109,7 @@ pub fn chat_turn_status(
     state.status(id)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn list_active_chat_turns(
     state: State<'_, ChatTurnManager>,
@@ -755,6 +1117,7 @@ pub fn list_active_chat_turns(
     state.active()
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn stop_chat_turn(
     state: State<'_, ChatTurnManager>,
@@ -763,6 +1126,245 @@ pub fn stop_chat_turn(
     state.stop(id)
 }
 
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn compact_chat_session(
+    state: State<'_, ChatTurnManager>,
+    account_id: String,
+    session_id: String,
+) -> Result<CompactChatSessionResult, String> {
+    let manager = state.inner().clone();
+    tokio::task::spawn_blocking(move || manager.compact(account_id, session_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn run_codex_compaction(
+    app_settings: &AppSettings,
+    account: &AccountProfile,
+    session_id: &str,
+) -> Result<Option<DiscussionContextUsage>, String> {
+    let canonical_home = settings::expand_home(&account.codex_home)?;
+    let mut command = settings::codex_app_server_command(app_settings);
+    configure_environment(&mut command, app_settings, account, &canonical_home, None);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_process_window(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Impossible de lancer codex app-server : {error}"))?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = terminate_chat_process_tree(&mut child);
+        return Err("Entree de codex app-server indisponible".to_string());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = terminate_chat_process_tree(&mut child);
+        return Err("Sortie de codex app-server indisponible".to_string());
+    };
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = (|| -> Result<(Option<DiscussionContextUsage>, String), String> {
+        let initialize_request = json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "codex_switch_terminal",
+                    "title": "Codex Switch Terminal",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": { "experimentalApi": true }
+            }
+        });
+        writeln!(stdin, "{initialize_request}")
+            .and_then(|_| stdin.flush())
+            .map_err(|error| format!("Initialisation de /compact impossible : {error}"))?;
+
+        let deadline = Instant::now() + COMPACT_TIMEOUT;
+        let initialize_response = loop {
+            let value = receive_app_server_value(&rx, deadline)?;
+            if value.get("id").and_then(Value::as_i64) == Some(1) {
+                break value;
+            }
+        };
+        if initialize_response.get("error").is_some() {
+            return Err(app_server_error_message(
+                &initialize_response,
+                "Initialisation de codex app-server impossible",
+            ));
+        }
+
+        for request in [
+            json!({ "method": "initialized", "params": {} }),
+            json!({
+                "method": "thread/resume",
+                "id": 2,
+                "params": {
+                    "threadId": session_id,
+                    "excludeTurns": true
+                }
+            }),
+        ] {
+            writeln!(stdin, "{request}")
+                .map_err(|error| format!("Envoi de /compact impossible : {error}"))?;
+        }
+        stdin
+            .flush()
+            .map_err(|error| format!("Envoi de /compact impossible : {error}"))?;
+
+        let resume_response = loop {
+            let value = receive_app_server_value(&rx, deadline)?;
+            if value.get("id").and_then(Value::as_i64) == Some(2) {
+                break value;
+            }
+        };
+        if resume_response.get("error").is_some() {
+            return Err(app_server_error_message(
+                &resume_response,
+                "Impossible de reprendre cette conversation",
+            ));
+        }
+        let resumed_thread_id = resume_response
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(session_id)
+            .to_string();
+
+        let compact_request = json!({
+            "method": "thread/compact/start",
+            "id": 3,
+            "params": { "threadId": resumed_thread_id }
+        });
+        writeln!(stdin, "{compact_request}")
+            .and_then(|_| stdin.flush())
+            .map_err(|error| format!("Envoi de /compact impossible : {error}"))?;
+
+        let mut accepted = false;
+        let mut completed = false;
+        let mut latest_usage = None;
+        while !accepted || !completed {
+            let value = receive_app_server_value(&rx, deadline)?;
+            if value.get("id").and_then(Value::as_i64) == Some(3) {
+                if value.get("error").is_some() {
+                    return Err(app_server_error_message(
+                        &value,
+                        "La compaction Codex a ete refusee",
+                    ));
+                }
+                accepted = true;
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) == Some("thread/tokenUsage/updated")
+                && value.pointer("/params/threadId").and_then(Value::as_str)
+                    == Some(resumed_thread_id.as_str())
+            {
+                if let Some(usage) = context_usage_from_app_server_notification(&value) {
+                    latest_usage = Some(usage);
+                }
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) != Some("turn/completed")
+                || value.pointer("/params/threadId").and_then(Value::as_str)
+                    != Some(resumed_thread_id.as_str())
+            {
+                continue;
+            }
+            match value
+                .pointer("/params/turn/status")
+                .and_then(Value::as_str)
+                .unwrap_or("failed")
+            {
+                "completed" => completed = true,
+                "interrupted" => return Err("La compaction a ete interrompue".to_string()),
+                _ => {
+                    return Err(value
+                        .pointer("/params/turn/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("La compaction Codex a echoue")
+                        .to_string())
+                }
+            }
+        }
+        Ok((latest_usage, resumed_thread_id))
+    })();
+
+    drop(stdin);
+    let _ = terminate_chat_process_tree(&mut child);
+    let _ = child.wait();
+
+    result.map(|(usage, resumed_thread_id)| {
+        usage.or_else(|| {
+            discussions::context_usage_for_account(&account.id, &resumed_thread_id)
+                .ok()
+                .flatten()
+        })
+    })
+}
+
+fn receive_app_server_value(
+    rx: &mpsc::Receiver<String>,
+    deadline: Instant,
+) -> Result<Value, String> {
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("La compaction Codex a depasse 3 minutes".to_string());
+        };
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    return Ok(value);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err("La compaction Codex a depasse 3 minutes".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("codex app-server s'est arrete pendant la compaction".to_string())
+            }
+        }
+    }
+}
+
+fn app_server_error_message(value: &Value, fallback: &str) -> String {
+    value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(fallback)
+        .chars()
+        .take(1200)
+        .collect()
+}
+
+fn context_usage_from_app_server_notification(value: &Value) -> Option<DiscussionContextUsage> {
+    let used_tokens = value
+        .pointer("/params/tokenUsage/last/totalTokens")
+        .and_then(nonnegative_json_u64)?;
+    let context_window = value
+        .pointer("/params/tokenUsage/modelContextWindow")
+        .and_then(nonnegative_json_u64)?;
+    DiscussionContextUsage::from_counts(used_tokens, context_window)
+}
+
+fn nonnegative_json_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+        .or_else(|| value.as_f64().map(|number| number.max(0.0) as u64))
+}
+
+#[cfg(test)]
 fn configure_provider_command(
     command: &mut Command,
     account: &AccountProfile,
@@ -775,6 +1377,68 @@ fn configure_provider_command(
     environment_instructions: Option<&str>,
     model_tool_server: Option<&ChatModelToolServerConfig>,
     model_tool_config_path: Option<&Path>,
+) {
+    configure_provider_command_with_images(
+        command,
+        account,
+        session_id,
+        mode,
+        model,
+        reasoning_effort,
+        app_connectors,
+        app_write_approved,
+        environment_instructions,
+        model_tool_server,
+        model_tool_config_path,
+        &[],
+    );
+}
+
+fn configure_provider_command_with_images(
+    command: &mut Command,
+    account: &AccountProfile,
+    session_id: Option<&str>,
+    mode: ChatTurnMode,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    app_connectors: Option<&[ChatAppConnector]>,
+    app_write_approved: bool,
+    environment_instructions: Option<&str>,
+    model_tool_server: Option<&ChatModelToolServerConfig>,
+    model_tool_config_path: Option<&Path>,
+    image_paths: &[PathBuf],
+) {
+    configure_provider_command_with_images_and_scope(
+        command,
+        account,
+        session_id,
+        mode,
+        model,
+        reasoning_effort,
+        app_connectors,
+        app_write_approved,
+        environment_instructions,
+        model_tool_server,
+        model_tool_config_path,
+        image_paths,
+        ChatFilesystemScope::Default,
+    );
+}
+
+fn configure_provider_command_with_images_and_scope(
+    command: &mut Command,
+    account: &AccountProfile,
+    session_id: Option<&str>,
+    mode: ChatTurnMode,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    app_connectors: Option<&[ChatAppConnector]>,
+    app_write_approved: bool,
+    environment_instructions: Option<&str>,
+    model_tool_server: Option<&ChatModelToolServerConfig>,
+    model_tool_config_path: Option<&Path>,
+    image_paths: &[PathBuf],
+    filesystem_scope: ChatFilesystemScope,
 ) {
     match account.provider {
         Provider::Codex => {
@@ -798,7 +1462,20 @@ fn configure_provider_command(
             // Le bypass global court-circuiterait aussi les demandes
             // d'approbation des apps. Un agent avec connecteurs conserve donc
             // le sandbox normal, meme si le compte autorise le bypass ailleurs.
-            if matches!(mode, ChatTurnMode::Plan | ChatTurnMode::Ask) {
+            if filesystem_scope == ChatFilesystemScope::ReviewProofArtifacts {
+                // Le cwd est `.codex-proof/` pour ce tour. `workspace-write`
+                // autorise donc la capture sans rendre le projet parent
+                // modifiable, meme si le compte utilise normalement le bypass.
+                command
+                    .arg("-C")
+                    .arg(".")
+                    .arg("-c")
+                    .arg("sandbox_mode=\"workspace-write\"")
+                    .arg("-c")
+                    .arg("approval_policy=\"never\"")
+                    .arg("-c")
+                    .arg("sandbox_workspace_write.network_access=false");
+            } else if matches!(mode, ChatTurnMode::Plan | ChatTurnMode::Ask) {
                 command.arg("-c").arg("sandbox_mode=\"read-only\"");
             } else if account.bypass
                 && app_connectors.is_none_or(|connectors| connectors.is_empty())
@@ -819,6 +1496,9 @@ fn configure_provider_command(
                     serde_json::to_string(instructions)
                         .expect("une chaine Rust est toujours serialisable en JSON")
                 ));
+            }
+            for path in image_paths {
+                command.arg("--image").arg(path);
             }
             if let Some(session_id) = session_id {
                 command.arg(session_id);
@@ -857,8 +1537,28 @@ fn configure_provider_command(
                     .arg(path)
                     .arg("--allowedTools")
                     .arg(format!(
-                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME}"
+                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CHAT_TOOL_NAME}"
                     ));
+            }
+        }
+        Provider::OpenCode => {
+            command
+                .arg("run")
+                .arg("--format")
+                .arg("json")
+                .arg("--thinking");
+            if let Some(session_id) = session_id {
+                command.arg("--session").arg(session_id);
+            }
+            command.arg("--agent").arg(match mode {
+                ChatTurnMode::Plan | ChatTurnMode::Ask => "plan",
+                ChatTurnMode::Build => "build",
+            });
+            if matches!(mode, ChatTurnMode::Build) && account.bypass {
+                command.arg(account.provider.bypass_flag());
+            }
+            if let Some(model) = model {
+                command.arg("--model").arg(model);
             }
         }
     }
@@ -875,13 +1575,28 @@ fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelTo
     for value in [
         format!("{prefix}.url={url}"),
         format!("{prefix}.bearer_token_env_var=\"{MCP_BEARER_ENV}\""),
-        format!("{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\"]"),
+        format!(
+            "{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\",\"{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}\",\"{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}\",\"{CREATE_CHAT_TOOL_NAME}\"]"
+        ),
         format!("{prefix}.enabled=true"),
         format!("{prefix}.required=true"),
         format!("{prefix}.startup_timeout_sec=5"),
         format!("{prefix}.tool_timeout_sec=30"),
         format!("{prefix}.default_tools_approval_mode=\"approve\""),
         format!("{prefix}.tools.{AUTONOMOUS_AGENT_TOOL_NAME}.approval_mode=\"approve\""),
+        format!(
+            "{prefix}.tools.{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}.approval_mode=\"approve\""
+        ),
+        format!(
+            "{prefix}.tools.{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}.approval_mode=\"approve\""
+        ),
+        format!(
+            "{prefix}.tools.{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}.approval_mode=\"approve\""
+        ),
+        format!(
+            "{prefix}.tools.{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}.approval_mode=\"approve\""
+        ),
+        format!("{prefix}.tools.{CREATE_CHAT_TOOL_NAME}.approval_mode=\"approve\""),
     ] {
         command.arg("-c").arg(value);
     }
@@ -941,7 +1656,7 @@ Utilise-la comme contexte durable dans cette conversation. Une demande explicite
 }
 
 fn autonomous_agent_tool_instructions() -> &'static str {
-    "Capacite native Codex Switch Terminal : l'outil MCP `create_autonomous_agent` cree et demarre un agent autonome persistant, automatiquement lie a ce chat. Quand l'utilisateur demande explicitement de creer, lancer, demarrer ou rendre autonome un agent, utilise cet outil directement avec un objectif precis. Deduis les reglages non critiques et conserve les garde-fous par defaut au lieu de renvoyer l'utilisateur vers un formulaire. N'appelle pas l'outil pour une question theorique sur les agents. Ne pretends jamais qu'un agent a ete cree si l'appel n'a pas reussi."
+    "Capacite native Codex Switch Terminal : six outils MCP permettent d'ouvrir un autre chat et de piloter les agents autonomes depuis un chat normal. Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle `create_chat` avec son message initial. Le nouveau chat herite du compte, du modele, de l'effort de raisonnement et de l'environnement courants ; un seul chat peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer, demarrer ou rendre autonome un nouvel agent, appelle `create_autonomous_agent` avec un objectif precis. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle `pause_autonomous_agent` sans demander d'identifiant ; cette pause arrete le cycle courant et empeche toute nouvelle planification jusqu'a une reprise explicite depuis l'interface. Quand il demande explicitement de modifier l'agent autonome lie a ce chat (nom, objectif, role, mode, frequence, validation humaine ou tests), appelle `update_autonomous_agent` avec uniquement les champs a changer. Quand il demande explicitement au superviseur d'activer, produire ou relancer le compte rendu general qui compile les rapports non lus par priorite, appelle `activate_supervisor_general_report` sans demander d'identifiant ; cet outil fonctionne depuis n'importe quel chat. Quand il demande explicitement d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle `apply_autonomous_agent_policy` avec une instruction precise et verifiable ; cet outil ne depend pas de la cle du chat, reste limite au compte courant et cible par defaut uniquement le projet courant. Utilise la portee `account` seulement si l'utilisateur vise explicitement tous ses projets. Pour une politique de validation visuelle, passe `requireVisualEvidence: true`, exige une capture ou maquette fidele avant autorisation, une capture du rendu reel apres implementation et une comparaison explicite avec correction des ecarts significatifs. Pour une politique non visuelle, passe `requireVisualEvidence: false`. Ne demande jamais d'identifiant d'agent. Deduis les reglages non critiques et conserve les objectifs, roles, frequences et garde-fous existants. N'appelle pas ces outils pour une question theorique. Ne pretends jamais qu'une creation, une modification ou une mise en pause a reussi si l'appel correspondant n'a pas reussi."
 }
 
 fn merge_turn_instructions(
@@ -1017,6 +1732,24 @@ fn selected_reasoning_effort(
     Ok(Some(value.to_string()))
 }
 
+fn validate_session_id(provider: Provider, session_id: &str) -> Result<(), String> {
+    let valid = match provider {
+        Provider::Codex | Provider::Claude => Uuid::parse_str(session_id).is_ok(),
+        Provider::OpenCode => {
+            let len = session_id.chars().count();
+            (1..=160).contains(&len)
+                && session_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err("Identifiant de conversation invalide".to_string())
+    }
+}
+
 fn configure_environment(
     command: &mut Command,
     settings: &AppSettings,
@@ -1024,10 +1757,9 @@ fn configure_environment(
     account_home: &Path,
     project_dir: Option<&Path>,
 ) {
-    command.env(
-        account.provider.home_env_var(),
-        account_home.to_string_lossy().to_string(),
-    );
+    for (key, value) in account.provider.home_env(account_home) {
+        command.env(key, value);
+    }
     command.env("NO_COLOR", "1");
     if let Some(project_dir) = project_dir {
         command.current_dir(project_dir);
@@ -1078,6 +1810,40 @@ fn resolve_project_dir(
     Ok(Some(path))
 }
 
+fn review_proof_workspace(
+    provider: Provider,
+    project_dir: Option<&Path>,
+    filesystem_scope: ChatFilesystemScope,
+) -> Result<Option<PathBuf>, String> {
+    if filesystem_scope != ChatFilesystemScope::ReviewProofArtifacts || provider != Provider::Codex
+    {
+        return Ok(None);
+    }
+    let project_dir = project_dir.ok_or_else(|| {
+        "Un dossier projet est requis pour produire une preuve visuelle de review".to_string()
+    })?;
+    let project_root = std::fs::canonicalize(project_dir)
+        .map_err(|error| format!("Dossier projet de la review inaccessible : {error}"))?;
+    let candidate = project_root.join(".codex-proof");
+    std::fs::create_dir_all(&candidate)
+        .map_err(|error| format!("Preparation de `.codex-proof` impossible : {error}"))?;
+    let proof_root = std::fs::canonicalize(&candidate)
+        .map_err(|error| format!("Dossier `.codex-proof` inaccessible : {error}"))?;
+    if proof_root == project_root || !proof_root.starts_with(&project_root) || !proof_root.is_dir()
+    {
+        return Err("Le dossier `.codex-proof` sort du projet autorise".to_string());
+    }
+    Ok(Some(proof_root))
+}
+
+fn review_proof_workspace_instructions(project_root: &Path, proof_root: &Path) -> String {
+    format!(
+        "BAC A SABLE DE PREUVE DE REVIEW : le projet source a inspecter est `{}` et reste en lecture seule pendant ce tour. Le repertoire de travail `{}` est l'unique zone du projet dans laquelle les commandes peuvent ecrire. Enregistre les captures ou maquettes directement dans ce repertoire (ou l'un de ses sous-dossiers), sans tenter de modifier le parent. Dans AUTONOMOUS_REVIEW_EVIDENCE, exprime toujours le chemin relativement au projet sous la forme `.codex-proof/<fichier>`, meme si la commande de capture utilise seulement `<fichier>` depuis le repertoire courant.",
+        project_root.display(),
+        proof_root.display(),
+    )
+}
+
 struct ResolvedProviderProgram {
     executable: PathBuf,
     managed_codex_package_root: Option<PathBuf>,
@@ -1087,7 +1853,15 @@ fn resolve_provider_program(
     raw: &str,
     provider: Provider,
 ) -> Result<ResolvedProviderProgram, String> {
-    let wrapper = resolve_cli_program(raw)?;
+    let wrapper = resolve_cli_program(raw).map_err(|error| {
+        if provider == Provider::OpenCode {
+            format!(
+                "{error}. Installe OpenCode (`npm install -g opencode-ai`) puis redemarre l'application"
+            )
+        } else {
+            error
+        }
+    })?;
     if provider == Provider::Codex {
         if let Some((executable, package_root)) = resolve_native_npm_codex(&wrapper) {
             return Ok(ResolvedProviderProgram {
@@ -1096,10 +1870,28 @@ fn resolve_provider_program(
             });
         }
     }
+    if provider == Provider::OpenCode {
+        if let Some(executable) = resolve_native_npm_opencode(&wrapper) {
+            return Ok(ResolvedProviderProgram {
+                executable,
+                managed_codex_package_root: None,
+            });
+        }
+    }
     Ok(ResolvedProviderProgram {
         executable: wrapper,
         managed_codex_package_root: None,
     })
+}
+
+/// Construit une commande directement executable pour un provider. Cette
+/// entree est partagee avec l'index de discussions OpenCode afin qu'un shim npm
+/// Windows soit resolu exactement comme lors d'un tour de chat.
+pub(crate) fn resolved_provider_command(raw: &str, provider: Provider) -> Result<Command, String> {
+    let program = resolve_provider_program(raw, provider)?;
+    let mut command = Command::new(&program.executable);
+    configure_resolved_program_environment(&mut command, &program);
+    Ok(command)
 }
 
 fn configure_resolved_program_environment(
@@ -1175,6 +1967,32 @@ fn resolve_native_npm_codex(wrapper: &Path) -> Option<(PathBuf, PathBuf)> {
 
 #[cfg(not(windows))]
 fn resolve_native_npm_codex(_wrapper: &Path) -> Option<(PathBuf, PathBuf)> {
+    None
+}
+
+/// Le paquet npm officiel expose un shim `opencode.cmd` vers son binaire natif.
+/// Lancer directement l'exe evite de conserver `cmd.exe` comme parent du tour
+/// et rend le flux JSON/les signaux identiques aux installations Scoop/Chocolatey.
+#[cfg(windows)]
+fn resolve_native_npm_opencode(wrapper: &Path) -> Option<PathBuf> {
+    let is_official_shim = wrapper
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("opencode.cmd"));
+    if !is_official_shim {
+        return None;
+    }
+    let executable = wrapper
+        .parent()?
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    executable.is_file().then_some(executable)
+}
+
+#[cfg(not(windows))]
+fn resolve_native_npm_opencode(_wrapper: &Path) -> Option<PathBuf> {
     None
 }
 
@@ -1287,6 +2105,134 @@ fn finish_turn(turn: &Arc<ChatTurn>, exit: Result<ExitStatus, String>, stderr: &
     let Ok(mut snapshot) = turn.snapshot.lock() else {
         return;
     };
+    let before = active_turn_signal_state(&snapshot);
+    finish_turn_snapshot(&mut snapshot, provider_terminal, exit, stderr);
+    let active_catalog_changed = before != active_turn_signal_state(&snapshot);
+    drop(snapshot);
+    if active_catalog_changed {
+        turn.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
+    }
+    archive_finished_snapshot(turn);
+}
+
+/// Remplace uniquement les allocations devenues immuables d'un tour termine
+/// par leur representation zlib. Les metadonnees legeres restent disponibles
+/// pour les catalogues actifs et l'eviction; `status` restitue le snapshot
+/// original. Le flux stdout doit etre ferme afin qu'aucun evenement tardif ne
+/// puisse diverger de l'archive.
+fn archive_finished_snapshot(turn: &Arc<ChatTurn>) {
+    if !turn.output_closed.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(mut snapshot) = turn.snapshot.lock() else {
+        return;
+    };
+    if matches!(
+        snapshot.status,
+        ChatTurnStatus::Running | ChatTurnStatus::Finalizing
+    ) || snapshot.finished_at.is_none()
+    {
+        return;
+    }
+    let Ok(mut archived) = turn.archived_snapshot.lock() else {
+        return;
+    };
+    if archived.is_some() {
+        return;
+    }
+
+    let reclaimable_bytes = snapshot_reclaimable_heap_bytes(&snapshot);
+    if reclaimable_bytes == 0 {
+        return;
+    }
+    let Ok(serialized) = serde_json::to_vec(&*snapshot) else {
+        return;
+    };
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    if encoder.write_all(&serialized).is_err() {
+        return;
+    }
+    let Ok(mut compressed) = encoder.finish() else {
+        return;
+    };
+    compressed.shrink_to_fit();
+    if compressed.capacity() >= reclaimable_bytes {
+        return;
+    }
+
+    *archived = Some(compressed);
+    snapshot.error = None;
+    snapshot.activities = Vec::new();
+    snapshot.thoughts = Vec::new();
+    snapshot.parts = Vec::new();
+}
+
+fn decode_archived_snapshot(compressed: &[u8]) -> Result<ChatTurnSnapshot, String> {
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut serialized = Vec::new();
+    decoder
+        .read_to_end(&mut serialized)
+        .map_err(|error| format!("Archive du tour illisible : {error}"))?;
+    serde_json::from_slice(&serialized)
+        .map_err(|error| format!("Snapshot du tour illisible : {error}"))
+}
+
+fn snapshot_reclaimable_heap_bytes(snapshot: &ChatTurnSnapshot) -> usize {
+    let mut bytes = snapshot.error.as_ref().map_or(0, String::capacity);
+    bytes = bytes.saturating_add(
+        snapshot
+            .activities
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ChatActivity>()),
+    );
+    for activity in &snapshot.activities {
+        bytes = bytes
+            .saturating_add(activity.id.capacity())
+            .saturating_add(activity.kind.capacity())
+            .saturating_add(activity.label.capacity())
+            .saturating_add(activity.detail.as_ref().map_or(0, String::capacity))
+            .saturating_add(activity.status.capacity());
+    }
+    bytes = bytes.saturating_add(
+        snapshot
+            .thoughts
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ChatThought>()),
+    );
+    for thought in &snapshot.thoughts {
+        bytes = bytes
+            .saturating_add(thought.id.capacity())
+            .saturating_add(thought.kind.capacity())
+            .saturating_add(thought.text.capacity())
+            .saturating_add(thought.status.capacity());
+    }
+    bytes = bytes.saturating_add(
+        snapshot
+            .parts
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ChatPart>()),
+    );
+    for part in &snapshot.parts {
+        bytes = bytes
+            .saturating_add(part.id.capacity())
+            .saturating_add(part.kind.capacity())
+            .saturating_add(part.status.capacity())
+            .saturating_add(part.text.as_ref().map_or(0, String::capacity))
+            .saturating_add(part.tool.as_ref().map_or(0, String::capacity))
+            .saturating_add(part.title.as_ref().map_or(0, String::capacity))
+            .saturating_add(part.subtitle.as_ref().map_or(0, String::capacity))
+            .saturating_add(part.detail.as_ref().map_or(0, String::capacity))
+            .saturating_add(part.output.as_ref().map_or(0, String::capacity));
+    }
+    bytes
+}
+
+fn finish_turn_snapshot(
+    snapshot: &mut ChatTurnSnapshot,
+    provider_terminal: Option<ProviderTerminalEvent>,
+    exit: Result<ExitStatus, String>,
+    stderr: &str,
+) {
     if snapshot.status == ChatTurnStatus::Cancelled {
         return;
     }
@@ -1299,17 +2245,17 @@ fn finish_turn(turn: &Arc<ChatTurn>, exit: Result<ExitStatus, String>, stderr: &
                     stderr,
                     "Le provider a signalé un échec",
                 ));
-                complete_running_activities(&mut snapshot, "error");
-                complete_running_thoughts(&mut snapshot, "error");
-                complete_running_parts(&mut snapshot, "error");
+                complete_running_activities(snapshot, "error");
+                complete_running_thoughts(snapshot, "error");
+                complete_running_parts(snapshot, "error");
             }
             _ => {
                 snapshot.status = ChatTurnStatus::Completed;
                 snapshot.error = None;
-                complete_running_activities(&mut snapshot, "complete");
-                complete_running_thoughts(&mut snapshot, "complete");
-                complete_running_parts(&mut snapshot, "complete");
-                remove_final_commentary(&mut snapshot);
+                complete_running_activities(snapshot, "complete");
+                complete_running_thoughts(snapshot, "complete");
+                complete_running_parts(snapshot, "complete");
+                remove_final_commentary(snapshot);
             }
         }
         return;
@@ -1318,25 +2264,25 @@ fn finish_turn(turn: &Arc<ChatTurn>, exit: Result<ExitStatus, String>, stderr: &
     match exit {
         Ok(status) if status.success() => {
             snapshot.status = ChatTurnStatus::Completed;
-            complete_running_activities(&mut snapshot, "complete");
-            complete_running_thoughts(&mut snapshot, "complete");
-            complete_running_parts(&mut snapshot, "complete");
-            remove_final_commentary(&mut snapshot);
+            complete_running_activities(snapshot, "complete");
+            complete_running_thoughts(snapshot, "complete");
+            complete_running_parts(snapshot, "complete");
+            remove_final_commentary(snapshot);
         }
         Ok(status) => {
             snapshot.status = ChatTurnStatus::Failed;
             let fallback = format!("Le provider s'est arrêté avec le code {:?}", status.code());
             snapshot.error = Some(first_non_empty(&snapshot.error, stderr, &fallback));
-            complete_running_activities(&mut snapshot, "error");
-            complete_running_thoughts(&mut snapshot, "error");
-            complete_running_parts(&mut snapshot, "error");
+            complete_running_activities(snapshot, "error");
+            complete_running_thoughts(snapshot, "error");
+            complete_running_parts(snapshot, "error");
         }
         Err(error) => {
             snapshot.status = ChatTurnStatus::Failed;
             snapshot.error = Some(first_non_empty(&snapshot.error, stderr, &error));
-            complete_running_activities(&mut snapshot, "error");
-            complete_running_thoughts(&mut snapshot, "error");
-            complete_running_parts(&mut snapshot, "error");
+            complete_running_activities(snapshot, "error");
+            complete_running_thoughts(snapshot, "error");
+            complete_running_parts(snapshot, "error");
         }
     }
 }
@@ -1414,6 +2360,23 @@ fn part_waits_for_user_input(part: &ChatPart) -> bool {
             })
 }
 
+fn active_turn_signal_state(
+    snapshot: &ChatTurnSnapshot,
+) -> Option<(String, Option<String>, ChatTurnStatus, bool)> {
+    matches!(
+        snapshot.status,
+        ChatTurnStatus::Running | ChatTurnStatus::Finalizing
+    )
+    .then(|| {
+        (
+            snapshot.account_id.clone(),
+            snapshot.session_id.clone(),
+            snapshot.status,
+            snapshot.parts.iter().any(part_waits_for_user_input),
+        )
+    })
+}
+
 fn remove_final_commentary(snapshot: &mut ChatTurnSnapshot) {
     if let Some(index) = snapshot
         .thoughts
@@ -1474,39 +2437,59 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
     let Ok(mut snapshot) = turn.snapshot.lock() else {
         return;
     };
+    let before = active_turn_signal_state(&snapshot);
+    apply_provider_event_to_snapshot(turn, provider, &mut snapshot, &value, event_type);
+    let active_catalog_changed = before != active_turn_signal_state(&snapshot);
+    drop(snapshot);
+    if active_catalog_changed {
+        turn.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
+    }
+}
+
+fn apply_provider_event_to_snapshot(
+    turn: &Arc<ChatTurn>,
+    provider: Provider,
+    snapshot: &mut ChatTurnSnapshot,
+    value: &Value,
+    event_type: &str,
+) {
+    if provider == Provider::OpenCode {
+        apply_opencode_event(turn, snapshot, value, event_type);
+        return;
+    }
 
     if event_type == "thread.started" {
         snapshot.session_id = value
             .get("thread_id")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        mark_agent_started(&mut snapshot);
+        mark_agent_started(snapshot);
         return;
     }
     if provider == Provider::Claude && event_type == "system" {
         if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
             snapshot.session_id = Some(session_id.to_string());
-            mark_agent_started(&mut snapshot);
+            mark_agent_started(snapshot);
         }
         return;
     }
     if provider == Provider::Claude && event_type == "assistant" {
-        if let Some(part) = claude_part_from_event(&value) {
-            upsert_part(&mut snapshot, part);
+        if let Some(part) = claude_part_from_event(value) {
+            upsert_part(snapshot, part);
         }
-        if let Some(thought) = claude_commentary_from_event(&value) {
-            upsert_thought(&mut snapshot, thought);
+        if let Some(thought) = claude_commentary_from_event(value) {
+            upsert_thought(snapshot, thought);
         }
         return;
     }
     if event_type == "turn.completed" {
-        mark_provider_terminal(turn, &mut snapshot, ProviderTerminalOutcome::Completed);
+        mark_provider_terminal(turn, snapshot, ProviderTerminalOutcome::Completed);
         return;
     }
     if event_type == "turn.failed" {
-        let error = event_error(&value)
+        let error = event_error(value)
             .unwrap_or_else(|| "Le provider a signalé l'échec du tour".to_string());
-        mark_provider_terminal(turn, &mut snapshot, ProviderTerminalOutcome::Failed(error));
+        mark_provider_terminal(turn, snapshot, ProviderTerminalOutcome::Failed(error));
         return;
     }
     if provider == Provider::Claude && event_type == "result" {
@@ -1518,7 +2501,7 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
             || subtype.starts_with("error");
         let outcome = if failed {
             ProviderTerminalOutcome::Failed(
-                event_error(&value)
+                event_error(value)
                     .or_else(|| {
                         value
                             .get("result")
@@ -1531,18 +2514,18 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
         } else {
             ProviderTerminalOutcome::Completed
         };
-        mark_provider_terminal(turn, &mut snapshot, outcome);
+        mark_provider_terminal(turn, snapshot, outcome);
         return;
     }
     if event_type == "error" {
-        let error = event_error(&value);
+        let error = event_error(value);
         if error
             .as_deref()
             .is_some_and(is_terminal_provider_error_message)
         {
             mark_provider_terminal(
                 turn,
-                &mut snapshot,
+                snapshot,
                 ProviderTerminalOutcome::Failed(error.unwrap_or_default()),
             );
         } else {
@@ -1558,13 +2541,153 @@ fn apply_provider_event(turn: &Arc<ChatTurn>, provider: Provider, line: &str) {
     };
     let completed = event_type == "item.completed";
     if let Some(part) = part_from_item(item, completed) {
-        upsert_part(&mut snapshot, part);
+        upsert_part(snapshot, part);
     }
     if let Some(thought) = thought_from_item(item, completed) {
-        upsert_thought(&mut snapshot, thought);
+        upsert_thought(snapshot, thought);
     }
     if let Some(activity) = activity_from_item(item, completed) {
-        upsert_activity(&mut snapshot, activity);
+        upsert_activity(snapshot, activity);
+    }
+}
+
+fn apply_opencode_event(
+    turn: &Arc<ChatTurn>,
+    snapshot: &mut ChatTurnSnapshot,
+    value: &Value,
+    event_type: &str,
+) {
+    if let Some(session_id) = value
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/part/sessionID").and_then(Value::as_str))
+    {
+        snapshot.session_id = Some(session_id.to_string());
+    }
+    mark_agent_started(snapshot);
+
+    match event_type {
+        "text" | "reasoning" => {
+            let Some(part) = value.get("part") else {
+                return;
+            };
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            let id = part
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(event_type)
+                .to_string();
+            upsert_part(
+                snapshot,
+                ChatPart {
+                    id: id.clone(),
+                    kind: if event_type == "reasoning" {
+                        "reasoning".to_string()
+                    } else {
+                        "text".to_string()
+                    },
+                    status: "complete".to_string(),
+                    text: Some(if event_type == "reasoning" {
+                        limit_text(text, MAX_THOUGHT_CHARS)
+                    } else {
+                        text.to_string()
+                    }),
+                    tool: None,
+                    title: None,
+                    subtitle: None,
+                    detail: None,
+                    output: None,
+                },
+            );
+            if event_type == "reasoning" {
+                upsert_thought(
+                    snapshot,
+                    ChatThought {
+                        id,
+                        kind: "reasoning".to_string(),
+                        text: limit_text(text, MAX_THOUGHT_CHARS),
+                        status: "complete".to_string(),
+                    },
+                );
+            }
+        }
+        "tool_use" => {
+            let Some(part) = value.get("part") else {
+                return;
+            };
+            let state = part.get("state").unwrap_or(&Value::Null);
+            let state_status = state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("running");
+            let status = match state_status {
+                "completed" => "complete",
+                "error" | "failed" => "error",
+                _ => "running",
+            };
+            let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let id = part
+                .get("id")
+                .or_else(|| part.get("callID"))
+                .and_then(Value::as_str)
+                .unwrap_or(tool)
+                .to_string();
+            let title = state
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Utilisation d'un outil")
+                .to_string();
+            let detail = state
+                .get("input")
+                .and_then(compact_json)
+                .map(|value| limit_part_detail(&value));
+            let output = state
+                .get("output")
+                .or_else(|| state.get("error"))
+                .and_then(compact_json)
+                .map(|value| limit_part_detail(&value));
+            upsert_part(
+                snapshot,
+                ChatPart {
+                    id: id.clone(),
+                    kind: "tool".to_string(),
+                    status: status.to_string(),
+                    text: None,
+                    tool: Some(tool.to_string()),
+                    title: Some(title.clone()),
+                    subtitle: Some(short_detail(tool)),
+                    detail: detail.clone(),
+                    output,
+                },
+            );
+            upsert_activity(
+                snapshot,
+                ChatActivity {
+                    id,
+                    kind: "tool".to_string(),
+                    label: title,
+                    detail: detail.map(|value| short_detail(&value)),
+                    status: status.to_string(),
+                },
+            );
+        }
+        "step_finish" => {
+            complete_running_activities(snapshot, "complete");
+            complete_running_thoughts(snapshot, "complete");
+            complete_running_parts(snapshot, "complete");
+        }
+        "error" => {
+            let error = event_error(value)
+                .unwrap_or_else(|| "OpenCode a signale l'echec du tour".to_string());
+            mark_provider_terminal(turn, snapshot, ProviderTerminalOutcome::Failed(error));
+        }
+        _ => {}
     }
 }
 
@@ -1592,7 +2715,10 @@ fn part_from_item(item: &Value, completed: bool) -> Option<ChatPart> {
     let status = part_status(item, completed).to_string();
 
     if matches!(item_kind, "agent_message" | "reasoning") {
-        let text = safe_item_text(item)?;
+        let text = safe_item_text(
+            item,
+            (item_kind == "reasoning").then_some(MAX_THOUGHT_CHARS),
+        )?;
         return Some(ChatPart {
             id,
             kind: if item_kind == "reasoning" {
@@ -1702,7 +2828,7 @@ fn part_from_item(item: &Value, completed: bool) -> Option<ChatPart> {
 
 fn claude_part_from_event(value: &Value) -> Option<ChatPart> {
     let message = value.get("message")?;
-    let text = safe_text_value(message.get("content")?)?;
+    let text = safe_text_value(message.get("content")?, None)?;
     Some(ChatPart {
         id: message
             .get("id")
@@ -1745,6 +2871,15 @@ fn limit_part_detail(value: &str) -> String {
     }
 }
 
+fn limit_text(value: &str, max_chars: usize) -> String {
+    let clipped = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
+
 fn mark_agent_started(snapshot: &mut ChatTurnSnapshot) {
     if let Some(activity) = snapshot
         .activities
@@ -1763,6 +2898,8 @@ fn event_error(value: &Value) -> Option<String> {
             error
                 .get("message")
                 .and_then(Value::as_str)
+                .or_else(|| error.pointer("/data/message").and_then(Value::as_str))
+                .or_else(|| error.get("name").and_then(Value::as_str))
                 .or_else(|| error.as_str())
         })
         .or_else(|| value.get("message").and_then(Value::as_str))
@@ -1814,7 +2951,7 @@ fn thought_from_item(item: &Value, completed: bool) -> Option<ChatThought> {
     } else {
         "running"
     };
-    let text = safe_item_text(item);
+    let text = safe_item_text(item, Some(MAX_THOUGHT_CHARS));
     if kind == "agent_message" && text.is_none() {
         return None;
     }
@@ -1841,7 +2978,7 @@ fn thought_from_item(item: &Value, completed: bool) -> Option<ChatThought> {
 
 fn claude_commentary_from_event(value: &Value) -> Option<ChatThought> {
     let message = value.get("message")?;
-    let text = safe_text_value(message.get("content")?)?;
+    let text = safe_text_value(message.get("content")?, Some(MAX_THOUGHT_CHARS))?;
     let id = message
         .get("id")
         .and_then(Value::as_str)
@@ -1855,24 +2992,27 @@ fn claude_commentary_from_event(value: &Value) -> Option<ChatThought> {
     })
 }
 
-fn safe_item_text(item: &Value) -> Option<String> {
+fn safe_item_text(item: &Value, max_chars: Option<usize>) -> Option<String> {
     ["text", "summary_text", "summary", "content"]
         .iter()
-        .find_map(|key| item.get(*key).and_then(safe_text_value))
+        .find_map(|key| {
+            item.get(*key)
+                .and_then(|value| safe_text_value(value, max_chars))
+        })
 }
 
-fn safe_text_value(value: &Value) -> Option<String> {
+fn safe_text_value(value: &Value, max_chars: Option<usize>) -> Option<String> {
     let fragments = match value {
-        Value::String(text) => vec![text.trim().to_string()],
+        Value::String(text) => vec![text.to_string()],
         Value::Array(values) => values
             .iter()
             .filter_map(|value| match value {
-                Value::String(text) => Some(text.trim().to_string()),
+                Value::String(text) => Some(text.to_string()),
                 Value::Object(object) => object
                     .get("text")
                     .or_else(|| object.get("summary_text"))
                     .and_then(Value::as_str)
-                    .map(|text| text.trim().to_string()),
+                    .map(str::to_string),
                 _ => None,
             })
             .collect(),
@@ -1880,23 +3020,21 @@ fn safe_text_value(value: &Value) -> Option<String> {
             .get("text")
             .or_else(|| object.get("summary_text"))
             .and_then(Value::as_str)
-            .map(|text| vec![text.trim().to_string()])
+            .map(|text| vec![text.to_string()])
             .unwrap_or_default(),
         _ => Vec::new(),
     };
     let combined = fragments
         .into_iter()
-        .filter(|text| !text.is_empty())
+        .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
     if combined.is_empty() {
         return None;
     }
-    let truncated = combined.chars().take(MAX_THOUGHT_CHARS).collect::<String>();
-    Some(if combined.chars().count() > MAX_THOUGHT_CHARS {
-        format!("{truncated}…")
-    } else {
-        truncated
+    Some(match max_chars {
+        Some(max_chars) => limit_text(&combined, max_chars),
+        None => combined,
     })
 }
 
@@ -2031,6 +3169,7 @@ fn provider_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Codex => "Codex",
         Provider::Claude => "Claude",
+        Provider::OpenCode => "OpenCode",
     }
 }
 
@@ -2052,6 +3191,7 @@ mod tests {
             label: "Compte test".to_string(),
             created_at: None,
             provider,
+            inference_provider: None,
             codex_home: ".codex-test".to_string(),
             project_dir: None,
             proxy_id: None,
@@ -2077,9 +3217,31 @@ mod tests {
                 thoughts: Vec::new(),
                 parts: Vec::new(),
             }),
+            archived_snapshot: Mutex::new(None),
+            output_closed: AtomicBool::new(false),
             child: Mutex::new(None),
             provider_terminal: Mutex::new(None),
+            runtime_sync: RuntimeSync::default(),
         })
+    }
+
+    #[test]
+    fn app_server_token_usage_notification_exposes_context_pressure() {
+        let notification = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "0199a213-81c0-7800-8aa1-bbab2a035a53",
+                "tokenUsage": {
+                    "last": { "totalTokens": 82_400 },
+                    "modelContextWindow": 100_000
+                }
+            }
+        });
+        let usage = context_usage_from_app_server_notification(&notification)
+            .expect("context usage notification");
+        assert_eq!(usage.used_tokens, 82_400);
+        assert_eq!(usage.context_window, 100_000);
+        assert_eq!(usage.used_percent, 80);
     }
 
     #[test]
@@ -2130,6 +3292,160 @@ mod tests {
         assert_eq!(snapshot.parts[0].status, "complete");
         assert_eq!(snapshot.parts[1].kind, "reasoning");
         assert_eq!(snapshot.parts[2].kind, "text");
+    }
+
+    #[test]
+    fn final_responses_remain_complete_beyond_the_thought_limit() {
+        let body = "const resultat = calculer(valeur);\n".repeat(180);
+        let response = format!("```ts\n{body}```");
+        assert!(response.chars().count() > MAX_THOUGHT_CHARS);
+        assert_eq!(
+            safe_text_value(&json!("    ligne imbriquée\n"), None).as_deref(),
+            Some("    ligne imbriquée\n"),
+            "l'indentation et la fin du texte font partie de la syntaxe"
+        );
+        assert_eq!(safe_text_value(&json!(" \n\t"), None), None);
+
+        let codex_item = json!({
+            "id": "message-long",
+            "type": "agent_message",
+            "text": response
+        });
+        let codex_part = part_from_item(&codex_item, true).expect("reponse Codex");
+        assert_eq!(codex_part.text.as_deref(), Some(response.as_str()));
+        assert!(codex_part
+            .text
+            .as_deref()
+            .is_some_and(|text| text.ends_with("```")));
+        let codex_commentary = thought_from_item(&codex_item, true).expect("resume Codex");
+        assert_eq!(
+            codex_commentary.text.chars().count(),
+            MAX_THOUGHT_CHARS + 1,
+            "seule la copie de commentaire interne reste bornee"
+        );
+
+        let claude_event = json!({
+            "message": {
+                "id": "message-long",
+                "content": [{ "type": "text", "text": response }]
+            }
+        });
+        let claude_part = claude_part_from_event(&claude_event).expect("reponse Claude");
+        assert_eq!(claude_part.text.as_deref(), Some(response.as_str()));
+        let claude_commentary = claude_commentary_from_event(&claude_event).expect("resume Claude");
+        assert_eq!(
+            claude_commentary.text.chars().count(),
+            MAX_THOUGHT_CHARS + 1
+        );
+
+        let opencode = test_turn();
+        let opencode_event = json!({
+            "type": "text",
+            "sessionID": "session-longue",
+            "part": { "id": "message-long", "text": response }
+        });
+        apply_provider_event(
+            &opencode,
+            Provider::OpenCode,
+            &serde_json::to_string(&opencode_event).unwrap(),
+        );
+        let snapshot = opencode.snapshot.lock().unwrap();
+        assert_eq!(snapshot.parts[0].text.as_deref(), Some(response.as_str()));
+    }
+
+    #[test]
+    fn finished_snapshots_are_compressed_and_restored_without_data_loss() {
+        let manager = ChatTurnManager::default();
+        let turn = test_turn();
+        {
+            let mut snapshot = turn.snapshot.lock().unwrap();
+            snapshot.status = ChatTurnStatus::Completed;
+            snapshot.finished_at = Some(42);
+            snapshot.error = Some("diagnostic final conserve".to_string());
+            let detail = [
+                "commande: cargo test --all-targets\n",
+                "résultat: validation réussie sans perte fonctionnelle\n",
+                "sortie: 0123456789abcdef0123456789abcdef\n",
+            ]
+            .concat()
+            .repeat(100);
+            for index in 0..MAX_PARTS {
+                snapshot.parts.push(ChatPart {
+                    id: format!("part-{index}"),
+                    kind: "tool".to_string(),
+                    status: "complete".to_string(),
+                    text: None,
+                    tool: Some("shell_command".to_string()),
+                    title: Some(format!("Validation {index}")),
+                    subtitle: None,
+                    detail: Some(detail.clone()),
+                    output: Some(format!("Code de sortie 0 pour l'étape {index}")),
+                });
+            }
+        }
+        let expected = {
+            let snapshot = turn.snapshot.lock().unwrap();
+            serde_json::to_value(&*snapshot).unwrap()
+        };
+        let reclaimable = {
+            let snapshot = turn.snapshot.lock().unwrap();
+            snapshot_reclaimable_heap_bytes(&snapshot)
+        };
+
+        archive_finished_snapshot(&turn);
+        assert!(turn.archived_snapshot.lock().unwrap().is_none());
+        turn.output_closed.store(true, Ordering::Release);
+        archive_finished_snapshot(&turn);
+
+        let compressed = turn
+            .archived_snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("archive compressee")
+            .len();
+        assert!(compressed < reclaimable);
+        assert!(turn.snapshot.lock().unwrap().parts.is_empty());
+        manager.turns.lock().unwrap().insert(1, turn);
+        let restored = manager.status(1).expect("snapshot restaure");
+        assert_eq!(serde_json::to_value(restored).unwrap(), expected);
+        println!(
+            "snapshot_reclaimable_bytes={reclaimable} archived_bytes={compressed} retained_cap_saving_bytes={}",
+            (reclaimable - compressed) * MAX_RETAINED_TURNS
+        );
+    }
+
+    #[test]
+    fn finished_snapshots_keep_the_live_form_when_compression_would_cost_more() {
+        let turn = test_turn();
+        {
+            let mut snapshot = turn.snapshot.lock().unwrap();
+            snapshot.status = ChatTurnStatus::Failed;
+            snapshot.finished_at = Some(42);
+            snapshot.error = Some("x".to_string());
+        }
+        turn.output_closed.store(true, Ordering::Release);
+        archive_finished_snapshot(&turn);
+
+        assert!(turn.archived_snapshot.lock().unwrap().is_none());
+        assert_eq!(turn.snapshot.lock().unwrap().error.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn every_turn_requests_a_silent_language_and_syntax_review() {
+        for expected in [
+            "relecture silencieuse",
+            "grammaire",
+            "syntaxe",
+            "orthographe",
+            "langue de l'utilisateur",
+            "délimiteurs et blocs sont complets",
+        ] {
+            assert!(RESPONSE_QUALITY_INSTRUCTIONS.contains(expected));
+        }
+        let instructions = merge_turn_instructions(Some(RESPONSE_QUALITY_INSTRUCTIONS), None)
+            .expect("instructions qualite");
+        assert_eq!(instructions, RESPONSE_QUALITY_INSTRUCTIONS);
     }
 
     #[test]
@@ -2290,6 +3606,218 @@ mod tests {
     }
 
     #[test]
+    fn codex_review_proof_scope_never_opens_the_parent_project() {
+        let account = test_account(Provider::Codex);
+        let mut command = Command::new("codex");
+        configure_provider_command_with_images_and_scope(
+            &mut command,
+            &account,
+            None,
+            ChatTurnMode::Plan,
+            None,
+            None,
+            None,
+            false,
+            Some("review visuelle"),
+            None,
+            None,
+            &[],
+            ChatFilesystemScope::ReviewProofArtifacts,
+        );
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        for expected in [
+            "sandbox_mode=\"workspace-write\"",
+            "approval_policy=\"never\"",
+            "sandbox_workspace_write.network_access=false",
+        ] {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == expected));
+        }
+        assert!(args.windows(2).any(|pair| pair == ["-C", "."]));
+        assert!(!args.iter().any(|arg| arg == "sandbox_mode=\"read-only\""));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_review_proof_workspace_is_created_inside_the_project() {
+        let project =
+            std::env::temp_dir().join(format!("cst-review-proof-scope-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&project).unwrap();
+
+        let proof = review_proof_workspace(
+            Provider::Codex,
+            Some(&project),
+            ChatFilesystemScope::ReviewProofArtifacts,
+        )
+        .unwrap()
+        .expect("workspace de preuve Codex");
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        assert_eq!(proof, canonical_project.join(".codex-proof"));
+        assert!(proof.is_dir());
+
+        let instructions = review_proof_workspace_instructions(&canonical_project, &proof);
+        assert!(instructions.contains("reste en lecture seule"));
+        assert!(instructions.contains("l'unique zone du projet"));
+        assert!(instructions.contains(".codex-proof/<fichier>"));
+        assert!(review_proof_workspace(
+            Provider::Claude,
+            Some(&project),
+            ChatFilesystemScope::ReviewProofArtifacts,
+        )
+        .unwrap()
+        .is_none());
+
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn opencode_command_uses_json_session_agent_model_and_auto_mode() {
+        let mut account = test_account(Provider::OpenCode);
+        account.inference_provider = Some("deepseek".to_string());
+        let mut command = Command::new("opencode");
+        configure_provider_command(
+            &mut command,
+            &account,
+            Some("ses_abc123"),
+            ChatTurnMode::Build,
+            Some("deepseek/deepseek-v4-pro"),
+            None,
+            None,
+            false,
+            Some("memoire de test"),
+            None,
+            None,
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        for expected in [
+            ["run", "--format"],
+            ["--format", "json"],
+            ["--session", "ses_abc123"],
+            ["--agent", "build"],
+            ["--model", "deepseek/deepseek-v4-pro"],
+        ] {
+            assert!(args.windows(2).any(|pair| pair == expected));
+        }
+        assert!(args.iter().any(|arg| arg == "--thinking"));
+        assert!(args.iter().any(|arg| arg == "--auto"));
+    }
+
+    #[test]
+    fn pasted_images_are_validated_written_and_removed() {
+        let attachment = ChatImageAttachmentRequest {
+            name: "capture.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_base64: BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nimage-test"),
+        };
+        let images = TemporaryChatImages::create(91, &[attachment]).unwrap();
+        let path = images.paths()[0].clone();
+        assert!(path.exists());
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        drop(images);
+        assert!(!path.exists());
+
+        let invalid = ChatImageAttachmentRequest {
+            name: "fausse.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_base64: BASE64_STANDARD.encode(b"pas une image"),
+        };
+        assert!(TemporaryChatImages::create(92, &[invalid]).is_err());
+    }
+
+    #[test]
+    fn codex_command_attaches_each_pasted_image() {
+        let account = test_account(Provider::Codex);
+        let paths = [
+            PathBuf::from("capture-a.png"),
+            PathBuf::from("capture-b.webp"),
+        ];
+        let mut command = Command::new("codex");
+        configure_provider_command_with_images(
+            &mut command,
+            &account,
+            Some("0199a213-81c0-7800-8aa1-bbab2a035a53"),
+            ChatTurnMode::Build,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            &paths,
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--image", "capture-a.png"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--image", "capture-b.webp"]));
+        let last_image = args.iter().rposition(|arg| arg == "--image").unwrap();
+        let session = args
+            .iter()
+            .position(|arg| arg == "0199a213-81c0-7800-8aa1-bbab2a035a53")
+            .unwrap();
+        assert!(
+            last_image < session,
+            "les options image precedent l'identifiant de reprise"
+        );
+    }
+
+    #[test]
+    fn opencode_events_capture_session_text_reasoning_and_tools() {
+        let turn = test_turn();
+        apply_provider_event(
+            &turn,
+            Provider::OpenCode,
+            r#"{"type":"reasoning","sessionID":"ses_test","part":{"id":"reason_1","type":"reasoning","text":"Je verifie."}}"#,
+        );
+        apply_provider_event(
+            &turn,
+            Provider::OpenCode,
+            r#"{"type":"tool_use","sessionID":"ses_test","part":{"id":"tool_1","type":"tool","tool":"bash","state":{"status":"completed","title":"Tests","input":{"command":"npm test"},"output":"ok"}}}"#,
+        );
+        apply_provider_event(
+            &turn,
+            Provider::OpenCode,
+            r#"{"type":"text","sessionID":"ses_test","part":{"id":"text_1","type":"text","text":"Tout est valide."}}"#,
+        );
+
+        let snapshot = turn.snapshot.lock().unwrap();
+        assert_eq!(snapshot.session_id.as_deref(), Some("ses_test"));
+        assert_eq!(snapshot.parts.len(), 3);
+        assert_eq!(snapshot.parts[0].kind, "reasoning");
+        assert_eq!(snapshot.parts[1].kind, "tool");
+        assert_eq!(snapshot.parts[1].status, "complete");
+        assert_eq!(snapshot.parts[2].text.as_deref(), Some("Tout est valide."));
+        assert_eq!(snapshot.thoughts.len(), 1);
+        assert_eq!(snapshot.activities.len(), 1);
+    }
+
+    #[test]
+    fn provider_session_validation_accepts_opencode_ids_only_for_opencode() {
+        assert!(validate_session_id(Provider::OpenCode, "ses_abc-123").is_ok());
+        assert!(validate_session_id(Provider::Codex, "ses_abc-123").is_err());
+        assert!(validate_session_id(Provider::OpenCode, "bad id").is_err());
+    }
+
+    #[test]
     fn codex_chat_gets_the_scoped_autonomous_agent_mcp_tool() {
         let account = test_account(Provider::Codex);
         let config = ChatModelToolServerConfig {
@@ -2318,10 +3846,15 @@ mod tests {
         for expected in [
             "mcp_servers.cst_chat.url=\"http://127.0.0.1:8080/mcp/chat-tools\"",
             "mcp_servers.cst_chat.bearer_token_env_var=\"CST_CHAT_AUTONOMOUS_TOOL_TOKEN\"",
-            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\"]",
+            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\",\"update_autonomous_agent\",\"pause_autonomous_agent\",\"activate_supervisor_general_report\",\"apply_autonomous_agent_policy\",\"create_chat\"]",
             "mcp_servers.cst_chat.required=true",
             "mcp_servers.cst_chat.default_tools_approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.create_autonomous_agent.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.update_autonomous_agent.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.pause_autonomous_agent.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.activate_supervisor_general_report.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.apply_autonomous_agent_policy.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.create_chat.approval_mode=\"approve\"",
         ] {
             assert!(args
                 .windows(2)
@@ -2339,7 +3872,17 @@ mod tests {
         assert!(environment.iter().any(|(key, value)| {
             key == MCP_BEARER_ENV && value.as_deref() == Some("secret-capability")
         }));
-        assert!(autonomous_agent_tool_instructions().contains("utilise cet outil directement"));
+        assert!(autonomous_agent_tool_instructions().contains("appelle `create_autonomous_agent`"));
+        assert!(autonomous_agent_tool_instructions().contains("appelle `update_autonomous_agent`"));
+        assert!(autonomous_agent_tool_instructions().contains("appelle `pause_autonomous_agent`"));
+        assert!(autonomous_agent_tool_instructions()
+            .contains("appelle `activate_supervisor_general_report`"));
+        assert!(autonomous_agent_tool_instructions()
+            .contains("appelle `apply_autonomous_agent_policy`"));
+        assert!(autonomous_agent_tool_instructions().contains("appelle `create_chat`"));
+        assert!(autonomous_agent_tool_instructions()
+            .to_ascii_lowercase()
+            .contains("ne demande jamais d'identifiant"));
     }
 
     #[test]
@@ -2611,6 +4154,7 @@ mod tests {
             account_id: "account".to_string(),
             session_id: Some("0199a213-81c0-7800-8aa1-bbab2a035a53".to_string()),
             prompt: "test".to_string(),
+            image_attachments: Vec::new(),
             project_dir: None,
             mode: ChatTurnMode::Build,
             model: None,
@@ -2636,6 +4180,7 @@ mod tests {
             account_id: "account".to_string(),
             session_id: None,
             prompt: "test".to_string(),
+            image_attachments: Vec::new(),
             project_dir: None,
             mode: ChatTurnMode::Build,
             model: None,
@@ -2703,11 +4248,41 @@ mod tests {
         );
         assert!(!active[0].waiting_for_user);
         assert!(active[1].waiting_for_user);
+        assert_eq!(manager.active_count(), 2);
+    }
+
+    #[test]
+    fn session_busy_tracks_running_and_finalizing_turns() {
+        let manager = ChatTurnManager::default();
+        let turn = test_turn();
+        {
+            let mut snapshot = turn.snapshot.lock().unwrap();
+            snapshot.session_id = Some("session-active".to_string());
+        }
+        manager.turns.lock().unwrap().insert(1, turn.clone());
+
+        assert!(manager
+            .session_is_busy("account", "session-active")
+            .unwrap());
+        assert!(!manager
+            .session_is_busy("other-account", "session-active")
+            .unwrap());
+
+        turn.snapshot.lock().unwrap().status = ChatTurnStatus::Finalizing;
+        assert!(manager
+            .session_is_busy("account", "session-active")
+            .unwrap());
+
+        turn.snapshot.lock().unwrap().status = ChatTurnStatus::Completed;
+        assert!(!manager
+            .session_is_busy("account", "session-active")
+            .unwrap());
     }
 
     #[test]
     fn stopping_a_turn_cancels_its_running_command_card() {
         let manager = ChatTurnManager::default();
+        let mut runtime_updates = manager.runtime_sync().subscribe();
         let turn = test_turn();
         turn.snapshot.lock().unwrap().parts.push(ChatPart {
             id: "command".to_string(),
@@ -2725,6 +4300,10 @@ mod tests {
         let stopped = manager.stop(1).unwrap();
         assert_eq!(stopped.status, ChatTurnStatus::Cancelled);
         assert_eq!(stopped.parts[0].status, "cancelled");
+        assert_eq!(
+            runtime_updates.try_recv().unwrap().topic,
+            RuntimeSyncTopic::ActiveChatTurns
+        );
     }
 
     #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -2774,6 +4353,28 @@ mod tests {
         let fallback = resolve_provider_program(shim.to_str().unwrap(), Provider::Codex).unwrap();
         assert_eq!(fallback.executable, shim);
         assert!(fallback.managed_codex_package_root.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn official_npm_opencode_uses_its_native_binary() {
+        let root = env::temp_dir().join(format!("cst-native-opencode-{}", Uuid::new_v4()));
+        let shim = root.join("opencode.cmd");
+        let native = root
+            .join("node_modules")
+            .join("opencode-ai")
+            .join("bin")
+            .join("opencode.exe");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&shim, "@echo off\r\n").unwrap();
+        std::fs::write(&native, b"").unwrap();
+
+        let resolved =
+            resolve_provider_program(shim.to_str().unwrap(), Provider::OpenCode).unwrap();
+        assert_eq!(resolved.executable, native);
+        assert!(resolved.managed_codex_package_root.is_none());
+
         let _ = std::fs::remove_dir_all(root);
     }
 

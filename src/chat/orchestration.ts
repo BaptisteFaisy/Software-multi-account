@@ -117,6 +117,51 @@ export type OrchestrationAction = "pause" | "resume" | "retry";
 
 export type OrchestrationAccountRole = "orchestrator" | "worker";
 
+export const AUTOMATIC_ORCHESTRATION_MARKER = "CST_AUTO_ORCHESTRATION:";
+
+export type AutomaticOrchestrationDecision = {
+  workerCount: number;
+  reason: string;
+};
+
+/**
+ * Lit uniquement la ligne de routage emise par le modele. Une mention du
+ * protocole dans une explication ordinaire ne doit jamais lancer une equipe.
+ */
+export const parseAutomaticOrchestrationDecision = (
+  text: string | null | undefined,
+): AutomaticOrchestrationDecision | null => {
+  if (!text) return null;
+  const line = text
+    .split(/\r?\n/)
+    .map((candidate) => candidate.trim())
+    .reverse()
+    .find((candidate) => candidate.startsWith(AUTOMATIC_ORCHESTRATION_MARKER));
+  if (!line) return null;
+
+  try {
+    const value = JSON.parse(line.slice(AUTOMATIC_ORCHESTRATION_MARKER.length).trim()) as {
+      decision?: unknown;
+      workerCount?: unknown;
+      reason?: unknown;
+    };
+    if (value?.decision !== "orchestrate") return null;
+    const workerCount = Number(value.workerCount);
+    if (!Number.isInteger(workerCount) || workerCount < 1 || workerCount > 12) return null;
+    return {
+      workerCount,
+      reason: typeof value.reason === "string" ? value.reason.trim().slice(0, 500) : "",
+    };
+  } catch {
+    return null;
+  }
+};
+
+export const automaticOrchestrationNotice = (
+  decision: AutomaticOrchestrationDecision,
+): string =>
+  `Orchestration automatique retenue · ${decision.workerCount} worker${decision.workerCount > 1 ? "s" : ""}${decision.reason ? ` · ${decision.reason}` : ""}`;
+
 export const orchestrationOrchestratorAccountId = (
   run: Pick<OrchestrationSnapshot, "accountId" | "orchestratorAccountId">,
 ): string => run.orchestratorAccountId?.trim() || run.accountId;

@@ -38,7 +38,7 @@ test("une remontee utilisateur fige la position pendant les nouveaux messages", 
   updateChatScrollState(
     state,
     { scrollTop: 180, scrollHeight: 1_100, clientHeight: 600 },
-    true,
+    "away",
   );
 
   assert.equal(state.followLatest, false);
@@ -58,7 +58,7 @@ test("revenir en bas reactive automatiquement le suivi", () => {
 
   assert.equal(CHAT_SCROLL_BOTTOM_EPSILON, 12);
   assert.equal(chatIsAtBottom(metrics), true);
-  updateChatScrollState(state, metrics, true);
+  updateChatScrollState(state, metrics, "toward-latest");
 
   assert.equal(state.followLatest, true);
   assert.equal(
@@ -68,6 +68,50 @@ test("revenir en bas reactive automatiquement le suivi", () => {
       clientHeight: 600,
     }),
     800,
+  );
+});
+
+test("un rendu au bas du fil ne reactive pas le suivi sans geste utilisateur", () => {
+  const state = { followLatest: false, scrollTop: 180 };
+
+  updateChatScrollState(state, {
+    scrollTop: 400,
+    scrollHeight: 1_000,
+    clientHeight: 600,
+  });
+
+  assert.equal(state.followLatest, false);
+  assert.equal(state.scrollTop, 180);
+  assert.equal(
+    restoreChatScrollTop(state, {
+      scrollTop: 400,
+      scrollHeight: 1_400,
+      clientHeight: 600,
+    }),
+    180,
+  );
+});
+
+test("un fil momentanement non defilable conserve la pause utilisateur", () => {
+  const state = { followLatest: false, scrollTop: 180 };
+
+  assert.equal(
+    restoreChatScrollTop(state, {
+      scrollTop: 0,
+      scrollHeight: 600,
+      clientHeight: 600,
+    }),
+    0,
+  );
+  assert.equal(state.followLatest, false);
+
+  assert.equal(
+    restoreChatScrollTop(state, {
+      scrollTop: 0,
+      scrollHeight: 1_400,
+      clientHeight: 600,
+    }),
+    180,
   );
 });
 

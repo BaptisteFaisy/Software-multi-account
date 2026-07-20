@@ -7,9 +7,9 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{mpsc, Mutex, OnceLock},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Fournisseur CLI gere par un compte / un agent.
@@ -17,13 +17,15 @@ use std::{
 /// `Codex` (ChatGPT/OpenAI) est le defaut historique : les comptes et agents
 /// existants (champ `provider` absent du settings.json) ainsi que tout code qui
 /// ne precise pas de provider restent Codex, ce qui preserve le comportement
-/// actuel bit pour bit. `Claude` designe Claude Code (CLI `claude`).
+/// actuel bit pour bit. `Claude` designe Claude Code (CLI `claude`) et
+/// `OpenCode` sert de runtime commun aux fournisseurs API annexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     #[default]
     Codex,
     Claude,
+    OpenCode,
 }
 
 impl Provider {
@@ -32,6 +34,7 @@ impl Provider {
         match self {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
+            Provider::OpenCode => "opencode",
         }
     }
 }
@@ -50,6 +53,11 @@ pub struct AccountProfile {
     /// par une version anterieure (sans ce champ) sont interpretes comme Codex.
     #[serde(default)]
     pub provider: Provider,
+    /// Fournisseur de modele selectionne dans OpenCode (`deepseek`, `minimax`,
+    /// `zai`, `zai-coding-plan`, `openrouter`, ...). Ce champ reste vide pour
+    /// les runtimes natifs Codex et Claude Code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_provider: Option<String>,
     /// Dossier "home" isole du compte. Pour Codex c'est `CODEX_HOME` ; pour
     /// Claude c'est `CLAUDE_CONFIG_DIR` (meme role : sessions + credentials +
     /// config propres au compte). Le nom de champ reste `codexHome` cote JSON
@@ -102,6 +110,7 @@ pub struct AccountLimitView {
     pub buckets: Vec<AccountRateLimitBucketView>,
     pub refreshed_at: Option<i64>,
     pub source: String,
+    pub refreshing: bool,
     pub error: Option<String>,
 }
 
@@ -200,6 +209,9 @@ pub struct WorkspaceProfile {
     /// Le champ absent des anciens settings est migre vers une memoire vide.
     #[serde(default)]
     pub memory: String,
+    /// VPS utilise par defaut pour les nouveaux chats et terminaux de ce projet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target_id: Option<String>,
 }
 
 pub const MAX_WORKSPACE_MEMORY_CHARS: usize = 8_000;
@@ -292,6 +304,7 @@ fn default_auto_install_extension() -> bool {
 
 const CODEX_AGENT_ID: &str = "codex";
 const CLAUDE_AGENT_ID: &str = "claude";
+const OPENCODE_AGENT_ID: &str = "opencode";
 const KOMBAI_AGENT_ID: &str = "kombai";
 
 fn default_agent_kind() -> String {
@@ -328,6 +341,7 @@ const WEEKLY_LIMIT_MINS: i64 = 7 * 24 * 60;
 // que l'on parle bien de la meme fenetre et du meme compte.
 const RATE_LIMIT_RESET_MATCH_TOLERANCE_SECS: u64 = 60;
 const RATE_LIMIT_READ_TIMEOUT_SECS: u64 = 18;
+const RATE_LIMIT_CACHE_TTL_SECS: u64 = 60;
 const MODEL_CATALOG_TIMEOUT_SECS: u64 = 12;
 
 impl Default for PoolConfig {
@@ -378,7 +392,7 @@ const UNCONNECTED_ACCOUNT_EXPIRY_SECS: i64 = 10 * 60;
 const DEFAULT_ACCOUNT_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_ACCOUNT_REASONING_EFFORT: &str = "medium";
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn load_settings() -> Result<AppSettings, String> {
     let path = settings_path()?;
     let mut settings = if path.exists() {
@@ -390,11 +404,13 @@ pub fn load_settings() -> Result<AppSettings, String> {
         settings
     };
 
-    let mut changed = if settings.auto_discover_accounts {
-        merge_discovered_profiles(&mut settings)?
-    } else {
-        false
-    };
+    let mut changed = false;
+    if settings.auto_discover_accounts && merge_discovered_profiles(&mut settings)? {
+        changed = true;
+    }
+    if deduplicate_accounts_by_home(&mut settings) {
+        changed = true;
+    }
     ensure_default_account(&mut settings);
     if ensure_agents(&mut settings) {
         changed = true;
@@ -402,6 +418,7 @@ pub fn load_settings() -> Result<AppSettings, String> {
     if ensure_workspaces(&mut settings) {
         changed = true;
     }
+    seed_missing_local_codex_credentials(&settings);
     if sync_account_limit_trackers(&mut settings) {
         changed = true;
     }
@@ -417,13 +434,16 @@ pub fn load_settings() -> Result<AppSettings, String> {
     Ok(settings)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn save_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
     let path = settings_path()?;
     let now = now_unix();
     merge_persisted_account_lifecycle(&path, &mut settings, now);
+    deduplicate_accounts_by_home(&mut settings);
+    ensure_default_account(&mut settings);
     ensure_agents(&mut settings);
     ensure_workspaces(&mut settings);
+    seed_missing_local_codex_credentials(&settings);
     sync_account_limit_trackers(&mut settings);
     remove_expired_unconnected_accounts(&mut settings, now);
     clear_expired_home_tombstones_for_registered_accounts(&mut settings);
@@ -445,11 +465,11 @@ fn merge_persisted_account_lifecycle(path: &Path, settings: &mut AppSettings, no
         .map(|value| value.expired_unconnected_account_homes.as_slice())
         .unwrap_or_default()
     {
-        let normalized = normalize_string_path(home);
+        let normalized = account_home_key(home);
         if !settings
             .expired_unconnected_account_homes
             .iter()
-            .any(|existing| normalize_string_path(existing) == normalized)
+            .any(|existing| account_home_key(existing) == normalized)
         {
             settings.expired_unconnected_account_homes.push(normalized);
         }
@@ -458,7 +478,7 @@ fn merge_persisted_account_lifecycle(path: &Path, settings: &mut AppSettings, no
     let tombstoned_homes = settings
         .expired_unconnected_account_homes
         .iter()
-        .map(|home| normalize_string_path(home))
+        .map(|home| account_home_key(home))
         .collect::<HashSet<_>>();
     for account in &mut settings.accounts {
         if let Some(existing) = persisted
@@ -478,7 +498,7 @@ fn merge_persisted_account_lifecycle(path: &Path, settings: &mut AppSettings, no
             if account.limits.weekly_anchor_at.is_none() {
                 account.limits.weekly_anchor_at = existing.limits.weekly_anchor_at;
             }
-        } else if !tombstoned_homes.contains(&normalize_string_path(&account.codex_home)) {
+        } else if !tombstoned_homes.contains(&account_home_key(&account.codex_home)) {
             // Le serveur fait autorite sur l'instant de creation, notamment en
             // mode web ou l'horloge du navigateur peut etre decalee.
             account.created_at = Some(now);
@@ -486,7 +506,45 @@ fn merge_persisted_account_lifecycle(path: &Path, settings: &mut AppSettings, no
     }
 }
 
-#[tauri::command]
+/// Les settings peuvent etre partages entre plusieurs serveurs alors que leurs
+/// runtimes restent isoles. Lorsqu'un profil Codex enregistre n'a pas encore de
+/// credential dans l'instance courante, amorce son `auth.json` depuis une copie
+/// soeur dont l'identite reelle est unique. Tout le reste du CODEX_HOME demeure
+/// local (config, sessions, verrous et suppressions).
+fn seed_missing_local_codex_credentials(settings: &AppSettings) -> usize {
+    let Some(current_data_dir) = env::var_os("CST_DATA_DIR").map(PathBuf::from) else {
+        return 0;
+    };
+
+    settings
+        .accounts
+        .iter()
+        .filter(|account| account.provider == Provider::Codex)
+        .filter_map(|account| {
+            let stripped = cst_data_suffix(account.codex_home.trim())?;
+            let relative_home = PathBuf::from(stripped.trim_start_matches(['\\', '/']));
+            let components = relative_home.components().collect::<Vec<_>>();
+            let is_account_home = components.len() >= 2
+                && matches!(components.first(), Some(std::path::Component::Normal(value)) if value.to_string_lossy().eq_ignore_ascii_case("codex-homes"))
+                && components
+                    .iter()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)));
+            if !is_account_home {
+                return None;
+            }
+
+            let primary_home = current_data_dir.join(&relative_home);
+            crate::account_usage::seed_local_data_dir_account_auth(
+                &current_data_dir,
+                &relative_home,
+                &primary_home,
+            )
+            .then_some(())
+        })
+        .count()
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn ensure_account_home(
     codex_home: String,
     provider: Option<Provider>,
@@ -494,7 +552,10 @@ pub fn ensure_account_home(
     model: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<(), String> {
-    let home = expand_home(&codex_home)?;
+    // La creation/configuration reste propre a l'instance courante. La lecture
+    // peut reutiliser un home authentifie d'une instance soeur, mais ne doit
+    // jamais y ecrire implicitement.
+    let home = expand_home_local(&codex_home)?;
     fs::create_dir_all(&home).map_err(|error| error.to_string())?;
     // `provider` absent (anciens appels front) => Codex : comportement inchange.
     provider
@@ -519,7 +580,7 @@ pub fn ensure_account_home(
 /// En cas de dossier dangereux ou non supprimable, l'operation est annulee AVANT
 /// d'ecrire `settings.json` (etat inchange) et l'erreur est remontee : le compte
 /// reste alors present et l'utilisateur peut le retirer sans effacer les fichiers.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn remove_account(account_id: String, delete_files: bool) -> Result<AppSettings, String> {
     let path = settings_path()?;
     let mut settings = load_settings()?;
@@ -546,11 +607,11 @@ pub fn remove_account(account_id: String, delete_files: bool) -> Result<AppSetti
     // (chemin refuse par les garde-fous, verrou fichier...), on renvoie l'erreur
     // sans rien persister -> l'etat reste coherent (le compte est toujours la).
     if delete_files {
-        let normalized_target = normalize_string_path(&target.codex_home);
+        let normalized_target = account_home_key(&target.codex_home);
         let still_referenced = settings
             .accounts
             .iter()
-            .any(|account| normalize_string_path(&account.codex_home) == normalized_target);
+            .any(|account| account_home_key(&account.codex_home) == normalized_target);
         if !still_referenced {
             delete_codex_home_dir(&target.codex_home)?;
         }
@@ -563,7 +624,10 @@ pub fn remove_account(account_id: String, delete_files: bool) -> Result<AppSetti
 /// Supprime le dossier CODEX_HOME d'un compte apres validation stricte. Un
 /// dossier absent est traite comme un succes (rien a effacer).
 fn delete_codex_home_dir(codex_home: &str) -> Result<(), String> {
-    let path = expand_home(codex_home)?;
+    // Une suppression vise uniquement le chemin declare dans cette instance :
+    // le fallback de lecture vers une instance soeur ne doit jamais devenir
+    // une suppression distante implicite.
+    let path = expand_home_local(codex_home)?;
     if !path.exists() {
         return Ok(());
     }
@@ -616,7 +680,7 @@ fn guard_deletable_codex_home(path: &Path) -> Result<(), String> {
         }
     }
 
-    // Le dossier doit ressembler au home d'un compte (Codex ou Claude).
+    // Le dossier doit ressembler au home d'un compte pris en charge.
     let looks_like_home = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -624,6 +688,7 @@ fn guard_deletable_codex_home(path: &Path) -> Result<(), String> {
             is_codex_like_dir(name)
                 || Provider::Codex.is_home_like_dir(name)
                 || Provider::Claude.is_home_like_dir(name)
+                || Provider::OpenCode.is_home_like_dir(name)
         })
         .unwrap_or(false);
     let under_homes = path
@@ -631,17 +696,20 @@ fn guard_deletable_codex_home(path: &Path) -> Result<(), String> {
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
         .map(|name| {
-            name.eq_ignore_ascii_case("codex-homes") || name.eq_ignore_ascii_case("claude-homes")
+            name.eq_ignore_ascii_case("codex-homes")
+                || name.eq_ignore_ascii_case("claude-homes")
+                || name.eq_ignore_ascii_case("opencode-homes")
         })
         .unwrap_or(false);
     let has_marker = path.join("auth.json").is_file()      // Codex
         || path.join("config.toml").is_file()              // Codex
         || path.join(".credentials.json").is_file()        // Claude
-        || path.join(".claude.json").is_file(); // Claude
+        || path.join(".claude.json").is_file()             // Claude
+        || path.join("data").join("opencode").join("auth.json").is_file(); // OpenCode
 
     if !(looks_like_home || under_homes || has_marker) {
         return Err(format!(
-            "Refus : {} ne ressemble pas a un dossier de compte Codex (nom .codex*, dossier codex-homes, ou auth.json/config.toml requis).",
+            "Refus : {} ne ressemble pas a un dossier de compte pris en charge.",
             path.display()
         ));
     }
@@ -657,22 +725,28 @@ fn guard_key(path: &Path) -> String {
         .to_string()
 }
 
-#[tauri::command]
-pub async fn account_limit_status() -> Result<Vec<AccountLimitView>, String> {
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn account_limit_status(force: Option<bool>) -> Result<Vec<AccountLimitView>, String> {
     let settings = load_settings()?;
-    tauri::async_runtime::spawn_blocking(move || account_limit_views(&settings))
-        .await
-        .map_err(|error| error.to_string())
+    tokio::task::spawn_blocking(move || {
+        if force.unwrap_or(false) {
+            account_limit_views(&settings)
+        } else {
+            account_limit_views_fast(&settings)
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn account_model_catalog(account_id: String) -> Result<Vec<AccountModelView>, String> {
-    tauri::async_runtime::spawn_blocking(move || load_account_model_catalog(&account_id))
+    tokio::task::spawn_blocking(move || load_account_model_catalog(&account_id))
         .await
         .map_err(|error| error.to_string())?
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn import_account_docs(paths: Vec<String>) -> Result<AppSettings, String> {
     let settings_file = settings_path()?;
     let mut settings = load_settings()?;
@@ -701,6 +775,7 @@ pub fn import_account_docs(paths: Vec<String>) -> Result<AppSettings, String> {
         return Err("Aucun token de compte trouve dans ces fichiers".to_string());
     }
 
+    deduplicate_accounts_by_home(&mut settings);
     ensure_default_account(&mut settings);
     write_settings(&settings_file, &settings)?;
     Ok(settings)
@@ -710,7 +785,7 @@ pub fn import_account_docs(paths: Vec<String>) -> Result<AppSettings, String> {
 /// (blob de session ChatGPT, export `accounts[].credentials`, objet plat,
 /// ou tableau de l'un de ces formats). Contrairement a `import_account_docs`,
 /// aucune lecture fichier : le JSON est fourni directement par l'UI.
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn import_account_json(content: String) -> Result<AppSettings, String> {
     let settings_file = settings_path()?;
     let mut settings = load_settings()?;
@@ -737,6 +812,7 @@ pub fn import_account_json(content: String) -> Result<AppSettings, String> {
         return Err("Aucun token de compte trouve dans ce JSON".to_string());
     }
 
+    deduplicate_accounts_by_home(&mut settings);
     ensure_default_account(&mut settings);
     write_settings(&settings_file, &settings)?;
     Ok(settings)
@@ -784,6 +860,7 @@ mod tests {
             label: "Test".to_string(),
             created_at: None,
             provider: Provider::Codex,
+            inference_provider: None,
             codex_home: home.to_string_lossy().to_string(),
             project_dir: None,
             proxy_id: None,
@@ -793,6 +870,52 @@ mod tests {
             model: None,
             reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn account_home_key_expands_userprofile_aliases() {
+        let suffix = format!(".codex-account-dedupe-{}", std::process::id());
+        let absolute = home_dir().unwrap().join(&suffix);
+        let aliased = format!("%userprofile%/{suffix}/");
+
+        assert_eq!(
+            account_home_key(&absolute.to_string_lossy()),
+            account_home_key(&aliased)
+        );
+    }
+
+    #[test]
+    fn duplicate_account_homes_keep_only_the_default_profile() {
+        let suffix = format!(".codex-account-dedupe-default-{}", std::process::id());
+        let absolute = home_dir().unwrap().join(&suffix);
+
+        let mut discovered = account_for_home(&absolute);
+        discovered.id = "auto-discovered".to_string();
+        discovered.label = "Nom automatique".to_string();
+        discovered.model = Some("modele-conserve".to_string());
+
+        let mut selected = account_for_home(&absolute);
+        selected.id = "selected-account".to_string();
+        selected.label = "Compte choisi".to_string();
+        selected.codex_home = format!("%USERPROFILE%\\{suffix}");
+        selected.model = None;
+
+        let mut other = account_for_home(&fresh_account_home("dedupe-other"));
+        other.id = "other".to_string();
+
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        settings.accounts = vec![discovered, selected, other];
+        settings.default_account_id = Some("selected-account".to_string());
+
+        assert!(deduplicate_accounts_by_home(&mut settings));
+        assert_eq!(settings.accounts.len(), 2);
+        assert_eq!(settings.accounts[0].id, "selected-account");
+        assert_eq!(settings.accounts[0].label, "Compte choisi");
+        assert_eq!(
+            settings.accounts[0].model.as_deref(),
+            Some("modele-conserve")
+        );
+        assert_eq!(settings.accounts[1].id, "other");
     }
 
     #[test]
@@ -1273,6 +1396,7 @@ mod tests {
                 id: "ancien-id-local".to_string(),
                 label: String::new(),
                 memory: String::new(),
+                execution_target_id: None,
                 path: "C:\\Projects\\Éire\\".to_string(),
             },
             // Meme chemin avec une autre casse, d'autres separateurs et un id
@@ -1281,6 +1405,7 @@ mod tests {
                 id: "ancien-id-distant".to_string(),
                 label: "dup".to_string(),
                 memory: "Conserver cette decision".to_string(),
+                execution_target_id: Some(" HTTP://127.0.0.1:18082/ ".to_string()),
                 path: "c:/projects/éire".to_string(),
             },
             // Chemin vide : retire.
@@ -1288,6 +1413,7 @@ mod tests {
                 id: "x".to_string(),
                 label: "vide".to_string(),
                 memory: String::new(),
+                execution_target_id: None,
                 path: "   ".to_string(),
             },
         ];
@@ -1301,6 +1427,10 @@ mod tests {
         // Label vide comble par le nom du dossier (UTF-8 safe).
         assert_eq!(ws.label, "Éire");
         assert_eq!(ws.memory, "Conserver cette decision");
+        assert_eq!(
+            ws.execution_target_id.as_deref(),
+            Some("http://127.0.0.1:18082")
+        );
     }
 
     #[test]
@@ -1310,6 +1440,7 @@ mod tests {
             id: "ancien-id".to_string(),
             label: "Projet".to_string(),
             memory: "Decision durable".to_string(),
+            execution_target_id: None,
             path: "C:\\Projects\\Projet".to_string(),
         }];
         settings.closed_workspace_ids = vec![
@@ -1330,6 +1461,7 @@ mod tests {
         settings.workspaces = vec![WorkspaceProfile {
             id: "ancien-id".to_string(),
             label: "Produit".to_string(),
+            execution_target_id: None,
             path: "C:\\Projects\\Produit".to_string(),
             memory: format!("  {}  ", "é".repeat(MAX_WORKSPACE_MEMORY_CHARS + 20)),
         }];
@@ -1375,6 +1507,16 @@ mod tests {
         assert_eq!(claude.provider, Provider::Claude);
         assert_eq!(claude.login_command.as_deref(), Some("auth login"));
         assert_eq!(claude.status_command.as_deref(), Some("auth status"));
+        let opencode = settings
+            .agents
+            .iter()
+            .find(|agent| agent.id == OPENCODE_AGENT_ID)
+            .expect("opencode agent seeded");
+        assert!(opencode.builtin);
+        assert_eq!(opencode.command, "opencode");
+        assert_eq!(opencode.provider, Provider::OpenCode);
+        assert_eq!(opencode.login_command.as_deref(), Some("auth login"));
+        assert_eq!(opencode.status_command.as_deref(), Some("auth list"));
         // Kombai n'est pas un agent terminal : il ne doit PAS etre seed ici.
         assert!(!settings
             .agents
@@ -1382,6 +1524,34 @@ mod tests {
             .any(|agent| agent.id == KOMBAI_AGENT_ID));
         // L'agent actif par defaut reste Codex (comportement historique).
         assert_eq!(settings.active_agent_id.as_deref(), Some(CODEX_AGENT_ID));
+    }
+
+    #[test]
+    fn ensure_agents_repairs_missing_builtin_claude_commands() {
+        let claude = AgentProfile {
+            id: CLAUDE_AGENT_ID.to_string(),
+            label: "Claude Code".to_string(),
+            command: "claude".to_string(),
+            provider: Provider::Claude,
+            kind: "cli".to_string(),
+            builtin: true,
+            login_command: None,
+            status_command: Some(" ".to_string()),
+            doctor_command: None,
+        };
+        let mut settings = empty_settings("codex", vec![claude], Some(CLAUDE_AGENT_ID));
+
+        assert!(ensure_agents(&mut settings));
+
+        let repaired = settings
+            .agents
+            .iter()
+            .find(|agent| agent.id == CLAUDE_AGENT_ID)
+            .expect("agent Claude repare");
+        assert_eq!(repaired.login_command.as_deref(), Some("auth login"));
+        assert_eq!(repaired.status_command.as_deref(), Some("auth status"));
+        assert_eq!(repaired.doctor_command.as_deref(), Some("doctor"));
+        assert!(!ensure_agents(&mut settings));
     }
 
     #[test]
@@ -1487,8 +1657,31 @@ mod tests {
         assert_eq!(view.provider, Provider::Claude);
         assert!(view.has_tokens);
         assert_eq!(view.source, "authenticated");
+        assert!(!view.refreshing);
         assert!(view.error.is_none());
         assert!(view.buckets.is_empty());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_limit_placeholder_is_immediate_and_marks_background_refresh() {
+        let home = fresh_account_home("codex-limit-placeholder");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"account_id":"placeholder","access_token":"token"}}"#,
+        )
+        .unwrap();
+        let account = account_for_home(&home);
+
+        let view = account_limit_placeholder(&account);
+
+        assert!(view.has_tokens);
+        assert!(view.refreshing);
+        assert_eq!(view.source, "refreshing");
+        assert!(view.buckets.is_empty());
+        assert!(view.error.is_none());
 
         let _ = fs::remove_dir_all(home);
     }
@@ -1818,6 +2011,28 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // OpenCode porte tous les fournisseurs API annexes. Un seul agent CLI est
+    // partage ; les credentials et le catalogue restent isoles par compte via
+    // les variables XDG configurees dans `provider.rs`.
+    if !settings
+        .agents
+        .iter()
+        .any(|agent| agent.id == OPENCODE_AGENT_ID)
+    {
+        settings.agents.push(AgentProfile {
+            id: OPENCODE_AGENT_ID.to_string(),
+            label: "OpenCode".to_string(),
+            command: "opencode".to_string(),
+            provider: Provider::OpenCode,
+            kind: "cli".to_string(),
+            builtin: true,
+            login_command: Some("auth login".to_string()),
+            status_command: Some("auth list".to_string()),
+            doctor_command: None,
+        });
+        changed = true;
+    }
+
     // Agent Claude Code integre. Comme l'agent Codex, il est (re)cree s'il
     // manque : Claude Code est un fournisseur pris en charge de premier rang.
     // Les versions recentes du CLI exposent l'authentification via
@@ -1839,6 +2054,47 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
             doctor_command: Some("doctor".to_string()),
         });
         changed = true;
+    }
+
+    // Les versions qui ont introduit Claude Code ont pu persister l'agent
+    // integre avant d'ajouter ses sous-commandes d'authentification. Repare
+    // uniquement les champs vides de l'agent builtin afin de conserver toute
+    // personnalisation explicite d'un utilisateur.
+    if let Some(agent) = settings
+        .agents
+        .iter_mut()
+        .find(|agent| agent.id == CLAUDE_AGENT_ID && agent.builtin)
+    {
+        if agent
+            .login_command
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            agent.login_command = Some("auth login".to_string());
+            changed = true;
+        }
+        if agent
+            .status_command
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            agent.status_command = Some("auth status".to_string());
+            changed = true;
+        }
+        if agent
+            .doctor_command
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            agent.doctor_command = Some("doctor".to_string());
+            changed = true;
+        }
     }
 
     // Kombai n'est PAS un agent terminal : il vit dans l'onglet "Kombai"
@@ -1897,7 +2153,7 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
 /// rester alignee sur `normalizeWorkspacePath` cote front (src/main.ts) : trim,
 /// retrait des slashes finaux, `\\` -> `/`, puis minuscule UNIQUEMENT pour les
 /// chemins Windows (`X:/...`) et UNC (`//...`), insensibles a la casse.
-fn normalize_workspace_path(path: &str) -> String {
+pub(crate) fn normalize_workspace_path(path: &str) -> String {
     let trimmed = path.trim().trim_end_matches(['\\', '/']).replace('\\', "/");
     let bytes = trimmed.as_bytes();
     let is_windows_drive =
@@ -1940,6 +2196,14 @@ fn normalize_workspace_memory(memory: &str) -> String {
         .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
         .take(MAX_WORKSPACE_MEMORY_CHARS)
         .collect()
+}
+
+fn normalize_workspace_execution_target_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .map(|target| target.trim_end_matches('/'))
+        .filter(|target| !target.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 /// Retourne uniquement la memoire du dossier exact. Une conversation ouverte
@@ -1997,6 +2261,8 @@ fn ensure_workspaces(settings: &mut AppSettings) -> bool {
         // survivre comme deux workspaces distincts.
         let id = normalize_workspace_path(&path);
         let memory = normalize_workspace_memory(&ws.memory);
+        let execution_target_id =
+            normalize_workspace_execution_target_id(ws.execution_target_id.as_deref());
         if closed_seen.contains(&id) {
             changed = true;
             continue;
@@ -2005,6 +2271,9 @@ fn ensure_workspaces(settings: &mut AppSettings) -> bool {
             if let Some(existing) = deduped.iter_mut().find(|workspace| workspace.id == id) {
                 if existing.memory.is_empty() && !memory.is_empty() {
                     existing.memory = memory;
+                }
+                if existing.execution_target_id.is_none() && execution_target_id.is_some() {
+                    existing.execution_target_id = execution_target_id;
                 }
             }
             changed = true;
@@ -2015,19 +2284,112 @@ fn ensure_workspaces(settings: &mut AppSettings) -> bool {
         } else {
             ws.label.trim().to_string()
         };
-        if ws.id != id || ws.label != label || ws.path != path || ws.memory != memory {
+        if ws.id != id
+            || ws.label != label
+            || ws.path != path
+            || ws.memory != memory
+            || ws.execution_target_id != execution_target_id
+        {
             changed = true;
         }
         ws.id = id;
         ws.label = label;
         ws.path = path;
         ws.memory = memory;
+        ws.execution_target_id = execution_target_id;
         deduped.push(ws);
     }
 
     settings.workspaces = deduped;
 
     changed
+}
+
+/// Un home d'authentification ne peut representer qu'un seul compte. Les
+/// anciennes versions comparaient les chaines brutes et pouvaient donc garder
+/// deux profils pour `%USERPROFILE%\\.codex-x` et
+/// `C:\\Users\\...\\.codex-x`, alors qu'ils ciblent le meme dossier.
+///
+/// La premiere occurrence est conservee, sauf si une occurrence ulterieure est
+/// le compte par defaut : dans ce cas son identifiant reste la reference
+/// canonique. Les quelques metadonnees absentes sont completees depuis le
+/// profil retire ; aucun fichier du home n'est supprime.
+fn deduplicate_accounts_by_home(settings: &mut AppSettings) -> bool {
+    if settings.accounts.len() < 2 {
+        return false;
+    }
+
+    let default_id = settings.default_account_id.as_deref();
+    let mut unique = Vec::<AccountProfile>::with_capacity(settings.accounts.len());
+    let mut home_keys = Vec::<String>::with_capacity(settings.accounts.len());
+    let mut changed = false;
+
+    for account in std::mem::take(&mut settings.accounts) {
+        let home_key = account_home_key(&account.codex_home);
+        // Un home vide est invalide, mais ne doit pas provoquer la suppression
+        // silencieuse de tous les profils invalides lors de leur migration.
+        if home_key.is_empty() {
+            home_keys.push(home_key);
+            unique.push(account);
+            continue;
+        }
+
+        let Some(existing_index) = home_keys.iter().position(|key| key == &home_key) else {
+            home_keys.push(home_key);
+            unique.push(account);
+            continue;
+        };
+
+        changed = true;
+        let current_is_default = default_id == Some(account.id.as_str());
+        let existing_is_default = default_id == Some(unique[existing_index].id.as_str());
+        if current_is_default && !existing_is_default {
+            let mut replacement = account;
+            merge_missing_account_metadata(&mut replacement, &unique[existing_index]);
+            unique[existing_index] = replacement;
+        } else {
+            merge_missing_account_metadata(&mut unique[existing_index], &account);
+        }
+    }
+
+    settings.accounts = unique;
+    changed
+}
+
+fn merge_missing_account_metadata(target: &mut AccountProfile, source: &AccountProfile) {
+    if target.label.trim().is_empty() && !source.label.trim().is_empty() {
+        target.label = source.label.clone();
+    }
+    if target.created_at.is_none() {
+        target.created_at = source.created_at;
+    }
+    if target.inference_provider.is_none() {
+        target.inference_provider = source.inference_provider.clone();
+    }
+    if target.project_dir.is_none() {
+        target.project_dir = source.project_dir.clone();
+    }
+    if target.proxy_id.is_none() {
+        target.proxy_id = source.proxy_id.clone();
+    }
+    if target.startup_command.is_none() {
+        target.startup_command = source.startup_command.clone();
+    }
+    if target.model.is_none() {
+        target.model = source.model.clone();
+    }
+    if target.reasoning_effort.is_none() {
+        target.reasoning_effort = source.reasoning_effort.clone();
+    }
+    if target.limits.connected_at.is_none() {
+        target.limits.connected_at = source.limits.connected_at;
+    }
+    if target.limits.session_anchor_at.is_none() {
+        target.limits.session_anchor_at = source.limits.session_anchor_at;
+    }
+    if target.limits.weekly_anchor_at.is_none() {
+        target.limits.weekly_anchor_at = source.limits.weekly_anchor_at;
+    }
 }
 
 fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String> {
@@ -2040,12 +2402,12 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
     let mut account_paths = settings
         .accounts
         .iter()
-        .map(|account| normalize_string_path(&account.codex_home))
+        .map(|account| account_home_key(&account.codex_home))
         .collect::<HashSet<_>>();
     let mut expired_homes = settings
         .expired_unconnected_account_homes
         .iter()
-        .map(|home| normalize_string_path(home))
+        .map(|home| account_home_key(home))
         .collect::<HashSet<_>>();
     let mut proxy_urls = settings
         .proxies
@@ -2069,14 +2431,14 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
         }
 
         let path_string = path.to_string_lossy().to_string();
-        let normalized = normalize_string_path(&path_string);
+        let normalized = account_home_key(&path_string);
         let has_auth = path.join("auth.json").is_file();
         let has_config = path.join("config.toml").is_file();
         if expired_homes.contains(&normalized) {
-            if Provider::Codex.has_auth(&path) {
+            if Provider::Codex.has_auth(&path, None) {
                 settings
                     .expired_unconnected_account_homes
-                    .retain(|home| normalize_string_path(home) != normalized);
+                    .retain(|home| account_home_key(home) != normalized);
                 expired_homes.remove(&normalized);
                 changed = true;
             } else {
@@ -2128,6 +2490,7 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
                 // du meme delai de dix minutes qu'une creation dans l'UI.
                 created_at: Some(now_unix()),
                 provider: Provider::Codex,
+                inference_provider: None,
                 codex_home: path_string.clone(),
                 project_dir: None,
                 proxy_id,
@@ -2201,7 +2564,9 @@ pub fn account_has_auth_tokens(account: &AccountProfile) -> bool {
     };
     // Detection des credentials propre au provider (Codex: auth.json ;
     // Claude: .credentials.json). Voir `provider::Provider::has_auth`.
-    account.provider.has_auth(&home)
+    account
+        .provider
+        .has_auth(&home, account.inference_provider.as_deref())
 }
 
 /// Commande CLI a utiliser pour lancer/piloter un `provider` : commande de
@@ -2217,6 +2582,7 @@ pub fn command_for_provider(settings: &AppSettings, provider: Provider) -> Strin
         .unwrap_or_else(|| match provider {
             Provider::Codex => "codex".to_string(),
             Provider::Claude => "claude".to_string(),
+            Provider::OpenCode => "opencode".to_string(),
         })
 }
 
@@ -2229,7 +2595,7 @@ fn remove_expired_unconnected_accounts(settings: &mut AppSettings, now: i64) -> 
     let tombstoned_homes = settings
         .expired_unconnected_account_homes
         .iter()
-        .map(|home| normalize_string_path(home))
+        .map(|home| account_home_key(home))
         .collect::<HashSet<_>>();
     let expired = settings
         .accounts
@@ -2245,15 +2611,10 @@ fn remove_expired_unconnected_accounts(settings: &mut AppSettings, now: i64) -> 
                 // Un ancien frontend peut tenter de sauvegarder a nouveau un
                 // profil deja expire sans connaitre `createdAt`. Le tombstone
                 // du home doit alors primer sur cette copie obsolete.
-                None => tombstoned_homes.contains(&normalize_string_path(&account.codex_home)),
+                None => tombstoned_homes.contains(&account_home_key(&account.codex_home)),
             }
         })
-        .map(|account| {
-            (
-                account.id.clone(),
-                normalize_string_path(&account.codex_home),
-            )
-        })
+        .map(|account| (account.id.clone(), account_home_key(&account.codex_home)))
         .collect::<Vec<_>>();
 
     if expired.is_empty() {
@@ -2298,12 +2659,12 @@ fn clear_expired_home_tombstones_for_registered_accounts(settings: &mut AppSetti
     let registered_homes = settings
         .accounts
         .iter()
-        .map(|account| normalize_string_path(&account.codex_home))
+        .map(|account| account_home_key(&account.codex_home))
         .collect::<HashSet<_>>();
     let previous_len = settings.expired_unconnected_account_homes.len();
     settings
         .expired_unconnected_account_homes
-        .retain(|home| !registered_homes.contains(&normalize_string_path(home)));
+        .retain(|home| !registered_homes.contains(&account_home_key(home)));
     settings.expired_unconnected_account_homes.len() != previous_len
 }
 
@@ -2347,7 +2708,193 @@ fn new_connected_limits(now: i64) -> AccountLimitTracking {
     }
 }
 
+/// Cache stale-while-revalidate des quotas. Demarrer un app-server par compte
+/// prend plusieurs secondes ; l'interface recoit donc immediatement le dernier
+/// snapshot (ou un placeholder connecte au premier passage), tandis qu'un seul
+/// rafraichissement reconstruit les lignes en arriere-plan.
+#[derive(Clone)]
+struct AccountLimitCache {
+    signature: String,
+    rows: Vec<AccountLimitView>,
+    completed_at: Option<Instant>,
+    refreshing: bool,
+}
+
+static ACCOUNT_LIMIT_CACHE: OnceLock<Mutex<Option<AccountLimitCache>>> = OnceLock::new();
+
+fn account_limit_cache() -> &'static Mutex<Option<AccountLimitCache>> {
+    ACCOUNT_LIMIT_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn lock_account_limit_cache() -> std::sync::MutexGuard<'static, Option<AccountLimitCache>> {
+    account_limit_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn account_limit_cache_signature(settings: &AppSettings) -> String {
+    let mut signature = serde_json::to_string(&(
+        &settings.accounts,
+        &settings.proxies,
+        settings.proxy_controls_enabled,
+        &settings.codex_command,
+    ))
+    .unwrap_or_default();
+    for account in &settings.accounts {
+        signature.push('|');
+        signature.push_str(&account.id);
+        signature.push(':');
+        signature.push(if account_has_auth_tokens(account) {
+            '1'
+        } else {
+            '0'
+        });
+    }
+    signature
+}
+
+fn account_limit_placeholder(account: &AccountProfile) -> AccountLimitView {
+    let now = now_unix();
+    let has_tokens = account_has_auth_tokens(account);
+    let authenticated_without_remote =
+        has_tokens && matches!(account.provider, Provider::Claude | Provider::OpenCode);
+    let refreshing = has_tokens && account.provider == Provider::Codex;
+
+    AccountLimitView {
+        id: account.id.clone(),
+        label: account.label.clone(),
+        provider: account.provider,
+        codex_home: account.codex_home.clone(),
+        has_tokens,
+        connected_at: account.limits.connected_at,
+        session_reset_at: None,
+        weekly_reset_at: None,
+        session_remaining_secs: None,
+        weekly_remaining_secs: None,
+        session_used_percent: None,
+        weekly_used_percent: None,
+        buckets: Vec::new(),
+        refreshed_at: authenticated_without_remote.then_some(now),
+        source: if authenticated_without_remote {
+            "authenticated"
+        } else if refreshing {
+            "refreshing"
+        } else {
+            "none"
+        }
+        .to_string(),
+        refreshing,
+        error: None,
+    }
+}
+
+fn prepare_cached_limit_rows(rows: &mut [AccountLimitView], refreshing: bool) {
+    let now = now_unix();
+    for row in rows {
+        row.session_remaining_secs = row.session_reset_at.map(|value| (value - now).max(0));
+        row.weekly_remaining_secs = row.weekly_reset_at.map(|value| (value - now).max(0));
+        row.refreshing = refreshing && row.provider == Provider::Codex && row.has_tokens;
+    }
+}
+
+fn account_limits_need_remote_refresh(rows: &[AccountLimitView]) -> bool {
+    rows.iter()
+        .any(|row| row.provider == Provider::Codex && row.has_tokens)
+}
+
+fn store_account_limit_cache(signature: String, mut rows: Vec<AccountLimitView>) {
+    prepare_cached_limit_rows(&mut rows, false);
+    let mut cache = lock_account_limit_cache();
+    *cache = Some(AccountLimitCache {
+        signature,
+        rows,
+        completed_at: Some(Instant::now()),
+        refreshing: false,
+    });
+}
+
+fn spawn_account_limit_refresh(settings: AppSettings, signature: String) {
+    thread::spawn(move || {
+        let refreshed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            account_limit_views_uncached(&settings)
+        }))
+        .ok();
+        let mut cache = lock_account_limit_cache();
+        let Some(current) = cache
+            .as_mut()
+            .filter(|current| current.signature == signature)
+        else {
+            return;
+        };
+        if let Some(mut rows) = refreshed {
+            prepare_cached_limit_rows(&mut rows, false);
+            current.rows = rows;
+            current.completed_at = Some(Instant::now());
+        }
+        current.refreshing = false;
+    });
+}
+
+fn account_limit_views_fast(settings: &AppSettings) -> Vec<AccountLimitView> {
+    let signature = account_limit_cache_signature(settings);
+    let now = Instant::now();
+    let (mut rows, refreshing, spawn_refresh) = {
+        let mut cache = lock_account_limit_cache();
+        match cache
+            .as_mut()
+            .filter(|current| current.signature == signature)
+        {
+            Some(current) => {
+                let fresh = current.completed_at.is_some_and(|completed_at| {
+                    now.duration_since(completed_at)
+                        < Duration::from_secs(RATE_LIMIT_CACHE_TTL_SECS)
+                });
+                if fresh {
+                    (current.rows.clone(), false, false)
+                } else if current.refreshing {
+                    (current.rows.clone(), true, false)
+                } else {
+                    let needs_refresh = account_limits_need_remote_refresh(&current.rows);
+                    current.refreshing = needs_refresh;
+                    if !needs_refresh {
+                        current.completed_at = Some(now);
+                    }
+                    (current.rows.clone(), needs_refresh, needs_refresh)
+                }
+            }
+            None => {
+                let rows = settings
+                    .accounts
+                    .iter()
+                    .map(account_limit_placeholder)
+                    .collect::<Vec<_>>();
+                let needs_refresh = account_limits_need_remote_refresh(&rows);
+                *cache = Some(AccountLimitCache {
+                    signature: signature.clone(),
+                    rows: rows.clone(),
+                    completed_at: (!needs_refresh).then_some(now),
+                    refreshing: needs_refresh,
+                });
+                (rows, needs_refresh, needs_refresh)
+            }
+        }
+    };
+
+    if spawn_refresh {
+        spawn_account_limit_refresh(settings.clone(), signature);
+    }
+    prepare_cached_limit_rows(&mut rows, refreshing);
+    rows
+}
+
 pub(crate) fn account_limit_views(settings: &AppSettings) -> Vec<AccountLimitView> {
+    let signature = account_limit_cache_signature(settings);
+    let rows = account_limit_views_uncached(settings);
+    store_account_limit_cache(signature, rows.clone());
+    rows
+}
+
+fn account_limit_views_uncached(settings: &AppSettings) -> Vec<AccountLimitView> {
     let accounts = settings.accounts.clone();
     let handles = accounts
         .into_iter()
@@ -2375,6 +2922,12 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
         // Claude Code ne fournit pas l'equivalent de `account/rateLimits/read`.
         // La vue Limites doit tout de meme reconnaitre sa session comme valide
         // sans lancer par erreur le `codex app-server` avec son home Claude.
+        refreshed_at = Some(now);
+        source = "authenticated";
+    } else if has_tokens && account.provider == Provider::OpenCode {
+        // Les fournisseurs pilotes par OpenCode n'exposent pas un format de
+        // quotas commun. La presence du credential suffit a marquer le compte
+        // connecte, sans appeler le serveur de quotas Codex.
         refreshed_at = Some(now);
         source = "authenticated";
     } else if has_tokens {
@@ -2446,6 +2999,7 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
         buckets,
         refreshed_at,
         source: source.to_string(),
+        refreshing: false,
         error,
     }
 }
@@ -2717,6 +3271,7 @@ fn local_snapshot_matches_current_credentials(
     let credentials = match account.provider {
         Provider::Codex => home.join("auth.json"),
         Provider::Claude => home.join(".credentials.json"),
+        Provider::OpenCode => home.join("data").join("opencode").join("auth.json"),
     };
     let Some(modified_at) = fs::metadata(credentials)
         .ok()
@@ -3292,6 +3847,7 @@ fn import_single_account(
                 label: account.label,
                 created_at: Some(now),
                 provider: Provider::Codex,
+                inference_provider: None,
                 codex_home: home_string,
                 project_dir: None,
                 proxy_id,
@@ -3982,30 +4538,59 @@ fn normalize_string_path(value: &str) -> String {
     value.trim().replace('/', "\\").to_ascii_lowercase()
 }
 
-pub fn expand_home(value: &str) -> Result<PathBuf, String> {
+/// Identite physique d'un home de compte. Les alias utilisateur et data sont
+/// developpes avant comparaison, puis un lien symbolique/jonction existant est
+/// resolu afin que deux syntaxes du meme dossier produisent la meme cle.
+fn account_home_key(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let expanded = expand_home_local(trimmed).unwrap_or_else(|_| PathBuf::from(trimmed));
+    let resolved = fs::canonicalize(&expanded).unwrap_or(expanded);
+    let normalized = resolved
+        .to_string_lossy()
+        .trim()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn strip_ascii_case_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn cst_data_suffix(value: &str) -> Option<&str> {
+    ["%CST_DATA_DIR%", "${CST_DATA_DIR}", "$CST_DATA_DIR"]
+        .into_iter()
+        .find_map(|prefix| strip_ascii_case_prefix(value, prefix))
+}
+
+fn expand_cst_data_path(stripped: &str) -> Result<PathBuf, String> {
+    let base = env::var_os("CST_DATA_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
+    Ok(base.join(stripped.trim_start_matches(['\\', '/'])))
+}
+
+/// Developpe un chemin sans jamais le rediriger vers une autre instance.
+/// Reserve aux operations d'ecriture/destruction et aux cles de deduplication.
+fn expand_home_local(value: &str) -> Result<PathBuf, String> {
     if value == "~" {
         return home_dir();
     }
 
-    if let Some(stripped) = value.strip_prefix("%CST_DATA_DIR%") {
-        let base = env::var_os("CST_DATA_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
-        return Ok(base.join(stripped.trim_start_matches(['\\', '/'])));
-    }
-
-    if let Some(stripped) = value.strip_prefix("${CST_DATA_DIR}") {
-        let base = env::var_os("CST_DATA_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
-        return Ok(base.join(stripped.trim_start_matches(['\\', '/'])));
-    }
-
-    if let Some(stripped) = value.strip_prefix("$CST_DATA_DIR") {
-        let base = env::var_os("CST_DATA_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
-        return Ok(base.join(stripped.trim_start_matches(['\\', '/'])));
+    if let Some(stripped) = cst_data_suffix(value) {
+        return expand_cst_data_path(stripped);
     }
 
     if let Some(stripped) = value
@@ -4015,7 +4600,7 @@ pub fn expand_home(value: &str) -> Result<PathBuf, String> {
         return Ok(home_dir()?.join(stripped));
     }
 
-    if let Some(stripped) = value.strip_prefix("%USERPROFILE%") {
+    if let Some(stripped) = strip_ascii_case_prefix(value, "%USERPROFILE%") {
         return Ok(home_dir()?.join(stripped.trim_start_matches(['\\', '/'])));
     }
 
@@ -4027,6 +4612,25 @@ pub fn expand_home(value: &str) -> Result<PathBuf, String> {
     }
 
     Ok(PathBuf::from(value))
+}
+
+/// Developpe un home de lecture/execution. Pour les comptes serveur ranges sous
+/// `CST_DATA_DIR/codex-homes`, une copie authentifiee d'une instance locale
+/// soeur est acceptee lorsque la copie locale est absente et que l'identite du
+/// compte est sans ambiguite. Tous les autres chemins restent strictement
+/// locaux.
+pub fn expand_home(value: &str) -> Result<PathBuf, String> {
+    let primary = expand_home_local(value)?;
+    let Some(stripped) = cst_data_suffix(value) else {
+        return Ok(primary);
+    };
+    let base = env::var_os("CST_DATA_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| "CST_DATA_DIR n'est pas defini".to_string())?;
+    let relative = PathBuf::from(stripped.trim_start_matches(['\\', '/']));
+    Ok(crate::account_usage::resolve_data_dir_account_home(
+        &base, &relative, primary,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -4056,6 +4660,7 @@ fn windows_drive_path_in_wsl(value: &str) -> Option<PathBuf> {
     Some(PathBuf::from("/mnt").join(drive).join(remainder))
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn pick_project_dir(current_dir: Option<String>) -> Result<Option<String>, String> {
     let start_dir = current_dir
@@ -4065,7 +4670,7 @@ pub async fn pick_project_dir(current_dir: Option<String>) -> Result<Option<Stri
         .and_then(|value| expand_home(value).ok())
         .filter(|path| path.is_dir());
 
-    let selected = tauri::async_runtime::spawn_blocking(move || {
+    let selected = tokio::task::spawn_blocking(move || {
         let mut dialog = rfd::FileDialog::new();
         if let Some(dir) = start_dir {
             dialog = dialog.set_directory(dir);

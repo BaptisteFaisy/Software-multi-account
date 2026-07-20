@@ -3,6 +3,7 @@ export type KeyboardShortcutId =
   | "search-discussions"
   | "open-discussions"
   | "open-settings"
+  | "toggle-sidebar"
   | "toggle-environments"
   | "new-terminal"
   | "toggle-pane-fullscreen"
@@ -49,8 +50,8 @@ export const KEYBOARD_SHORTCUT_DEFINITIONS: readonly KeyboardShortcutDefinition[
   {
     id: "open-discussions",
     group: "general",
-    label: "Toutes les discussions",
-    description: "Ouvrir la vue qui permet de reprendre une discussion.",
+    label: "Ouvrir l’historique",
+    description: "Ouvrir l’historique qui permet de reprendre une discussion.",
     defaultBinding: "Mod+Shift+K",
   },
   {
@@ -59,6 +60,13 @@ export const KEYBOARD_SHORTCUT_DEFINITIONS: readonly KeyboardShortcutDefinition[
     label: "Paramètres",
     description: "Ouvrir directement les paramètres de l’application.",
     defaultBinding: "Mod+Comma",
+  },
+  {
+    id: "toggle-sidebar",
+    group: "general",
+    label: "Colonne de gauche",
+    description: "Masquer ou réafficher la barre latérale des conversations.",
+    defaultBinding: "Mod+B",
   },
   {
     id: "toggle-environments",
@@ -79,14 +87,14 @@ export const KEYBOARD_SHORTCUT_DEFINITIONS: readonly KeyboardShortcutDefinition[
     group: "chat",
     label: "Agrandir ou réduire le panneau survolé",
     description: "Basculer le chat ou le terminal placé sous la souris en plein écran.",
-    defaultBinding: "Space",
+    defaultBinding: "1",
   },
   {
     id: "close-chat",
     group: "chat",
     label: "Fermer le chat survolé",
     description: "Retirer le panneau en conservant sa discussion dans l’historique.",
-    defaultBinding: "Backspace",
+    defaultBinding: "2",
   },
   {
     id: "close-chat-and-discussion",

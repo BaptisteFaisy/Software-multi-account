@@ -7,6 +7,7 @@ pub struct ClientStartupConfig {
     pub remote_mode: bool,
     pub base_url: Option<String>,
     pub token: Option<String>,
+    pub nodes: Option<String>,
 }
 
 #[tauri::command]
@@ -35,10 +36,15 @@ pub fn client_startup_config() -> ClientStartupConfig {
         .or_else(|| arg_value(&args, "--remote-token"))
         .or_else(read_local_server_token);
 
+    let nodes = env::var("CST_CLIENT_NODES")
+        .ok()
+        .or_else(|| arg_value(&args, "--remote-nodes"));
+
     ClientStartupConfig {
         remote_mode,
         base_url,
         token,
+        nodes,
     }
 }
 

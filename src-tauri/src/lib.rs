@@ -4,22 +4,36 @@ mod autonomous;
 mod chat;
 mod chat_model_tools;
 pub mod chat_tools;
+#[cfg(feature = "desktop")]
 mod client_startup;
+mod creative_accounts;
 pub mod devices;
 mod discussions;
 mod doctolib_lab;
+mod forum;
 mod fs_util;
+mod git_docker_environment;
+mod image_generation;
 mod kombai;
 mod metrics;
+mod mobile_push;
 mod orchestration;
 mod pool;
+mod private_messages;
 mod provider;
+mod runtime_sync;
 mod security;
 pub mod server;
 mod settings;
+mod telegram_notifications;
+#[cfg(feature = "desktop")]
 mod terminal;
+mod video_generation;
 mod voice;
+mod vps_deploy;
+mod whatsapp_notifications;
 mod work_time;
+mod workspace_access;
 
 // `Provider` fait partie des DTOs publics du serveur.
 pub use settings::Provider;
@@ -50,20 +64,59 @@ pub fn run() {
             .expect("repertoire des agents autonomes introuvable"),
     )
     .expect("etat des agents autonomes illisible");
+    telegram_notifications::start_polling(autonomous_manager.clone());
     let orchestration_manager = orchestration::OrchestrationManager::new(
         chat_manager.clone(),
         settings::runtime_data_path("orchestrated-runs.json")
             .expect("repertoire des chats orchestres introuvable"),
     )
     .expect("etat des chats orchestres illisible");
+    let forum_manager = forum::ForumManager::new(
+        settings::runtime_data_path("forum.json").expect("repertoire du forum introuvable"),
+    )
+    .expect("etat du forum illisible");
+    let private_message_manager = private_messages::PrivateMessageManager::new(
+        settings::runtime_data_path("private-messages.json")
+            .expect("repertoire de la messagerie introuvable"),
+    )
+    .expect("etat de la messagerie illisible");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .setup(|app| {
+            if std::env::var_os("CST_DOCKERIZE_GIT_SCRIPT").is_none() {
+                let bundled_script = app.path().resource_dir().ok().map(|directory| {
+                    directory
+                        .join("skills")
+                        .join("dockerize-git")
+                        .join("scripts")
+                        .join("dockerize-git.mjs")
+                });
+                let source_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("public")
+                    .join("skills")
+                    .join("dockerize-git")
+                    .join("scripts")
+                    .join("dockerize-git.mjs");
+                let script = bundled_script
+                    .filter(|path| path.is_file())
+                    .or_else(|| source_script.is_file().then_some(source_script));
+
+                if let Some(script) = script {
+                    std::env::set_var("CST_DOCKERIZE_GIT_SCRIPT", script);
+                }
+            }
+            Ok(())
+        })
         .manage(terminal::TerminalManager::default())
         .manage(chat_manager)
         .manage(autonomous_manager)
         .manage(orchestration_manager)
+        .manage(forum_manager)
+        .manage(private_message_manager)
         .manage(doctolib_lab::DoctolibLabManager::default())
         .manage(PoolState::default())
         .manage(kombai::KombaiManager::default())
@@ -85,6 +138,7 @@ pub fn run() {
             settings::account_limit_status,
             settings::account_model_catalog,
             settings::pick_project_dir,
+            git_docker_environment::create_git_docker_environment,
             metrics::usage_dashboard,
             account_usage::account_token_usage,
             work_time::work_time_dashboard,
@@ -93,20 +147,34 @@ pub fn run() {
             discussions::claim_session_for_terminal,
             discussions::copy_discussion_to_account,
             discussions::move_discussion,
+            discussions::rename_discussion,
             discussions::export_discussion_transcript,
             discussions::get_discussion_transcript,
             discussions::delete_discussion,
+            forum::list_forum_topics,
+            forum::get_forum_topic,
+            forum::create_forum_topic,
+            forum::reply_to_forum_topic,
+            private_messages::list_private_message_users,
+            private_messages::list_private_message_conversations,
+            private_messages::get_private_message_conversation,
+            private_messages::get_private_message_image,
+            private_messages::send_private_message,
             chat::start_chat_turn,
             chat::list_active_chat_turns,
             chat::chat_turn_status,
             chat::stop_chat_turn,
+            chat::compact_chat_session,
             autonomous::list_autonomous_agents,
+            autonomous::read_autonomous_review_evidence,
             autonomous::create_autonomous_agent,
             autonomous::update_autonomous_agent,
             autonomous::control_autonomous_agent,
             autonomous::schedule_autonomous_agent,
             autonomous::reassign_autonomous_agent_account,
             autonomous::add_autonomous_agent_memory,
+            autonomous::mark_autonomous_agent_report_read,
+            autonomous::send_autonomous_agent_message,
             autonomous::delete_autonomous_agent_memory,
             autonomous::delete_autonomous_agent,
             orchestration::list_orchestrations,
@@ -122,6 +190,31 @@ pub fn run() {
             doctolib_lab::doctolib_lab_confirm,
             voice::process_voice_input,
             voice::voice_runtime_status,
+            creative_accounts::creative_accounts,
+            creative_accounts::connect_creative_account,
+            creative_accounts::delete_creative_account,
+            creative_accounts::set_default_creative_account,
+            whatsapp_notifications::whatsapp_connection,
+            whatsapp_notifications::connect_whatsapp,
+            whatsapp_notifications::disconnect_whatsapp,
+            whatsapp_notifications::test_whatsapp,
+            telegram_notifications::telegram_connection,
+            telegram_notifications::connect_telegram,
+            telegram_notifications::refresh_telegram_pairing,
+            telegram_notifications::disconnect_telegram,
+            telegram_notifications::test_telegram,
+            telegram_notifications::telegram_manager,
+            telegram_notifications::connect_telegram_manager,
+            telegram_notifications::prepare_managed_telegram_bot,
+            telegram_notifications::disconnect_telegram_manager,
+            image_generation::image_generation_capabilities,
+            image_generation::start_image_generation,
+            image_generation::image_generation_status,
+            image_generation::cancel_image_generation,
+            video_generation::video_generation_capabilities,
+            video_generation::start_video_generation,
+            video_generation::video_generation_status,
+            video_generation::cancel_video_generation,
             terminal::start_terminal,
             terminal::write_terminal,
             terminal::resize_terminal,
@@ -162,6 +255,7 @@ fn pool_bind_addr(port: u16) -> String {
         .unwrap_or_else(|| format!("127.0.0.1:{port}"))
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 async fn pool_start(state: tauri::State<'_, PoolState>) -> Result<Value, String> {
     stop_runtime(&state);
@@ -181,7 +275,7 @@ async fn pool_start(state: tauri::State<'_, PoolState>) -> Result<Value, String>
     let router = pool::router(manager.clone(), None);
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
-    tauri::async_runtime::spawn(async move {
+    tokio::task::spawn(async move {
         let _ = axum::serve(listener, router.into_make_service())
             .with_graceful_shutdown(async {
                 let _ = rx.await;
@@ -199,12 +293,14 @@ async fn pool_start(state: tauri::State<'_, PoolState>) -> Result<Value, String>
     pool_snapshot(&manager, true, port)
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn pool_stop(state: tauri::State<'_, PoolState>) -> Result<Value, String> {
     stop_runtime(&state);
     Ok(json!({ "running": false }))
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn pool_status(state: tauri::State<'_, PoolState>) -> Result<Value, String> {
     let guard = state
@@ -225,6 +321,7 @@ fn pool_status(state: tauri::State<'_, PoolState>) -> Result<Value, String> {
     }
 }
 
+#[cfg(feature = "desktop")]
 #[tauri::command]
 fn pool_pick_terminal_account(
     state: tauri::State<'_, PoolState>,

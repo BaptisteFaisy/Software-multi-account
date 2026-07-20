@@ -6,7 +6,9 @@
 //! exclus. Lorsque plusieurs chats travaillent en parallele, leurs intervalles
 //! sont fusionnes afin qu'une minute reelle ne soit jamais comptee deux fois.
 
-use crate::{account_usage::collect_rollouts, metrics, settings};
+use crate::{
+    account_usage::collect_rollouts, discussions::is_autonomous_prompt, metrics, settings,
+};
 use chrono::{Local, NaiveTime, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
@@ -75,9 +77,9 @@ struct DayWorkTime {
 
 static WORK_TIME_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedFileWorkTime>>> = OnceLock::new();
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn work_time_dashboard() -> Result<WorkTimeDashboard, String> {
-    tauri::async_runtime::spawn_blocking(work_time_dashboard_for_server)
+    tokio::task::spawn_blocking(work_time_dashboard_for_server)
         .await
         .map_err(|error| error.to_string())?
 }
@@ -104,6 +106,9 @@ fn build_dashboard(settings: &settings::AppSettings) -> WorkTimeDashboard {
         match account.provider {
             settings::Provider::Codex => collect_codex_files(&home, &mut codex_files),
             settings::Provider::Claude => collect_claude_files(&home, &mut claude_files),
+            // Le store OpenCode est gere par sa propre base ; les executions
+            // restent tout de meme comptees par les metriques de lancement.
+            settings::Provider::OpenCode => {}
         }
     }
 
@@ -418,9 +423,13 @@ fn aggregate_intervals(mut intervals: Vec<WorkInterval>, generated_at: i64) -> W
             "{}:{}:{}",
             interval.chat_id, interval.start_ms, interval.end_ms
         );
-        split_interval_by_day(interval.start_ms, interval.end_ms, |date, _, _| {
-            days.entry(date).or_default().turns.insert(turn_key.clone());
-        });
+        let start_date = Local
+            .timestamp_millis_opt(interval.start_ms)
+            .single()
+            .unwrap_or_else(Local::now)
+            .format("%Y-%m-%d")
+            .to_string();
+        days.entry(start_date).or_default().turns.insert(turn_key);
     }
 
     let mut merged = Vec::<(i64, i64)>::new();
@@ -506,6 +515,10 @@ fn codex_line_affects_work_time(line: &str) -> bool {
         "\"user_message\"",
         "\"agent_message\"",
         "\"token_count\"",
+        "\"function_call\"",
+        "\"function_call_output\"",
+        "\"custom_tool_call\"",
+        "\"custom_tool_call_output\"",
         "\"turn_aborted\"",
         "\"task_complete\"",
         "\"turn_complete\"",
@@ -527,13 +540,6 @@ fn codex_meta_is_subagent(meta: &Value) -> bool {
 
 fn is_synthetic_prompt(message: &str) -> bool {
     message.starts_with("<environment_context>") || message.starts_with("<user_instructions>")
-}
-
-fn is_autonomous_prompt(message: &str) -> bool {
-    message.contains("CST_AUTONOMOUS_AGENT_SESSION: true")
-        || message.contains("chat de type agent autonome")
-        || message.contains("Poursuis de maniere autonome l'objectif durable")
-        || (message.contains("AUTONOMOUS_STATUS:") && message.contains("AUTONOMOUS_MEMORY:"))
 }
 
 fn claude_message_text(value: &Value) -> Option<String> {
@@ -643,6 +649,30 @@ mod tests {
         assert_eq!(dashboard.tracked_chats, 2);
         assert_eq!(dashboard.tracked_turns, 2);
         assert_eq!(dashboard.days[0].turn_count, 2);
+    }
+
+    #[test]
+    fn a_turn_crossing_midnight_is_split_without_counting_two_turns() {
+        let start_ms = Local
+            .with_ymd_and_hms(2026, 7, 14, 23, 59, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let dashboard = aggregate_intervals(
+            vec![WorkInterval {
+                start_ms,
+                end_ms: start_ms + 120_000,
+                chat_id: "night-chat".to_string(),
+            }],
+            start_ms / 1_000,
+        );
+
+        assert_eq!(dashboard.days.len(), 2);
+        assert_eq!(dashboard.total_seconds, 120);
+        assert_eq!(
+            dashboard.days.iter().map(|day| day.turn_count).sum::<u64>(),
+            1
+        );
     }
 
     #[test]

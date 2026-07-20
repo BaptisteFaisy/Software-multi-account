@@ -48,7 +48,7 @@ function Get-LocalToken {
     return $null
   }
 
-  $match = [regex]::Match($tokenLine, '"([^"]+)"')
+  $match = [regex]::Match($tokenLine, '["'']([^"'']+)["'']')
   if (-not $match.Success) {
     return $null
   }
