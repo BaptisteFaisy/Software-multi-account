@@ -565,6 +565,41 @@ pub fn ensure_account_home(
     Ok(())
 }
 
+/// Ajoute un compte au registre partage sans transporter la vue personnelle
+/// des workspaces du navigateur. Sur le serveur SaaS, tous les utilisateurs
+/// authentifies voient le meme pool de comptes et les memes homes de provider.
+pub fn add_shared_account(account: AccountProfile) -> Result<AppSettings, String> {
+    if account.id.trim().is_empty() {
+        return Err("Identifiant de compte manquant".to_string());
+    }
+    if account.label.trim().is_empty() {
+        return Err("Nom de compte manquant".to_string());
+    }
+    if account.codex_home.trim().is_empty() {
+        return Err("Dossier du compte manquant".to_string());
+    }
+
+    let path = settings_path()?;
+    let mut settings = load_settings()?;
+    if settings
+        .accounts
+        .iter()
+        .any(|existing| existing.id == account.id)
+    {
+        return Err("Ce compte existe deja".to_string());
+    }
+
+    let account_id = account.id.clone();
+    settings.accounts.push(account);
+    if settings.default_account_id.is_none() {
+        settings.default_account_id = Some(account_id);
+    }
+    ensure_agents(&mut settings);
+    sync_account_limit_trackers(&mut settings);
+    write_settings(&path, &settings)?;
+    Ok(settings)
+}
+
 /// Retire un compte du Pool / de la liste. Si `delete_files` est faux, ne touche
 /// PAS au dossier CODEX_HOME sur le disque : seul l'enregistrement dans
 /// `settings.json` est supprime (avec `auto_discover_accounts = false`, le compte

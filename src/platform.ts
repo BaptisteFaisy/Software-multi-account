@@ -115,6 +115,8 @@ const REMOTE_BOOTSTRAP_TIMEOUT_MS = 8_000;
 const listeners = new Map<string, Set<Listener<any>>>();
 const remoteSockets = new Map<number, WebSocket>();
 const remoteTerminalRoutes = new Map<number, RemoteTerminalRoute>();
+const REMOTE_TERMINAL_OUTPUT_LIMIT = 32_768;
+const remoteTerminalOutput = new Map<number, string>();
 const remoteChatTurnRoutes = new Map<number, { route: RemoteTerminalRoute; remoteId: number }>();
 const remoteChatTurnIds = new Map<string, number>();
 const remoteSessionRoutes = new Map<string, RemoteTerminalRoute>();
@@ -684,6 +686,34 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     return tauriInvoke<T>(command, args);
   }
 
+  // Le client desktop connecte a un VPS conserve le micro et les modeles
+  // vocaux du poste. Un navigateur ou une app mobile, qui ne possede pas de
+  // runtime Tauri local, continue d'utiliser le moteur expose par cst-server.
+  // Le repli serveur permet aussi a un client desktop sans modele local de
+  // profiter d'un moteur vocal configure sur le VPS ou dans un datacenter.
+  if (
+    isTauriRuntime()
+    && (command === "process_voice_input" || command === "voice_runtime_status")
+  ) {
+    let localError: unknown = null;
+    try {
+      return await tauriInvoke<T>(command, args);
+    } catch (error) {
+      localError = error;
+    }
+
+    try {
+      return await remoteInvoke<T>(command, args);
+    } catch (remoteError) {
+      const detail = (error: unknown) =>
+        String(error instanceof Error ? error.message : error).replace(/^Error:\s*/i, "");
+      const operation = command === "process_voice_input" ? "La transcription" : "Le statut vocal";
+      throw new Error(
+        `${operation} est indisponible sur ce poste (${detail(localError)}) et sur le VPS (${detail(remoteError)}).`,
+      );
+    }
+  }
+
   return remoteInvoke<T>(command, args);
 }
 
@@ -693,6 +723,8 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return api<T>("GET", "/api/settings", undefined, REMOTE_BOOTSTRAP_TIMEOUT_MS);
     case "save_settings":
       return api<T>("PUT", "/api/settings", args.settings, REMOTE_BOOTSTRAP_TIMEOUT_MS);
+    case "add_shared_account":
+      return api<T>("POST", "/api/accounts", args.account, REMOTE_BOOTSTRAP_TIMEOUT_MS);
     case "ensure_account_home":
       return api<T>("POST", "/api/accounts/home", {
         codexHome: args.codexHome,
@@ -754,11 +786,15 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return pickRemotePoolAccount<T>();
     case "start_terminal":
       return startRemoteTerminal<T>(args);
+    case "terminal_output_snapshot":
+      return (remoteTerminalOutput.get(Number(args.id)) ?? "") as T;
     case "list_dir":
       return api<T>(
         "GET",
         `/api/fs/list${args.path ? `?path=${encodeURIComponent(String(args.path))}` : ""}`,
       );
+    case "create_workspace":
+      return api<T>("POST", "/api/workspaces", { name: args.name });
     case "create_git_docker_environment":
       return api<T>("POST", "/api/workspaces/git-docker", args.request);
     case "workspace_access":
@@ -1737,7 +1773,10 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
   const targetNodeId = typeof args.targetNodeId === "string"
     ? normalizeBaseUrl(args.targetNodeId).toLowerCase()
     : "";
-  if (Number.isFinite(requestedId)) remoteStartingTerminals.add(requestedId);
+  if (Number.isFinite(requestedId)) {
+    remoteStartingTerminals.add(requestedId);
+    remoteTerminalOutput.delete(requestedId);
+  }
 
   const payload = {
     id: args.id,
@@ -1760,12 +1799,13 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
         const response = await apiAt<RemoteStartResponse>(route, "POST", "/api/terminals", payload);
         if (Number.isFinite(requestedId) && requestedId !== response.id) {
           movePendingTerminalInput(requestedId, response.id);
+          moveRemoteTerminalOutput(requestedId, response.id);
         }
         remoteTerminalRoutes.set(response.id, route);
-        emit("pty-data", {
-          id: response.id,
-          data: `\r\n[Route] Terminal sur ${route.label} (${route.baseUrl})\r\n`,
-        });
+        emitRemoteTerminalData(
+          response.id,
+          `\r\n[Route] Terminal sur ${route.label} (${route.baseUrl})\r\n`,
+        );
         openTerminalSocket(response.id, route);
         return response as T;
       } catch (error) {
@@ -1812,7 +1852,7 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
     if (remoteSockets.get(id) !== socket) return;
     const message = JSON.parse(String(event.data)) as RemoteWsMessage;
     if (message.type === "data") {
-      emit("pty-data", { id: message.id, data: message.data });
+      emitRemoteTerminalData(message.id, message.data);
     } else if (message.type === "exit") {
       remoteSockets.delete(message.id);
       remoteTerminalRoutes.delete(message.id);
@@ -1820,8 +1860,9 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
       remoteTerminalReconnectAttempts.delete(message.id);
       remotePendingTerminalInput.clear(message.id);
       emit("pty-exit", { id: message.id });
+      window.setTimeout(() => remoteTerminalOutput.delete(message.id), 30_000);
     } else if (message.type === "error") {
-      emit("pty-data", { id: message.id, data: `\r\n${message.message}\r\n` });
+      emitRemoteTerminalData(message.id, `\r\n${message.message}\r\n`);
     } else if (message.type === "status") {
       // Message de controle uniquement. L'injecter dans xterm deplace le
       // curseur a l'insu de la TUI et son prochain redraw peut alors effacer la
@@ -1895,6 +1936,7 @@ async function stopRemoteTerminal(id: number) {
   socket?.close();
   remoteSockets.delete(id);
   remoteTerminalRoutes.delete(id);
+  remoteTerminalOutput.delete(id);
   try {
     await apiAt(route, "DELETE", `/api/terminals/${id}`);
   } catch {
@@ -1914,6 +1956,18 @@ function takePendingTerminalInput(id: number) {
 
 function movePendingTerminalInput(from: number, to: number) {
   remotePendingTerminalInput.move(from, to);
+}
+
+function emitRemoteTerminalData(id: number, data: string) {
+  const previous = remoteTerminalOutput.get(id) ?? "";
+  remoteTerminalOutput.set(id, `${previous}${data}`.slice(-REMOTE_TERMINAL_OUTPUT_LIMIT));
+  emit("pty-data", { id, data });
+}
+
+function moveRemoteTerminalOutput(from: number, to: number) {
+  const output = remoteTerminalOutput.get(from);
+  if (output !== undefined) remoteTerminalOutput.set(to, output);
+  remoteTerminalOutput.delete(from);
 }
 
 function clearRemoteTerminalReconnectTimer(id: number) {

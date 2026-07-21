@@ -215,9 +215,18 @@ charger de modele : calcul vocal en cours, modele Ollama charge en attente ou
 inactif. Elle indique la topologie locale/distante, la VRAM allouee et
 l'activite totale rapportee par `nvidia-smi`.
 
-En mode web/mobile, la transcription et le resume sont executes sur la machine
-qui heberge `cst-server`. C'est donc cette machine qui doit posseder le GPU,
-Ollama et les fichiers Whisper ; le telephone ne charge aucun modele.
+Quand le client desktop est connecte a un VPS, le micro et le moteur vocal du
+PC restent prioritaires ; le VPS ne recoit alors que le texte deja transcrit.
+Si le moteur local est absent, le client essaie automatiquement le moteur vocal
+de `cst-server`. En mode navigateur ou mobile, la transcription et le resume
+sont executes par `cst-server` : le serveur doit donc disposer de Whisper et
+Ollama, ou etre configure vers les API GPU distantes decrites ci-dessous. Le
+telephone ne charge aucun modele.
+
+Le tunnel SSH ouvre l'interface sur `http://127.0.0.1`, origine autorisee pour
+le micro par les navigateurs. Un acces direct au VPS depuis un autre appareil
+doit obligatoirement utiliser HTTPS ; une page `http://IP_DU_VPS:8080` ne peut
+pas obtenir la permission micro.
 
 ### GPU distant ou datacenter
 
@@ -405,7 +414,10 @@ minutes, mais jamais un test en cours. Il ne
 modifie jamais directement le fichier d'etat, ne contourne aucune review et ne
 reprend pas un agent volontairement mis en pause ou termine. Sa configuration
 est protegee dans l'interface ; il se met en veille quand aucun agent utilisateur
-n'est encore active.
+n'est encore actif. Une pause explicite de tous les agents utilisateur non
+termines interrompt aussi son tour courant et le met immediatement en veille,
+meme si des comptes rendus non lus restent en attente. Ces comptes rendus sont
+conserves et seront compiles apres la reprise d'un agent.
 
 Lorsqu'une commande de test est configuree (par exemple `npm test && npm run
 build`), une declaration `complete` ne suffit pas : le moteur execute la
@@ -509,7 +521,9 @@ l'hote `cst-server`.
   noeud local).
 - Mettre un agent en pause arrete son tour courant. La reprise le replanifie
   immediatement. Depuis la liste, **Tout mettre en pause** suspend en une fois
-  tous les agents utilisateur actifs, sans interrompre le superviseur systeme.
+  les agents actifs ou en attente d'intervention ; lorsque toute la flotte
+  utilisateur est suspendue, le superviseur systeme est lui aussi interrompu et
+  mis en veille.
 - Le moteur n'autorise pas implicitement les actions externes irreversibles :
   l'agent doit demander une intervention humaine lorsqu'une autorisation, un
   secret ou une decision est indispensable.

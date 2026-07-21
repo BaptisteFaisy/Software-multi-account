@@ -32,6 +32,14 @@ import {
 } from "./platform";
 import { initPwaSupport } from "./pwa";
 import {
+  consumeRemoteCodexLoginOutput,
+  failRemoteCodexLoginWindow,
+  focusRemoteCodexLoginWindow,
+  openRemoteCodexLoginWindow,
+  remoteCodexLoginWindowIsOpen,
+  remoteCodexLoginWindowNeedsCode,
+} from "./remote-login-window";
+import {
   authenticatedUser,
   bindUserAccountUi,
   initializeUserAuth,
@@ -39,6 +47,10 @@ import {
   renderUserAuthGate,
   renderUserProfileModal,
 } from "./user-auth";
+import {
+  accountScopedStorage,
+  setAccountStorageScope,
+} from "./account-storage";
 import {
   chatHoverShortcutAction,
   type ChatHoverShortcutAction,
@@ -1931,11 +1943,11 @@ const normalizeClaudeDesignModePreference = (value: unknown): ClaudeDesignMode =
     ? value
     : "prototype";
 let activeDesignTool: DesignTool = normalizeDesignToolPreference(
-  localStorage.getItem(DESIGN_TOOL_STORAGE_KEY),
+  accountScopedStorage.getItem(DESIGN_TOOL_STORAGE_KEY),
 );
-let designClaudeAccountId: string | null = localStorage.getItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY);
+let designClaudeAccountId: string | null = accountScopedStorage.getItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY);
 let designClaudeMode: ClaudeDesignMode = normalizeClaudeDesignModePreference(
-  localStorage.getItem(DESIGN_CLAUDE_MODE_STORAGE_KEY),
+  accountScopedStorage.getItem(DESIGN_CLAUDE_MODE_STORAGE_KEY),
 );
 let designClaudeContextKey: string | null = null;
 let designClaudeProjectDir: string | null = null;
@@ -2062,7 +2074,7 @@ type AutonomousMonitorPosition = { x: number; y: number };
 type AutonomousMonitorSize = { width: number; height: number };
 const loadAutonomousMonitorPosition = (): AutonomousMonitorPosition | null => {
   try {
-    const stored = JSON.parse(localStorage.getItem(AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY) ?? "null");
+    const stored = JSON.parse(accountScopedStorage.getItem(AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY) ?? "null");
     if (
       stored
       && typeof stored === "object"
@@ -2078,7 +2090,7 @@ const loadAutonomousMonitorPosition = (): AutonomousMonitorPosition | null => {
 };
 const loadAutonomousMonitorSize = (): AutonomousMonitorSize | null => {
   try {
-    const stored = JSON.parse(localStorage.getItem(AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY) ?? "null");
+    const stored = JSON.parse(accountScopedStorage.getItem(AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY) ?? "null");
     if (
       stored
       && typeof stored === "object"
@@ -2096,7 +2108,7 @@ const loadAutonomousMonitorSize = (): AutonomousMonitorSize | null => {
 };
 const loadSeenAutonomousReportIds = (): Set<string> => {
   try {
-    const stored = JSON.parse(localStorage.getItem(AUTONOMOUS_SEEN_REPORTS_STORAGE_KEY) ?? "[]");
+    const stored = JSON.parse(accountScopedStorage.getItem(AUTONOMOUS_SEEN_REPORTS_STORAGE_KEY) ?? "[]");
     return new Set(Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : []);
   } catch {
     return new Set();
@@ -2104,7 +2116,7 @@ const loadSeenAutonomousReportIds = (): Set<string> => {
 };
 let autonomousSeenReportIds = loadSeenAutonomousReportIds();
 let autonomousMonitorOpen = false;
-let autonomousMonitorCompact = localStorage.getItem(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY) === "1";
+let autonomousMonitorCompact = accountScopedStorage.getItem(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY) === "1";
 let autonomousMonitorPosition = loadAutonomousMonitorPosition();
 let autonomousMonitorSize = loadAutonomousMonitorSize();
 const autonomousMonitorDisclosureState = new Map<string, boolean>();
@@ -2248,12 +2260,14 @@ let promptHistory: PromptHistoryView | null = null;
 let promptHistoryLoaded = false;
 let promptHistoryRefreshPromise: Promise<void> | null = null;
 // Selecteur de workspace (mode web) : modale de navigation de dossiers serveur.
-type WorkspacePickerTarget = "active" | "new-terminal";
+type WorkspacePickerTarget = "active" | "new-terminal" | "create";
 let workspaceModalOpen = false;
 let workspacePickerTarget: WorkspacePickerTarget = "active";
 let workspaceBrowse: FsListResponse | null = null;
 let workspaceBrowseLoading = false;
 let workspaceBrowseError = "";
+let workspaceCreateBusy = false;
+let workspaceCreateName = "";
 let terminalEnvironmentMenuOpen = false;
 let gitDockerEnvironmentModalOpen = false;
 let gitDockerEnvironmentSubmitting = false;
@@ -3334,7 +3348,7 @@ const userWorkspacePath = (path: string | null | undefined): string | null => {
 
 const loadWorkspacePaths = (): string[] => {
   try {
-    const parsed = JSON.parse(localStorage.getItem(WORKSPACES_STORAGE_KEY) ?? "[]");
+    const parsed = JSON.parse(accountScopedStorage.getItem(WORKSPACES_STORAGE_KEY) ?? "[]");
     if (!Array.isArray(parsed)) return [];
     const seen = new Set<string>();
     const sanitized = parsed
@@ -3348,7 +3362,7 @@ const loadWorkspacePaths = (): string[] => {
         return true;
       });
     if (JSON.stringify(parsed) !== JSON.stringify(sanitized)) {
-      localStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify(sanitized));
+      accountScopedStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify(sanitized));
     }
     return sanitized;
   } catch {
@@ -3357,7 +3371,7 @@ const loadWorkspacePaths = (): string[] => {
 };
 
 const storeWorkspacePaths = (paths: readonly string[]) => {
-  localStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify(paths));
+  accountScopedStorage.setItem(WORKSPACES_STORAGE_KEY, JSON.stringify(paths));
 };
 
 const rememberWorkspace = (path: string) => {
@@ -3376,9 +3390,9 @@ const forgetWorkspace = (path: string) => {
 };
 
 const currentWorkspace = (): string | null => {
-  const stored = localStorage.getItem(WORKSPACE_STORAGE_KEY);
+  const stored = accountScopedStorage.getItem(WORKSPACE_STORAGE_KEY);
   const environment = userWorkspacePath(stored);
-  if (stored?.trim() && !environment) localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+  if (stored?.trim() && !environment) accountScopedStorage.removeItem(WORKSPACE_STORAGE_KEY);
   return environment;
 };
 
@@ -3386,9 +3400,9 @@ const setCurrentWorkspace = (path: string | null) => {
   const trimmed = userWorkspacePath(path);
   if (trimmed) {
     rememberWorkspace(trimmed);
-    localStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
+    accountScopedStorage.setItem(WORKSPACE_STORAGE_KEY, trimmed);
   } else {
-    localStorage.removeItem(WORKSPACE_STORAGE_KEY);
+    accountScopedStorage.removeItem(WORKSPACE_STORAGE_KEY);
   }
 };
 
@@ -3402,13 +3416,13 @@ const WORKSPACE_UNKNOWN = "__unknown__";
 const CHAT_WS_FILTER_KEY = "codex-switch-terminal.chat-workspace-filter";
 
 const chatWorkspaceFilterRaw = (): string | null =>
-  localStorage.getItem(CHAT_WS_FILTER_KEY);
+  accountScopedStorage.getItem(CHAT_WS_FILTER_KEY);
 const activeChatWorkspaceFilter = (): string => {
   const stored = chatWorkspaceFilterRaw();
   return stored || WORKSPACE_ALL;
 };
 const setChatWorkspaceFilter = (value: string) => {
-  localStorage.setItem(CHAT_WS_FILTER_KEY, value);
+  accountScopedStorage.setItem(CHAT_WS_FILTER_KEY, value);
 };
 
 // Workspace lie a un NOUVEAU chat (capture-a-la-creation) : garantit que le
@@ -3730,9 +3744,9 @@ const EMPTY_TERMINAL_STATE: PersistedTerminalState = { v: 4, activeKey: null, te
 const loadOpenTerminalRecords = (): PersistedTerminalState => {
   try {
     const raw =
-      localStorage.getItem(OPEN_TERMINALS_STORAGE_KEY) ??
+      accountScopedStorage.getItem(OPEN_TERMINALS_STORAGE_KEY) ??
       LEGACY_OPEN_TERMINALS_STORAGE_KEYS
-        .map((key) => localStorage.getItem(key))
+        .map((key) => accountScopedStorage.getItem(key))
         .find((value): value is string => value !== null);
     if (!raw) return { ...EMPTY_TERMINAL_STATE };
     const parsed = JSON.parse(raw);
@@ -3776,8 +3790,8 @@ const loadOpenTerminalRecords = (): PersistedTerminalState => {
 };
 
 const saveOpenTerminalRecords = (state: PersistedTerminalState) => {
-  localStorage.setItem(OPEN_TERMINALS_STORAGE_KEY, JSON.stringify(state));
-  LEGACY_OPEN_TERMINALS_STORAGE_KEYS.forEach((key) => localStorage.removeItem(key));
+  accountScopedStorage.setItem(OPEN_TERMINALS_STORAGE_KEY, JSON.stringify(state));
+  LEGACY_OPEN_TERMINALS_STORAGE_KEYS.forEach((key) => accountScopedStorage.removeItem(key));
 };
 
 const persistTerminalSessions = () => {
@@ -4555,7 +4569,7 @@ const openGitDockerEnvironmentModal = () => {
   gitDockerEnvironmentError = "";
   gitDockerEnvironmentSubmitting = false;
   gitDockerEnvironmentModalOpen = true;
-  statusText = "Nouvel environnement depuis Git";
+  statusText = "Nouvel environnement depuis GitHub";
   render();
   requestAnimationFrame(() => {
     document.querySelector<HTMLInputElement>("#gitDockerRepositoryUrl")?.focus();
@@ -4602,7 +4616,7 @@ const submitGitDockerEnvironment = async (form: HTMLFormElement) => {
   readGitDockerEnvironmentForm();
   gitDockerEnvironmentSubmitting = true;
   gitDockerEnvironmentError = "";
-  statusText = "Clonage du depot et preparation Docker...";
+  statusText = "Clonage du dépôt GitHub et préparation...";
   render();
 
   try {
@@ -4631,7 +4645,7 @@ const submitGitDockerEnvironment = async (form: HTMLFormElement) => {
   } catch (error) {
     gitDockerEnvironmentSubmitting = false;
     gitDockerEnvironmentError = String(error);
-    statusText = "Creation de l'environnement Git impossible";
+    statusText = "Création de l'environnement GitHub impossible";
     render();
   }
 };
@@ -5320,7 +5334,7 @@ const refreshSkills = async (): Promise<void> => {
     bundledError = String((error as Error)?.message ?? error);
   }
   const bundledIds = new Set(bundledSkills.map((skill) => skill.id));
-  const customSkills = loadCustomSkills()
+  const customSkills = loadCustomSkills(accountScopedStorage)
     .filter((skill) => !bundledIds.has(skill.id));
   skillsList = [...customSkills, ...bundledSkills];
   skillsError = bundledError;
@@ -5331,7 +5345,7 @@ const refreshSkills = async (): Promise<void> => {
 
 const openSkillEditor = (id: string | null = null): void => {
   const customSkill = id
-    ? loadCustomSkills().find((skill) => skill.id === id) ?? null
+    ? loadCustomSkills(accountScopedStorage).find((skill) => skill.id === id) ?? null
     : null;
   if (id && !customSkill) {
     statusText = "Seuls les skills personnels peuvent être modifiés";
@@ -5341,6 +5355,7 @@ const openSkillEditor = (id: string | null = null): void => {
   void loadSkillsViewModule()
     .then((module) => module.openCustomSkillEditor({
       skill: customSkill,
+      storage: accountScopedStorage,
       reservedIds: (skillsList ?? []).map((skill) => skill.id),
       renderIcons,
       onSaved: async (skill, created) => {
@@ -5362,11 +5377,11 @@ const openSkillEditor = (id: string | null = null): void => {
 };
 
 const deleteCustomSkill = async (id: string): Promise<void> => {
-  const customSkills = loadCustomSkills();
+  const customSkills = loadCustomSkills(accountScopedStorage);
   const skill = customSkills.find((candidate) => candidate.id === id);
   if (!skill) return;
   if (!window.confirm(`Supprimer définitivement le skill « ${skill.name} » ?`)) return;
-  if (!persistCustomSkills(removeCustomSkill(customSkills, id))) {
+  if (!persistCustomSkills(removeCustomSkill(customSkills, id), accountScopedStorage)) {
     statusText = "Impossible de supprimer ce skill sur cet appareil";
     render();
     return;
@@ -5553,12 +5568,12 @@ const insertPromptInExpertChat = (
 
 const recordPromptShortcutUse = (id: string): void => {
   void loadPromptLibraryModule()
-    .then((module) => module.recordPromptUse(id))
+    .then((module) => module.recordPromptUse(id, accountScopedStorage))
     .catch(() => undefined);
 };
 
 const favoritePromptShortcutById = (id: string): FavoritePromptShortcut | null =>
-  loadFavoritePromptShortcuts().find((prompt) => prompt.id === id) ?? null;
+  loadFavoritePromptShortcuts(accountScopedStorage).find((prompt) => prompt.id === id) ?? null;
 
 const insertFavoritePromptInMainChat = (id: string): void => {
   const prompt = favoritePromptShortcutById(id);
@@ -6327,16 +6342,32 @@ const reloginAccount = async (accountId: string) => {
     render();
     return;
   }
-  statusText = `Ouverture de la connexion ${accountProviderLabel(account)} pour ${account.label}…`;
-  await createNewTerminal(
-    accountId,
-    true,
-    reconnectCommand,
-    agentId,
-    null,
-    null,
-    true,
-  );
+  const popupOpened =
+    provider === "codex" && isRemoteMode()
+      ? openRemoteCodexLoginWindow(account.id, account.label)
+      : false;
+  statusText = popupOpened
+    ? `Préparation de la fenêtre OpenAI pour ${account.label}…`
+    : `Ouverture de la connexion ${accountProviderLabel(account)} pour ${account.label}…`;
+  try {
+    const session = await createNewTerminal(
+      accountId,
+      true,
+      reconnectCommand,
+      agentId,
+      null,
+      null,
+      true,
+    );
+    if (!session && popupOpened) {
+      failRemoteCodexLoginWindow(accountId, "Le terminal de connexion n’a pas pu démarrer.");
+    }
+  } catch (error) {
+    const message = String(error);
+    if (popupOpened) failRemoteCodexLoginWindow(accountId, message);
+    statusText = message;
+    render();
+  }
 };
 
 const nextUnconnectedAccountExpiry = (): number | null => {
@@ -8035,7 +8066,7 @@ const chatPanelModel = (): ChatPanelModel => {
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: provider === "codex",
     composerSelectorsEnabled: chatComposerSelectorsEnabled,
-    favoritePrompts: loadFavoritePromptShortcuts(),
+    favoritePrompts: loadFavoritePromptShortcuts(accountScopedStorage),
     supportsGoals: provider === "codex",
     agentTools: chatAgentToolDefinitions(),
     enabledTools: chatEnabledTools,
@@ -9613,7 +9644,7 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: provider === "codex",
     composerSelectorsEnabled: chatComposerSelectorsEnabled,
-    favoritePrompts: loadFavoritePromptShortcuts(),
+    favoritePrompts: loadFavoritePromptShortcuts(accountScopedStorage),
     supportsGoals: provider === "codex",
     agentTools: chatAgentToolDefinitions(),
     enabledTools: pane.enabledTools,
@@ -9708,7 +9739,7 @@ const persistExpertChats = () => {
       orchestrationTaskId: pane.orchestrationTaskId,
     })),
   };
-  localStorage.setItem(EXPERT_OPEN_CHATS_STORAGE_KEY, JSON.stringify(state));
+  accountScopedStorage.setItem(EXPERT_OPEN_CHATS_STORAGE_KEY, JSON.stringify(state));
 };
 
 const restoreExpertChats = () => {
@@ -9716,12 +9747,12 @@ const restoreExpertChats = () => {
   expertChatsRestored = true;
   let persisted: PersistedExpertChats | null = null;
   try {
-    const parsed = JSON.parse(localStorage.getItem(EXPERT_OPEN_CHATS_STORAGE_KEY) ?? "null") as Partial<PersistedExpertChats> | null;
+    const parsed = JSON.parse(accountScopedStorage.getItem(EXPERT_OPEN_CHATS_STORAGE_KEY) ?? "null") as Partial<PersistedExpertChats> | null;
     if (parsed?.v === 1 && Array.isArray(parsed.panes)) {
       persisted = parsed as PersistedExpertChats;
     }
   } catch {
-    localStorage.removeItem(EXPERT_OPEN_CHATS_STORAGE_KEY);
+    accountScopedStorage.removeItem(EXPERT_OPEN_CHATS_STORAGE_KEY);
   }
 
   expertChatPanes = (persisted?.panes ?? [])
@@ -12140,7 +12171,7 @@ const restoreTerminals = async () => {
 
 const readClaudeDesignSessions = (): Record<string, string> => {
   try {
-    const parsed = JSON.parse(localStorage.getItem(DESIGN_CLAUDE_SESSIONS_STORAGE_KEY) ?? "{}") as unknown;
+    const parsed = JSON.parse(accountScopedStorage.getItem(DESIGN_CLAUDE_SESSIONS_STORAGE_KEY) ?? "{}") as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return Object.fromEntries(
       Object.entries(parsed)
@@ -12153,7 +12184,7 @@ const readClaudeDesignSessions = (): Record<string, string> => {
 
 const writeClaudeDesignSessions = (sessions: Record<string, string>) => {
   try {
-    localStorage.setItem(DESIGN_CLAUDE_SESSIONS_STORAGE_KEY, JSON.stringify(sessions));
+    accountScopedStorage.setItem(DESIGN_CLAUDE_SESSIONS_STORAGE_KEY, JSON.stringify(sessions));
   } catch {
     // Le studio reste utilisable si le stockage du navigateur est indisponible.
   }
@@ -12199,7 +12230,7 @@ const syncClaudeDesignContext = (): boolean => {
 
   if (designClaudeAccountId !== account.id) {
     designClaudeAccountId = account.id;
-    localStorage.setItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY, account.id);
+    accountScopedStorage.setItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY, account.id);
   }
   const projectDir = currentProjectDir() ?? account.projectDir?.trim() ?? null;
   const contextKey = claudeDesignContextKeyFor(account, projectDir);
@@ -12582,7 +12613,7 @@ const selectClaudeDesignAccount = (accountId: string) => {
   const account = claudeDesignAccounts().find((candidate) => candidate.id === accountId);
   if (!account) return;
   designClaudeAccountId = account.id;
-  localStorage.setItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY, account.id);
+  accountScopedStorage.setItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY, account.id);
   designClaudeContextKey = null;
   syncClaudeDesignContext();
   statusText = `Claude Design · ${account.label}`;
@@ -12592,14 +12623,14 @@ const selectClaudeDesignAccount = (accountId: string) => {
 
 const selectClaudeDesignMode = (mode: ClaudeDesignMode) => {
   designClaudeMode = mode;
-  localStorage.setItem(DESIGN_CLAUDE_MODE_STORAGE_KEY, mode);
+  accountScopedStorage.setItem(DESIGN_CLAUDE_MODE_STORAGE_KEY, mode);
   render();
   window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#claudeDesignPrompt")?.focus());
 };
 
 const selectDesignTool = (tool: DesignTool) => {
   activeDesignTool = tool;
-  localStorage.setItem(DESIGN_TOOL_STORAGE_KEY, tool);
+  accountScopedStorage.setItem(DESIGN_TOOL_STORAGE_KEY, tool);
   statusText = tool === "kombai"
     ? "Kombai · IDE frontend embarqué"
     : "Claude Design · studio intégré";
@@ -12819,10 +12850,12 @@ const pickProjectDir = async () => {
 // --- Selecteur de workspace ----------------------------------------------
 // Ouvre le choix de l'environnement actif ou celui du terminal en cours de
 // creation. Desktop : dialogue natif. Web : navigateur de dossiers du serveur.
-const workspacePickerPath = () =>
-  userEnvironmentPath(
+const workspacePickerPath = () => {
+  if (workspacePickerTarget === "create") return null;
+  return userEnvironmentPath(
     workspacePickerTarget === "new-terminal" ? newTerminalWorkspacePath : currentWorkspace(),
   );
+};
 
 const chooseWorkspace = (
   path: string | null,
@@ -12985,6 +13018,7 @@ const selectWorkspaceFilter = (value: string) => {
 
 const openWorkspacePicker = async (target: WorkspacePickerTarget = "active") => {
   workspacePickerTarget = target;
+  if (target === "create") workspaceCreateName = "";
   if (isRemoteMode()) {
     rememberDialogTrigger(
       "workspace",
@@ -12994,7 +13028,10 @@ const openWorkspacePicker = async (target: WorkspacePickerTarget = "active") => 
     workspaceBrowse = null;
     workspaceBrowseError = "";
     render();
-    await loadWorkspaceDir(workspacePickerPath());
+    // Le navigateur distant repart toujours de la racine personnelle renvoyee
+    // par le serveur. Un chemin actif ou partage n'est jamais utilise comme
+    // point d'entree implicite.
+    await loadWorkspaceDir(null);
     return;
   }
 
@@ -13028,6 +13065,28 @@ const loadWorkspaceDir = async (path: string | null) => {
   }
   workspaceBrowseLoading = false;
   render();
+};
+
+const createPersonalWorkspace = async (form: HTMLFormElement) => {
+  if (workspaceCreateBusy || !form.reportValidity()) return;
+  const name = form.querySelector<HTMLInputElement>("#newPersonalWorkspaceName")?.value.trim() ?? "";
+  if (!name) return;
+  workspaceCreateName = name;
+  workspaceCreateBusy = true;
+  workspaceBrowseError = "";
+  render();
+  try {
+    const created = await invoke<WorkspaceAccessView>("create_workspace", { name });
+    workspaceCreateBusy = false;
+    workspaceCreateName = "";
+    await refreshWorkspaceAccess();
+    chooseWorkspace(created.path, "active");
+    statusText = `Environnement personnel créé : ${created.label}`;
+  } catch (error) {
+    workspaceCreateBusy = false;
+    workspaceBrowseError = String(error);
+    render();
+  }
 };
 
 const closeWorkspaceModal = () => {
@@ -14209,7 +14268,7 @@ const syncAutonomousUnreadBadges = (): void => {
 const persistSeenAutonomousReportIds = (): void => {
   const bounded = [...autonomousSeenReportIds].slice(-512);
   autonomousSeenReportIds = new Set(bounded);
-  localStorage.setItem(AUTONOMOUS_SEEN_REPORTS_STORAGE_KEY, JSON.stringify(bounded));
+  accountScopedStorage.setItem(AUTONOMOUS_SEEN_REPORTS_STORAGE_KEY, JSON.stringify(bounded));
 };
 
 const markAutonomousReportSeen = async (reportId: string): Promise<void> => {
@@ -14794,12 +14853,12 @@ const clearAutonomousMonitorSizeStyles = (monitor: HTMLElement): void => {
 const persistAutonomousMonitorPosition = (): void => {
   try {
     if (autonomousMonitorPosition) {
-      localStorage.setItem(
+      accountScopedStorage.setItem(
         AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY,
         JSON.stringify(autonomousMonitorPosition),
       );
     } else {
-      localStorage.removeItem(AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY);
+      accountScopedStorage.removeItem(AUTONOMOUS_MONITOR_POSITION_STORAGE_KEY);
     }
   } catch {
     // Le déplacement reste utilisable même si le stockage local est indisponible.
@@ -14809,12 +14868,12 @@ const persistAutonomousMonitorPosition = (): void => {
 const persistAutonomousMonitorSize = (): void => {
   try {
     if (autonomousMonitorSize) {
-      localStorage.setItem(
+      accountScopedStorage.setItem(
         AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY,
         JSON.stringify(autonomousMonitorSize),
       );
     } else {
-      localStorage.removeItem(AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY);
+      accountScopedStorage.removeItem(AUTONOMOUS_MONITOR_SIZE_STORAGE_KEY);
     }
   } catch {
     // Le redimensionnement reste utilisable même si le stockage local est indisponible.
@@ -15369,7 +15428,7 @@ const pauseAllAutonomousAgents = async (): Promise<void> => {
   if (autonomousBusyId) return;
   const targets = autonomousAgentsToPause(autonomousAgents);
   if (!targets.length) {
-    statusText = "Aucun agent utilisateur actif à mettre en pause";
+    statusText = "Aucun agent actif ou en attente à mettre en pause";
     render();
     return;
   }
@@ -15397,7 +15456,7 @@ const pauseAllAutonomousAgents = async (): Promise<void> => {
     const pausedLabel = `${pausedCount} agent${pausedCount > 1 ? "s" : ""} mis en pause`;
     statusText = failures.length
       ? `${pausedLabel} · ${failures.length} échec${failures.length > 1 ? "s" : ""} (${failures.join(" ; ")})`
-      : pausedLabel;
+      : `${pausedLabel} · le superviseur se met en veille quand toute la flotte est suspendue`;
   } finally {
     autonomousBusyId = null;
     render();
@@ -15692,7 +15751,7 @@ const bindAutonomousMonitorUi = () => {
   document.querySelector<HTMLButtonElement>("#autonomousMonitorLauncher")?.addEventListener("click", () => openAutonomousMonitor());
   document.querySelector<HTMLButtonElement>("#autonomousMonitorCompactToggle")?.addEventListener("click", () => {
     autonomousMonitorCompact = !autonomousMonitorCompact;
-    localStorage.setItem(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY, autonomousMonitorCompact ? "1" : "0");
+    accountScopedStorage.setItem(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY, autonomousMonitorCompact ? "1" : "0");
     syncAutonomousMonitorUi();
     document.querySelector<HTMLButtonElement>("#autonomousMonitorCompactToggle")?.focus();
   });
@@ -16327,10 +16386,10 @@ const renderAutonomousPanel = (): string => {
   const userAgentCount = autonomousAgents.filter((agent) => !agent.systemManaged).length;
   const pausingAll = autonomousBusyId === AUTONOMOUS_PAUSE_ALL_BUSY_ID;
   const pauseAllTitle = pausableCount === 1
-    ? "Mettre en pause l’agent actif"
+    ? "Mettre en pause l’agent restant"
     : pausableCount > 1
-      ? `Mettre en pause les ${pausableCount} agents actifs`
-      : "Aucun agent actif à mettre en pause";
+      ? `Mettre en pause les ${pausableCount} agents à suspendre`
+      : "Tous les agents sont déjà suspendus";
   const workingCount = autonomousAgents.filter(autonomousAgentIsRunning).length;
   const validatedCount = autonomousAgents.filter((agent) => agent.testStatus === "passed").length;
   const autonomousTokenTotal = autonomousTokenUsageTotal(autonomousAgents);
@@ -16490,7 +16549,7 @@ const renderAutonomousPanel = (): string => {
       <header class="autonomous-list-head">
         <div><strong>Mes agents</strong></div>
         <div class="autonomous-list-actions">
-          ${userAgentCount ? `<button id="autonomousPauseAll" type="button" class="tool-button autonomous-list-pause-all" title="${escapeAttr(pauseAllTitle)}" aria-label="${escapeAttr(pauseAllTitle)}" ${pausableCount && !autonomousBusyId ? "" : "disabled"}><i data-lucide="${pausingAll ? "loader-circle" : "pause"}"></i><span>${pausingAll ? "Mise en pause…" : pausableCount ? "Tout mettre en pause" : "Aucun agent actif"}</span></button>` : ""}
+          ${userAgentCount ? `<button id="autonomousPauseAll" type="button" class="tool-button autonomous-list-pause-all" title="${escapeAttr(pauseAllTitle)}" aria-label="${escapeAttr(pauseAllTitle)}" ${pausableCount && !autonomousBusyId ? "" : "disabled"}><i data-lucide="${pausingAll ? "loader-circle" : "pause"}"></i><span>${pausingAll ? "Mise en pause…" : pausableCount ? "Tout mettre en pause" : "Flotte suspendue"}</span></button>` : ""}
           <button id="autonomousRefresh" type="button" class="icon-button" title="Actualiser" aria-label="Actualiser les agents" ${autonomousBusyId ? "disabled" : ""}><i data-lucide="refresh-ccw"></i></button>
         </div>
       </header>
@@ -20125,7 +20184,14 @@ const currentTaskEnvironment = (): TaskEnvironment | null => {
 const currentTaskAccountId = (): string | null =>
   authenticatedUser()?.id ?? null;
 
+const loadAccountScheduledChatItems = (): ScheduledChatItem[] =>
+  loadScheduledChatItems(accountScopedStorage);
+
+const persistAccountScheduledChatItems = (items: readonly ScheduledChatItem[]): boolean =>
+  persistScheduledChatItems(items, accountScopedStorage);
+
 const scheduledChatsPanelOptions = (): ScheduledChatsPanelOptions => ({
+  storage: accountScopedStorage,
   environments: knownWorkspaces().map((workspace) => ({
     path: workspace.path,
     label: workspace.label,
@@ -20148,12 +20214,12 @@ const renderActiveAppPanel = (): string => {
       return renderAccountsAndPool();
     case "tasks":
       return tasksViewModule?.renderTasksPanel(
-        undefined,
+        accountScopedStorage,
         currentTaskEnvironment(),
         currentTaskAccountId(),
       ) ?? "";
     case "prompts":
-      return promptLibraryModule?.renderPromptLibraryPanel() ?? "";
+      return promptLibraryModule?.renderPromptLibraryPanel(accountScopedStorage) ?? "";
     case "scheduled-chat":
       return scheduledChatsViewModule?.renderScheduledChatsPanel(scheduledChatsPanelOptions()) ?? "";
     case "limits":
@@ -20240,6 +20306,12 @@ const renderTerminalEnvironmentMenu = (): string => {
   const activePath = userEnvironmentPath(currentWorkspace());
   const activeId = activePath ? workspaceIdForPath(activePath) : null;
   const workspacesById = new Map(knownWorkspaces().map((workspace) => [workspace.id, workspace]));
+  const hasOwnedEnvironment = isRemoteMode()
+    ? workspaceAccess.some((environment) => environment.role === "owner")
+    : workspacesById.size > 0;
+  const createEnvironmentLabel = hasOwnedEnvironment
+    ? "Créer un autre environnement"
+    : "Créer un environnement";
   const executionTargets = remoteChatExecutionTargets();
   const memoryWorkspace = environmentMemoryTargetId
     ? workspacesById.get(environmentMemoryTargetId) ?? null
@@ -20391,16 +20463,16 @@ const renderTerminalEnvironmentMenu = (): string => {
       <div class="terminal-environment-menu-list">
         ${renderWorkspaceAccessPanel()}
         ${memoryEditor}
-        ${environments || `<div class="terminal-environment-menu-empty"><i data-lucide="folder-open"></i><strong>Aucun environnement</strong><small>Choisissez un dossier ou importez directement un projet Git.</small></div>`}
+        ${environments || `<div class="terminal-environment-menu-empty"><i data-lucide="folder-open"></i><strong>Aucun environnement</strong><small>Créez votre premier espace privé ou importez directement un projet Git.</small></div>`}
       </div>
       <footer class="terminal-environment-menu-actions">
-        <span><i data-lucide="folder-open"></i>Dossier existant ou nouveau projet depuis un lien Git</span>
+        <span><i data-lucide="folder-plus"></i>Vous pouvez créer autant d'environnements privés que nécessaire.</span>
         <div class="terminal-environment-menu-create-actions">
-          <button type="button" class="tool-button" id="createGitDockerEnvironmentFromMenu" title="Cloner un depot Git et preparer son image Docker">
-            <i data-lucide="container"></i><span>Depuis Git / Docker</span>
+          <button type="button" class="tool-button" id="createGitDockerEnvironmentFromMenu" title="Cloner un dépôt GitHub dans votre espace privé">
+            <i data-lucide="folder-git-2"></i><span>Depuis GitHub</span>
           </button>
-          <button type="button" class="tool-button primary" id="createEnvironmentFromMenu" title="Afficher les dossiers et parcourir l'arborescence">
-            <i data-lucide="folder-open"></i><span>Parcourir les dossiers</span>
+          <button type="button" class="tool-button primary" id="createEnvironmentFromMenu" title="${createEnvironmentLabel}">
+            <i data-lucide="folder-plus"></i><span>${createEnvironmentLabel}</span>
           </button>
         </div>
       </footer>
@@ -20755,7 +20827,7 @@ const renderChatFirstShell = () => {
   const isChat = activeView === "chat";
   const tutorialNeedsAttention = !tutorialHasStarted();
   const contextTasks = taskItemsForEnvironment(
-    loadTaskItems(undefined, currentTaskAccountId()),
+    loadTaskItems(accountScopedStorage, currentTaskAccountId()),
     currentWorkspace(),
   )
     .filter((task) => !task.completed)
@@ -20769,7 +20841,7 @@ const renderChatFirstShell = () => {
       return priorityDifference || right.createdAt - left.createdAt;
     });
   const activeTaskCount = contextTasks.length;
-  const scheduledChatCount = scheduledChatPendingCount(loadScheduledChatItems());
+  const scheduledChatCount = scheduledChatPendingCount(loadAccountScheduledChatItems());
   const bugReportAttentionCount = bugReportAgents().filter(
     (agent) => agent.status === "needs_attention" || !!agent.pendingReview,
   ).length;
@@ -21149,8 +21221,8 @@ const renderLegacyTerminalShell = () => {
           <div class="section-row">
             <span>Environnements</span>
             <span class="section-actions">
-              <button class="icon-button" id="workspaceAddSide" title="Choisir ou ajouter un environnement">
-                <i data-lucide="folder-open"></i>
+              <button class="icon-button" id="workspaceAddSide" title="Créer un environnement personnel">
+                <i data-lucide="folder-plus"></i>
               </button>
               <button class="icon-button" id="newTerminalSide" title="${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "Limite de 16 terminaux atteinte" : "Nouveau terminal dans l'environnement actif"}" ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
                 <i data-lucide="plus"></i>
@@ -21297,7 +21369,7 @@ const renderLegacyTerminalShell = () => {
                       : activeView === "scheduled-chat"
                           ? scheduledChatsViewModule?.renderScheduledChatsPanel(scheduledChatsPanelOptions()) ?? ""
                           : activeView === "prompts"
-                            ? promptLibraryModule?.renderPromptLibraryPanel() ?? ""
+                            ? promptLibraryModule?.renderPromptLibraryPanel(accountScopedStorage) ?? ""
                         : activeView === "audit"
                             ? renderAuditPanel()
                             : activeView === "skills"
@@ -23190,10 +23262,10 @@ const renderGitDockerEnvironmentModal = () => {
       <section class="modal git-docker-environment-modal" role="dialog" aria-modal="true" aria-labelledby="gitDockerEnvironmentTitle" tabindex="-1">
         <header class="modal-head">
           <div class="git-docker-environment-title">
-            <span><i data-lucide="container"></i></span>
+            <span><i data-lucide="folder-git-2"></i></span>
             <div>
-              <h2 id="gitDockerEnvironmentTitle">Nouvel environnement Git / Docker</h2>
-              <p>Un lien Git suffit pour creer le dossier projet et preparer son lancement.</p>
+              <h2 id="gitDockerEnvironmentTitle">Créer un environnement depuis GitHub</h2>
+              <p>Chaque import crée un nouveau dossier dans l'espace privé du compte connecté.</p>
             </div>
           </div>
           <button class="icon-button" type="button" id="closeGitDockerEnvironment" title="Fermer" aria-label="Fermer" ${disabled}>
@@ -23203,9 +23275,9 @@ const renderGitDockerEnvironmentModal = () => {
         <form id="gitDockerEnvironmentForm" class="git-docker-environment-form">
           <div class="modal-body git-docker-environment-body">
             <label class="git-docker-field git-docker-field-wide">
-              <span>Lien du depot Git <b>requis</b></span>
-              <input id="gitDockerRepositoryUrl" value="${escapeAttr(draft.repositoryUrl)}" placeholder="https://github.com/organisation/projet.git" inputmode="url" autocomplete="off" maxlength="2048" required ${disabled} />
-              <small>HTTPS ou SSH. Les tokens integres dans l'URL sont refuses.</small>
+              <span>Lien du dépôt GitHub <b>requis</b></span>
+              <input id="gitDockerRepositoryUrl" value="${escapeAttr(draft.repositoryUrl)}" placeholder="https://github.com/BaptisteFaisy/Software-multi-account.git" inputmode="url" autocomplete="off" maxlength="2048" required ${disabled} />
+              <small>HTTPS ou SSH. Les jetons intégrés dans l'URL sont refusés.</small>
             </label>
             <div class="git-docker-form-grid">
               <label class="git-docker-field">
@@ -23259,7 +23331,7 @@ const renderGitDockerEnvironmentModal = () => {
               </fieldset>` : ""}
             <div class="git-docker-safety-note">
               <i data-lucide="shield-check"></i>
-              <span><strong>Environnement isole</strong><small>Le depot est clone dans SwitchProjects. Ses commandes ne s'executent que pendant le build Docker.</small></span>
+              <span><strong>Environnement isolé</strong><small>Le dépôt est cloné dans votre espace personnel et enregistré pour votre compte uniquement.</small></span>
             </div>
             ${gitDockerEnvironmentError ? `<div class="git-docker-error" role="alert"><i data-lucide="triangle-alert"></i><span>${escapeHtml(gitDockerEnvironmentError)}</span></div>` : ""}
             ${gitDockerEnvironmentSubmitting ? `<div class="git-docker-progress" role="status"><i data-lucide="loader-circle"></i><span>Clonage, analyse et preparation en cours. Cette operation peut prendre plusieurs minutes.</span></div>` : ""}
@@ -23268,7 +23340,7 @@ const renderGitDockerEnvironmentModal = () => {
             <button class="tool-button" type="button" id="cancelGitDockerEnvironment" ${disabled}>Annuler</button>
             <button class="tool-button primary" type="submit" ${disabled}>
               <i data-lucide="${gitDockerEnvironmentSubmitting ? "loader-circle" : "folder-git-2"}"></i>
-              <span>${gitDockerEnvironmentSubmitting ? "Creation en cours..." : "Creer l'environnement"}</span>
+              <span>${gitDockerEnvironmentSubmitting ? "Création en cours..." : "Créer depuis GitHub"}</span>
             </button>
           </footer>
         </form>
@@ -23281,6 +23353,7 @@ const renderWorkspaceModal = () => {
 
   const data = workspaceBrowse;
   const entries = data?.entries ?? [];
+  const creatingPersonalEnvironment = workspacePickerTarget === "create";
   const selectableBrowsePath = userEnvironmentPath(data?.path);
   const breadcrumbs = workspacePathBreadcrumbs(data?.root, data?.path);
   const breadcrumbTrail = breadcrumbs
@@ -23293,7 +23366,14 @@ const renderWorkspaceModal = () => {
     )
     .join("");
   const browseId = data?.path ? workspaceIdForPath(data.path) : null;
+  const browseRootId = data?.root ? normalizeWorkspacePath(data.root) : null;
   const quickAccess = knownWorkspaces()
+    .filter((workspace) => {
+      if (!isRemoteMode()) return true;
+      if (!browseRootId) return false;
+      const workspaceId = normalizeWorkspacePath(workspace.path);
+      return workspaceId === browseRootId || workspaceId.startsWith(`${browseRootId}/`);
+    })
     .filter((workspace) => workspace.id !== browseId)
     .slice(0, 8)
     .map(
@@ -23316,14 +23396,30 @@ const renderWorkspaceModal = () => {
     .join("");
   const selected = workspacePickerPath();
   const pickingForTerminal = workspacePickerTarget === "new-terminal";
+  const hasOwnedEnvironment = isRemoteMode()
+    ? workspaceAccess.some((environment) => environment.role === "owner")
+    : knownWorkspaces().length > 0;
+  const modalTitle = creatingPersonalEnvironment
+    ? hasOwnedEnvironment
+      ? "Créer un autre environnement personnel"
+      : "Créer un environnement personnel"
+    : pickingForTerminal
+      ? "Environnement du nouveau terminal"
+      : "Choisir l'environnement actif";
+  const modalDescription = creatingPersonalEnvironment
+    ? "Créez un dossier privé dans votre espace. Les dossiers des autres comptes ne sont jamais affichés."
+    : pickingForTerminal
+      ? "Naviguez uniquement dans votre espace personnel, puis choisissez le dossier fixe de cette session."
+      : "Parcourez uniquement vos dossiers personnels. Un environnement partagé se sélectionne depuis la liste des environnements autorisés.";
+  const createDisabled = workspaceCreateBusy ? "disabled" : "";
 
   return `
     <div class="modal-backdrop" id="workspaceBackdrop">
       <section class="modal workspace-browser-modal" role="dialog" aria-modal="true" aria-labelledby="workspaceModalTitle" tabindex="-1">
         <header class="modal-head">
           <div>
-            <h2 id="workspaceModalTitle">${pickingForTerminal ? "Environnement du nouveau terminal" : "Choisir l'environnement actif"}</h2>
-            <p>${pickingForTerminal ? "Naviguez puis choisissez le dossier fixe de cette session." : "Parcourez les dossiers puis choisissez celui qui regroupera les chats et les agents."}</p>
+            <h2 id="workspaceModalTitle">${modalTitle}</h2>
+            <p>${modalDescription}</p>
           </div>
           <button class="icon-button" id="closeWorkspaceModal" title="Fermer" aria-label="Fermer">
             <i data-lucide="x"></i>
@@ -23331,6 +23427,15 @@ const renderWorkspaceModal = () => {
         </header>
 
         <div class="modal-body workspace-browser-body">
+          ${creatingPersonalEnvironment ? `<form id="createPersonalWorkspaceForm" class="ws-create-environment-form">
+            <label for="newPersonalWorkspaceName"><span>Nom du nouvel environnement</span><small>Un dossier distinct sera créé uniquement dans votre espace.</small></label>
+            <div><input id="newPersonalWorkspaceName" name="name" value="${escapeAttr(workspaceCreateName)}" maxlength="120" placeholder="Ex. Site vitrine" autocomplete="off" required ${createDisabled} /><button class="tool-button primary" type="submit" ${createDisabled}><i data-lucide="${workspaceCreateBusy ? "loader-circle" : "folder-plus"}"></i><span>${workspaceCreateBusy ? "Création..." : "Créer"}</span></button></div>
+          </form>
+          <section class="ws-create-github-option" aria-label="Créer depuis GitHub">
+            <span class="ws-create-github-icon"><i data-lucide="folder-git-2"></i></span>
+            <span><strong>Depuis un lien GitHub</strong><small>Clonez le dépôt dans un autre environnement privé, sans afficher les dossiers des autres comptes.</small></span>
+            <button type="button" class="tool-button" id="createWorkspaceFromGitHub" ${createDisabled}><i data-lucide="folder-git-2"></i><span>Importer</span></button>
+          </section>` : ""}
           ${breadcrumbTrail ? `<nav class="ws-breadcrumb" aria-label="Chemin du dossier">${breadcrumbTrail}</nav>` : ""}
           <div class="ws-path-row">
             <input id="workspacePathInput" value="${escapeAttr(data?.path ?? "")}" placeholder="Chemin du dossier" spellcheck="false" aria-label="Chemin du dossier" />
@@ -23340,7 +23445,7 @@ const renderWorkspaceModal = () => {
             </button>
           </div>
           ${selected ? `<div class="ws-current">Environnement actif : <strong>${escapeHtml(selected)}</strong></div>` : ""}
-          ${quickAccess ? `<section class="ws-quick-access"><header><span>Acces rapides</span><small>Environnements connus</small></header><div>${quickAccess}</div></section>` : ""}
+          ${quickAccess ? `<section class="ws-quick-access"><header><span>Accès rapides</span><small>Vos environnements personnels</small></header><div>${quickAccess}</div></section>` : ""}
           <div class="ws-folder-toolbar">
             <label for="workspaceFolderSearch"><i data-lucide="search"></i><input id="workspaceFolderSearch" type="search" placeholder="Filtrer les sous-dossiers..." autocomplete="off" /></label>
             <span id="workspaceVisibleFolderCount">${entries.length} dossier${entries.length > 1 ? "s" : ""}</span>
@@ -25103,7 +25208,7 @@ const armScheduledChatTimer = (): void => {
     scheduledChatTimer = null;
   }
   if (!scheduledChatSchedulerStarted) return;
-  const nextAt = nextScheduledChatAt(loadScheduledChatItems());
+  const nextAt = nextScheduledChatAt(loadAccountScheduledChatItems());
   if (nextAt === null) return;
   // Une vérification au plus tard chaque minute absorbe les changements
   // d’horloge et le réveil d’un ordinateur, tout en déclenchant précisément
@@ -25119,16 +25224,16 @@ const dispatchDueScheduledChats = async (): Promise<void> => {
   if (!scheduledChatSchedulerStarted || scheduledChatDispatchInFlight || !settings) return;
   scheduledChatDispatchInFlight = true;
   try {
-    let due = dueScheduledChatItems(loadScheduledChatItems());
+    let due = dueScheduledChatItems(loadAccountScheduledChatItems());
     while (due.length) {
       const item = due[0];
-      const claimedItems = claimScheduledChatItem(loadScheduledChatItems(), item.id);
+      const claimedItems = claimScheduledChatItem(loadAccountScheduledChatItems(), item.id);
       const claimed = claimedItems.find((candidate) => candidate.id === item.id);
       if (!claimed || claimed.status !== "launching") {
-        due = dueScheduledChatItems(loadScheduledChatItems());
+        due = dueScheduledChatItems(loadAccountScheduledChatItems());
         continue;
       }
-      if (!persistScheduledChatItems(claimedItems)) {
+      if (!persistAccountScheduledChatItems(claimedItems)) {
         statusText = `Impossible d’enregistrer le lancement de « ${scheduledChatTitle(item)} »`;
         break;
       }
@@ -25136,19 +25241,19 @@ const dispatchDueScheduledChats = async (): Promise<void> => {
 
       try {
         await executeScheduledChatItem(claimed);
-        const launched = markScheduledChatLaunched(loadScheduledChatItems(), item.id);
-        persistScheduledChatItems(launched);
+        const launched = markScheduledChatLaunched(loadAccountScheduledChatItems(), item.id);
+        persistAccountScheduledChatItems(launched);
         syncScheduledChatNavigationBadges(launched);
         statusText = `Chat planifié lancé : ${scheduledChatTitle(item)}`;
       } catch (error) {
-        const failed = markScheduledChatFailed(loadScheduledChatItems(), item.id, error);
-        persistScheduledChatItems(failed);
+        const failed = markScheduledChatFailed(loadAccountScheduledChatItems(), item.id, error);
+        persistAccountScheduledChatItems(failed);
         syncScheduledChatNavigationBadges(failed);
         statusText = `Échec du chat planifié : ${String(error)}`;
         if (activeView === "scheduled-chat") render();
       }
 
-      due = dueScheduledChatItems(loadScheduledChatItems());
+      due = dueScheduledChatItems(loadAccountScheduledChatItems());
     }
   } finally {
     scheduledChatDispatchInFlight = false;
@@ -25162,12 +25267,12 @@ const startScheduledChatScheduler = (): void => {
     return;
   }
   scheduledChatSchedulerStarted = true;
-  const current = loadScheduledChatItems();
+  const current = loadAccountScheduledChatItems();
   // Un statut « lancement » ne peut pas survivre à un redémarrage du frontend :
   // il redevient une erreur explicite et relançable au lieu de rester bloqué.
   const recovered = recoverInterruptedScheduledChats(current, Date.now(), 0);
   if (JSON.stringify(recovered) !== JSON.stringify(current)) {
-    persistScheduledChatItems(recovered);
+    persistAccountScheduledChatItems(recovered);
   }
   syncScheduledChatNavigationBadges(recovered);
   void dispatchDueScheduledChats();
@@ -25611,11 +25716,28 @@ const addAccountAndLogin = async () => {
   settings.accounts.push(account);
   selectedAccountId = account.id;
   settings.defaultAccountId = account.id;
+  // Le placeholder doit etre ouvert pendant le clic utilisateur, avant la
+  // sauvegarde asynchrone, sinon les navigateurs le traitent comme un popup
+  // non sollicite et le bloquent.
+  const popupPrepared =
+    provider === "codex" && isRemoteMode()
+      ? openRemoteCodexLoginWindow(account.id, account.label)
+      : false;
   try {
-    settings = await invoke<AppSettings>("save_settings", { settings });
+    if (isRemoteMode()) {
+      const sharedAccountSettings = await invoke<AppSettings>("add_shared_account", { account });
+      // Seul le registre de comptes est global. La vue des workspaces reste
+      // celle de l'utilisateur courant et ne doit jamais etre remplacee par le
+      // snapshot global renvoye pendant l'ajout.
+      settings.accounts = sharedAccountSettings.accounts;
+      settings.defaultAccountId = account.id;
+    } else {
+      settings = await invoke<AppSettings>("save_settings", { settings });
+    }
     scheduleUnconnectedAccountCleanup();
   } catch (error) {
     statusText = String(error);
+    if (popupPrepared) failRemoteCodexLoginWindow(account.id, statusText);
     render();
     return;
   }
@@ -25804,6 +25926,7 @@ const bindUi = () => {
     },
   });
   tasksViewModule?.mountTasksPanel({
+    storage: accountScopedStorage,
     renderIcons,
     environment: currentTaskEnvironment(),
     accountId: currentTaskAccountId(),
@@ -25816,6 +25939,7 @@ const bindUi = () => {
     },
   });
   promptLibraryModule?.mountPromptLibraryPanel({
+    storage: accountScopedStorage,
     renderIcons,
     onUsePrompt: useLibraryPromptInChat,
   });
@@ -25973,7 +26097,7 @@ const bindUi = () => {
       terminalEnvironmentMenuOpen = false;
       clearEnvironmentMemoryDraft();
       render();
-      void openWorkspacePicker("active");
+      void openWorkspacePicker("create");
     });
   document
     .querySelector<HTMLButtonElement>("#createGitDockerEnvironmentFromMenu")
@@ -26271,7 +26395,7 @@ const bindUi = () => {
   });
 
   document.querySelector<HTMLButtonElement>("#workspaceAddSide")?.addEventListener("click", () => {
-    void openWorkspacePicker("active");
+    void openWorkspacePicker("create");
   });
 
   // Switcher de workspace (barre laterale du chat) : selection d'un dossier /
@@ -26319,6 +26443,28 @@ const bindUi = () => {
     const empty = document.querySelector<HTMLElement>("#workspaceSearchEmpty");
     if (empty) empty.hidden = !query || visible > 0;
   });
+
+  document
+    .querySelector<HTMLFormElement>("#createPersonalWorkspaceForm")
+    ?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void createPersonalWorkspace(event.currentTarget as HTMLFormElement);
+    });
+
+  document
+    .querySelector<HTMLButtonElement>("#createWorkspaceFromGitHub")
+    ?.addEventListener("click", () => {
+      workspaceModalOpen = false;
+      workspaceBrowse = null;
+      workspaceBrowseError = "";
+      openGitDockerEnvironmentModal();
+    });
+
+  document
+    .querySelector<HTMLInputElement>("#newPersonalWorkspaceName")
+    ?.addEventListener("input", (event) => {
+      workspaceCreateName = (event.currentTarget as HTMLInputElement).value;
+    });
 
   document.querySelector<HTMLButtonElement>("#confirmWorkspaceModal")?.addEventListener("click", () => {
     const path = workspaceBrowse?.path?.trim();
@@ -26789,8 +26935,8 @@ const bindUi = () => {
       const id = input.dataset.contextTaskToggle;
       if (!id) return;
       const accountId = currentTaskAccountId();
-      const next = setTaskCompleted(loadTaskItems(undefined, accountId), id, input.checked);
-      if (!persistTaskItems(next, undefined, accountId)) {
+      const next = setTaskCompleted(loadTaskItems(accountScopedStorage, accountId), id, input.checked);
+      if (!persistTaskItems(next, accountScopedStorage, accountId)) {
         statusText = "Impossible d’enregistrer les tâches sur cet appareil";
         input.checked = false;
         return;
@@ -26920,7 +27066,7 @@ const bindUi = () => {
   document.querySelectorAll<HTMLButtonElement>("[data-design-starter]").forEach((button) => {
     button.addEventListener("click", () => {
       designClaudeMode = normalizeClaudeDesignModePreference(button.dataset.designStarterMode);
-      localStorage.setItem(DESIGN_CLAUDE_MODE_STORAGE_KEY, designClaudeMode);
+      accountScopedStorage.setItem(DESIGN_CLAUDE_MODE_STORAGE_KEY, designClaudeMode);
       designClaudeDraft = button.dataset.designStarter ?? "";
       render();
       window.requestAnimationFrame(() => {
@@ -27626,8 +27772,10 @@ const createNewTerminalOnce = async (
     render();
     return null;
   }
+  const backgroundLogin =
+    loginOnly && !!accountId && remoteCodexLoginWindowIsOpen(accountId);
 
-  activeView = "terminal";
+  if (!backgroundLogin) activeView = "terminal";
   // Ouvrir un login ne doit pas faire apparaitre en meme temps tous les
   // terminaux de travail sauvegardes. Si une restauration a deja commence, on
   // l'attend toutefois pour conserver un comptage de slots coherent.
@@ -27679,13 +27827,19 @@ const createNewTerminalOnce = async (
   selectedAccountId = account.id;
   settings.defaultAccountId = account.id;
   settings.activeAgentId = chosenAgentId;
-  try {
-    settings = await invoke<AppSettings>("save_settings", { settings });
-  } catch (error) {
-    releaseTerminalSlot();
-    throw error;
+  if (!loginOnly) {
+    try {
+      settings = await invoke<AppSettings>("save_settings", { settings });
+    } catch (error) {
+      releaseTerminalSlot();
+      throw error;
+    }
   }
 
+  // Les comptes et leurs homes sont globaux sur le serveur. Un login ne doit
+  // jamais repasser par PUT /settings : cette route synchronise aussi la vue
+  // personnelle des workspaces et rejetterait a tort les anciens chemins
+  // partages encore presents dans le navigateur d'un utilisateur.
   const savedAccount = settings.accounts.find((candidate) => candidate.id === account.id) ?? null;
   if (!savedAccount) {
     releaseTerminalSlot();
@@ -27706,18 +27860,27 @@ const createNewTerminalOnce = async (
   }
   terminalSessions.push(session);
   releaseTerminalSlot();
-  activateTerminalSession(session);
-  requestTerminalFocusKey = session.key;
-  activeView = "terminal";
-  stopLimitPoll();
-  stopUsagePoll();
-  stopDiscussionsPoll();
-  stopChatSync();
-  stopChatTurnPoll();
-  statusText = "Demarrage terminal";
+  if (!backgroundLogin) {
+    activateTerminalSession(session);
+    requestTerminalFocusKey = session.key;
+    activeView = "terminal";
+    stopLimitPoll();
+    stopUsagePoll();
+    stopDiscussionsPoll();
+    stopChatSync();
+    stopChatTurnPoll();
+    statusText = "Demarrage terminal";
+  } else {
+    selectedAccountId = account.id;
+    statusText = `Préparation de la fenêtre OpenAI pour ${account.label}…`;
+  }
   render();
 
-  await startTerminalSession(session, commandOverride, loginOnly);
+  await startTerminalSession(session, commandOverride, loginOnly, !backgroundLogin);
+  if (backgroundLogin) {
+    statusText = `Connexion OpenAI en attente pour ${account.label}`;
+    render();
+  }
   persistTerminalSessions();
   return session;
 };
@@ -27752,6 +27915,11 @@ const createNewTerminal = async (
       session.status !== "Ferme",
   );
   if (existingLogin) {
+    if (focusRemoteCodexLoginWindow(accountId)) {
+      statusText = "Connexion déjà ouverte dans la fenêtre OpenAI";
+      render();
+      return existingLogin;
+    }
     activateTerminalSession(existingLogin);
     activeView = "terminal";
     requestTerminalFocusKey = existingLogin.key;
@@ -27762,7 +27930,10 @@ const createNewTerminal = async (
 
   const inFlightLogin = loginTerminalCreations.get(accountId);
   if (inFlightLogin) {
-    statusText = "Connexion deja en cours dans le terminal ouvert";
+    const popupFocused = focusRemoteCodexLoginWindow(accountId);
+    statusText = popupFocused
+      ? "Connexion déjà en cours dans la fenêtre OpenAI"
+      : "Connexion deja en cours dans le terminal ouvert";
     render();
     return inFlightLogin;
   }
@@ -27775,6 +27946,83 @@ const createNewTerminal = async (
     if (loginTerminalCreations.get(accountId) === creation) {
       loginTerminalCreations.delete(accountId);
     }
+  }
+};
+
+const applyRemoteCodexLoginOutput = (session: TerminalSession, data: string) => {
+  if (!session.loginOnly) return "none" as const;
+  const update = consumeRemoteCodexLoginOutput(session.accountId, data);
+  if (update.type === "ready") {
+    statusText = `Onglet OpenAI ouvert — code ${update.userCode} copié, collez-le pour continuer`;
+    render();
+    return update.type;
+  }
+  if (update.type === "success") {
+    const accountLabel = accountById(session.accountId)?.label ?? session.title;
+    void closeTerminalSession(session.key).finally(() => {
+      statusText = `Connexion réussie pour ${accountLabel}`;
+      render();
+      void refreshLimitStatus(true, true);
+    });
+    return update.type;
+  }
+  if (update.type === "error") {
+    void closeTerminalSession(session.key).finally(() => {
+      statusText = update.message;
+      render();
+    });
+  }
+  return update.type;
+};
+
+// Le WebSocket peut livrer les premiers octets du CLI pendant que l'appel
+// POST /terminals se termine. Le transport conserve donc un court snapshot que
+// l'on rejoue ici jusqu'a retrouver le lien et le code appareil. Cette voie de
+// secours evite une fenetre de connexion qui tourne indefiniment.
+const replayRemoteCodexLoginOutput = async (session: TerminalSession) => {
+  const terminalId = session.ptyId;
+  if (
+    !isRemoteMode()
+    || !session.loginOnly
+    || terminalId === null
+    || !remoteCodexLoginWindowNeedsCode(session.accountId)
+  ) {
+    return;
+  }
+
+  let previous = "";
+  const deadline = Date.now() + 12_000;
+  while (
+    Date.now() < deadline
+    && terminalSessions.includes(session)
+    && session.ptyId === terminalId
+  ) {
+    if (!remoteCodexLoginWindowNeedsCode(session.accountId)) {
+      if (!remoteCodexLoginWindowIsOpen(session.accountId)) {
+        await closeTerminalSession(session.key);
+      }
+      return;
+    }
+    const snapshot = await invoke<string>("terminal_output_snapshot", { id: terminalId })
+      .catch(() => "");
+    if (snapshot && snapshot !== previous) {
+      const delta = snapshot.startsWith(previous) ? snapshot.slice(previous.length) : snapshot;
+      previous = snapshot;
+      if (applyRemoteCodexLoginOutput(session, delta) !== "none") return;
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 200));
+  }
+
+  if (
+    terminalSessions.includes(session)
+    && session.ptyId === terminalId
+    && remoteCodexLoginWindowNeedsCode(session.accountId)
+  ) {
+    const message = "Le code OpenAI n’a pas été reçu. Fermez cette fenêtre puis réessayez.";
+    failRemoteCodexLoginWindow(session.accountId, message);
+    await closeTerminalSession(session.key);
+    statusText = message;
+    render();
   }
 };
 
@@ -27845,6 +28093,9 @@ const startTerminalSession = async (
     session.running = true;
     session.status = "Actif";
     statusText = "Terminal actif";
+    if (loginOnly && isRemoteMode() && remoteCodexLoginWindowIsOpen(session.accountId)) {
+      void replayRemoteCodexLoginOutput(session);
+    }
     if (!loginOnly && settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
       // Utilise le workspace capture par cette session, meme si l'utilisateur
       // en a selectionne un autre pendant le demarrage du PTY.
@@ -28091,6 +28342,7 @@ const setupEvents = async () => {
   unlistenData = await listen<PtyDataEvent>("pty-data", (event) => {
     const session = terminalSessionsByPtyId.get(event.payload.id);
     session?.terminal.write(event.payload.data);
+    if (session?.loginOnly) applyRemoteCodexLoginOutput(session, event.payload.data);
   });
 
   unlistenExit = await listen<PtyExitEvent>("pty-exit", (event) => {
@@ -28101,6 +28353,13 @@ const setupEvents = async () => {
     session.ptyId = null;
     session.running = false;
     session.status = "Ferme";
+
+    if (session.loginOnly) {
+      failRemoteCodexLoginWindow(
+        session.accountId,
+        "La connexion s’est interrompue avant d’être validée.",
+      );
+    }
 
     if (session.key === activeTerminalKey) {
       statusText = "Terminal ferme";
@@ -28428,6 +28687,22 @@ const boot = async () => {
       return;
     }
   }
+
+  // localStorage est partage par origine : le compte authentifie devient la
+  // portee de toutes les donnees fonctionnelles conservees sur cet appareil.
+  setAccountStorageScope(isRemoteMode() ? authenticatedUser()?.id : null);
+  activeDesignTool = normalizeDesignToolPreference(
+    accountScopedStorage.getItem(DESIGN_TOOL_STORAGE_KEY),
+  );
+  designClaudeAccountId = accountScopedStorage.getItem(DESIGN_CLAUDE_ACCOUNT_STORAGE_KEY);
+  designClaudeMode = normalizeClaudeDesignModePreference(
+    accountScopedStorage.getItem(DESIGN_CLAUDE_MODE_STORAGE_KEY),
+  );
+  autonomousSeenReportIds = loadSeenAutonomousReportIds();
+  autonomousMonitorCompact =
+    accountScopedStorage.getItem(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY) === "1";
+  autonomousMonitorPosition = loadAutonomousMonitorPosition();
+  autonomousMonitorSize = loadAutonomousMonitorSize();
 
   try {
     settings = await invoke<AppSettings>("load_settings");

@@ -685,7 +685,24 @@ mod tests {
             repository_name("https://github.com/acme/My.App.git"),
             "My-App"
         );
+        assert_eq!(
+            repository_name("https://github.com/BaptisteFaisy/Software-multi-account.git"),
+            "Software-multi-account"
+        );
         assert_eq!(repository_name("git@git.example.com:acme/api.git"), "api");
+    }
+
+    #[test]
+    fn reserves_another_directory_for_each_import_of_the_same_repository() {
+        let root = std::env::temp_dir().join(format!("cst-git-env-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        let first = reserve_workspace(&root, "Software-multi-account").unwrap();
+        let second = reserve_workspace(&root, "Software-multi-account").unwrap();
+
+        assert_eq!(first.file_name().unwrap(), "Software-multi-account");
+        assert_eq!(second.file_name().unwrap(), "Software-multi-account-2");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

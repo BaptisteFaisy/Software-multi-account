@@ -136,6 +136,15 @@ ecrit dans l'etat du tunnel. Pour fermer le tunnel :
 npm run connect:vps:web:stop -- -Profile google-trial
 ```
 
+Le microphone fonctionne directement dans le client desktop ouvert par le
+tunnel : la transcription locale du PC est utilisee en priorite, puis le moteur
+du VPS sert de repli. Pour un navigateur ou l'application mobile, expose
+l'interface avec HTTPS et configure le VPS vers Whisper/Ollama ou vers un GPU
+distant. Les variables `CST_VOICE_TRANSCRIPTION_*`, `CST_VOICE_OLLAMA_*` et
+`CST_VOICE_ALLOW_INSECURE_REMOTE` presentes dans l'environnement au moment du
+deploiement sont transmises au conteneur. Une URL publique en HTTP simple ne
+peut pas recevoir la permission microphone du navigateur.
+
 ## Mettre un VPS a jour depuis GitHub
 
 Chaque profil VPS peut etre reconstruit a la demande depuis la branche ou le

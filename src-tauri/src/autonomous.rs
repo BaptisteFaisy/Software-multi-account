@@ -748,6 +748,26 @@ fn agent_keeps_supervisor_enabled(agent: &AutonomousAgentSnapshot) -> bool {
         ) || agent.reports.iter().any(|report| report.read_at.is_none()))
 }
 
+/// Une pause explicite de toute la flotte utilisateur prime sur le traitement
+/// des comptes rendus non lus. Ceux-ci restent persistants et seront compiles
+/// lorsque l'un des agents sera repris. Les missions deja terminees ne doivent
+/// pas empecher la mise en veille demandee par l'utilisateur.
+fn user_fleet_is_explicitly_paused(store: &AutonomousAgentStore) -> bool {
+    let mut has_paused_agent = false;
+    for agent in store
+        .agents
+        .iter()
+        .filter(|agent| !agent_is_system_supervisor(agent))
+    {
+        match agent.status {
+            AutonomousAgentStatus::Paused => has_paused_agent = true,
+            AutonomousAgentStatus::Completed => {}
+            AutonomousAgentStatus::Active | AutonomousAgentStatus::NeedsAttention => return false,
+        }
+    }
+    has_paused_agent
+}
+
 fn supervisor_source_priority(agent: &AutonomousAgentSnapshot) -> u8 {
     if !agent_keeps_supervisor_enabled(agent) {
         return 0;
@@ -853,9 +873,11 @@ fn new_system_supervisor(source: &AutonomousAgentSnapshot, now: i64) -> Autonomo
 }
 
 /// Maintient l'invariant de flotte : un superviseur systeme existe et reste
-/// actif tant qu'au moins un agent utilisateur est actif ou en attention. Il
-/// repare aussi les incoherences d'ordonnancement sans contourner les pauses,
-/// les fins de mission ou les reviews humaines.
+/// actif tant qu'au moins un agent utilisateur est actif ou en attention. Une
+/// pause explicite de tous les agents non termines le met immediatement en
+/// veille, meme si des rapports restent a lire. Il repare aussi les
+/// incoherences d'ordonnancement sans contourner les pauses, les fins de mission
+/// ou les reviews humaines.
 fn reconcile_system_supervisor(
     store: &mut AutonomousAgentStore,
     now: i64,
@@ -910,13 +932,18 @@ fn reconcile_system_supervisor(
         }
     }
 
-    let source = store
-        .agents
-        .iter()
-        .filter(|agent| !agent_is_system_supervisor(agent))
-        .max_by_key(|agent| supervisor_source_priority(agent))
-        .filter(|agent| supervisor_source_priority(agent) > 0)
-        .cloned();
+    let fleet_explicitly_paused = user_fleet_is_explicitly_paused(store);
+    let source = if fleet_explicitly_paused {
+        None
+    } else {
+        store
+            .agents
+            .iter()
+            .filter(|agent| !agent_is_system_supervisor(agent))
+            .max_by_key(|agent| supervisor_source_priority(agent))
+            .filter(|agent| supervisor_source_priority(agent) > 0)
+            .cloned()
+    };
     let supervisor_index = store.agents.iter().position(agent_is_system_supervisor);
 
     let Some(source) = source else {
@@ -944,8 +971,13 @@ fn reconcile_system_supervisor(
                     supervisor,
                     now,
                     "system_supervisor_standby",
-                    "Supervision mise en veille : aucun autre agent autonome n'est active"
-                        .to_string(),
+                    if fleet_explicitly_paused {
+                        "Supervision mise en veille : tous les agents utilisateur sont en pause"
+                            .to_string()
+                    } else {
+                        "Supervision mise en veille : aucun autre agent autonome n'est actif"
+                            .to_string()
+                    },
                 );
                 changed = true;
             }
@@ -2232,7 +2264,11 @@ impl AutonomousAgentManager {
                     );
                 }
                 AutonomousAgentAction::AuthorizePayment => {
-                    if agent.status != AutonomousAgentStatus::NeedsAttention {
+                    if !matches!(
+                        agent.status,
+                        AutonomousAgentStatus::NeedsAttention | AutonomousAgentStatus::Paused
+                    ) || agent.pending_review.is_none()
+                    {
                         return Err("Cet agent n'attend aucun paiement".to_string());
                     }
                     let mut review = agent.pending_review.take().ok_or_else(|| {
@@ -2285,7 +2321,11 @@ impl AutonomousAgentManager {
                 AutonomousAgentAction::ApproveReview
                 | AutonomousAgentAction::ConfirmPayment
                 | AutonomousAgentAction::RejectReview => {
-                    if agent.status != AutonomousAgentStatus::NeedsAttention {
+                    if !matches!(
+                        agent.status,
+                        AutonomousAgentStatus::NeedsAttention | AutonomousAgentStatus::Paused
+                    ) || agent.pending_review.is_none()
+                    {
                         return Err("Cet agent n'attend aucune verification humaine".to_string());
                     }
                     let pending_is_payment = agent
@@ -8986,12 +9026,24 @@ mod tests {
     fn system_supervisor_stays_for_attention_and_sleeps_after_an_explicit_pause() {
         let mut target = sample_agent(AutonomousAgentStatus::NeedsAttention);
         target.last_error = Some("test backend failed".to_string());
+        assert!(push_report(
+            &mut target,
+            "Rapport non lu a conserver pendant la pause",
+            90,
+        ));
+        let mut completed = sample_agent(AutonomousAgentStatus::Completed);
+        completed.id = "agent-completed".to_string();
+        assert!(push_report(
+            &mut completed,
+            "Rapport termine non lu a conserver pendant la pause",
+            80,
+        ));
         let mut store = AutonomousAgentStore {
             version: STORE_VERSION,
-            agents: vec![target],
+            agents: vec![target, completed],
         };
         reconcile_system_supervisor(&mut store, 100);
-        assert_eq!(store.agents.len(), 2);
+        assert_eq!(store.agents.len(), 3);
 
         let supervisor = store
             .agents
@@ -9017,6 +9069,14 @@ mod tests {
             .unwrap();
         assert_eq!(supervisor.status, AutonomousAgentStatus::Paused);
         assert_eq!(supervisor.next_run_at, None);
+        assert_eq!(store.agents[0].reports[0].read_at, None);
+        assert_eq!(store.agents[1].reports[0].read_at, None);
+        assert!(supervisor.events.iter().any(|event| {
+            event.kind == "system_supervisor_standby"
+                && event
+                    .message
+                    .contains("tous les agents utilisateur sont en pause")
+        }));
     }
 
     #[test]
@@ -10455,6 +10515,11 @@ mod tests {
         assert!(manager
             .control("agent-1", AutonomousAgentAction::Resume, None)
             .is_err());
+        let paused = manager
+            .control("agent-1", AutonomousAgentAction::Pause, None)
+            .unwrap();
+        assert_eq!(paused.status, AutonomousAgentStatus::Paused);
+        assert!(paused.pending_review.is_some());
         let approved = manager
             .control("agent-1", AutonomousAgentAction::ApproveReview, None)
             .unwrap();

@@ -1,4 +1,5 @@
 import { invoke } from "./platform";
+import { accountScopedStorage } from "./account-storage";
 import "./video.css";
 
 export type VideoGenerationMode = "text" | "image";
@@ -409,13 +410,8 @@ export function persistVideoHistory(
   }
 }
 
-function browserStorage(): Storage | null {
-  if (typeof window === "undefined") return null;
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
-  }
+function browserStorage(): Pick<Storage, "getItem" | "setItem"> | null {
+  return typeof window === "undefined" ? null : accountScopedStorage;
 }
 
 const selectedModel = (): VideoModel | null =>

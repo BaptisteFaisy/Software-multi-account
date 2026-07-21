@@ -121,10 +121,11 @@ test("les statuts autonomes et leur planning sont lisibles", () => {
     autonomousAgentsToPause([
       agent({ id: "active" }),
       agent({ id: "system", systemManaged: true }),
+      agent({ id: "attention", status: "needs_attention" }),
       agent({ id: "paused", status: "paused" }),
       agent({ id: "completed", status: "completed" }),
     ]).map((candidate) => candidate.id),
-    ["active"],
+    ["active", "attention"],
   );
   assert.equal(formatAutonomousSchedule(agent({ currentTestId: "test-1" }), 1_000), "Validation des tests en cours");
   assert.equal(formatAutonomousSchedule(agent({ currentStartId: "start-1" }), 1_000), "Démarrage du prochain tour");
@@ -591,7 +592,7 @@ test("le lanceur des agents autonomes peut etre reduit durablement", () => {
   assert.match(main, /AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY/);
   assert.match(main, /id="autonomousMonitorCompactToggle"/);
   assert.match(main, /Réduire le bouton Agents autonomes/);
-  assert.match(main, /localStorage\.setItem\(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY/);
+  assert.match(main, /accountScopedStorage\.setItem\(AUTONOMOUS_MONITOR_COMPACT_STORAGE_KEY/);
   assert.match(style, /\.autonomous-monitor-host\.is-compact #autonomousMonitorLauncher/);
   assert.match(style, /\.autonomous-monitor-host\.is-compact \.autonomous-monitor-launcher-copy \{ display: none; \}/);
   assert.match(theme, /data-theme="light"\] #autonomousMonitorCompactToggle/);

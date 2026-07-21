@@ -12,6 +12,8 @@ const server = readFileSync(new URL("../src-tauri/src/server.rs", import.meta.ur
 const styles = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 const setup = readFileSync(new URL("../scripts/setup-local-voice.ps1", import.meta.url), "utf8");
 const remoteSetup = readFileSync(new URL("../scripts/configure-remote-voice.ps1", import.meta.url), "utf8");
+const portableVpsDeploy = readFileSync(new URL("../scripts/deploy-vps-ansible.ps1", import.meta.url), "utf8");
+const nativeVpsDeploy = readFileSync(new URL("../scripts/deploy-vps.ps1", import.meta.url), "utf8");
 const remoteGuide = readFileSync(new URL("../docs/remote-voice-gpu.md", import.meta.url), "utf8");
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
@@ -48,6 +50,15 @@ test("le mode distant route aussi la voix vers la machine GPU", () => {
   assert.match(voice, /result\.transcriptionProvider\.includes\("remote"\)/);
 });
 
+test("le client desktop connecte au VPS garde le moteur vocal local avec repli serveur", () => {
+  assert.match(
+    platform,
+    /isTauriRuntime\(\)[\s\S]*?command === "process_voice_input"[\s\S]*?tauriInvoke<T>\(command, args\)[\s\S]*?remoteInvoke<T>\(command, args\)/,
+  );
+  assert.match(platform, /command === "voice_runtime_status"/);
+  assert.match(platform, /indisponible sur ce poste[\s\S]*?et sur le VPS/);
+});
+
 test("le transport GPU distant exige TLS et garde les jetons hors du JSON", () => {
   assert.match(backend, /CST_VOICE_TRANSCRIPTION_API_KEY/);
   assert.match(backend, /CST_VOICE_OLLAMA_API_KEY/);
@@ -59,6 +70,16 @@ test("le transport GPU distant exige TLS et garde les jetons hors du JSON", () =
   assert.doesNotMatch(remoteSetup, /ApiKey\s*=/i);
   assert.equal(packageJson.scripts["voice:remote"].includes("configure-remote-voice.ps1"), true);
   assert.match(remoteGuide, /Ollama ne doit pas etre expose directement/);
+});
+
+test("les deploiements VPS transmettent la configuration vocale distante", () => {
+  for (const deployScript of [portableVpsDeploy, nativeVpsDeploy]) {
+    assert.match(deployScript, /CST_VOICE_TRANSCRIPTION_MODE/);
+    assert.match(deployScript, /CST_VOICE_TRANSCRIPTION_URL/);
+    assert.match(deployScript, /CST_VOICE_TRANSCRIPTION_API_KEY/);
+    assert.match(deployScript, /CST_VOICE_OLLAMA_URL/);
+    assert.match(deployScript, /CST_VOICE_OLLAMA_API_KEY/);
+  }
 });
 
 test("les parametres affichent le statut vocal et GPU sans charger le modele", () => {

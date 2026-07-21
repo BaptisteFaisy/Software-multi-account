@@ -185,7 +185,7 @@ test("la vue Skills expose création, import, édition et suppression", () => {
   const viewStyle = readFileSync(new URL("../src/skills-view.css", import.meta.url), "utf8");
 
   assert.match(main, /import\("\.\/skills-view"\)/);
-  assert.match(main, /loadCustomSkills\(\)/);
+  assert.match(main, /loadCustomSkills\(accountScopedStorage\)/);
   assert.match(main, /Skill « \$\{skill\.name\} » ajouté et disponible dans les chats/);
   assert.match(view, /id="skillsAdd"/);
   assert.match(view, /data-skill-edit/);

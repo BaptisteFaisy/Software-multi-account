@@ -181,8 +181,9 @@ impl WorkspaceAccessManager {
         fs::create_dir_all(data_dir.join(USER_SPACES_DIRECTORY))
             .map_err(|error| format!("Creation des espaces personnels impossible: {error}"))?;
         let store = if store_path.is_file() {
-            let content = fs::read_to_string(&store_path)
-                .map_err(|error| format!("Lecture des droits d'environnement impossible: {error}"))?;
+            let content = fs::read_to_string(&store_path).map_err(|error| {
+                format!("Lecture des droits d'environnement impossible: {error}")
+            })?;
             serde_json::from_str(&content)
                 .map_err(|error| format!("Droits d'environnement invalides: {error}"))?
         } else {
@@ -218,9 +219,70 @@ impl WorkspaceAccessManager {
         canonical_existing_dir(&root)
     }
 
-    /// Autorise la navigation uniquement dans la racine personnelle ou dans
-    /// un environnement deja partage avec l'utilisateur. La borne renvoyee est
-    /// utilisee comme parent maximal par le navigateur de dossiers.
+    /// Cree un environnement vide directement dans la racine personnelle du
+    /// compte. Le nom physique contient un identifiant aleatoire afin qu'un
+    /// autre compte ne puisse ni le deviner ni provoquer de collision.
+    pub(crate) fn create_environment(
+        &self,
+        identity: &AuthIdentity,
+        requested_name: &str,
+    ) -> Result<WorkspaceAccessView, WorkspaceAccessError> {
+        let label = normalize_new_environment_label(requested_name)?;
+        let personal_root = self.personal_root(identity)?;
+        let directory = personal_root.join(new_environment_directory_name(&label));
+        fs::create_dir(&directory).map_err(|error| {
+            WorkspaceAccessError::internal(format!(
+                "Creation de l'environnement impossible: {error}"
+            ))
+        })?;
+        if let Err(error) = restrict_private_directory(&directory) {
+            let _ = fs::remove_dir(&directory);
+            return Err(WorkspaceAccessError::internal(error));
+        }
+        let resolved = match canonical_existing_dir(&directory) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = fs::remove_dir(&directory);
+                return Err(error);
+            }
+        };
+
+        let now = now_ts();
+        let environment = StoredWorkspaceAccess {
+            id: Uuid::new_v4().to_string(),
+            owner_id: identity.id.clone(),
+            owner_username: identity.username.clone(),
+            path: display_path(&resolved),
+            label,
+            share_code: new_share_code(),
+            memory: String::new(),
+            execution_target_id: None,
+            members: Vec::new(),
+            requests: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let view = access_view(&environment, &identity.id);
+        let mut store = match self.lock_store() {
+            Ok(store) => store,
+            Err(error) => {
+                let _ = fs::remove_dir(&resolved);
+                return Err(error);
+            }
+        };
+        store.environments.push(environment);
+        if let Err(error) = self.persist_locked(&store) {
+            store.environments.pop();
+            drop(store);
+            let _ = fs::remove_dir(&resolved);
+            return Err(error);
+        }
+        Ok(view)
+    }
+
+    /// Autorise le navigateur de dossiers uniquement dans la racine personnelle.
+    /// Meme un environnement partage et accepte n'expose jamais son arborescence
+    /// dans le selecteur de creation d'un autre compte.
     pub(crate) fn authorize_browse_path(
         &self,
         identity: &AuthIdentity,
@@ -234,13 +296,7 @@ impl WorkspaceAccessManager {
         if requested.starts_with(&personal_root) {
             return Ok((requested, personal_root));
         }
-
-        let store = self.lock_store()?;
-        let environment = matching_environment(&store.environments, &requested)
-            .filter(|environment| user_can_access(environment, &identity.id))
-            .ok_or_else(WorkspaceAccessError::not_found)?;
-        let boundary = canonical_existing_dir(Path::new(&environment.path))?;
-        Ok((requested, boundary))
+        Err(WorkspaceAccessError::not_found())
     }
 
     /// Valide un chemin de travail. Un dossier situe dans l'espace personnel
@@ -546,10 +602,7 @@ impl WorkspaceAccessManager {
         })
     }
 
-    fn persist_locked(
-        &self,
-        store: &WorkspaceAccessStore,
-    ) -> Result<(), WorkspaceAccessError> {
+    fn persist_locked(&self, store: &WorkspaceAccessStore) -> Result<(), WorkspaceAccessError> {
         let bytes = serde_json::to_vec_pretty(store).map_err(|error| {
             WorkspaceAccessError::internal(format!(
                 "Serialisation des droits d'environnement impossible: {error}"
@@ -742,6 +795,47 @@ fn normalized_label(suggested: Option<&str>, path: &Path) -> String {
         .to_string()
 }
 
+fn normalize_new_environment_label(value: &str) -> Result<String, WorkspaceAccessError> {
+    let label = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_LABEL_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if label.is_empty() {
+        return Err(WorkspaceAccessError::validation(
+            "Le nom de l'environnement est obligatoire",
+        ));
+    }
+    Ok(label)
+}
+
+fn new_environment_directory_name(label: &str) -> String {
+    let mut slug = String::new();
+    let mut separator_pending = false;
+    for character in label.chars() {
+        if character.is_alphanumeric() {
+            if separator_pending && !slug.is_empty() {
+                slug.push('-');
+            }
+            separator_pending = false;
+            slug.extend(character.to_lowercase());
+            if slug.chars().count() >= 48 {
+                break;
+            }
+        } else {
+            separator_pending = true;
+        }
+    }
+    if slug.is_empty() {
+        slug.push_str("environnement");
+    }
+    let random = Uuid::new_v4().simple().to_string();
+    format!("env-{slug}-{}", &random[..8])
+}
+
 fn normalize_memory(memory: &str) -> String {
     memory
         .trim()
@@ -764,7 +858,13 @@ fn normalize_closed_ids(ids: &[String]) -> Vec<String> {
 
 fn new_share_code() -> String {
     let value = Uuid::new_v4().simple().to_string().to_uppercase();
-    format!("{}-{}-{}-{}", &value[0..4], &value[4..8], &value[8..12], &value[12..16])
+    format!(
+        "{}-{}-{}-{}",
+        &value[0..4],
+        &value[4..8],
+        &value[8..12],
+        &value[12..16]
+    )
 }
 
 fn normalize_share_code(value: &str) -> Result<String, WorkspaceAccessError> {
@@ -833,7 +933,10 @@ mod tests {
         let manager = WorkspaceAccessManager::load(root.clone()).unwrap();
         let owner = identity("owner-1", "alice");
         let guest = identity("guest-1", "bob");
-        let environment = manager.personal_root(&owner).unwrap().join("secret-project");
+        let environment = manager
+            .personal_root(&owner)
+            .unwrap()
+            .join("secret-project");
         fs::create_dir_all(&environment).unwrap();
         manager
             .claim_or_authorize_environment(&owner, &display_path(&environment), Some("Secret"))
@@ -856,6 +959,35 @@ mod tests {
         assert!(manager
             .authorize_existing_environment(&guest, &display_path(&environment))
             .is_ok());
+        assert!(manager
+            .authorize_browse_path(&guest, Some(&display_path(&environment)))
+            .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn created_environment_stays_inside_its_owner_personal_root() {
+        let root = std::env::temp_dir().join(format!("cst-workspace-access-{}", Uuid::new_v4()));
+        let manager = WorkspaceAccessManager::load(root.clone()).unwrap();
+        let owner = identity("owner-1", "alice");
+        let guest = identity("guest-1", "bob");
+
+        let created = manager.create_environment(&owner, "Projet prive").unwrap();
+        let second = manager.create_environment(&owner, "Second projet").unwrap();
+        let owner_root = manager.personal_root(&owner).unwrap();
+        let created_path = fs::canonicalize(&created.path).unwrap();
+        let second_path = fs::canonicalize(&second.path).unwrap();
+        assert!(created_path.starts_with(&owner_root));
+        assert!(second_path.starts_with(&owner_root));
+        assert_ne!(created_path, second_path);
+        assert_eq!(manager.list_for(&owner).unwrap().len(), 2);
+        assert!(manager
+            .authorize_browse_path(&owner, Some(&created.path))
+            .is_ok());
+        assert!(manager
+            .authorize_browse_path(&guest, Some(&created.path))
+            .is_err());
+        assert!(manager.list_for(&guest).unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

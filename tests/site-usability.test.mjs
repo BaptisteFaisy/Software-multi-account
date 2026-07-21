@@ -146,7 +146,7 @@ test("les tâches à faire peuvent rester visibles en bas de la colonne droite",
   assert.match(main, /localStorage\.setItem\(CHAT_CONTEXT_TASKS_VISIBLE_STORAGE_KEY, String\(visible\)\)/);
   assert.match(main, /\.filter\(\(task\) => !task\.completed\)/);
   assert.match(main, /data-context-task-toggle/);
-  assert.match(main, /persistTaskItems\(next, undefined, accountId\)/);
+  assert.match(main, /persistTaskItems\(next, accountScopedStorage, accountId\)/);
   assert.match(main, /#chatContextTasksOpenAll, #chatContextTasksMore, #chatContextTasksEmpty/);
   assert.match(style, /\.chat-context-tasks \{[^}]*flex-direction:\s*column;[^}]*border-top:/s);
   assert.match(style, /\.chat-context-tasks input:focus-visible \+ span/);

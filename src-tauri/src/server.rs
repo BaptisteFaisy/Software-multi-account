@@ -36,7 +36,7 @@ use crate::{
         MAX_PRIVATE_MESSAGE_REQUEST_BYTES,
     },
     runtime_sync::RuntimeSync,
-    settings::{self, AppSettings, Provider},
+    settings::{self, AccountProfile, AppSettings, Provider},
     telegram_notifications::{
         self, ConnectTelegramManagerRequest, ConnectTelegramRequest,
         PrepareManagedTelegramBotRequest,
@@ -48,9 +48,7 @@ use crate::{
     },
     whatsapp_notifications::{self, ConnectWhatsAppRequest},
     work_time,
-    workspace_access::{
-        WorkspaceAccessError, WorkspaceAccessErrorKind, WorkspaceAccessManager,
-    },
+    workspace_access::{WorkspaceAccessError, WorkspaceAccessErrorKind, WorkspaceAccessManager},
 };
 use axum::{
     body::Bytes,
@@ -409,6 +407,11 @@ struct FsListQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateWorkspaceRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RequestWorkspaceAccessRequest {
     share_code: String,
@@ -609,9 +612,7 @@ impl RemoteTerminalManager {
                 return Err("Environnement obligatoire avant d'ouvrir un terminal".to_string());
             } else {
                 let workspace_id = format!("{id}-{}", Uuid::new_v4().simple());
-                let repo_dir = generated_workspaces_root
-                    .join(&workspace_id)
-                    .join("repo");
+                let repo_dir = generated_workspaces_root.join(&workspace_id).join("repo");
                 let repo_label = prepare_workspace(
                     repo_url,
                     request.branch.as_deref(),
@@ -1053,7 +1054,10 @@ pub async fn run_from_env() -> Result<(), String> {
         )
         .route("/vps/deployments/:id", get(api_vps_deployment))
         .route("/settings", get(api_get_settings).put(api_put_settings))
-        .route("/accounts", get(api_get_accounts))
+        .route(
+            "/accounts",
+            get(api_get_accounts).post(api_add_shared_account),
+        )
         .route("/accounts/import", post(api_import_account))
         .route("/accounts/home", post(api_ensure_account_home))
         .route("/accounts/:id", delete(api_remove_account))
@@ -1307,7 +1311,10 @@ pub async fn run_from_env() -> Result<(), String> {
             "/kombai/install-extension",
             post(api_kombai_install_extension),
         )
-        .route("/workspaces", get(api_workspaces))
+        .route(
+            "/workspaces",
+            get(api_workspaces).post(api_create_workspace),
+        )
         .route("/workspaces/access", get(api_workspace_access))
         .route(
             "/workspaces/access/request",
@@ -1938,6 +1945,16 @@ async fn api_get_accounts(State(state): State<Arc<ServerState>>, headers: Header
     })
 }
 
+async fn api_add_shared_account(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(account): Json<AccountProfile>,
+) -> Response {
+    auth_or(&state, &headers, || {
+        settings::add_shared_account(account).map(json_response)
+    })
+}
+
 async fn api_import_account(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -2046,9 +2063,9 @@ async fn api_list_discussions(
     };
     match actor {
         RequestActor::Administrator => json_response(dashboard),
-        RequestActor::User(identity) => {
-            json_response(filter_discussions_for_identity(&state, &identity, dashboard))
-        }
+        RequestActor::User(identity) => json_response(filter_discussions_for_identity(
+            &state, &identity, dashboard,
+        )),
     }
 }
 
@@ -2085,9 +2102,8 @@ fn authorize_discussion_for_identity(
     account_id: &str,
     session_id: &str,
 ) -> Result<(), Response> {
-    let dashboard = discussions::list_discussions_dashboard().map_err(|error| {
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config)
-    })?;
+    let dashboard = discussions::list_discussions_dashboard()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config))?;
     let discussion = dashboard
         .accounts
         .iter()
@@ -2741,12 +2757,18 @@ async fn api_start_terminal(
     } else {
         None
     };
-    let generated_workspaces_root = match actor.user() {
-        Some(identity) => match state.workspace_access.personal_root(identity) {
-            Ok(path) => path,
-            Err(error) => return workspace_access_error(&state, error),
-        },
-        None => state.config.data_dir.join("workspaces"),
+    // Une authentification de compte utilise exclusivement le home partage du
+    // compte. Elle ne doit ni creer ni valider un espace personnel utilisateur.
+    let generated_workspaces_root = if request.login_only {
+        state.config.data_dir.join("workspaces")
+    } else {
+        match actor.user() {
+            Some(identity) => match state.workspace_access.personal_root(identity) {
+                Ok(path) => path,
+                Err(error) => return workspace_access_error(&state, error),
+            },
+            None => state.config.data_dir.join("workspaces"),
+        }
     };
     let owner_id = actor.owner_id().to_string();
     let identity = actor.user().cloned();
@@ -2839,12 +2861,9 @@ async fn api_start_chat_turn(
         );
     }
     if let (Some(identity), Some(session_id)) = (actor.user(), request.session_id.as_deref()) {
-        if let Err(response) = authorize_discussion_for_identity(
-            &state,
-            identity,
-            &request.account_id,
-            session_id,
-        ) {
+        if let Err(response) =
+            authorize_discussion_for_identity(&state, identity, &request.account_id, session_id)
+        {
             return response;
         }
     }
@@ -4365,9 +4384,10 @@ fn authorize_autonomous_resource(
     let Some(identity) = actor.user() else {
         return Ok(());
     };
-    let agents = state.autonomous.list().map_err(|error| {
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config)
-    })?;
+    let agents = state
+        .autonomous
+        .list()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config))?;
     let agent = agents.iter().find(|agent| agent.id == id).ok_or_else(|| {
         api_error(
             StatusCode::NOT_FOUND,
@@ -4403,9 +4423,10 @@ fn authorize_orchestration_resource(
     let Some(identity) = actor.user() else {
         return Ok(());
     };
-    let runs = state.orchestration.list().map_err(|error| {
-        api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config)
-    })?;
+    let runs = state
+        .orchestration
+        .list()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config))?;
     let run = runs.iter().find(|run| run.id == id).ok_or_else(|| {
         api_error(
             StatusCode::NOT_FOUND,
@@ -4901,12 +4922,8 @@ async fn api_promote_autonomous_agent_to_orchestration(
             &state.config,
         );
     }
-    let resolved = match resolve_actor_environment(
-        &state,
-        &actor,
-        request.project_dir.trim(),
-        true,
-    ) {
+    let resolved = match resolve_actor_environment(&state, &actor, request.project_dir.trim(), true)
+    {
         Ok(path) => path,
         Err(response) => return response,
     };
@@ -4967,12 +4984,8 @@ async fn api_create_orchestration(
             &state.config,
         );
     }
-    let resolved = match resolve_actor_environment(
-        &state,
-        &actor,
-        request.project_dir.trim(),
-        true,
-    ) {
+    let resolved = match resolve_actor_environment(&state, &actor, request.project_dir.trim(), true)
+    {
         Ok(path) => path,
         Err(response) => return response,
     };
@@ -5277,6 +5290,24 @@ async fn api_workspaces(State(state): State<Arc<ServerState>>, headers: HeaderMa
     }
 }
 
+async fn api_create_workspace(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateWorkspaceRequest>,
+) -> Response {
+    let identity = match require_user_actor(&state, &headers) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    match state
+        .workspace_access
+        .create_environment(&identity, &request.name)
+    {
+        Ok(value) => (StatusCode::CREATED, Json(value)).into_response(),
+        Err(error) => workspace_access_error(&state, error),
+    }
+}
+
 async fn api_workspace_access(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -5304,11 +5335,7 @@ async fn api_request_workspace_access(
         .workspace_access
         .request_access(&identity, &request.share_code)
     {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(json!({ "requested": true })),
-        )
-            .into_response(),
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "requested": true }))).into_response(),
         Err(error) => workspace_access_error(&state, error),
     }
 }
@@ -5372,8 +5399,8 @@ async fn api_create_git_docker_environment(
     headers: HeaderMap,
     Json(request): Json<CreateGitDockerEnvironmentRequest>,
 ) -> Response {
-    let actor = match request_actor(&state, &headers) {
-        Ok(actor) => actor,
+    let identity = match require_user_actor(&state, &headers) {
+        Ok(identity) => identity,
         Err(response) => return response,
     };
     if is_draining(&state) {
@@ -5383,39 +5410,24 @@ async fn api_create_git_docker_environment(
             &state.config,
         );
     }
-    let (projects_root, bundles_root) = match actor.user() {
-        Some(identity) => {
-            let projects_root = match state.workspace_access.personal_root(identity) {
-                Ok(root) => root,
-                Err(error) => return workspace_access_error(&state, error),
-            };
-            let bundles_root = projects_root
-                .parent()
-                .unwrap_or(&projects_root)
-                .join("docker-images");
-            (projects_root, bundles_root)
-        }
-        None => (
-            state
-                .config
-                .workspaces_root
-                .join(git_docker_environment::PROJECTS_DIRECTORY),
-            state.config.data_dir.join("docker-images"),
-        ),
+    let projects_root = match state.workspace_access.personal_root(&identity) {
+        Ok(root) => root,
+        Err(error) => return workspace_access_error(&state, error),
     };
+    let bundles_root = projects_root
+        .parent()
+        .unwrap_or(&projects_root)
+        .join("docker-images");
     let access = state.workspace_access.clone();
-    let identity = actor.user().cloned();
     match tokio::task::spawn_blocking(move || {
         let result = git_docker_environment::create_git_docker_environment_in(
             &projects_root,
             &bundles_root,
             request,
         )?;
-        if let Some(identity) = identity.as_ref() {
-            access
-                .claim_or_authorize_environment(identity, &result.workspace_path, None)
-                .map_err(|error| error.message)?;
-        }
+        access
+            .claim_or_authorize_environment(&identity, &result.workspace_path, None)
+            .map_err(|error| error.message)?;
         Ok::<_, String>(result)
     })
     .await
@@ -5475,7 +5487,10 @@ async fn api_delete_workspace(
                     &state.config,
                 );
             }
-            match state.workspace_access.remove_owned_environment(&identity, &id) {
+            match state
+                .workspace_access
+                .remove_owned_environment(&identity, &id)
+            {
                 Ok(()) => json_response(json!({ "ok": true })),
                 Err(error) => workspace_access_error(&state, error),
             }
@@ -5506,9 +5521,7 @@ async fn api_fs_list(
             {
                 Some(path) => match resolve_within_root(&root, path) {
                     Ok(dir) => dir,
-                    Err(error) => {
-                        return api_error(StatusCode::BAD_REQUEST, &error, &state.config)
-                    }
+                    Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
                 },
                 None => strip_extended_prefix(&root),
             };
@@ -5555,24 +5568,23 @@ async fn ws_terminal(
     ws: WebSocketUpgrade,
 ) -> Response {
     let token = params.get("token").map(String::as_str).unwrap_or("");
-    let actor = if crate::security::constant_time_eq(
-        token.as_bytes(),
-        state.config.admin_token.as_bytes(),
-    ) {
-        RequestActor::Administrator
-    } else {
-        if !websocket_origin_allowed(&state.config, &headers) {
-            return api_error(
-                StatusCode::FORBIDDEN,
-                "origine WebSocket non autorisee",
-                &state.config,
-            );
-        }
-        match request_actor(&state, &headers) {
-            Ok(actor) => actor,
-            Err(response) => return response,
-        }
-    };
+    let actor =
+        if crate::security::constant_time_eq(token.as_bytes(), state.config.admin_token.as_bytes())
+        {
+            RequestActor::Administrator
+        } else {
+            if !websocket_origin_allowed(&state.config, &headers) {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "origine WebSocket non autorisee",
+                    &state.config,
+                );
+            }
+            match request_actor(&state, &headers) {
+                Ok(actor) => actor,
+                Err(response) => return response,
+            }
+        };
 
     let session = match state.terminals.get_for_actor(id, &actor) {
         Ok(session) => session,
@@ -5695,24 +5707,23 @@ async fn ws_discussions(
     ws: WebSocketUpgrade,
 ) -> Response {
     let token = params.get("token").map(String::as_str).unwrap_or("");
-    let actor = if crate::security::constant_time_eq(
-        token.as_bytes(),
-        state.config.admin_token.as_bytes(),
-    ) {
-        RequestActor::Administrator
-    } else {
-        if !websocket_origin_allowed(&state.config, &headers) {
-            return api_error(
-                StatusCode::FORBIDDEN,
-                "origine WebSocket non autorisee",
-                &state.config,
-            );
-        }
-        match request_actor(&state, &headers) {
-            Ok(actor) => actor,
-            Err(response) => return response,
-        }
-    };
+    let actor =
+        if crate::security::constant_time_eq(token.as_bytes(), state.config.admin_token.as_bytes())
+        {
+            RequestActor::Administrator
+        } else {
+            if !websocket_origin_allowed(&state.config, &headers) {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "origine WebSocket non autorisee",
+                    &state.config,
+                );
+            }
+            match request_actor(&state, &headers) {
+                Ok(actor) => actor,
+                Err(response) => return response,
+            }
+        };
 
     let account_id = params.get("accountId").cloned();
     let session_id = params.get("sessionId").cloned();
@@ -6007,10 +6018,7 @@ fn auth_or(
     }
 }
 
-fn request_actor(
-    state: &Arc<ServerState>,
-    headers: &HeaderMap,
-) -> Result<RequestActor, Response> {
+fn request_actor(state: &Arc<ServerState>, headers: &HeaderMap) -> Result<RequestActor, Response> {
     let bearer = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -6042,7 +6050,7 @@ fn require_user_actor(
         RequestActor::User(identity) => Ok(identity),
         RequestActor::Administrator => Err(api_error(
             StatusCode::FORBIDDEN,
-            "Le partage exige une session utilisateur nominative",
+            "Cette action exige une session utilisateur nominative",
             &state.config,
         )),
     }

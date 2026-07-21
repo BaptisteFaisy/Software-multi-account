@@ -134,6 +134,20 @@ npm run connect:vps -- -Profile vps-paris -LocalPort 18080
 Le binaire `Codex Switch Terminal Cloud.exe` de la racine est choisi en
 priorite. Un autre build peut etre indique avec `-ClientExe`.
 
+## Utiliser le micro avec un chat du VPS
+
+Le client desktop capture toujours le micro du PC. Lorsqu'il est relie au VPS,
+il utilise d'abord Whisper et Ollama installes sur le PC avec
+`npm run voice:setup`; si ce moteur local est indisponible, il essaie ensuite
+le moteur vocal configure sur `cst-server`.
+
+Le tunnel expose le site sur `http://127.0.0.1`, qui est une origine securisee
+pour l'API microphone. Pour ouvrir le site depuis un telephone ou un autre PC,
+utilise une URL HTTPS valide : les navigateurs refusent le micro sur une URL
+publique `http://IP:8080`. Dans ce mode web/mobile, configure Whisper et Ollama
+sur le serveur, ou les endpoints GPU distants `CST_VOICE_*` decrits dans le
+[guide vocal distant](remote-voice-gpu.md).
+
 ## Allouer les chats entre plusieurs VPS
 
 Pour plusieurs noeuds neufs, copie d'abord le manifeste sans secret puis

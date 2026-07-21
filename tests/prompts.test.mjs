@@ -243,7 +243,7 @@ test("la bibliothèque est reliée aux navigations desktop et mobile", () => {
   assert.match(main, /import type \{ PromptLibraryItem \} from "\.\/prompts";/);
   assert.match(main, /promptLibraryModulePromise = import\("\.\/prompts-view"\)/);
   assert.match(main, /if \(view === "prompts" && !promptLibraryModule\)/);
-  assert.match(main, /case "prompts":\s*return promptLibraryModule\?\.renderPromptLibraryPanel\(\) \?\? "";/);
+  assert.match(main, /case "prompts":\s*return promptLibraryModule\?\.renderPromptLibraryPanel\(accountScopedStorage\) \?\? "";/);
   assert.match(main, /promptLibraryModule\?\.mountPromptLibraryPanel\(\{[\s\S]*?onUsePrompt: useLibraryPromptInChat/);
   assert.match(main, /prompt\?: string \| null/);
   assert.match(main, /pane\.draft = pendingPrompt/);
@@ -275,7 +275,7 @@ test("le composeur ouvre un sélecteur rapide et insère le prompt sans l'envoye
   assert.match(main, /currentInput\.dispatchEvent\(new Event\("input"/);
   assert.match(view, /model\.favoritePrompts\.length/);
   assert.match(view, /data-chat-action="favorite-prompt"/);
-  assert.match(main, /favoritePrompts: loadFavoritePromptShortcuts\(\)/);
+  assert.match(main, /favoritePrompts: loadFavoritePromptShortcuts\(accountScopedStorage\)/);
   assert.match(main, /insertFavoritePromptInMainChat/);
   assert.match(main, /insertFavoritePromptInExpertChat/);
   assert.match(main, /recordPromptShortcutUse/);

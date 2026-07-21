@@ -107,7 +107,7 @@ test("un environnement vide ne recoit jamais de chat de base", () => {
 
 test("le choix d'environnement propose un explorateur de dossiers navigable", () => {
   for (const marker of [
-    "Parcourir les dossiers",
+    "Créer un autre environnement",
     "workspacePathBreadcrumbs",
     "workspaceFolderSearch",
     "ws-quick-access",
@@ -181,8 +181,11 @@ test("les backends desktop et serveur refusent un environnement implicite", () =
 test("un nouvel environnement peut etre cree directement depuis un lien Git Docker", () => {
   for (const marker of [
     'id="createGitDockerEnvironmentFromMenu"',
+    'id="createWorkspaceFromGitHub"',
     'id="gitDockerRepositoryUrl"',
     'id="gitDockerMode"',
+    "Créer un environnement depuis GitHub",
+    "https://github.com/BaptisteFaisy/Software-multi-account.git",
     "Analyser et preparer",
     "Construire et exporter l'image",
     "Deployer et lancer sur un VPS",
@@ -196,6 +199,13 @@ test("un nouvel environnement peut etre cree directement depuis un lien Git Dock
   assert.match(platform, /case "create_git_docker_environment":\s*return api<T>\("POST", "\/api\/workspaces\/git-docker", args\.request\)/);
   assert.match(desktopApp, /git_docker_environment::create_git_docker_environment/);
   assert.match(server, /"\/workspaces\/git-docker",\s*post\(api_create_git_docker_environment\)/);
+  const handlerStart = server.indexOf("async fn api_create_git_docker_environment");
+  const handlerEnd = server.indexOf("async fn api_delete_workspace", handlerStart);
+  const handler = server.slice(handlerStart, handlerEnd);
+  assert.match(handler, /require_user_actor\(&state, &headers\)/);
+  assert.match(handler, /personal_root\(&identity\)/);
+  assert.match(handler, /claim_or_authorize_environment\(&identity/);
+  assert.doesNotMatch(handler, /RequestActor::Administrator|PROJECTS_DIRECTORY/);
 });
 
 test("le backend Git Docker clone sans shell et conserve l'environnement si Docker echoue", () => {

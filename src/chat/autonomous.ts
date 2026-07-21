@@ -895,7 +895,9 @@ export const autonomousAgentIsRunning = (agent: AutonomousAgentSnapshot): boolea
 export const autonomousAgentsToPause = (
   agents: readonly AutonomousAgentSnapshot[],
 ): AutonomousAgentSnapshot[] =>
-  agents.filter((agent) => agent.status === "active" && !agent.systemManaged);
+  agents.filter((agent) =>
+    !agent.systemManaged
+    && (agent.status === "active" || agent.status === "needs_attention"));
 
 export const autonomousTestStatusLabel = (status: AutonomousTestStatus): string => {
   switch (status) {
