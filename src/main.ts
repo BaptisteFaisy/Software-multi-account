@@ -33,12 +33,20 @@ import {
 import { initPwaSupport } from "./pwa";
 import {
   consumeRemoteCodexLoginOutput,
+  copyRemoteCodexLoginCode,
   failRemoteCodexLoginWindow,
   focusRemoteCodexLoginWindow,
   openRemoteCodexLoginWindow,
+  prepareRemoteCodexLoginTab,
+  remoteCodexLoginPanel,
   remoteCodexLoginWindowIsOpen,
   remoteCodexLoginWindowNeedsCode,
 } from "./remote-login-window";
+import {
+  consumeRemoteClaudeLoginOutput,
+  forgetRemoteClaudeLoginOutput,
+  normalizeRemoteClaudeLoginCode,
+} from "./remote-claude-login";
 import {
   authenticatedUser,
   bindUserAccountUi,
@@ -391,6 +399,8 @@ import {
   ExternalLink,
   LayoutTemplate,
   AppWindow,
+  AudioLines,
+  AudioWaveform,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
@@ -416,6 +426,7 @@ import {
   CircleCheck,
   CircleDollarSign,
   CircleX,
+  CloudUpload,
   Coins,
   ClipboardCheck,
   Clock3,
@@ -427,6 +438,8 @@ import {
   Eye,
   EyeOff,
   Film,
+  FileAudio,
+  FileCheck2,
   Flag,
   FlaskConical,
   FolderOpen,
@@ -464,6 +477,7 @@ import {
   Radio,
   Ratio,
   RefreshCcw,
+  RefreshCw,
   Rocket,
   Route,
   Save,
@@ -798,6 +812,28 @@ const loadVideoModule = (): Promise<VideoModule> => {
       });
   }
   return videoModulePromise;
+};
+
+type TranscriptionModule = typeof import("./transcription");
+
+let transcriptionModule: TranscriptionModule | null = null;
+let transcriptionModulePromise: Promise<TranscriptionModule> | null = null;
+
+const loadTranscriptionModule = (): Promise<TranscriptionModule> => {
+  if (transcriptionModule) return Promise.resolve(transcriptionModule);
+  if (!transcriptionModulePromise) {
+    transcriptionModulePromise = import("./transcription")
+      .then((module) => {
+        transcriptionModule = module;
+        return module;
+      })
+      .catch((error) => {
+        transcriptionModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return transcriptionModulePromise;
 };
 
 type DesignModule = typeof import("./design");
@@ -1173,6 +1209,10 @@ type AppSettings = {
   kombai: KombaiConfig;
   codexBypass: boolean;
   autoDiscoverAccounts: boolean;
+  // Maintient un process Claude vivant par conversation (mode entree stream-json)
+  // au lieu d'un process one-shot par tour : les taches shell en arriere-plan
+  // survivent d'un tour a l'autre. Opt-in ; defaut false cote serveur.
+  claudePersistentSession?: boolean;
   // Empeche l'auto-decouverte de recreer un profil expire a partir de son
   // dossier de configuration reste sur le disque.
   expiredUnconnectedAccountHomes?: string[];
@@ -1414,6 +1454,7 @@ type AppView =
   | "limits"
   | "dashboard"
   | "video"
+  | "transcription"
   | "vps"
   | "design"
   | "doctolib-lab"
@@ -1452,6 +1493,7 @@ const lazyModuleViews = new Set<AppView>([
   "dashboard",
   "vps",
   "video",
+  "transcription",
   "design",
   "doctolib-lab",
 ]);
@@ -1578,6 +1620,7 @@ type ActiveChatTurnSummary = {
   id: number;
   accountId: string;
   sessionId?: string | null;
+  sourceChatKey?: string | null;
   status: Exclude<ChatTurnStatus, "idle">;
   startedAt: number;
   waitingForUser: boolean;
@@ -2512,6 +2555,8 @@ let chatSkillButtonIds: string[] | null = null;
 
 const lucideIcons = {
   Activity,
+  AudioLines,
+  AudioWaveform,
   Badge,
   Calculator,
   ChartNoAxesColumn,
@@ -2556,6 +2601,7 @@ const lucideIcons = {
   CircleCheck,
   CircleDollarSign,
   CircleX,
+  CloudUpload,
   Coins,
   ClipboardCheck,
   Clock3,
@@ -2567,6 +2613,8 @@ const lucideIcons = {
   Eye,
   EyeOff,
   Film,
+  FileAudio,
+  FileCheck2,
   Flag,
   FlaskConical,
   FolderOpen,
@@ -2591,6 +2639,7 @@ const lucideIcons = {
   Radio,
   Ratio,
   RefreshCcw,
+  RefreshCw,
   Rocket,
   Route,
   Save,
@@ -4960,6 +5009,8 @@ const auditViewLabelFor = (view: AppView): string => {
       return "vue Stats";
     case "video":
       return "studio vidéo";
+    case "transcription":
+      return "transcription audio";
     case "design":
       return "espace Design";
     case "discussions":
@@ -6042,6 +6093,15 @@ const setActiveView = (view: AppView) => {
       });
     return;
   }
+  if (view === "transcription" && !transcriptionModule) {
+    void loadTranscriptionModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Transcription audio indisponible : ${String(error)}`;
+        render();
+      });
+    return;
+  }
   if (view === "design" && !designModule) {
     void loadDesignModule()
       .then(() => setActiveView(view))
@@ -6076,6 +6136,7 @@ const setActiveView = (view: AppView) => {
     limits: "Vue limites",
     dashboard: "Vue dashboard",
     video: "Studio IA génératif",
+    transcription: "Transcription audio sur le VPS",
     vps: "Déploiement VPS",
     "doctolib-lab": "RDV Lab expérimental",
     autonomous: "Agents autonomes",
@@ -6166,6 +6227,7 @@ const setActiveView = (view: AppView) => {
 
   if (activeView !== "vps") vpsModule?.deactivateVpsPanel();
   if (activeView !== "video") videoModule?.deactivateVideoPanel();
+  if (activeView !== "transcription") transcriptionModule?.deactivateTranscriptionPanel();
 
   if (activeView === "chat") startAllExpertChatWork();
   else stopAllExpertChatWork();
@@ -6198,6 +6260,7 @@ const setActiveView = (view: AppView) => {
   if (activeView === "messaging") void messagingModule?.refreshMessaging(render);
   if (activeView === "vps") vpsModule?.activateVpsPanel(render);
   if (activeView === "video") videoModule?.activateVideoPanel(render);
+  if (activeView === "transcription") transcriptionModule?.activateTranscriptionPanel(render);
   if (activeView === "history" && !promptHistoryLoaded) void refreshPromptHistory();
   if (activeView === "skills") void refreshSkills();
   if (activeView === "settings") {
@@ -6322,7 +6385,7 @@ const refreshLimitStatus = (silent = false, force = false): Promise<void> => {
 // le compte cible : c'est la seule facon de regenerer une session revoquee /
 // expiree, sans laquelle la vue Limites ne peut relire aucun quota. On reutilise
 // la machinerie terminal existante (meme CODEX_HOME/agent que le compte).
-const reloginAccount = async (accountId: string) => {
+const reloginAccount = async (accountId: string, openAiTabPrepared = false) => {
   if (!settings) return;
   const account = settings.accounts.find((candidate) => candidate.id === accountId);
   if (!account) {
@@ -6344,7 +6407,9 @@ const reloginAccount = async (accountId: string) => {
   }
   const popupOpened =
     provider === "codex" && isRemoteMode()
-      ? openRemoteCodexLoginWindow(account.id, account.label)
+      ? openAiTabPrepared
+        ? prepareRemoteCodexLoginTab(account.id, account.label)
+        : openRemoteCodexLoginWindow(account.id, account.label)
       : false;
   statusText = popupOpened
     ? `Préparation de la fenêtre OpenAI pour ${account.label}…`
@@ -8816,7 +8881,6 @@ const sendChatMessage = async (
     await applyChatTurnSnapshot(chatTurn);
     return snapshot.status !== "failed" && snapshot.status !== "cancelled";
   } catch (error) {
-    chatMessages = markLatestPendingMessageFailed(chatMessages);
     const pane = expertChatPanes.find(
       (candidate) =>
         candidate.turn?.status === "running" &&
@@ -8824,6 +8888,18 @@ const sendChatMessage = async (
         candidate.turn.accountId === account.id,
     );
     if (pane) {
+      // Coupure de transport ambigue : le serveur a peut-etre deja lance le tour.
+      // Reconcilier par sourceChatKey plutot que fabriquer un « failed » (qui
+      // s'afficherait « Disponible » alors que l'agent reflechit encore).
+      if (!isDefiniteChatTurnRejection(error) && pane.turn?.status === "running") {
+        statusText = "Connexion interrompue — vérification du tour en cours…";
+        refreshExpertChatPane(pane);
+        await refreshActiveChatTurns();
+        if (pane.turn && pane.turn.id !== 0) {
+          return chatTurnIsBusy(pane.turn.status);
+        }
+      }
+      chatMessages = markLatestPendingMessageFailed(chatMessages);
       pane.activeSubmission ??= chatActiveSubmission;
       const failedTurn = {
         ...pane.turn!,
@@ -8853,6 +8929,7 @@ const sendChatMessage = async (
       }
       return false;
     }
+    chatMessages = markLatestPendingMessageFailed(chatMessages);
     const failedTurn = {
       ...chatTurn,
       id: 0,
@@ -10642,6 +10719,25 @@ const sendExpertChatMessage = async (
     return snapshot.status !== "failed" && snapshot.status !== "cancelled";
   } catch (error) {
     if (!expertChatPanes.includes(pane)) return false;
+    // Un poll ou une notification runtime a pu deja adopter le vrai tour serveur
+    // (id != 0) avant que cette requete echoue : ne jamais l'ecraser en « failed ».
+    if (pane.turn && pane.turn.id !== 0) {
+      return chatTurnIsBusy(pane.turn.status);
+    }
+    // Coupure de transport ambigue : le serveur a peut-etre deja committe et lance
+    // le tour (une image alourdit la requete et elargit cette fenetre). Reconcilier
+    // via list_active_chat_turns — adoption par sourceChatKey — au lieu de marquer
+    // « failed », ce qui afficherait « Disponible » alors que l'agent reflechit.
+    if (!isDefiniteChatTurnRejection(error) && pane.turn?.status === "running") {
+      statusText = "Connexion interrompue — vérification du tour en cours…";
+      refreshExpertChatPane(pane);
+      await refreshActiveChatTurns();
+      if (!expertChatPanes.includes(pane)) return false;
+      if (pane.turn && pane.turn.id !== 0) {
+        return chatTurnIsBusy(pane.turn.status);
+      }
+      // Aucun tour serveur actif : le tour n'a vraiment pas demarre -> vrai echec.
+    }
     const wasAvailableBeforeFailure = expertChatPaneIsAvailable(pane);
     pane.messages = markLatestPendingMessageFailed(pane.messages);
     const failedTurn = {
@@ -13237,6 +13333,8 @@ function mobileViewLabel(view: AppView): string {
       return "Stats";
     case "video":
       return "Vidéo";
+    case "transcription":
+      return "Transcrire";
     case "vps":
       return "VPS";
     case "doctolib-lab":
@@ -13440,6 +13538,7 @@ function ensureMobileChrome(): void {
           <button type="button" role="menuitem" data-view="scheduled-chat"><i data-lucide="calendar-clock"></i><span>Chat planifié</span></button>
           <button type="button" role="menuitem" data-view="prompts"><i data-lucide="message-square-text"></i><span>Prompts</span></button>
           <button type="button" role="menuitem" data-view="video"><i data-lucide="wand-sparkles"></i><span>Studio IA</span></button>
+          <button type="button" role="menuitem" data-view="transcription"><i data-lucide="audio-lines"></i><span>Transcrire</span></button>
           <button type="button" role="menuitem" data-view="limits"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
           <button type="button" role="menuitem" data-view="dashboard"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
           ${isRemoteMode() ? `<button type="button" role="menuitem" data-view="vps"><i data-lucide="server"></i><span>VPS</span></button>` : ""}
@@ -13918,6 +14017,30 @@ const claimChatOpenRequests = async (): Promise<void> => {
   }
 };
 
+// Une erreur portant un httpStatus est un rejet serveur definitif (413, 401,
+// autre 4xx/5xx JSON) : le tour n'a pas demarre. Sans httpStatus, c'est une
+// coupure de transport, et le serveur a peut-etre deja lance le tour — il faut
+// alors reconcilier plutot que fabriquer un echec (qui s'afficherait « Disponible »).
+const isDefiniteChatTurnRejection = (error: unknown): boolean =>
+  typeof (error as { httpStatus?: number } | null | undefined)?.httpStatus === "number";
+
+// Rattrape un tour serveur encore actif lance par ce pane mais dont la reponse
+// `start_chat_turn` s'est perdue : sur un nouveau chat il n'a pas encore de
+// session_id, donc seul le sourceChatKey permet de le relier au pane d'origine.
+const activeChatTurnBySourceKey = (
+  turns: readonly ActiveChatTurnSummary[],
+  pane: ExpertChatPane,
+): ActiveChatTurnSummary | null =>
+  turns
+    .filter(
+      (turn) =>
+        (turn.status === "running" || turn.status === "finalizing")
+        && turn.accountId === pane.accountId
+        && !!turn.sourceChatKey
+        && turn.sourceChatKey === pane.key,
+    )
+    .sort((left, right) => right.startedAt - left.startedAt || right.id - left.id)[0] ?? null;
+
 const refreshActiveChatTurns = async (): Promise<boolean> => {
   if (activeChatTurnsInFlight) return false;
   activeChatTurnsInFlight = true;
@@ -13931,7 +14054,9 @@ const refreshActiveChatTurns = async (): Promise<boolean> => {
 
     const visiblePanes = new Set(visibleExpertChatPanes());
     await Promise.allSettled(expertChatPanes.map(async (pane) => {
-      const candidate = activeChatTurnForDiscussion(next, pane.discussion);
+      const candidate =
+        activeChatTurnForDiscussion(next, pane.discussion)
+        ?? activeChatTurnBySourceKey(next, pane);
       if (candidate && shouldAdoptActiveChatTurn(pane.turn, candidate)) {
         if (
           pane.turn?.id !== candidate.id ||
@@ -18916,6 +19041,8 @@ const appViewTitle = (view: AppView): string => {
       return "Statistiques";
     case "video":
       return "Studio IA";
+    case "transcription":
+      return "Transcrire";
     case "vps":
       return "VPS";
     case "doctolib-lab":
@@ -20125,6 +20252,23 @@ const renderSettingsPanel = (): string => {
           </button>
         </div>
       </section>
+      <section class="appearance-settings claude-persistent-session-settings" aria-labelledby="claudePersistentSessionTitle">
+        <div class="appearance-settings-copy">
+          <span class="settings-card-icon"><i data-lucide="history"></i></span>
+          <span>
+            <strong id="claudePersistentSessionTitle">Session Claude persistante</strong>
+            <small>Garde un même process Claude vivant pour toute la conversation : les tâches shell en arrière-plan survivent d’un message à l’autre, plus de notification « tâche interrompue ». S’active pour les comptes Claude en bypass, à partir du 2ᵉ message.</small>
+          </span>
+        </div>
+        <div class="theme-choice-group" role="group" aria-label="Session Claude persistante">
+          <button type="button" data-claude-persistent-session="off" class="${settings?.claudePersistentSession ? "" : "active"}" aria-pressed="${!settings?.claudePersistentSession}">
+            <i data-lucide="circle"></i><span>Désactivée</span>
+          </button>
+          <button type="button" data-claude-persistent-session="on" class="${settings?.claudePersistentSession ? "active" : ""}" aria-pressed="${settings?.claudePersistentSession ?? false}">
+            <i data-lucide="history"></i><span>Activée</span>
+          </button>
+        </div>
+      </section>
       ${renderKeyboardShortcutSettings()}
       ${renderChatReadySoundSettings()}
       ${renderTelegramConnectionSettings()}
@@ -20228,6 +20372,8 @@ const renderActiveAppPanel = (): string => {
       return renderDashboardPanel();
     case "video":
       return videoModule?.renderVideoPanel() ?? "";
+    case "transcription":
+      return transcriptionModule?.renderTranscriptionPanel() ?? "";
     case "vps":
       return vpsModule?.renderVpsPanel() ?? "";
     case "doctolib-lab":
@@ -20276,23 +20422,23 @@ const renderWorkspaceAccessPanel = (): string => {
   );
   const disabled = workspaceAccessBusyKey ? "disabled" : "";
   const requestForm = `<form id="workspaceAccessRequestForm" class="workspace-access-request-form">
-    <label for="workspaceShareCode"><span>Rejoindre un environnement</span><small>Le propriétaire devra accepter la demande.</small></label>
+    <label for="workspaceShareCode"><span>Rejoindre un espace d’équipe</span><small>Le propriétaire devra accepter la demande avant que son projet et ses chats deviennent visibles.</small></label>
     <div><input id="workspaceShareCode" name="shareCode" autocomplete="off" maxlength="24" placeholder="ABCD-EF12-3456-7890" required ${disabled} /><button type="submit" class="tool-button primary" ${disabled}><i data-lucide="send"></i><span>Demander l'accès</span></button></div>
   </form>`;
   const selectedContent = selected?.role === "owner"
     ? `<div class="workspace-access-owner">
-        <header><span><strong>${escapeHtml(selected.label)}</strong><small>Espace privé dont vous êtes propriétaire</small></span><button type="button" class="icon-button" data-close-workspace-access aria-label="Fermer la gestion des accès"><i data-lucide="x"></i></button></header>
-        <label class="workspace-share-code"><span>Code de partage</span><small>Ce code permet seulement d'envoyer une demande.</small><div><input id="workspaceShareCodeValue" readonly value="${escapeAttr(selected.shareCode ?? "")}" /><button type="button" class="tool-button" id="copyWorkspaceShareCode" ${selected.shareCode ? "" : "disabled"}><i data-lucide="copy"></i><span>Copier</span></button></div></label>
+        <header><span><strong>${escapeHtml(selected.label)}</strong><small>Espace d’équipe dont vous gardez le contrôle</small></span><button type="button" class="icon-button" data-close-workspace-access aria-label="Fermer la gestion des accès"><i data-lucide="x"></i></button></header>
+        <label class="workspace-share-code"><span>Code d’invitation</span><small>Le code crée une demande. Après votre accord, le membre retrouve les fichiers, la mémoire, les chats et les agents de cet environnement.</small><div><input id="workspaceShareCodeValue" readonly value="${escapeAttr(selected.shareCode ?? "")}" /><button type="button" class="tool-button" id="copyWorkspaceShareCode" ${selected.shareCode ? "" : "disabled"}><i data-lucide="copy"></i><span>Copier</span></button></div></label>
         <section class="workspace-access-requests"><header><strong>Demandes en attente</strong><small>${selected.requests.length}</small></header>
-          ${selected.requests.map((request) => `<article><span><strong>${escapeHtml(request.username)}</strong><small>Demande reçue ${escapeHtml(formatTimestamp(request.createdAt))}</small></span><div><button type="button" class="tool-button primary" data-workspace-access-accept="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(request.userId)}" ${disabled}><i data-lucide="check"></i><span>Accepter</span></button><button type="button" class="tool-button" data-workspace-access-reject="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(request.userId)}" ${disabled}><i data-lucide="x"></i><span>Refuser</span></button></div></article>`).join("") || `<p>Aucune demande. Les documents restent accessibles uniquement à votre compte.</p>`}
+          ${selected.requests.map((request) => `<article><span><strong>${escapeHtml(request.username)}</strong><small>Demande reçue ${escapeHtml(formatTimestamp(request.createdAt))}</small></span><div><button type="button" class="tool-button primary" data-workspace-access-accept="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(request.userId)}" ${disabled}><i data-lucide="check"></i><span>Accepter</span></button><button type="button" class="tool-button" data-workspace-access-reject="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(request.userId)}" ${disabled}><i data-lucide="x"></i><span>Refuser</span></button></div></article>`).join("") || `<p>Aucune demande. Le projet, ses chats et ses agents restent accessibles uniquement aux comptes déjà autorisés.</p>`}
         </section>
-        <section class="workspace-access-members"><header><strong>Comptes autorisés</strong><small>${selected.members.length}</small></header>
+        <section class="workspace-access-members"><header><strong>Membres de l’espace</strong><small>${selected.members.length}</small></header>
           ${selected.members.map((member) => `<article><span><strong>${escapeHtml(member.username)}</strong><small>Accès accordé ${escapeHtml(formatTimestamp(member.createdAt))}</small></span><button type="button" class="tool-button danger" data-workspace-access-revoke="${escapeAttr(selected.id)}" data-workspace-access-user="${escapeAttr(member.userId)}" ${disabled}><i data-lucide="user-x"></i><span>Révoquer</span></button></article>`).join("") || `<p>Aucun autre compte n'a accès à cet environnement.</p>`}
         </section>
       </div>`
     : selected
-      ? `<div class="workspace-access-owner workspace-access-member"><header><span><strong>${escapeHtml(selected.label)}</strong><small>Partagé par ${escapeHtml(selected.ownerUsername)}</small></span><button type="button" class="icon-button" data-close-workspace-access aria-label="Fermer"><i data-lucide="x"></i></button></header><p><i data-lucide="shield-check"></i>Le propriétaire a autorisé votre compte. Vous pouvez accéder aux documents de cet environnement tant que cette autorisation reste active.</p></div>`
-      : `<div class="workspace-access-summary"><span class="terminal-environment-memory-icon"><i data-lucide="shield-check"></i></span><span><strong>Vos environnements sont privés</strong><small>Chaque dossier est lié à votre compte. Un autre compte n'y accède qu'après votre acceptation.</small></span>${pendingCount ? `<button type="button" class="tool-button primary" data-open-pending-workspace-access><i data-lucide="user-check"></i><span>${pendingCount} demande${pendingCount > 1 ? "s" : ""}</span></button>` : ""}</div>`;
+      ? `<div class="workspace-access-owner workspace-access-member"><header><span><strong>${escapeHtml(selected.label)}</strong><small>Espace d’équipe partagé par ${escapeHtml(selected.ownerUsername)}</small></span><button type="button" class="icon-button" data-close-workspace-access aria-label="Fermer"><i data-lucide="x"></i></button></header><p><i data-lucide="users"></i>Vous travaillez dans le même environnement : fichiers, mémoire, historique des chats, agents autonomes et orchestrations sont communs. Vos préférences et vos autres environnements restent personnels.</p></div>`
+      : `<div class="workspace-access-summary"><span class="terminal-environment-memory-icon"><i data-lucide="users"></i></span><span><strong>Travail en équipe sur le VPS</strong><small>Invitez un autre compte dans un environnement pour partager son projet, ses chats et ses agents. Tout le reste reste privé.</small></span>${pendingCount ? `<button type="button" class="tool-button primary" data-open-pending-workspace-access><i data-lucide="user-check"></i><span>${pendingCount} demande${pendingCount > 1 ? "s" : ""}</span></button>` : ""}</div>`;
 
   return `<section class="workspace-access-panel" aria-label="Accès aux environnements">
     ${workspaceAccessError ? `<div class="workspace-access-error" role="alert"><i data-lucide="circle-alert"></i><span>${escapeHtml(workspaceAccessError)}</span></div>` : ""}
@@ -20482,6 +20628,10 @@ const renderTerminalEnvironmentMenu = (): string => {
 
 const renderExpertTerminalGrid = () => {
   const loginSession = activeLoginTerminal();
+  const claudeLoginSession =
+    loginSession && accountProvider(accountById(loginSession.accountId)) === "claude"
+      ? loginSession
+      : null;
   const folderPath = userWorkspacePath(terminalFolderFilter);
   if (!folderPath && !loginSession) {
     return `<section class="terminal-environment-gate" data-folder-terminal-view="unselected">
@@ -20560,7 +20710,7 @@ const renderExpertTerminalGrid = () => {
   `).join("");
 
   return `
-    <section class="folder-terminal-panel" data-folder-terminal-view="${escapeAttr(loginSession ? "login" : folderPath ?? "")}">
+    <section class="folder-terminal-panel ${claudeLoginSession ? "has-claude-login-code" : ""}" data-folder-terminal-view="${escapeAttr(loginSession ? "login" : folderPath ?? "")}">
       <header class="folder-terminal-head">
         <span class="folder-terminal-mark"><i data-lucide="${loginSession ? "log-in" : "folder-open"}"></i></span>
         <span class="folder-terminal-copy">
@@ -20581,6 +20731,16 @@ const renderExpertTerminalGrid = () => {
         <span class="folder-isolation-chip"><i data-lucide="${loginSession ? "key-round" : "folder-open"}"></i>${loginSession ? "Connexion du compte" : "Environnement actif"}</span>
         ${agentChips}
       </div>
+      ${claudeLoginSession
+        ? `<form class="claude-login-code-form" data-claude-login-code-form="${escapeAttr(claudeLoginSession.key)}">
+            <label for="claudeLoginCode-${escapeAttr(claudeLoginSession.key)}">
+              <span>Code Claude</span>
+              <input id="claudeLoginCode-${escapeAttr(claudeLoginSession.key)}" data-claude-login-code-input="${escapeAttr(claudeLoginSession.key)}" type="text" inputmode="text" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="4096" placeholder="Colle ici le code affiché dans l’onglet Claude" required />
+            </label>
+            <button type="submit" class="tool-button primary"><i data-lucide="key-round"></i><span>Envoyer le code</span></button>
+            <small>Le code est envoyé directement au terminal et n’est pas enregistré.</small>
+          </form>`
+        : ""}
       <div class="expert-terminal-wall" style="--expert-columns: ${columns}; --expert-rows: ${rows}" aria-label="Mur de ${sessions.length} terminaux">
         ${panes}${emptySlots}
       </div>
@@ -20992,6 +21152,9 @@ const renderChatFirstShell = () => {
           <button type="button" id="promptsToggle" class="${activeView === "prompts" ? "active" : ""}" title="Bibliothèque de prompts" ${activeView === "prompts" ? 'aria-current="page"' : ""}>
             <span class="chat-context-icon"><i data-lucide="message-square-text"></i></span><span class="chat-context-copy"><strong>Prompts</strong><small>Bibliothèque personnelle</small></span>
           </button>
+          <button type="button" id="transcriptionToggle" class="${activeView === "transcription" ? "active" : ""}" title="Transcrire un fichier audio avec le GPU du VPS" ${activeView === "transcription" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="audio-lines"></i></span><span class="chat-context-copy"><strong>Transcrire</strong><small>Audio vers texte · GPU</small></span>
+          </button>
           <button type="button" id="sideDiscussions" class="${activeView === "discussions" ? "active" : ""}" title="Historique — reprendre une conversation dans un autre compte" ${activeView === "discussions" ? 'aria-current="page"' : ""}>
             <span class="chat-context-icon"><i data-lucide="history"></i></span><span class="chat-context-copy"><strong>Historique</strong><small>Reprendre une discussion</small></span>
           </button>
@@ -21300,6 +21463,10 @@ const renderLegacyTerminalShell = () => {
               <i data-lucide="wand-sparkles"></i>
               <span>Studio IA</span>
             </button>
+            <button id="transcriptionToggle" class="tool-button ${activeView === "transcription" ? "primary" : ""}" title="Transcrire un audio avec le GPU du VPS">
+              <i data-lucide="audio-lines"></i>
+              <span>Transcrire</span>
+            </button>
             <button id="auditToggle" class="tool-button ${activeView === "audit" ? "primary" : ""}" title="Audit design de la vue affichée (détecteur Impeccable)">
               <i data-lucide="scan-eye"></i>
               <span>Audit</span>
@@ -21349,11 +21516,13 @@ const renderLegacyTerminalShell = () => {
               : activeView === "limits"
                 ? renderLimitsPanel()
                 : activeView === "dashboard"
-                  ? renderDashboardPanel()
-                  : activeView === "video"
-                    ? videoModule?.renderVideoPanel() ?? ""
-                    : activeView === "vps"
-                      ? vpsModule?.renderVpsPanel() ?? ""
+                   ? renderDashboardPanel()
+                   : activeView === "video"
+                     ? videoModule?.renderVideoPanel() ?? ""
+                    : activeView === "transcription"
+                      ? transcriptionModule?.renderTranscriptionPanel() ?? ""
+                      : activeView === "vps"
+                        ? vpsModule?.renderVpsPanel() ?? ""
                     : activeView === "design"
                       ? designModule?.renderDesignPanel({
                           activeTool: activeDesignTool,
@@ -21404,6 +21573,34 @@ const renderLegacyTerminalShell = () => {
   revealSelectedStatsPoint();
 };
 
+// Encadre permanent du code appareil Codex, affiche sous la carte du compte
+// pendant toute la connexion distante. Il double le presse-papiers : le code
+// reste lisible et recopiable meme si l'onglet OpenAI a pris le focus, la ou le
+// toast de statut disparaissait aussitot. Symetrique du champ « Code Claude ».
+const renderCodexLoginCodePanel = (accountId: string): string => {
+  const panel = remoteCodexLoginPanel(accountId);
+  if (!panel) return "";
+  const ready = panel.phase === "ready" && !!panel.userCode;
+  const codeText = ready ? panel.userCode ?? "" : "Génération du code…";
+  return `
+        <div class="codex-login-code ${ready ? "ready" : "pending"}" data-codex-login-code="${escapeAttr(accountId)}">
+          <div class="codex-login-code-head">
+            <span><i data-lucide="key-round"></i>Code Codex</span>
+            <small>${ready ? "À saisir sur la page OpenAI" : "Connexion en préparation…"}</small>
+          </div>
+          <output class="codex-login-code-value">${escapeHtml(codeText)}</output>
+          <div class="codex-login-code-actions">
+            <button type="button" class="tool-button" data-copy-codex-code="${escapeAttr(accountId)}"${ready ? "" : " disabled"}>
+              <i data-lucide="copy"></i><span>Copier le code</span>
+            </button>
+            <a class="tool-button" href="${escapeAttr(panel.verificationUrl)}" target="_blank" rel="noopener">
+              <i data-lucide="external-link"></i><span>Ouvrir OpenAI</span>
+            </a>
+          </div>
+          <small>Entre ce code sur la page OpenAI pour autoriser ce VPS. Il n’est pas enregistré.</small>
+        </div>`;
+};
+
 const renderAccountsPanel = () => {
   if (!settings) return "";
 
@@ -21411,25 +21608,36 @@ const renderAccountsPanel = () => {
     .map((item) => {
       const provider = accountProvider(item);
       const providerName = accountProviderLabel(item);
+      const codexPanel =
+        provider === "codex" && isRemoteMode()
+          ? renderCodexLoginCodePanel(item.id)
+          : "";
       return `
-        <article class="simple-account-card ${item.id === selectedAccountId ? "active" : ""}">
-          <div class="simple-account-identity">
-            <span class="simple-account-provider-icon ${provider}" aria-hidden="true">
-              <i data-lucide="${provider === "claude" ? "sparkles" : provider === "opencode" ? "bot" : "cpu"}"></i>
-            </span>
-            <span class="simple-account-copy">
-              <strong>${escapeHtml(item.label)}</strong>
-              <small>${escapeHtml(providerName)}</small>
-            </span>
+        <article class="simple-account-card ${item.id === selectedAccountId ? "active" : ""} ${codexPanel ? "has-login-code" : ""}">
+          <div class="simple-account-row">
+            <div class="simple-account-identity">
+              <span class="simple-account-provider-icon ${provider}" aria-hidden="true">
+                <i data-lucide="${provider === "claude" ? "sparkles" : provider === "opencode" ? "bot" : "cpu"}"></i>
+              </span>
+              <span class="simple-account-copy">
+                <strong>${escapeHtml(item.label)}</strong>
+                <small>${escapeHtml(providerName)}</small>
+              </span>
+            </div>
+            <div class="simple-account-actions">
+              ${accountProvider(item) === "codex" && isRemoteMode()
+                ? `<a class="tool-button" data-login-account="${escapeAttr(item.id)}" href="https://auth.openai.com/codex/device" target="_blank" rel="noopener" title="Se connecter avec OpenAI">
+                    <i data-lucide="log-in"></i><span>Se connecter</span>
+                  </a>`
+                : `<button type="button" class="tool-button" data-login-account="${escapeAttr(item.id)}" title="Se connecter avec ${escapeAttr(providerName)}">
+                    <i data-lucide="log-in"></i><span>Se connecter</span>
+                  </button>`}
+              <button type="button" class="icon-button wide danger" data-delete-account="${escapeAttr(item.id)}" title="Supprimer ${escapeAttr(item.label)}" aria-label="Supprimer ${escapeAttr(item.label)}">
+                <i data-lucide="trash-2"></i>
+              </button>
+            </div>
           </div>
-          <div class="simple-account-actions">
-            <button type="button" class="tool-button" data-login-account="${escapeAttr(item.id)}" title="Se connecter avec ${escapeAttr(providerName)}">
-              <i data-lucide="log-in"></i><span>Se connecter</span>
-            </button>
-            <button type="button" class="icon-button wide danger" data-delete-account="${escapeAttr(item.id)}" title="Supprimer ${escapeAttr(item.label)}" aria-label="Supprimer ${escapeAttr(item.label)}">
-              <i data-lucide="trash-2"></i>
-            </button>
-          </div>
+          ${codexPanel}
         </article>`;
     })
     .join("");
@@ -25913,6 +26121,7 @@ const bindUi = () => {
   });
   vpsModule?.bindVpsPanel(render);
   videoModule?.bindVideoPanel(render, renderIcons);
+  transcriptionModule?.bindTranscriptionPanel(render);
   forumModule?.bindForumUi({
     rerender: render,
     setStatus: (message) => {
@@ -26215,13 +26424,54 @@ const bindUi = () => {
     });
   });
 
+  document.querySelectorAll<HTMLFormElement>("[data-claude-login-code-form]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const sessionKey = form.dataset.claudeLoginCodeForm;
+      const session = terminalSessions.find((candidate) => candidate.key === sessionKey);
+      const input = form.querySelector<HTMLInputElement>("[data-claude-login-code-input]");
+      const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]');
+      if (!input || !session || session.ptyId === null || !session.running) {
+        statusText = "Le terminal Claude n’est plus disponible. Relance la connexion.";
+        render();
+        return;
+      }
+
+      const code = normalizeRemoteClaudeLoginCode(input.value);
+      if (!code) {
+        input.setCustomValidity("Colle uniquement le code affiché par Claude.");
+        input.reportValidity();
+        return;
+      }
+
+      input.setCustomValidity("");
+      input.disabled = true;
+      if (submit) submit.disabled = true;
+      const terminalId = session.ptyId;
+      void invoke("write_terminal", { id: terminalId, data: `${code}\r` })
+        .then(() => {
+          input.value = "";
+          statusText = "Code Claude envoyé, validation en cours…";
+          session.terminal.focus();
+        })
+        .catch((error) => {
+          statusText = `Envoi du code Claude impossible : ${String(error)}`;
+          input.focus();
+        })
+        .finally(() => {
+          if (input.isConnected) input.disabled = false;
+          if (submit?.isConnected) submit.disabled = false;
+        });
+    });
+  });
+
   document.querySelectorAll<HTMLElement>("[data-expert-terminal-pane]").forEach((pane) => {
     pane.addEventListener("pointerdown", (event) => {
       if ((event.target as HTMLElement).closest("[data-close-terminal],[data-toggle-chat-sidebar],[data-toggle-terminal-fullscreen]")) return;
       const session = terminalSessions.find(
         (candidate) => candidate.key === pane.dataset.expertTerminalPane,
       );
-      if (session && session.key !== activeTerminalKey) focusExpertSession(session);
+      if (session) focusExpertSession(session, true);
     });
 
   });
@@ -26346,12 +26596,33 @@ const bindUi = () => {
     void addAccountAndLogin();
   });
 
-  document.querySelectorAll<HTMLButtonElement>("[data-login-account]").forEach((button) => {
+  document.querySelectorAll<HTMLElement>("[data-login-account]").forEach((button) => {
     button.addEventListener("click", () => {
       const accountId = button.dataset.loginAccount;
       if (!accountId) return;
       selectedAccountId = accountId;
+      if (button instanceof HTMLAnchorElement && button.target === "_blank") {
+        // Laisse d'abord Chrome executer l'ouverture native du lien. Le login
+        // terminal demarre au tour suivant sans risquer d'annuler la navigation.
+        window.setTimeout(() => void reloginAccount(accountId, true), 0);
+        return;
+      }
       void reloginAccount(accountId);
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-copy-codex-code]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const accountId = button.dataset.copyCodexCode;
+      if (!accountId) return;
+      const code = copyRemoteCodexLoginCode(accountId);
+      if (!code) {
+        statusText = "Le code Codex n’est plus disponible. Relance la connexion.";
+        render();
+        return;
+      }
+      statusText = `Code Codex ${code} copié — colle-le sur la page OpenAI`;
+      render();
     });
   });
 
@@ -26846,6 +27117,27 @@ const bindUi = () => {
       setChatComposerSelectorsEnabled(button.dataset.chatComposerSelectors === "enabled");
     });
   });
+  document.querySelectorAll<HTMLButtonElement>("[data-claude-persistent-session]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (!settings) return;
+      const enabled = button.dataset.claudePersistentSession === "on";
+      if ((settings.claudePersistentSession ?? false) === enabled) return;
+      settings.claudePersistentSession = enabled;
+      // Reglage cote serveur (AppSettings) : on persiste tout de suite.
+      void invoke<AppSettings>("save_settings", { settings })
+        .then((updated) => {
+          settings = updated;
+          statusText = enabled
+            ? "Session Claude persistante activée"
+            : "Session Claude persistante désactivée";
+          render();
+        })
+        .catch((error) => {
+          statusText = String(error);
+          render();
+        });
+    });
+  });
   document.querySelector<HTMLInputElement>("#chatReadySoundEnabled")?.addEventListener("change", (event) => {
     const enabled = (event.currentTarget as HTMLInputElement).checked;
     if (enabled) void unlockChatReadySound();
@@ -26960,6 +27252,10 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#videoToggle")?.addEventListener("click", () => {
     setActiveView("video");
+  });
+
+  document.querySelector<HTMLButtonElement>("#transcriptionToggle")?.addEventListener("click", () => {
+    setActiveView("transcription");
   });
 
   document.querySelectorAll<HTMLButtonElement>("[data-stats-tab]").forEach((button) => {
@@ -27751,7 +28047,13 @@ const mountExpertTerminals = () => {
     terminalEnvironmentMenuOpen ||
     gitDockerEnvironmentModalOpen;
   const focusKey = requestTerminalFocusKey ?? focusedTerminalKeyBeforeRender;
-  if (!modalOpen && focusKey) sessionByKey.get(focusKey)?.terminal.focus();
+  if (!modalOpen && focusKey) {
+    const claudeCodeInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("[data-claude-login-code-input]"),
+    ).find((input) => input.dataset.claudeLoginCodeInput === focusKey);
+    if (claudeCodeInput) claudeCodeInput.focus();
+    else sessionByKey.get(focusKey)?.terminal.focus();
+  }
   requestTerminalFocusKey = null;
   requestAnimationFrame(() => fitAndResizeExpertTerminals());
 };
@@ -27915,8 +28217,9 @@ const createNewTerminal = async (
       session.status !== "Ferme",
   );
   if (existingLogin) {
-    if (focusRemoteCodexLoginWindow(accountId)) {
-      statusText = "Connexion déjà ouverte dans la fenêtre OpenAI";
+    if (remoteCodexLoginWindowIsOpen(accountId)) {
+      focusRemoteCodexLoginWindow(accountId);
+      statusText = "Connexion déjà ouverte dans l’onglet OpenAI";
       render();
       return existingLogin;
     }
@@ -27975,6 +28278,45 @@ const applyRemoteCodexLoginOutput = (session: TerminalSession, data: string) => 
   return update.type;
 };
 
+const applyRemoteClaudeLoginOutput = (session: TerminalSession, data: string) => {
+  if (
+    !isRemoteMode()
+    || !session.loginOnly
+    || accountProvider(accountById(session.accountId)) !== "claude"
+  ) {
+    return "none" as const;
+  }
+
+  const update = consumeRemoteClaudeLoginOutput(session.key, data);
+  if (update.type === "ready") {
+    statusText = "Ouverture de Claude dans le navigateur…";
+    render();
+    void openExternalHttpsUrl(update.url)
+      .then(() => {
+        if (!terminalSessions.includes(session)) return;
+        statusText = "Copie le code affiché par Claude, puis colle-le dans ce terminal";
+        requestTerminalFocusKey = session.key;
+        render();
+      })
+      .catch(() => {
+        if (!terminalSessions.includes(session)) return;
+        statusText = "Ouverture automatique bloquée : clique sur le lien Claude dans ce terminal";
+        requestTerminalFocusKey = session.key;
+        render();
+      });
+    return update.type;
+  }
+  if (update.type === "success") {
+    const accountLabel = accountById(session.accountId)?.label ?? session.title;
+    void closeTerminalSession(session.key).finally(() => {
+      statusText = `Connexion Claude réussie pour ${accountLabel}`;
+      render();
+      void refreshLimitStatus(true, true);
+    });
+  }
+  return update.type;
+};
+
 // Le WebSocket peut livrer les premiers octets du CLI pendant que l'appel
 // POST /terminals se termine. Le transport conserve donc un court snapshot que
 // l'on rejoue ici jusqu'a retrouver le lien et le code appareil. Cette voie de
@@ -28023,6 +28365,40 @@ const replayRemoteCodexLoginOutput = async (session: TerminalSession) => {
     await closeTerminalSession(session.key);
     statusText = message;
     render();
+  }
+};
+
+// Claude imprime dynamiquement son URL OAuth apres le demarrage du CLI. Le
+// premier message peut arriver avant l'abonnement WebSocket du navigateur ; le
+// tampon du transport permet alors de relayer tout de meme cette URL vers le
+// navigateur systeme. Contrairement a Codex, le terminal reste visible afin que
+// l'utilisateur puisse y recoller le code affiche par Claude.
+const replayRemoteClaudeLoginOutput = async (session: TerminalSession) => {
+  const terminalId = session.ptyId;
+  if (
+    !isRemoteMode()
+    || !session.loginOnly
+    || terminalId === null
+    || accountProvider(accountById(session.accountId)) !== "claude"
+  ) {
+    return;
+  }
+
+  let previous = "";
+  const deadline = Date.now() + 12_000;
+  while (
+    Date.now() < deadline
+    && terminalSessions.includes(session)
+    && session.ptyId === terminalId
+  ) {
+    const snapshot = await invoke<string>("terminal_output_snapshot", { id: terminalId })
+      .catch(() => "");
+    if (snapshot && snapshot !== previous) {
+      const delta = snapshot.startsWith(previous) ? snapshot.slice(previous.length) : snapshot;
+      previous = snapshot;
+      if (applyRemoteClaudeLoginOutput(session, delta) !== "none") return;
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 200));
   }
 };
 
@@ -28093,8 +28469,12 @@ const startTerminalSession = async (
     session.running = true;
     session.status = "Actif";
     statusText = "Terminal actif";
-    if (loginOnly && isRemoteMode() && remoteCodexLoginWindowIsOpen(session.accountId)) {
-      void replayRemoteCodexLoginOutput(session);
+    if (loginOnly && isRemoteMode()) {
+      if (remoteCodexLoginWindowIsOpen(session.accountId)) {
+        void replayRemoteCodexLoginOutput(session);
+      } else if (accountProvider(startedAccount) === "claude") {
+        void replayRemoteClaudeLoginOutput(session);
+      }
     }
     if (!loginOnly && settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
       // Utilise le workspace capture par cette session, meme si l'utilisateur
@@ -28127,6 +28507,7 @@ const closeTerminalSession = async (key: string) => {
   if (index === -1) return;
 
   const [session] = terminalSessions.splice(index, 1);
+  if (session.loginOnly) forgetRemoteClaudeLoginOutput(session.key);
   if (expertTerminalFullscreenKey === key) expertTerminalFullscreenKey = null;
   const closedWorkspaceKey = terminalWorkspaceDescriptor(session).key;
   const ptyId = session.ptyId;
@@ -28299,6 +28680,9 @@ const setupEvents = async () => {
     }
     if (activeView === "vps") void vpsModule?.refreshVpsPanel(render, true);
     if (activeView === "video") void videoModule?.refreshVideoPanel(render, true);
+    if (activeView === "transcription") {
+      void transcriptionModule?.refreshTranscriptionPanel(render, true);
+    }
     if (activeView === "design" && activeDesignTool === "kombai") void refreshKombaiStatus();
     if (
       activeView === "design" && activeDesignTool === "claude" &&
@@ -28342,7 +28726,10 @@ const setupEvents = async () => {
   unlistenData = await listen<PtyDataEvent>("pty-data", (event) => {
     const session = terminalSessionsByPtyId.get(event.payload.id);
     session?.terminal.write(event.payload.data);
-    if (session?.loginOnly) applyRemoteCodexLoginOutput(session, event.payload.data);
+    if (session?.loginOnly) {
+      applyRemoteCodexLoginOutput(session, event.payload.data);
+      applyRemoteClaudeLoginOutput(session, event.payload.data);
+    }
   });
 
   unlistenExit = await listen<PtyExitEvent>("pty-exit", (event) => {
@@ -28355,6 +28742,7 @@ const setupEvents = async () => {
     session.status = "Ferme";
 
     if (session.loginOnly) {
+      forgetRemoteClaudeLoginOutput(session.key);
       failRemoteCodexLoginWindow(
         session.accountId,
         "La connexion s’est interrompue avant d’être validée.",

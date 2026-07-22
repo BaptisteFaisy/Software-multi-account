@@ -12,6 +12,11 @@ services:
       - "127.0.0.1:{{ cst_remote_port }}:8080"
     volumes:
       - /srv/cst:/srv/cst
+{% if cst_gpu_transcription | default(false) | bool %}
+    depends_on:
+      speaches:
+        condition: service_healthy
+{% endif %}
     stop_grace_period: 45s
     security_opt:
       - no-new-privileges:true
@@ -21,3 +26,33 @@ services:
       timeout: 4s
       start_period: 20s
       retries: 8
+{% if cst_gpu_transcription | default(false) | bool %}
+
+  speaches:
+    image: {{ cst_speaches_image | to_json }}
+    container_name: codex-switch-terminal-speaches
+    restart: unless-stopped
+    init: true
+    expose:
+      - "8000"
+    volumes:
+      - speaches-models:/home/ubuntu/.cache/huggingface/hub
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  speaches-models:
+{% endif %}

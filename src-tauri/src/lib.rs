@@ -58,6 +58,7 @@ struct PoolState {
 #[cfg(feature = "desktop")]
 pub fn run() {
     let chat_manager = chat::ChatTurnManager::default();
+    chat::start_orphan_chat_image_sweeper();
     let autonomous_manager = autonomous::AutonomousAgentManager::new(
         chat_manager.clone(),
         settings::runtime_data_path("autonomous-agents.json")
@@ -189,6 +190,7 @@ pub fn run() {
             doctolib_lab::doctolib_lab_search,
             doctolib_lab::doctolib_lab_confirm,
             voice::process_voice_input,
+            voice::transcribe_audio_file,
             voice::voice_runtime_status,
             creative_accounts::creative_accounts,
             creative_accounts::connect_creative_account,

@@ -100,6 +100,11 @@ test("le wrapper protege les secrets et cree un profil reutilisable", () => {
   assert.match(wrapper, /--exclude=codex-homes\/\*\/\.sandbox-secrets/);
   assert.match(wrapper, /agent\(s\) autonome\(s\) utilisent un projet hors du workspace transfere/);
   assert.match(wrapper, /capacity = \$Capacity/);
+  assert.match(wrapper, /cst_public_base_url = \$PublicBaseUrl/);
+  assert.match(wrapper, /publicBaseUrl = \$PublicBaseUrl/);
+  assert.match(wrapper, /existingProfile\.publicBaseUrl/);
+  assert.match(envTemplate, /CST_PUBLIC_BASE_URL=\{\{ cst_public_base_url \| to_json \}\}/);
+  assert.match(envTemplate, /CST_ALLOWED_ORIGINS=\{\{ cst_public_base_url \| to_json \}\}/);
   assert.doesNotMatch(wrapper, /Write-Host[^\n]*\$adminToken/);
   assert.match(packageJson.scripts["deploy:vps:portable"], /deploy-vps-ansible\.ps1/);
   assert.match(packageJson.scripts["update:vps:github"], /update-vps-from-github\.ps1/);

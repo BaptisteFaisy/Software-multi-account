@@ -126,6 +126,25 @@ les options selectionnes.
   partagee de Switch est la couche qui garantit l'isolation par environnement.
 - Une memoire est du contexte, pas un coffre-fort : n'y place aucun secret.
 
+### Travail en equipe sur un VPS
+
+Chaque personne se connecte avec son propre compte utilisateur. Le proprietaire
+d'un environnement peut ensuite ouvrir le selecteur d'environnement, cliquer
+sur le bouclier de l'espace concerne et copier son **code d'invitation**. Le
+second utilisateur saisit ce code dans **Rejoindre un espace d'equipe** ; le
+partage ne devient actif qu'apres acceptation par le proprietaire.
+
+Les membres autorises retrouvent le meme projet, sa memoire, l'historique de ses
+chats, ses agents autonomes et ses orchestrations. Les conversations sont
+filtrees d'apres l'environnement auquel elles appartiennent : partager un
+projet n'expose donc ni les autres environnements, ni les preferences locales,
+ni les terminaux interactifs d'un autre utilisateur. Le proprietaire peut
+revoquer un membre a tout moment depuis le meme panneau.
+
+Si les inscriptions ont ete fermees apres la creation du compte proprietaire,
+reactive temporairement `CST_ALLOW_REGISTRATION=true` pour creer le second
+compte, puis repasse la variable a `false`.
+
 Pour connecter un nouveau compte Codex, cree son dossier dans l'interface,
 ouvre un terminal avec ce compte, puis lance :
 
@@ -146,8 +165,43 @@ cle API n'est jamais copiee dans `settings.json`.
 - terminaux PTY groupes par environnement ;
 - import de comptes depuis des exports JSON ;
 - suivi des quotas et selection d'un compte disponible ;
+- onglet **Transcrire** pour envoyer WAV, MP3, M4A, FLAC, OGG, OPUS ou WebM au GPU du VPS ;
 - chats autonomes persistants avec reprise, pause et planification ;
 - interface desktop, web et mobile.
+
+## Transcription audio sur le GPU du VPS
+
+L'onglet **Transcrire** accepte un fichier audio jusqu'a 100 Mo, l'envoie en
+binaire a `cst-server`, puis affiche la transcription Whisper exacte. Il ne
+lance pas Ollama et ne reformule donc pas le contenu. Le resultat peut etre
+copie ou exporte en `.txt`; le fichier temporaire est supprime apres traitement.
+
+Pour un deploiement portable sur un VPS NVIDIA dont le pilote est deja
+installe, active le moteur CUDA integre :
+
+```powershell
+npm run deploy:vps:portable -- `
+  -SshTarget "ubuntu@mon-vps" `
+  -NodeId "gpu-vps" `
+  -GpuTranscription
+```
+
+Ansible installe NVIDIA Container Toolkit, verifie CUDA depuis Docker, puis
+lance Speaches/faster-whisper sur le reseau prive de Compose. Aucun port du
+moteur n'est publie. Le modele par defaut est
+`Systran/faster-whisper-small`; choisis-en un autre avec
+`-TranscriptionModel "Systran/faster-whisper-large-v3"`. Le premier fichier
+peut prendre plus de temps pendant le telechargement et le chargement du modele.
+
+Avec Compose sans Ansible :
+
+```bash
+docker compose -f compose.yaml -f compose.gpu.yaml up -d --wait
+```
+
+Le client desktop connecte a un VPS envoie lui aussi les fichiers de cet onglet
+au serveur. Ce comportement est volontairement distinct du bouton micro, qui
+conserve sa priorite locale decrite ci-dessous.
 
 ## Dictee vocale locale (RTX 3060 Ti)
 

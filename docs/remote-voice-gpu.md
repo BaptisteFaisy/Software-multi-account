@@ -24,6 +24,10 @@ Le contrat reseau n'est lie a aucun fournisseur cloud :
 - transport : HTTPS obligatoire pour une adresse non locale. HTTP ne peut etre
   active qu'explicitement avec `CST_VOICE_ALLOW_INSECURE_REMOTE=1`.
 
+L'onglet **Transcrire** reutilise le meme endpoint STT, mais envoie directement
+le fichier d'origine (WAV, MP3, M4A, FLAC, OGG, OPUS ou WebM) et restitue le
+transcript sans reformulation Ollama. La limite applicative est de 100 Mo.
+
 ## Serveur GPU de reference
 
 Une machine Linux avec pilote NVIDIA, Docker et NVIDIA Container Toolkit suffit.
@@ -57,6 +61,17 @@ curl -X POST \
 Le modele `small` est un bon point de depart pour conserver le profil actuel.
 Une machine de datacenter disposant de plus de VRAM pourra ensuite tester
 `Systran/faster-whisper-large-v3` sans changement dans Switch.
+
+Pour une pile Codex Switch Terminal deja geree par Docker Compose, le fichier
+`compose.gpu.yaml` fournit cette topologie sans publier le port 8000 :
+
+```bash
+docker compose -f compose.yaml -f compose.gpu.yaml up -d --wait
+```
+
+Le deploiement Ansible equivalent s'active avec `-GpuTranscription`; il installe
+NVIDIA Container Toolkit, verifie l'acces CUDA depuis Docker et conserve le
+cache des modeles dans un volume dedie.
 
 ### 2. Reformulation avec Ollama
 
@@ -129,6 +144,7 @@ repli est explicite et affiche un avertissement dans l'interface.
 | `CST_VOICE_TRANSCRIPTION_MODE` | Surcharge `local` ou `remote` |
 | `CST_VOICE_TRANSCRIPTION_URL` | URL complete de `/v1/audio/transcriptions` |
 | `CST_VOICE_TRANSCRIPTION_MODEL` | Identifiant du modele STT distant |
+| `CST_VOICE_TRANSCRIPTION_ACCELERATOR` | `auto`, `gpu` ou `cpu`, affiche dans le statut de l'onglet |
 | `CST_VOICE_TRANSCRIPTION_API_KEY` | Jeton Bearer STT, jamais lu depuis le JSON |
 | `CST_VOICE_OLLAMA_URL` | Base Ollama locale ou distante |
 | `CST_VOICE_OLLAMA_MODEL` | Modele de reformulation |

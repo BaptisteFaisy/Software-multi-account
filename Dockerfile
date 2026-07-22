@@ -48,6 +48,7 @@ RUN apt-get update \
       chromium \
       curl \
       file \
+      ffmpeg \
       gzip \
       git \
       gosu \

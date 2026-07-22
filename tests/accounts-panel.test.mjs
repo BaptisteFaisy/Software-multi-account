@@ -73,7 +73,7 @@ test("chaque compte expose seulement connexion et suppression", () => {
   assert.match(accountsPanel, />Se connecter<\/span>/);
   assert.match(
     main,
-    /querySelectorAll<HTMLButtonElement>\("\[data-login-account\]"\)/,
+    /querySelectorAll<HTMLElement>\("\[data-login-account\]"\)/,
   );
   assert.match(
     main,

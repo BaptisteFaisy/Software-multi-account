@@ -1124,13 +1124,24 @@ export const renderChatPanel = (
           </div>
           ${renderChatRuntimeStatus(model)}
           <div class="chat-voice-control">
+            <select
+              data-chat-control="voice-mode"
+              class="chat-voice-mode"
+              title="Format du texte dicté"
+              aria-label="Format du texte dicté"
+              ${model.accounts.length ? "" : "disabled"}
+            >
+              <option value="faithful">Fidèle</option>
+              <option value="clean" selected>Nettoyé</option>
+              <option value="summary">Résumé</option>
+            </select>
             <button
               id="${id("chatVoice")}"
               data-chat-action="voice"
               type="button"
               class="chat-voice"
-              title="Dicter puis resumer localement"
-              aria-label="Dicter un message puis le resumer avec les modeles locaux"
+              title="Dicter puis nettoyer localement"
+              aria-label="Dicter un message avec le mode de texte choisi"
               aria-pressed="false"
               ${model.accounts.length ? "" : "disabled"}
             >

@@ -59,3 +59,32 @@ test("un partage accepte ne devient pas une porte d'entree du navigateur", () =>
     /authorize_existing_environment\(&guest,[\s\S]*?\.is_ok\(\)[\s\S]*?authorize_browse_path\(&guest,[\s\S]*?\.is_err\(\)/,
   );
 });
+
+test("un membre retrouve tout l'ecosysteme rattache a l'environnement partage", () => {
+  const discussionFilter = server.slice(
+    server.indexOf("fn filter_discussions_for_identity"),
+    server.indexOf("fn authorize_discussion_for_identity"),
+  );
+  const autonomousList = server.slice(
+    server.indexOf("async fn api_list_autonomous_agents"),
+    server.indexOf("async fn api_create_autonomous_agent"),
+  );
+  const orchestrationList = server.slice(
+    server.indexOf("async fn api_list_orchestrations"),
+    server.indexOf("async fn api_create_orchestration"),
+  );
+
+  assert.match(discussionFilter, /authorize_existing_environment\(identity, cwd\)/);
+  assert.match(autonomousList, /authorize_existing_environment\(identity, project_dir\)/);
+  assert.match(orchestrationList, /authorize_existing_environment\(identity, &run\.project_dir\)/);
+  assert.match(main, /fichiers, mémoire, historique des chats, agents autonomes et orchestrations sont communs/);
+});
+
+test("le partage reste limite a l'environnement explicitement autorise", () => {
+  assert.match(access, /fn user_can_access[\s\S]*?environment\.owner_id == user_id[\s\S]*?members/);
+  assert.match(
+    server,
+    /fn authorize_discussion_for_identity[\s\S]*?authorize_existing_environment\(identity, cwd\)/,
+  );
+  assert.match(main, /Vos préférences et vos autres environnements restent personnels/);
+});

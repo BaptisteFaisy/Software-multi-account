@@ -1,6 +1,7 @@
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { openExternalHttpsUrl } from "./platform";
 import { terminalThemeFor, type ThemeMode } from "./theme";
 
 /**
@@ -15,6 +16,16 @@ export const createTerminalRuntime = (theme: ThemeMode = "dark") => {
     fontFamily: "Cascadia Mono, Consolas, monospace",
     fontSize: 13,
     lineHeight: 1.15,
+    // Les CLI lances sur un VPS ne peuvent pas ouvrir le navigateur local.
+    // Relayer leurs liens OSC 8 via la couche native permet notamment a
+    // `claude auth login` d'ouvrir OAuth dans le navigateur du poste client.
+    linkHandler: {
+      activate: (_event, uri) => {
+        void openExternalHttpsUrl(uri).catch((error) => {
+          terminal.writeln(`\r\nImpossible d'ouvrir ce lien : ${String(error)}\r\n`);
+        });
+      },
+    },
     theme: terminalThemeFor(theme),
   });
   const fitAddon = new FitAddon();

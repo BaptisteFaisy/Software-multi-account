@@ -11,6 +11,7 @@ param(
   [int]$RemotePort = 8080,
   [ValidateRange(1, 65535)]
   [int]$LocalPort = 18080,
+  [string]$PublicBaseUrl = "",
   [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
   [string]$NodeId = "vps",
   [string]$NodeLabel = "VPS",
@@ -21,8 +22,15 @@ param(
   [string]$Image = "",
   [string]$RegistryUsername = "",
   [string]$RegistryTokenFile = "",
+  [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$')]
+  [string]$TranscriptionModel = "Systran/faster-whisper-small",
+  [string]$TranscriptionUrl = "",
+  [ValidateSet("auto", "gpu", "cpu")]
+  [string]$TranscriptionAccelerator = "auto",
+  [string]$SpeachesImage = "ghcr.io/speaches-ai/speaches:latest-cuda-12.6.3",
   [ValidatePattern('^[A-Za-z0-9._-]+$')]
   [string]$WslDistribution = "Ubuntu",
+  [switch]$GpuTranscription,
   [switch]$SkipAccountSeed,
   [switch]$NoWorkspaceSeed,
   [switch]$AcceptNewHostKey,
@@ -199,6 +207,9 @@ function Quote-SshOptionPath {
 
 Assert-OneLine -Name "NodeLabel" -Value $NodeLabel
 Assert-OneLine -Name "Image" -Value $Image
+Assert-OneLine -Name "TranscriptionModel" -Value $TranscriptionModel
+Assert-OneLine -Name "TranscriptionUrl" -Value $TranscriptionUrl
+Assert-OneLine -Name "SpeachesImage" -Value $SpeachesImage
 
 foreach ($command in @("wsl.exe", "ssh", "tar", "git")) {
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
@@ -226,6 +237,84 @@ if (Test-Path -LiteralPath $ProfilePath) {
   }
 }
 
+if (-not $PSBoundParameters.ContainsKey("GpuTranscription") -and $existingProfile) {
+  $GpuTranscription = [bool]$existingProfile.gpuTranscription
+}
+if (
+  -not $PSBoundParameters.ContainsKey("TranscriptionModel") -and
+  $existingProfile -and
+  [string]$existingProfile.transcriptionModel
+) {
+  $TranscriptionModel = [string]$existingProfile.transcriptionModel
+}
+if (
+  -not $PSBoundParameters.ContainsKey("TranscriptionUrl") -and
+  $existingProfile -and
+  [string]$existingProfile.transcriptionUrl
+) {
+  $TranscriptionUrl = [string]$existingProfile.transcriptionUrl
+}
+if (
+  -not $PSBoundParameters.ContainsKey("TranscriptionAccelerator") -and
+  $existingProfile -and
+  [string]$existingProfile.transcriptionAccelerator
+) {
+  $TranscriptionAccelerator = [string]$existingProfile.transcriptionAccelerator
+}
+if (
+  -not $PSBoundParameters.ContainsKey("SpeachesImage") -and
+  $existingProfile -and
+  [string]$existingProfile.speachesImage
+) {
+  $SpeachesImage = [string]$existingProfile.speachesImage
+}
+Assert-OneLine -Name "TranscriptionModel" -Value $TranscriptionModel
+Assert-OneLine -Name "TranscriptionUrl" -Value $TranscriptionUrl
+Assert-OneLine -Name "SpeachesImage" -Value $SpeachesImage
+
+if ($TranscriptionUrl.Trim()) {
+  try {
+    $transcriptionUri = [Uri]$TranscriptionUrl.Trim()
+  }
+  catch {
+    throw "TranscriptionUrl doit etre une URL HTTPS absolue."
+  }
+  if (
+    -not $transcriptionUri.IsAbsoluteUri -or
+    $transcriptionUri.Scheme -ne "https" -or
+    $transcriptionUri.UserInfo -or
+    $transcriptionUri.Fragment
+  ) {
+    throw "TranscriptionUrl doit etre une URL HTTPS absolue, sans identifiants ni fragment."
+  }
+  $TranscriptionUrl = $transcriptionUri.AbsoluteUri
+}
+
+if (-not $PublicBaseUrl.Trim() -and $existingProfile -and [string]$existingProfile.publicBaseUrl) {
+  $PublicBaseUrl = [string]$existingProfile.publicBaseUrl
+}
+if (-not $PublicBaseUrl.Trim()) {
+  $PublicBaseUrl = "http://127.0.0.1:$RemotePort"
+}
+Assert-OneLine -Name "PublicBaseUrl" -Value $PublicBaseUrl
+try {
+  $publicBaseUri = [Uri]$PublicBaseUrl.Trim()
+}
+catch {
+  throw "PublicBaseUrl doit etre une origine HTTP(S) absolue."
+}
+if (
+  -not $publicBaseUri.IsAbsoluteUri -or
+  $publicBaseUri.Scheme -notin @("http", "https") -or
+  $publicBaseUri.UserInfo -or
+  ($publicBaseUri.AbsolutePath -and $publicBaseUri.AbsolutePath -ne "/") -or
+  $publicBaseUri.Query -or
+  $publicBaseUri.Fragment
+) {
+  throw "PublicBaseUrl doit etre une origine HTTP(S) absolue, sans chemin, identifiants, requete ni fragment."
+}
+$PublicBaseUrl = $publicBaseUri.GetLeftPart([UriPartial]::Authority)
+
 $localAdminToken = ""
 $localGitPat = ""
 $forwardedEnvironment = [ordered]@{}
@@ -240,9 +329,11 @@ $forwardNames = @(
   "CST_VOICE_TRANSCRIPTION_URL",
   "CST_VOICE_TRANSCRIPTION_MODEL",
   "CST_VOICE_TRANSCRIPTION_API_KEY",
+  "CST_VOICE_TRANSCRIPTION_ACCELERATOR",
   "CST_VOICE_OLLAMA_URL",
   "CST_VOICE_OLLAMA_MODEL",
   "CST_VOICE_OLLAMA_API_KEY",
+  "CST_VOICE_OLLAMA_HOST_HEADER",
   "CST_VOICE_ALLOW_INSECURE_REMOTE"
 )
 if (Test-Path -LiteralPath $LocalEnvFile) {
@@ -267,6 +358,27 @@ if (Test-Path -LiteralPath $LocalEnvFile) {
       [Environment]::SetEnvironmentVariable($name, $previousValues[$name])
     }
   }
+}
+
+if ($GpuTranscription) {
+  foreach ($name in @(
+    "CST_VOICE_TRANSCRIPTION_MODE",
+    "CST_VOICE_TRANSCRIPTION_URL",
+    "CST_VOICE_TRANSCRIPTION_MODEL",
+    "CST_VOICE_TRANSCRIPTION_API_KEY",
+    "CST_VOICE_TRANSCRIPTION_ACCELERATOR",
+    "CST_VOICE_ALLOW_INSECURE_REMOTE"
+  )) {
+    $forwardedEnvironment.Remove($name)
+  }
+}
+elseif ($TranscriptionUrl.Trim()) {
+  $forwardedEnvironment["CST_VOICE_TRANSCRIPTION_MODE"] = "remote"
+  $forwardedEnvironment["CST_VOICE_TRANSCRIPTION_URL"] = $TranscriptionUrl.Trim()
+  $forwardedEnvironment["CST_VOICE_TRANSCRIPTION_MODEL"] = $TranscriptionModel.Trim()
+  $forwardedEnvironment["CST_VOICE_TRANSCRIPTION_ACCELERATOR"] = $TranscriptionAccelerator
+  $forwardedEnvironment.Remove("CST_VOICE_TRANSCRIPTION_API_KEY")
+  $forwardedEnvironment.Remove("CST_VOICE_ALLOW_INSECURE_REMOTE")
 }
 
 if ($existingProfile -and [string]$existingProfile.tokenProtected) {
@@ -521,6 +633,10 @@ try {
     cst_node_label = $NodeLabel
     cst_capacity = $Capacity
     cst_remote_port = $RemotePort
+    cst_public_base_url = $PublicBaseUrl
+    cst_gpu_transcription = [bool]$GpuTranscription
+    cst_transcription_model = $TranscriptionModel.Trim()
+    cst_speaches_image = $SpeachesImage.Trim()
     cst_release = $release
     cst_commit = $commit
     cst_image = $Image.Trim()
@@ -569,8 +685,14 @@ try {
     identityFile = $resolvedIdentity
     knownHostsFile = $resolvedKnownHostsFile
     remotePort = $RemotePort
+    publicBaseUrl = $PublicBaseUrl
     defaultLocalPort = $LocalPort
     capacity = $Capacity
+    gpuTranscription = [bool]$GpuTranscription
+    transcriptionModel = $TranscriptionModel.Trim()
+    transcriptionUrl = $TranscriptionUrl.Trim()
+    transcriptionAccelerator = $TranscriptionAccelerator
+    speachesImage = $SpeachesImage.Trim()
     tokenProtected = (Protect-Secret $adminToken)
     deploymentMode = "ansible-compose"
     image = if ($Image.Trim()) { $Image.Trim() } else { "codex-switch-terminal:$release" }
@@ -583,6 +705,7 @@ try {
   Write-Host "Profil      : $NodeId"
   Write-Host "Runtime     : $SshTarget (127.0.0.1:$RemotePort)"
   Write-Host "Workspace   : /srv/cst/workspaces/$WorkspaceName"
+  Write-Host "Transcrire  : $(if ($GpuTranscription) { "GPU du VPS · $($TranscriptionModel.Trim())" } elseif ($TranscriptionUrl.Trim()) { "$TranscriptionAccelerator distant · $($TranscriptionModel.Trim())" } else { "configuration externe" })"
   Write-Host "Connexion   : npm run connect:vps -- -Profile $NodeId"
 }
 finally {

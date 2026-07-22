@@ -376,7 +376,7 @@ test("la gestion minimale des comptes reste utilisable sur mobile", () => {
   assert.match(panel, /id="addAccountForm"/);
   assert.doesNotMatch(panel, /proxyUrlInput|addProxy|proxySelect/);
   assert.match(style, /@media \(max-width: 720px\) \{[\s\S]*?\.simple-account-add \{\s*grid-template-columns: 1fr;/);
-  assert.match(style, /@media \(max-width: 520px\) \{[\s\S]*?\.simple-account-card \{[\s\S]*?flex-direction: column;/);
+  assert.match(style, /@media \(max-width: 520px\) \{[\s\S]*?\.simple-account-row \{[\s\S]*?flex-direction: column;/);
 });
 
 test("les informations d'etat visibles respectent une taille et un contraste lisibles", () => {

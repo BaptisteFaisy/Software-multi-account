@@ -1,13 +1,15 @@
-import { invoke } from "../platform";
+import { invoke, type VoiceOutputMode } from "../platform";
 
 const TARGET_SAMPLE_RATE = 16_000;
 const MAX_RECORDING_MS = 5 * 60 * 1_000;
 const MIN_RECORDING_MS = 350;
+const VOICE_OUTPUT_MODE_STORAGE_KEY = "cst.voice.outputMode";
 
 type VoiceProcessResponse = {
   transcript: string;
   summary: string;
   summarized: boolean;
+  outputMode: VoiceOutputMode;
   warning?: string | null;
   transcriptionModel: string;
   summaryModel: string;
@@ -29,9 +31,35 @@ type VoiceSession = {
   startedAt: number;
   elapsedTimer: number | null;
   limitTimer: number | null;
+  outputMode: VoiceOutputMode;
 };
 
 let activeSession: VoiceSession | null = null;
+
+const normalizeVoiceOutputMode = (value: unknown): VoiceOutputMode =>
+  value === "faithful" || value === "summary" ? value : "clean";
+
+const storedVoiceOutputMode = (): VoiceOutputMode => {
+  try {
+    return normalizeVoiceOutputMode(window.localStorage.getItem(VOICE_OUTPUT_MODE_STORAGE_KEY));
+  } catch {
+    return "clean";
+  }
+};
+
+const rememberVoiceOutputMode = (mode: VoiceOutputMode) => {
+  try {
+    window.localStorage.setItem(VOICE_OUTPUT_MODE_STORAGE_KEY, mode);
+  } catch {
+    // Le mode nettoye reste le repli si le stockage prive est indisponible.
+  }
+};
+
+const voiceModeLabel = (mode: VoiceOutputMode): string => mode === "faithful"
+  ? "fidele"
+  : mode === "summary"
+    ? "compte rendu"
+    : "nettoye";
 
 class PcmVoiceRecorder {
   private constructor(
@@ -187,10 +215,13 @@ const voiceElements = (session: VoiceSession) => ({
   prompt: document.getElementById(session.promptId) as HTMLTextAreaElement | null,
   button: document.getElementById(session.buttonId) as HTMLButtonElement | null,
   status: document.getElementById(session.statusId) as HTMLElement | null,
+  mode: document.querySelector<HTMLSelectElement>(
+    `[data-chat-control='voice-mode'][data-voice-for='${CSS.escape(session.buttonId)}']`,
+  ),
 });
 
 const syncSessionUi = (session: VoiceSession) => {
-  const { button, status } = voiceElements(session);
+  const { button, status, mode } = voiceElements(session);
   if (button) {
     button.classList.toggle("is-requesting", session.state === "requesting");
     button.classList.toggle("is-recording", session.state === "recording");
@@ -199,8 +230,16 @@ const syncSessionUi = (session: VoiceSession) => {
     button.title = session.state === "recording"
       ? "Terminer la dictee"
       : session.state === "processing"
-        ? "Transcription et resume local en cours"
+        ? session.outputMode === "faithful"
+          ? "Transcription fidele en cours"
+          : session.outputMode === "summary"
+            ? "Transcription et compte rendu en cours"
+            : "Transcription et nettoyage local en cours"
         : "Autorisation du micro";
+  }
+  if (mode) {
+    mode.value = session.outputMode;
+    mode.disabled = true;
   }
   if (status) {
     status.textContent = session.message;
@@ -225,7 +264,11 @@ const resetVoiceButton = (buttonId: string) => {
   const button = document.getElementById(buttonId) as HTMLButtonElement | null;
   button?.classList.remove("is-requesting", "is-recording", "is-processing");
   button?.setAttribute("aria-pressed", "false");
-  if (button) button.title = "Dicter puis resumer localement";
+  if (button) button.title = "Dicter avec le mode de texte choisi";
+  const mode = document.querySelector<HTMLSelectElement>(
+    `[data-chat-control='voice-mode'][data-voice-for='${CSS.escape(buttonId)}']`,
+  );
+  if (mode) mode.disabled = false;
 };
 
 const showFinalStatus = (
@@ -274,7 +317,11 @@ const finishVoiceSession = async (session: VoiceSession) => {
   if (activeSession !== session || session.state !== "recording" || !session.recorder) return;
   clearSessionTimers(session);
   session.state = "processing";
-  session.message = "Transcription et reformulation en cours...";
+  session.message = session.outputMode === "faithful"
+    ? "Transcription fidele en cours..."
+    : session.outputMode === "summary"
+      ? "Transcription et compte rendu en cours..."
+      : "Transcription et nettoyage en cours...";
   syncSessionUi(session);
 
   try {
@@ -286,16 +333,17 @@ const finishVoiceSession = async (session: VoiceSession) => {
       audioBase64: bytesToBase64(wav),
       mimeType: "audio/wav",
       language: (navigator.language || "fr").split("-")[0].toLowerCase(),
+      outputMode: session.outputMode,
     });
     const { prompt } = voiceElements(session);
     if (!prompt) throw new Error("Le champ du chat a ete ferme pendant la transcription.");
     insertVoiceText(prompt, result.summary || result.transcript);
     activeSession = null;
-    if (result.warning || !result.summarized) {
+    if (result.warning || (session.outputMode !== "faithful" && !result.summarized)) {
       showFinalStatus(
         session.buttonId,
         session.statusId,
-        result.warning || "Transcription inseree; resume local indisponible.",
+        result.warning || "Transcription inseree; reformulation locale indisponible.",
         "warning",
       );
     } else {
@@ -307,7 +355,7 @@ const finishVoiceSession = async (session: VoiceSession) => {
       showFinalStatus(
         session.buttonId,
         session.statusId,
-        `Texte vocal insere ${location} (${elapsed} s)`,
+        `Texte vocal ${voiceModeLabel(session.outputMode)} insere ${location} (${elapsed} s)`,
         "success",
       );
     }
@@ -326,6 +374,7 @@ const startVoiceSession = async (
   prompt: HTMLTextAreaElement,
   button: HTMLButtonElement,
   status: HTMLElement,
+  outputMode: VoiceOutputMode,
 ) => {
   if (activeSession) {
     if (activeSession.promptId === prompt.id && activeSession.state === "recording") {
@@ -350,6 +399,7 @@ const startVoiceSession = async (
     startedAt: performance.now(),
     elapsedTimer: null,
     limitTimer: null,
+    outputMode,
   };
   activeSession = session;
   syncSessionUi(session);
@@ -383,10 +433,18 @@ export const bindVoiceComposer = (root: ParentNode) => {
   const prompt = root.querySelector<HTMLTextAreaElement>("[data-chat-control='prompt']");
   const button = root.querySelector<HTMLButtonElement>("[data-chat-action='voice']");
   const status = root.querySelector<HTMLElement>("[data-chat-control='voice-status']");
-  if (!prompt || !button || !status || button.dataset.voiceBound === "true") return;
+  const mode = root.querySelector<HTMLSelectElement>("[data-chat-control='voice-mode']");
+  if (!prompt || !button || !status || !mode || button.dataset.voiceBound === "true") return;
+  mode.dataset.voiceFor = button.id;
+  mode.value = storedVoiceOutputMode();
+  mode.addEventListener("change", () => {
+    const selected = normalizeVoiceOutputMode(mode.value);
+    mode.value = selected;
+    rememberVoiceOutputMode(selected);
+  });
   button.dataset.voiceBound = "true";
   button.addEventListener("click", () => {
-    void startVoiceSession(prompt, button, status);
+    void startVoiceSession(prompt, button, status, normalizeVoiceOutputMode(mode.value));
   });
   if (activeSession?.promptId === prompt.id) syncSessionUi(activeSession);
 };

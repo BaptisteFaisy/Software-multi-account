@@ -1,6 +1,6 @@
 param(
-  [ValidateSet("base", "small-q5_1", "small")]
-  [string]$WhisperModel = "small-q5_1",
+  [ValidateSet("base", "small-q5_1", "small", "large-v3-turbo-q5_0")]
+  [string]$WhisperModel = "large-v3-turbo-q5_0",
   [string]$SummaryModel = "qwen3:4b-instruct-2507-q4_K_M",
   [string]$VoiceHome = "",
   [switch]$Force,
@@ -34,6 +34,10 @@ $modelCatalog = @{
   "small" = @{
     File = "ggml-small.bin"
     Sha1 = "55356645c2b361a969dfd0ef2c5a50d530afd8d5"
+  }
+  "large-v3-turbo-q5_0" = @{
+    File = "ggml-large-v3-turbo-q5_0.bin"
+    Sha1 = "e050f7970618a659205450ad97eb95a18d69c9ee"
   }
 }
 
@@ -213,6 +217,7 @@ if (-not $SkipOllamaPull) {
 
 $voiceConfig = [ordered]@{
   transcriptionMode = "local"
+  transcriptionAccelerator = "gpu"
   whisperModel = $modelInfo.File
   ollamaModel = $SummaryModel
   ollamaUrl = "http://127.0.0.1:11434"

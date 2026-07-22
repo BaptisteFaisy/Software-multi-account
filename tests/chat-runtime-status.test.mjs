@@ -18,6 +18,7 @@ import {
 } from "../src/chat/runtime.ts";
 const view = readFileSync(new URL("../src/chat/view.ts", import.meta.url), "utf8");
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+const platform = readFileSync(new URL("../src/platform.ts", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 const chatBackend = readFileSync(new URL("../src-tauri/src/chat.rs", import.meta.url), "utf8");
 
@@ -316,6 +317,48 @@ test("le bouton d'envoi OpenCode reste sombre et conserve son icone", () => {
   assert.match(style, /\.chat-app-layout \.chat-send \{[\s\S]*?appearance: none;/);
   assert.match(style, /\.chat-app-layout \.chat-send \{[\s\S]*?background: rgba\(255, 255, 255, 0\.08\);/);
   assert.doesNotMatch(style, /\.chat-app-layout \.chat-send \{[\s\S]*?linear-gradient\(180deg, #f1f1f1/);
+});
+
+test("un envoi d'image dont la reponse s'est perdue ne bascule plus le chat en « Disponible »", () => {
+  // Le tour serveur est committe et lance AVANT que la reponse HTTP ne parte
+  // (chat.rs). Avec une image (~27 Mo base64) la reponse peut se perdre alors que
+  // l'agent tourne deja : il ne faut donc jamais fabriquer un « failed » (rendu
+  // « Disponible ») sur une coupure de transport, et il faut pouvoir readopter le
+  // tour orphelin d'un nouveau chat qui n'a pas encore de sessionId.
+
+  // 1) apiAt distingue un rejet HTTP definitif (4xx/5xx) d'une coupure de transport.
+  assert.match(platform, /rejection\.httpStatus = response\.status;/);
+
+  // 2) Reconciliation par sourceChatKey, meme sans discussion ni sessionId.
+  assert.match(main, /const isDefiniteChatTurnRejection =/);
+  assert.match(main, /const activeChatTurnBySourceKey =/);
+  assert.match(main, /turn\.sourceChatKey === pane\.key/);
+  assert.match(
+    main,
+    /activeChatTurnForDiscussion\(next, pane\.discussion\)\s*\?\?\s*activeChatTurnBySourceKey\(next, pane\)/,
+  );
+
+  // 3) Le catch reconcilie au lieu de marquer « failed » sur erreur ambigue, et
+  //    n'ecrase jamais un vrai tour serveur deja adopte (id != 0).
+  assert.match(
+    main,
+    /if \(pane\.turn && pane\.turn\.id !== 0\) \{\s*\n\s*return chatTurnIsBusy\(pane\.turn\.status\);/,
+  );
+  assert.match(
+    main,
+    /if \(!isDefiniteChatTurnRejection\(error\) && pane\.turn\?\.status === "running"\)/,
+  );
+
+  // 4) Le serveur transporte le sourceChatKey du snapshot vers le catalogue actif.
+  assert.match(
+    chatBackend,
+    /pub struct ChatTurnSnapshot \{[\s\S]*?pub source_chat_key: Option<String>,/,
+  );
+  assert.match(
+    chatBackend,
+    /pub struct ActiveChatTurnSummary \{[\s\S]*?pub source_chat_key: Option<String>,/,
+  );
+  assert.match(chatBackend, /source_chat_key: snapshot\.source_chat_key\.clone\(\),/);
 });
 
 test("une mise a jour d'outil dans un transcript declenche le rafraichissement", () => {

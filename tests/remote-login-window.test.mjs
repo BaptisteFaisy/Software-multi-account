@@ -29,6 +29,11 @@ test("la connexion Codex distante ouvre directement OpenAI dans un nouvel onglet
     /window\.open\(CODEX_DEVICE_VERIFICATION_URL, "_blank"\)/,
   );
   assert.doesNotMatch(popup, /popup=yes|width=560|height=720/);
+  assert.match(
+    main,
+    /href="https:\/\/auth\.openai\.com\/codex\/device" target="_blank" rel="noopener"/,
+  );
+  assert.match(main, /window\.setTimeout\(\(\) => void reloginAccount\(accountId, true\), 0\)/);
 });
 
 test("la fenetre extrait uniquement le lien appareil OpenAI et son code", () => {
@@ -69,6 +74,20 @@ test("le terminal de login reste en arriere-plan et est ferme apres validation",
   assert.match(main, /update\.type === "success"[\s\S]*?closeTerminalSession\(session\.key\)/);
 });
 
+test("un onglet OpenAI natif conserve le suivi du device-auth sans WindowProxy", () => {
+  assert.match(popup, /export const prepareRemoteCodexLoginTab/);
+  assert.match(popup, /popup: null/);
+  assert.match(
+    popup,
+    /if \(!state \|\| \(state\.popup && !popupIsUsable\(state\.popup\)\)\) return false/,
+  );
+  assert.match(
+    popup,
+    /if \(!state \|\| \(state\.popup && !popupIsUsable\(state\.popup\)\)\) return \{ type: "none" \}/,
+  );
+  assert.match(main, /prepareRemoteCodexLoginTab\(account\.id, account\.label\)/);
+});
+
 test("un popup bloque conserve le terminal comme solution de repli", () => {
   assert.match(popup, /if \(!popupIsUsable\(popup\)\) return false;/);
   assert.match(
@@ -92,4 +111,35 @@ test("une connexion sans code ne peut plus charger indefiniment", () => {
   assert.match(main, /Le code OpenAI n’a pas été reçu/);
   assert.match(main, /failRemoteCodexLoginWindow\(session\.accountId, message\)/);
   assert.match(main, /await closeTerminalSession\(session\.key\)/);
+});
+
+test("le panneau du code Codex reste lisible et recopiable pendant la connexion", () => {
+  const accountId = "acc-panel";
+  popupModule.prepareRemoteCodexLoginTab(accountId, "Perso");
+  const pending = popupModule.remoteCodexLoginPanel(accountId);
+  assert.equal(pending?.phase, "preparing");
+  assert.equal(pending?.userCode, null);
+  assert.equal(pending?.verificationUrl, "https://auth.openai.com/codex/device");
+
+  const update = popupModule.consumeRemoteCodexLoginOutput(
+    accountId,
+    "https://auth.openai.com/codex/device\r\nEnter this one-time code: HT2W-2WYBH\r\n",
+  );
+  assert.equal(update.type, "ready");
+
+  const ready = popupModule.remoteCodexLoginPanel(accountId);
+  assert.equal(ready?.phase, "ready");
+  assert.equal(ready?.userCode, "HT2W-2WYBH");
+
+  assert.equal(popupModule.copyRemoteCodexLoginCode(accountId), "HT2W-2WYBH");
+  assert.equal(popupModule.copyRemoteCodexLoginCode("compte-inconnu"), null);
+});
+
+test("la page Comptes affiche un encadre permanent avec le code Codex", () => {
+  assert.match(main, /const renderCodexLoginCodePanel = \(accountId: string\): string =>/);
+  assert.match(main, /const panel = remoteCodexLoginPanel\(accountId\);/);
+  assert.match(main, /renderCodexLoginCodePanel\(item\.id\)/);
+  assert.match(main, /class="codex-login-code \$\{ready \? "ready" : "pending"\}"/);
+  assert.match(main, /data-copy-codex-code="\$\{escapeAttr\(accountId\)\}"/);
+  assert.match(main, /const code = copyRemoteCodexLoginCode\(accountId\);/);
 });

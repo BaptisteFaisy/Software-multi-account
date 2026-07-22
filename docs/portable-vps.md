@@ -145,6 +145,17 @@ distant. Les variables `CST_VOICE_TRANSCRIPTION_*`, `CST_VOICE_OLLAMA_*` et
 deploiement sont transmises au conteneur. Une URL publique en HTTP simple ne
 peut pas recevoir la permission microphone du navigateur.
 
+Sur un VPS NVIDIA, ajoute `-GpuTranscription` au deploiement pour installer le
+runtime de conteneurs NVIDIA et un Speaches/faster-whisper prive. L'onglet
+**Transcrire** enverra alors directement les fichiers audio au GPU du VPS :
+
+```powershell
+npm run deploy:vps:portable -- -SshTarget "ubuntu@mon-vps" -NodeId "gpu-vps" -GpuTranscription
+```
+
+Le pilote NVIDIA doit deja etre installe sur l'hote. Le modele par defaut est
+`Systran/faster-whisper-small`; `-TranscriptionModel` permet de le remplacer.
+
 ## Mettre un VPS a jour depuis GitHub
 
 Chaque profil VPS peut etre reconstruit a la demande depuis la branche ou le

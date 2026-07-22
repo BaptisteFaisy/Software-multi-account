@@ -19,7 +19,7 @@ test("une image du presse-papiers devient une piece jointe avec apercu supprimab
   assert.match(attachments, /readAsDataURL\(file\)/);
   assert.match(attachments, /URL\.createObjectURL\(file\)/);
   assert.match(attachments, /MAX_CHAT_IMAGE_ATTACHMENTS = 4/);
-  assert.match(attachments, /MAX_CHAT_IMAGE_TOTAL_BYTES = 20 \* 1024 \* 1024/);
+  assert.match(attachments, /MAX_CHAT_IMAGE_TOTAL_BYTES = 100 \* 1024 \* 1024/);
 
   assert.match(view, /data-chat-control="image-attachments"/);
   assert.match(view, /data-chat-action="remove-image"/);
@@ -49,4 +49,17 @@ test("le serveur valide les images et Codex les recoit via son option native", (
   assert.match(backend, /command\.arg\("--image"\)\.arg\(path\)/);
   assert.match(backend, /let _image_files = image_files/);
   assert.match(server, /DefaultBodyLimit::max\(MAX_CHAT_TURN_REQUEST_BYTES\)/);
+});
+
+test("les images orphelines sont balayees automatiquement au demarrage puis periodiquement", () => {
+  // La suppression par tour reste en place (Drop en fin de tour).
+  assert.match(backend, /impl Drop for TemporaryChatImages/);
+  // Un balayeur efface en plus les images qu'un tour plante n'a pas pu nettoyer.
+  assert.match(backend, /fn sweep_orphan_chat_images_in\(directory: &Path, max_age: Duration\)/);
+  assert.match(backend, /pub\(crate\) fn start_orphan_chat_image_sweeper\(\)/);
+  assert.match(backend, /static STARTED: Once = Once::new\(\);/);
+  // Le seuil d'age evite de toucher un tour en cours ; passage horaire.
+  assert.match(backend, /Duration::from_secs\(6 \* 60 \* 60\)/);
+  // Cable au demarrage reel du serveur VPS.
+  assert.match(server, /start_orphan_chat_image_sweeper\(\)/);
 });

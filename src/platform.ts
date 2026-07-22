@@ -85,6 +85,44 @@ export type ChatExecutionTarget = {
   primary: boolean;
 };
 
+export type VoiceOutputMode = "faithful" | "clean" | "summary";
+
+export type AudioFileTranscriptionResponse = {
+  text: string;
+  fileName: string;
+  language: string;
+  model: string;
+  provider: string;
+  accelerator: "gpu" | "cpu" | "distant" | string;
+  outputMode: VoiceOutputMode;
+  postProcessed: boolean;
+  postProcessingModel?: string | null;
+  postProcessingMs: number;
+  processingMs: number;
+  warning?: string | null;
+};
+
+export type TranscriptionRuntimeStatus = {
+  mode: "local" | "remote" | string;
+  state: "active" | "loaded" | "inactive" | "unavailable" | string;
+  stage: "idle" | "transcribing" | "summarizing" | string;
+  transcriptionModel: string;
+  transcriptionTarget: string;
+  transcriptionAccelerator?: string;
+  transcriptionReady?: boolean;
+  whisperReady: boolean;
+  gpu?: {
+    index: number;
+    name: string;
+    utilizationPercent: number;
+    memoryUsedMb: number;
+    memoryTotalMb: number;
+  } | null;
+  warning?: string | null;
+};
+
+export const MAX_TRANSCRIPTION_AUDIO_BYTES = 100 * 1024 * 1024;
+
 type MobileBridge = {
   getBaseUrl?: () => string;
   getToken?: () => string;
@@ -717,6 +755,63 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
   return remoteInvoke<T>(command, args);
 }
 
+const fileAsBase64 = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      const value = typeof reader.result === "string" ? reader.result : "";
+      const payload = value.includes(",") ? value.slice(value.indexOf(",") + 1) : value;
+      if (!payload) reject(new Error("Le fichier audio est vide ou illisible."));
+      else resolve(payload);
+    }, { once: true });
+    reader.addEventListener("error", () => {
+      reject(reader.error ?? new Error("Lecture du fichier audio impossible."));
+    }, { once: true });
+    reader.addEventListener("abort", () => reject(new DOMException("Lecture annulee", "AbortError")), {
+      once: true,
+    });
+    reader.readAsDataURL(file);
+  });
+
+/**
+ * Envoie un fichier brut au runtime distant. Le desktop connecte a un VPS ne
+ * tente volontairement aucun moteur local : l'onglet Transcrire cible la carte
+ * graphique du serveur selectionne.
+ */
+export async function transcribeAudioFile(
+  file: File,
+  language = "auto",
+  outputMode: VoiceOutputMode = "clean",
+  signal?: AbortSignal,
+): Promise<AudioFileTranscriptionResponse> {
+  if (!file.size) throw new Error("Le fichier audio est vide.");
+  if (file.size > MAX_TRANSCRIPTION_AUDIO_BYTES) {
+    throw new Error("Le fichier audio depasse la limite de 100 Mo.");
+  }
+  if (signal?.aborted) throw new DOMException("Transcription annulee", "AbortError");
+
+  if (!isRemoteMode()) {
+    const audioBase64 = await fileAsBase64(file);
+    if (signal?.aborted) throw new DOMException("Transcription annulee", "AbortError");
+    return tauriInvoke<AudioFileTranscriptionResponse>("transcribe_audio_file", {
+      audioBase64,
+      fileName: file.name,
+      mimeType: file.type || "application/octet-stream",
+      language,
+      outputMode,
+    });
+  }
+
+  return uploadRemoteAudioFile(file, language, outputMode, signal);
+}
+
+export function transcriptionRuntimeStatus(): Promise<TranscriptionRuntimeStatus> {
+  if (!isRemoteMode()) {
+    return tauriInvoke<TranscriptionRuntimeStatus>("voice_runtime_status");
+  }
+  return api<TranscriptionRuntimeStatus>("GET", "/api/voice/status");
+}
+
 async function remoteInvoke<T>(command: string, args: Record<string, any>): Promise<T> {
   switch (command) {
     case "load_settings":
@@ -911,6 +1006,7 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         audioBase64: args.audioBase64,
         mimeType: args.mimeType ?? "audio/wav",
         language: args.language ?? "fr",
+        outputMode: args.outputMode ?? "clean",
       });
     case "voice_runtime_status":
       return api<T>("GET", "/api/voice/status");
@@ -1123,6 +1219,58 @@ async function api<T>(
   return apiAt<T>(defaultRemoteRoute(), method, path, body, timeoutMs);
 }
 
+async function uploadRemoteAudioFile(
+  file: File,
+  language: string,
+  outputMode: VoiceOutputMode,
+  signal?: AbortSignal,
+): Promise<AudioFileTranscriptionResponse> {
+  const route = defaultRemoteRoute();
+  const query = new URLSearchParams({
+    fileName: file.name.slice(0, 180),
+    language,
+    outputMode,
+  });
+  let response: Response;
+  try {
+    response = await fetch(`${route.baseUrl}/api/transcriptions?${query.toString()}`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        ...(route.token ? { Authorization: `Bearer ${route.token}` } : {}),
+        "Content-Type": file.type || "application/octet-stream",
+      },
+      body: file,
+      signal,
+    });
+  } catch (error) {
+    if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+      throw new DOMException("Transcription annulee", "AbortError");
+    }
+    throw new Error(`Envoi du fichier au VPS impossible : ${String(error)}`);
+  }
+
+  const text = await response.text();
+  let value: any = null;
+  try {
+    value = text ? JSON.parse(text) : null;
+  } catch {
+    value = null;
+  }
+  if (!response.ok) {
+    if (response.status === 401 && route.baseUrl === remoteBaseUrl()) clearRemoteConfig();
+    const message = value?.error?.message
+      || value?.message
+      || (response.status === 413 ? "Le fichier audio depasse la limite de 100 Mo." : response.statusText)
+      || "La transcription a echoue.";
+    throw new Error(message);
+  }
+  if (!value || typeof value.text !== "string") {
+    throw new Error("Le VPS a renvoye une reponse de transcription illisible.");
+  }
+  return value as AudioFileTranscriptionResponse;
+}
+
 /**
  * Souscrit au signal leger partage par les tours actifs, les agents autonomes
  * et la messagerie privee. Un socket est ouvert par noeud afin que le catalogue
@@ -1316,7 +1464,12 @@ async function apiAt<T>(
     if (!response.ok) {
       const message = value?.error?.message || value?.message || response.statusText;
       if (response.status === 401 && route.baseUrl === remoteBaseUrl()) clearRemoteConfig();
-      throw new Error(message);
+      // Marquer le rejet HTTP definitif (4xx/5xx JSON) pour le distinguer d'une
+      // simple coupure de transport : un envoi de chat interrompu apres que le
+      // serveur a deja lance le tour ne doit pas etre traite comme un echec.
+      const rejection = new Error(message) as Error & { httpStatus?: number };
+      rejection.httpStatus = response.status;
+      throw rejection;
     }
     return value as T;
   } catch (error) {

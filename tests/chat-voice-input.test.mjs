@@ -99,15 +99,15 @@ test("les parametres affichent le statut vocal et GPU sans charger le modele", (
   assert.match(styles, /voice-runtime-primary\[data-state="active"\]/);
 });
 
-test("Whisper termine avant le chargement du petit modele Ollama", () => {
+test("Whisper termine avant le nettoyage par le modele Ollama", () => {
   const transcription = backend.indexOf("transcribe_with_local_whisper(");
-  const summarization = backend.indexOf("summarize_with_ollama");
+  const summarization = backend.indexOf("post_process_with_ollama");
   assert.ok(transcription >= 0 && summarization > transcription);
   assert.match(
     backend,
     /DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b-instruct-2507-q4_K_M"/,
   );
-  assert.match(setup, /\[string\]\$WhisperModel = "small-q5_1"/);
+  assert.match(setup, /\[string\]\$WhisperModel = "large-v3-turbo-q5_0"/);
   assert.match(
     setup,
     /\[string\]\$SummaryModel = "qwen3:4b-instruct-2507-q4_K_M"/,

@@ -4,6 +4,8 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$OllamaUrl,
   [string]$TranscriptionModel = "whisper-1",
+  [ValidateSet("auto", "gpu", "cpu")]
+  [string]$TranscriptionAccelerator = "gpu",
   [string]$SummaryModel = "qwen3:4b-instruct-2507-q4_K_M",
   [string]$VoiceHome = "",
   [switch]$FallbackLocal,
@@ -68,6 +70,7 @@ if (Test-Path -LiteralPath $configPath) {
 
 $voiceConfig = [ordered]@{
   transcriptionMode = "remote"
+  transcriptionAccelerator = $TranscriptionAccelerator
   remoteTranscriptionUrl = $TranscriptionUrl
   remoteTranscriptionModel = $TranscriptionModel.Trim()
   remoteFallbackLocal = [bool]$FallbackLocal

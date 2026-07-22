@@ -19,9 +19,16 @@ use std::{
 use uuid::Uuid;
 
 pub const MAX_REQUEST_BYTES: usize = 15 * 1024 * 1024;
+/// Taille maximale d'un fichier envoye depuis l'onglet Transcrire.
+/// Le flux HTTP reste binaire (sans surcout base64) sur le VPS.
+pub const MAX_AUDIO_FILE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_AUDIO_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TRANSCRIPT_CHARS: usize = 32_000;
-const DEFAULT_WHISPER_MODEL: &str = "ggml-small-q5_1.bin";
+const MAX_AUDIO_FILE_TRANSCRIPT_CHARS: usize = 2_000_000;
+const MAX_NORMALIZED_AUDIO_BYTES: u64 = 512 * 1024 * 1024;
+const REMOTE_AUDIO_CHUNK_SECONDS: u64 = 15 * 60;
+const OLLAMA_CHUNK_CHARS: usize = 9_000;
+const DEFAULT_WHISPER_MODEL: &str = "ggml-large-v3-turbo-q5_0.bin";
 const DEFAULT_REMOTE_TRANSCRIPTION_MODEL: &str = "whisper-1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b-instruct-2507-q4_K_M";
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -34,6 +41,8 @@ pub struct VoiceProcessRequest {
     pub mime_type: String,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_output_mode")]
+    pub output_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,6 +51,7 @@ pub struct VoiceProcessResponse {
     pub transcript: String,
     pub summary: String,
     pub summarized: bool,
+    pub output_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
     pub transcription_model: String,
@@ -50,6 +60,25 @@ pub struct VoiceProcessResponse {
     pub summary_provider: String,
     pub transcription_ms: u128,
     pub summary_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioFileTranscriptionResponse {
+    pub text: String,
+    pub file_name: String,
+    pub language: String,
+    pub model: String,
+    pub provider: String,
+    pub accelerator: String,
+    pub output_mode: String,
+    pub post_processed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_processing_model: Option<String>,
+    pub post_processing_ms: u128,
+    pub processing_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +92,8 @@ pub struct VoiceRuntimeStatus {
     pub transcription_model: String,
     pub summary_model: String,
     pub transcription_target: String,
+    pub transcription_accelerator: String,
+    pub transcription_ready: bool,
     pub summary_target: String,
     pub whisper_ready: bool,
     pub ollama_reachable: bool,
@@ -133,6 +164,8 @@ struct VoiceConfig {
     #[serde(default)]
     remote_fallback_local: bool,
     #[serde(default)]
+    transcription_accelerator: Option<String>,
+    #[serde(default)]
     ollama_model: Option<String>,
     #[serde(default)]
     ollama_url: Option<String>,
@@ -142,6 +175,23 @@ struct VoiceConfig {
 enum TranscriptionMode {
     Local,
     Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceOutputMode {
+    Faithful,
+    Clean,
+    Summary,
+}
+
+impl VoiceOutputMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Faithful => "faithful",
+            Self::Clean => "clean",
+            Self::Summary => "summary",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -260,24 +310,222 @@ fn default_language() -> String {
     "fr".to_string()
 }
 
+fn default_output_mode() -> String {
+    "clean".to_string()
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub async fn process_voice_input(
     audio_base64: String,
     mime_type: Option<String>,
     language: Option<String>,
+    output_mode: Option<String>,
 ) -> Result<VoiceProcessResponse, String> {
     process_voice_request(VoiceProcessRequest {
         audio_base64,
         mime_type: mime_type.unwrap_or_else(default_audio_mime_type),
         language: language.unwrap_or_else(default_language),
+        output_mode: output_mode.unwrap_or_else(default_output_mode),
     })
     .await
+}
+
+/// Transcrit un fichier importe depuis l'onglet dedie, puis applique si besoin
+/// le nettoyage ou le compte rendu Ollama choisi par l'utilisateur.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub async fn transcribe_audio_file(
+    audio_base64: String,
+    file_name: String,
+    mime_type: Option<String>,
+    language: Option<String>,
+    output_mode: Option<String>,
+) -> Result<AudioFileTranscriptionResponse, String> {
+    let audio = decode_audio_file_base64(&audio_base64)?;
+    transcribe_audio_file_bytes(
+        audio,
+        file_name,
+        mime_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        language.unwrap_or_else(|| "auto".to_string()),
+        output_mode.unwrap_or_else(default_output_mode),
+    )
+    .await
+}
+
+pub async fn transcribe_audio_file_bytes(
+    audio: Vec<u8>,
+    file_name: String,
+    mime_type: String,
+    language: String,
+    output_mode: String,
+) -> Result<AudioFileTranscriptionResponse, String> {
+    if audio.is_empty() {
+        return Err("Le fichier audio est vide.".to_string());
+    }
+    if audio.len() > MAX_AUDIO_FILE_BYTES {
+        return Err(format!(
+            "Le fichier audio depasse la limite de {} Mo.",
+            MAX_AUDIO_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let language = normalize_language(&language)?;
+    let output_mode = normalize_output_mode(&output_mode)?;
+    let (file_name, mime_type) = normalize_audio_file_metadata(&file_name, &mime_type)?;
+    let voice_home = voice_home()?;
+    let config = load_voice_config(&voice_home)?;
+    let transcription_mode = configured_transcription_mode(&config)?;
+    let mut activity = VoiceActivityGuard::begin();
+    let started = Instant::now();
+
+    let (transcript, model, provider, transcription_warning) = match transcription_mode {
+        TranscriptionMode::Local => {
+            let wav = normalize_uploaded_audio(audio, file_name.clone()).await?;
+            let (text, model) = transcribe_with_local_whisper(
+                wav,
+                language.clone(),
+                &voice_home,
+                config.whisper_model.as_deref(),
+            )
+            .await?;
+            (text, model, "whisper-local".to_string(), None)
+        }
+        TranscriptionMode::Remote => {
+            let endpoint = configured_value(
+                "CST_VOICE_TRANSCRIPTION_URL",
+                config.remote_transcription_url.as_deref(),
+            )
+            .ok_or_else(|| {
+                "Le VPS exige CST_VOICE_TRANSCRIPTION_URL pour transcrire les fichiers.".to_string()
+            })?;
+            let endpoint = validate_remote_url(&endpoint, "URL de transcription")?;
+            let model = configured_value(
+                "CST_VOICE_TRANSCRIPTION_MODEL",
+                config.remote_transcription_model.as_deref(),
+            )
+            .unwrap_or_else(|| DEFAULT_REMOTE_TRANSCRIPTION_MODEL.to_string());
+
+            match transcribe_audio_remote_chunked(
+                &audio, &file_name, &mime_type, &language, &endpoint, &model,
+            )
+            .await
+            {
+                Ok((text, chunk_count)) => (
+                    text,
+                    model,
+                    "openai-compatible-remote".to_string(),
+                    (chunk_count > 1).then(|| {
+                        format!(
+                            "Audio long traite automatiquement en {chunk_count} segments pour eviter les passages manquants."
+                        )
+                    }),
+                ),
+                Err(remote_error) if config.remote_fallback_local => {
+                    let wav = normalize_uploaded_audio(audio, file_name.clone())
+                        .await
+                        .map_err(|local_error| {
+                            format!(
+                                "Transcription distante indisponible ({remote_error}) et conversion locale impossible ({local_error})."
+                            )
+                        })?;
+                    let (text, local_model) = transcribe_with_local_whisper(
+                        wav,
+                        language.clone(),
+                        &voice_home,
+                        config.whisper_model.as_deref(),
+                    )
+                    .await
+                    .map_err(|local_error| {
+                        format!(
+                            "Transcription distante indisponible ({remote_error}) et repli local impossible ({local_error})."
+                        )
+                    })?;
+                    (
+                        text,
+                        local_model,
+                        "whisper-local-fallback".to_string(),
+                        Some(format!(
+                            "Moteur distant indisponible ; transcription locale utilisee : {remote_error}"
+                        )),
+                    )
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
+
+    if transcript.chars().count() > MAX_AUDIO_FILE_TRANSCRIPT_CHARS {
+        return Err(format!(
+            "La transcription depasse la limite de {MAX_AUDIO_FILE_TRANSCRIPT_CHARS} caracteres."
+        ));
+    }
+
+    let summary_model = configured_value("CST_VOICE_OLLAMA_MODEL", config.ollama_model.as_deref())
+        .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
+    let (text, post_processed, post_processing_model, post_processing_ms, processing_warning) =
+        if output_mode == VoiceOutputMode::Faithful {
+            (transcript, false, None, 0, None)
+        } else {
+            let ollama_base_url =
+                configured_value("CST_VOICE_OLLAMA_URL", config.ollama_url.as_deref())
+                    .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+            let ollama_endpoint = ollama_chat_url(&ollama_base_url)?;
+            activity.start_summarizing();
+            let processing_started = Instant::now();
+            match post_process_with_ollama(
+                &transcript,
+                &summary_model,
+                &ollama_endpoint,
+                output_mode,
+            )
+            .await
+            {
+                Ok(text) => (
+                    text,
+                    true,
+                    Some(summary_model),
+                    processing_started.elapsed().as_millis(),
+                    None,
+                ),
+                Err(error) => (
+                    transcript,
+                    false,
+                    None,
+                    processing_started.elapsed().as_millis(),
+                    Some(format!(
+                        "Texte brut conserve car la reformulation locale a echoue : {error}"
+                    )),
+                ),
+            }
+        };
+
+    if text.chars().count() > MAX_AUDIO_FILE_TRANSCRIPT_CHARS {
+        return Err(format!(
+            "Le texte produit depasse la limite de {MAX_AUDIO_FILE_TRANSCRIPT_CHARS} caracteres."
+        ));
+    }
+
+    let accelerator = transcription_accelerator(&config, &provider).await?;
+    Ok(AudioFileTranscriptionResponse {
+        text,
+        file_name,
+        language,
+        model,
+        provider,
+        accelerator,
+        output_mode: output_mode.as_str().to_string(),
+        post_processed,
+        post_processing_model,
+        post_processing_ms,
+        processing_ms: started.elapsed().as_millis(),
+        warning: merge_warnings(transcription_warning, processing_warning),
+    })
 }
 
 pub async fn process_voice_request(
     request: VoiceProcessRequest,
 ) -> Result<VoiceProcessResponse, String> {
     let language = normalize_language(&request.language)?;
+    let output_mode = normalize_output_mode(&request.output_mode)?;
     let audio = decode_wav(&request.audio_base64, &request.mime_type)?;
     let voice_home = voice_home()?;
     let config = load_voice_config(&voice_home)?;
@@ -356,27 +604,39 @@ pub async fn process_voice_request(
 
     let summary_model = configured_value("CST_VOICE_OLLAMA_MODEL", config.ollama_model.as_deref())
         .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
-    let ollama_base_url = configured_value("CST_VOICE_OLLAMA_URL", config.ollama_url.as_deref())
-        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
-    let ollama_endpoint = ollama_chat_url(&ollama_base_url)?;
-    let summary_provider = if is_loopback_url(&ollama_endpoint) {
-        "ollama-local"
+    let (summary, summarized, summary_provider, summary_ms, summary_warning) = if output_mode
+        == VoiceOutputMode::Faithful
+    {
+        (transcript.clone(), false, "disabled".to_string(), 0, None)
     } else {
-        "ollama-remote"
-    }
-    .to_string();
-    activity.start_summarizing();
-    let summary_started = Instant::now();
-    let summary_result = summarize_with_ollama(&transcript, &summary_model, &ollama_endpoint).await;
-    let summary_ms = summary_started.elapsed().as_millis();
-
-    let (summary, summarized, summary_warning) = match summary_result {
-        Ok(summary) => (summary, true, None),
-        Err(error) => (
-            transcript.clone(),
-            false,
-            Some(format!("Transcription inseree sans resume : {error}")),
-        ),
+        let ollama_base_url =
+            configured_value("CST_VOICE_OLLAMA_URL", config.ollama_url.as_deref())
+                .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+        let ollama_endpoint = ollama_chat_url(&ollama_base_url)?;
+        let summary_provider = if is_loopback_url(&ollama_endpoint) {
+            "ollama-local"
+        } else {
+            "ollama-remote"
+        }
+        .to_string();
+        activity.start_summarizing();
+        let summary_started = Instant::now();
+        let summary_result =
+            post_process_with_ollama(&transcript, &summary_model, &ollama_endpoint, output_mode)
+                .await;
+        let summary_ms = summary_started.elapsed().as_millis();
+        match summary_result {
+            Ok(summary) => (summary, true, summary_provider, summary_ms, None),
+            Err(error) => (
+                transcript.clone(),
+                false,
+                summary_provider,
+                summary_ms,
+                Some(format!(
+                    "Transcription inseree sans reformulation : {error}"
+                )),
+            ),
+        }
     };
     let warning = merge_warnings(transcription_warning, summary_warning);
 
@@ -384,6 +644,7 @@ pub async fn process_voice_request(
         transcript,
         summary,
         summarized,
+        output_mode: output_mode.as_str().to_string(),
         warning,
         transcription_model,
         summary_model,
@@ -475,6 +736,12 @@ pub async fn voice_runtime_status() -> Result<VoiceRuntimeStatus, String> {
         Err(error) => (false, false, false, None, Some(error)),
     };
 
+    let status_provider = match transcription_mode {
+        TranscriptionMode::Local => "whisper-local",
+        TranscriptionMode::Remote => "openai-compatible-remote",
+    };
+    let transcription_accelerator = transcription_accelerator(&config, status_provider).await?;
+
     let gpu = tokio::task::spawn_blocking(query_nvidia_gpu)
         .await
         .unwrap_or(None);
@@ -509,6 +776,11 @@ pub async fn voice_runtime_status() -> Result<VoiceRuntimeStatus, String> {
         transcription_model,
         summary_model,
         transcription_target,
+        transcription_accelerator,
+        transcription_ready: match transcription_mode {
+            TranscriptionMode::Local => whisper_ready,
+            TranscriptionMode::Remote => transcription_warning.is_none(),
+        },
         summary_target,
         whisper_ready,
         ollama_reachable,
@@ -629,6 +901,20 @@ fn safe_url_label(url: &Url) -> String {
     safe.to_string()
 }
 
+fn configure_ollama_request(
+    mut request: reqwest::RequestBuilder,
+) -> Result<reqwest::RequestBuilder, String> {
+    if let Some(token) = configured_value("CST_VOICE_OLLAMA_API_KEY", None) {
+        request = request.bearer_auth(token);
+    }
+    if let Some(host) = configured_value("CST_VOICE_OLLAMA_HOST_HEADER", None) {
+        let host = reqwest::header::HeaderValue::from_str(&host)
+            .map_err(|_| "CST_VOICE_OLLAMA_HOST_HEADER est invalide.".to_string())?;
+        request = request.header(reqwest::header::HOST, host);
+    }
+    Ok(request)
+}
+
 fn merge_warnings(first: Option<String>, second: Option<String>) -> Option<String> {
     match (first, second) {
         (Some(first), Some(second)) => Some(format!("{first} {second}")),
@@ -656,10 +942,7 @@ async fn probe_ollama_runtime(
         .redirect(Policy::none())
         .build()
         .map_err(|error| format!("Client de statut Ollama indisponible : {error}"))?;
-    let mut request = client.get(endpoint.clone());
-    if let Some(token) = configured_value("CST_VOICE_OLLAMA_API_KEY", None) {
-        request = request.bearer_auth(token);
-    }
+    let request = configure_ollama_request(client.get(endpoint.clone()))?;
     let label = safe_url_label(endpoint);
     let response = request.send().await.map_err(|error| {
         let error = error.without_url();
@@ -733,6 +1016,224 @@ fn normalize_language(value: &str) -> Result<String, String> {
         Ok(normalized)
     } else {
         Err("Langue de transcription invalide (utilise par exemple fr, en ou auto).".to_string())
+    }
+}
+
+fn normalize_output_mode(value: &str) -> Result<VoiceOutputMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "faithful" | "raw" | "verbatim" => Ok(VoiceOutputMode::Faithful),
+        "clean" | "cleaned" => Ok(VoiceOutputMode::Clean),
+        "summary" | "report" => Ok(VoiceOutputMode::Summary),
+        _ => Err("Mode de texte invalide : utilise faithful, clean ou summary.".to_string()),
+    }
+}
+
+fn decode_audio_file_base64(encoded: &str) -> Result<Vec<u8>, String> {
+    let payload = encoded
+        .rsplit_once(',')
+        .map(|(_, payload)| payload)
+        .unwrap_or(encoded)
+        .trim();
+    let max_encoded_len = MAX_AUDIO_FILE_BYTES.saturating_mul(4) / 3 + 8;
+    if payload.len() > max_encoded_len {
+        return Err(format!(
+            "Le fichier audio depasse la limite de {} Mo.",
+            MAX_AUDIO_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let audio = STANDARD
+        .decode(payload)
+        .map_err(|_| "Fichier audio illisible (base64 invalide).".to_string())?;
+    if audio.len() > MAX_AUDIO_FILE_BYTES {
+        return Err(format!(
+            "Le fichier audio depasse la limite de {} Mo.",
+            MAX_AUDIO_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    Ok(audio)
+}
+
+fn audio_extension_for_mime(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "audio/wav" | "audio/wave" | "audio/x-wav" => Some("wav"),
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        "audio/mp4" | "audio/x-m4a" | "video/mp4" => Some("m4a"),
+        "audio/aac" => Some("aac"),
+        "audio/flac" | "audio/x-flac" => Some("flac"),
+        "audio/ogg" | "application/ogg" => Some("ogg"),
+        "audio/opus" => Some("opus"),
+        "audio/webm" | "video/webm" => Some("webm"),
+        "audio/x-ms-wma" => Some("wma"),
+        "audio/amr" => Some("amr"),
+        "audio/aiff" | "audio/x-aiff" => Some("aiff"),
+        _ => None,
+    }
+}
+
+fn audio_mime_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "wav" => Some("audio/wav"),
+        "mp3" | "mpeg" | "mpga" => Some("audio/mpeg"),
+        "m4a" | "mp4" => Some("audio/mp4"),
+        "aac" => Some("audio/aac"),
+        "flac" => Some("audio/flac"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "opus" => Some("audio/opus"),
+        "webm" => Some("audio/webm"),
+        "wma" => Some("audio/x-ms-wma"),
+        "amr" => Some("audio/amr"),
+        "aif" | "aiff" => Some("audio/aiff"),
+        _ => None,
+    }
+}
+
+fn normalize_audio_file_metadata(
+    file_name: &str,
+    mime_type: &str,
+) -> Result<(String, String), String> {
+    let raw_name = file_name
+        .rsplit(|character| character == '/' || character == '\\')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let mut safe_name = raw_name
+        .chars()
+        .filter(|character| {
+            character.is_alphanumeric()
+                || matches!(character, ' ' | '.' | '-' | '_' | '(' | ')' | '[' | ']')
+        })
+        .take(180)
+        .collect::<String>();
+    while safe_name.starts_with('.') {
+        safe_name.remove(0);
+    }
+
+    let normalized_mime = mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let extension = safe_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .filter(|extension| audio_mime_for_extension(extension).is_some())
+        .or_else(|| audio_extension_for_mime(&normalized_mime).map(str::to_string))
+        .ok_or_else(|| {
+            "Format audio non pris en charge. Utilise WAV, MP3, M4A, AAC, FLAC, OGG, OPUS ou WebM."
+                .to_string()
+        })?;
+
+    if audio_mime_for_extension(
+        safe_name
+            .rsplit_once('.')
+            .map(|(_, value)| value.to_ascii_lowercase())
+            .as_deref()
+            .unwrap_or(""),
+    )
+    .is_none()
+    {
+        safe_name = format!("audio.{extension}");
+    }
+    if safe_name.is_empty() {
+        safe_name = format!("audio.{extension}");
+    }
+
+    let mime_is_supported = normalized_mime.starts_with("audio/")
+        || matches!(
+            normalized_mime.as_str(),
+            "video/mp4" | "video/webm" | "application/ogg" | "application/octet-stream"
+        );
+    let safe_mime = if mime_is_supported && normalized_mime != "application/octet-stream" {
+        normalized_mime
+    } else {
+        audio_mime_for_extension(&extension)
+            .unwrap_or("application/octet-stream")
+            .to_string()
+    };
+    Ok((safe_name, safe_mime))
+}
+
+async fn normalize_uploaded_audio(audio: Vec<u8>, file_name: String) -> Result<Vec<u8>, String> {
+    if audio.len() >= 12 && &audio[0..4] == b"RIFF" && &audio[8..12] == b"WAVE" {
+        return Ok(audio);
+    }
+    tokio::task::spawn_blocking(move || normalize_uploaded_audio_blocking(&audio, &file_name))
+        .await
+        .map_err(|error| format!("Conversion audio interrompue : {error}"))?
+}
+
+fn normalize_uploaded_audio_blocking(audio: &[u8], file_name: &str) -> Result<Vec<u8>, String> {
+    let temp = TempVoiceDir::create()?;
+    let input_path = temp.path().join(file_name);
+    let output_path = temp.path().join("normalized.wav");
+    fs::write(&input_path, audio)
+        .map_err(|error| format!("Ecriture du fichier audio impossible : {error}"))?;
+
+    let ffmpeg = env::var("CST_VOICE_FFMPEG_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let output = Command::new(&ffmpeg)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-c:a")
+        .arg("pcm_s16le")
+        .arg(&output_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            format!(
+                "Impossible de convertir ce format audio avec ffmpeg ({ffmpeg}) : {error}. Installe ffmpeg ou utilise un fichier WAV."
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "Conversion audio impossible. {}",
+            concise_process_error(&output.stderr, &output.stdout)
+        ));
+    }
+    let metadata = fs::metadata(&output_path)
+        .map_err(|error| format!("Lecture du WAV converti impossible : {error}"))?;
+    if metadata.len() > MAX_NORMALIZED_AUDIO_BYTES {
+        return Err("L'audio decode est trop long (maximum conseille : 4 heures).".to_string());
+    }
+    fs::read(&output_path).map_err(|error| format!("Lecture du WAV converti impossible : {error}"))
+}
+
+async fn transcription_accelerator(config: &VoiceConfig, provider: &str) -> Result<String, String> {
+    let preference = configured_value(
+        "CST_VOICE_TRANSCRIPTION_ACCELERATOR",
+        config.transcription_accelerator.as_deref(),
+    )
+    .unwrap_or_else(|| "auto".to_string())
+    .to_ascii_lowercase();
+    match preference.as_str() {
+        "gpu" => Ok("gpu".to_string()),
+        "cpu" => Ok("cpu".to_string()),
+        "auto" if provider.contains("remote") => Ok("distant".to_string()),
+        "auto" => {
+            let gpu = tokio::task::spawn_blocking(query_nvidia_gpu)
+                .await
+                .unwrap_or(None);
+            Ok(if gpu.is_some() { "gpu" } else { "cpu" }.to_string())
+        }
+        _ => Err(
+            "Accelerateur de transcription invalide : utilise auto, gpu ou cpu dans CST_VOICE_TRANSCRIPTION_ACCELERATOR."
+                .to_string(),
+        ),
     }
 }
 
@@ -972,10 +1473,167 @@ async fn transcribe_wav_remote(
     endpoint: &Url,
     model: &str,
 ) -> Result<String, String> {
+    transcribe_audio_remote(
+        audio,
+        "recording.wav",
+        "audio/wav",
+        language,
+        endpoint,
+        model,
+    )
+    .await
+}
+
+async fn transcribe_audio_remote_chunked(
+    audio: &[u8],
+    file_name: &str,
+    mime_type: &str,
+    language: &str,
+    endpoint: &Url,
+    model: &str,
+) -> Result<(String, usize), String> {
+    let owned_audio = audio.to_vec();
+    let owned_name = file_name.to_string();
+    let chunks =
+        tokio::task::spawn_blocking(move || split_long_audio_blocking(&owned_audio, &owned_name))
+            .await
+            .map_err(|error| format!("Decoupage audio interrompu : {error}"))??;
+
+    let Some(chunks) = chunks else {
+        let text =
+            transcribe_audio_remote(audio, file_name, mime_type, language, endpoint, model).await?;
+        return Ok((text, 1));
+    };
+
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("audio");
+    let chunk_count = chunks.len();
+    let mut transcripts = Vec::with_capacity(chunk_count);
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let chunk_name = format!("{stem}-partie-{:03}.wav", index + 1);
+        let text =
+            transcribe_audio_remote(&chunk, &chunk_name, "audio/wav", language, endpoint, model)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "La partie {} sur {chunk_count} n'a pas pu etre transcrite : {error}",
+                        index + 1
+                    )
+                })?;
+        transcripts.push(text);
+    }
+    Ok((transcripts.join("\n\n"), chunk_count))
+}
+
+fn split_long_audio_blocking(
+    audio: &[u8],
+    file_name: &str,
+) -> Result<Option<Vec<Vec<u8>>>, String> {
+    let temp = TempVoiceDir::create()?;
+    let input_path = temp.path().join(file_name);
+    fs::write(&input_path, audio)
+        .map_err(|error| format!("Ecriture du fichier audio impossible : {error}"))?;
+
+    let ffmpeg = env::var("CST_VOICE_FFMPEG_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ffmpeg".to_string());
+    let ffprobe = env::var("CST_VOICE_FFPROBE_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "ffprobe".to_string());
+    let probe = match Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&input_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+    if !probe.status.success() {
+        return Ok(None);
+    }
+    let duration = String::from_utf8_lossy(&probe.stdout)
+        .trim()
+        .parse::<f64>()
+        .unwrap_or_default();
+    if !duration.is_finite() || duration <= REMOTE_AUDIO_CHUNK_SECONDS as f64 {
+        return Ok(None);
+    }
+
+    let chunk_count = (duration / REMOTE_AUDIO_CHUNK_SECONDS as f64).ceil() as usize;
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for index in 0..chunk_count {
+        let start = index as u64 * REMOTE_AUDIO_CHUNK_SECONDS;
+        let output_path = temp.path().join(format!("chunk-{index:03}.wav"));
+        let output = Command::new(&ffmpeg)
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-ss")
+            .arg(start.to_string())
+            .arg("-i")
+            .arg(&input_path)
+            .arg("-t")
+            .arg(REMOTE_AUDIO_CHUNK_SECONDS.to_string())
+            .arg("-vn")
+            .arg("-ac")
+            .arg("1")
+            .arg("-ar")
+            .arg("16000")
+            .arg("-c:a")
+            .arg("pcm_s16le")
+            .arg(&output_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("Impossible de decouper l'audio avec ffmpeg : {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Decoupage audio impossible. {}",
+                concise_process_error(&output.stderr, &output.stdout)
+            ));
+        }
+        let chunk = fs::read(&output_path)
+            .map_err(|error| format!("Lecture d'un segment audio impossible : {error}"))?;
+        if chunk.len() > 44 {
+            chunks.push(chunk);
+        }
+    }
+    if chunks.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(chunks))
+}
+
+async fn transcribe_audio_remote(
+    audio: &[u8],
+    file_name: &str,
+    mime_type: &str,
+    language: &str,
+    endpoint: &Url,
+    model: &str,
+) -> Result<String, String> {
     let audio_part = multipart::Part::bytes(audio.to_vec())
-        .file_name("recording.wav")
-        .mime_str("audio/wav")
-        .map_err(|error| format!("Preparation du WAV distant impossible : {error}"))?;
+        .file_name(file_name.to_string())
+        .mime_str(mime_type)
+        .map_err(|error| format!("Preparation du fichier audio distant impossible : {error}"))?;
     let mut form = multipart::Form::new()
         .part("file", audio_part)
         .text("model", model.to_string())
@@ -1037,40 +1695,124 @@ fn concise_process_error(stderr: &[u8], stdout: &[u8]) -> String {
     tail.trim().replace(['\r', '\n'], " ")
 }
 
-async fn summarize_with_ollama(
+async fn post_process_with_ollama(
     transcript: &str,
     model: &str,
     endpoint: &Url,
+    output_mode: VoiceOutputMode,
 ) -> Result<String, String> {
+    if output_mode == VoiceOutputMode::Faithful {
+        return Ok(transcript.trim().to_string());
+    }
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(300))
         .redirect(Policy::none())
         .build()
         .map_err(|error| format!("Client Ollama indisponible : {error}"))?;
-    let mut request = client.post(endpoint.clone()).json(&json!({
-            "model": model,
-            "stream": false,
-            "think": false,
-            "keep_alive": "10m",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Tu reformules une dictee en message clair pret a envoyer a un assistant de programmation. Conserve toutes les demandes, contraintes, negations, noms de fichiers, chemins, commandes, nombres et exemples. Supprime seulement les hesitations, mots de remplissage et repetitions. N'invente rien et ne reponds pas a la demande. Garde la langue de la dictee. Retourne uniquement le message final, sans titre ni commentaire."
-                },
-                {
-                    "role": "user",
-                    "content": transcript
-                }
-            ],
-            "options": {
-                "temperature": 0.1,
-                "num_ctx": 4096,
-                "num_predict": 768
-            }
-        }));
-    if let Some(token) = configured_value("CST_VOICE_OLLAMA_API_KEY", None) {
-        request = request.bearer_auth(token);
+
+    let chunks = split_transcript_for_ollama(transcript, OLLAMA_CHUNK_CHARS);
+    let mut outputs = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        let prompt = match output_mode {
+            VoiceOutputMode::Clean => "Nettoie cette transcription sans la resumer. Supprime uniquement les hesitations (par exemple euh, hum), tics de langage, repetitions accidentelles et faux departs. Retablis une ponctuation et des paragraphes naturels. Conserve absolument toutes les informations utiles, demandes, contraintes, negations, noms propres, noms de fichiers, chemins, commandes, nombres, dates, exemples et nuances. Ne reponds pas au contenu, n'ajoute rien et garde sa langue. Retourne uniquement le texte nettoye.",
+            VoiceOutputMode::Summary => "Transforme cette partie de transcription en compte rendu clair et concis. Supprime les hesitations, repetitions, digressions sans consequence et faux departs. Conserve les faits, decisions, actions, responsables, objections, incertitudes, dates, nombres, noms propres et details techniques utiles. Structure avec de courts paragraphes ou listes si cela aide. N'invente rien, ne reponds pas au contenu et garde sa langue. Retourne uniquement le compte rendu.",
+            VoiceOutputMode::Faithful => unreachable!(),
+        };
+        let num_predict = match output_mode {
+            VoiceOutputMode::Clean => (chunk.chars().count() / 2 + 256).clamp(768, 4_096),
+            VoiceOutputMode::Summary => 1_536,
+            VoiceOutputMode::Faithful => unreachable!(),
+        };
+        let output =
+            ollama_rewrite_once(&client, chunk, model, endpoint, prompt, 8_192, num_predict)
+                .await
+                .map_err(|error| {
+                    if chunks.len() > 1 {
+                        format!(
+                            "Traitement du bloc {} sur {} impossible : {error}",
+                            index + 1,
+                            chunks.len()
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+        outputs.push(output);
     }
+
+    if output_mode == VoiceOutputMode::Summary && outputs.len() > 1 {
+        let intermediate = outputs.join("\n\n");
+        return ollama_rewrite_once(
+            &client,
+            &intermediate,
+            model,
+            endpoint,
+            "Fusionne ces comptes rendus partiels en un seul compte rendu coherent, concis et bien structure. Elimine les doublons mais conserve tous les faits, decisions, actions, responsables, objections, incertitudes, dates, nombres, noms propres et details techniques utiles. Respecte l'ordre logique ou chronologique. N'invente rien et retourne uniquement le compte rendu final.",
+            16_384,
+            2_048,
+        )
+        .await;
+    }
+
+    Ok(outputs.join("\n\n"))
+}
+
+fn split_transcript_for_ollama(transcript: &str, max_chars: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for word in transcript.split_whitespace() {
+        let separator = usize::from(!current.is_empty());
+        if !current.is_empty()
+            && current.chars().count() + separator + word.chars().count() > max_chars
+        {
+            chunks.push(current);
+            current = String::new();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+async fn ollama_rewrite_once(
+    client: &reqwest::Client,
+    text: &str,
+    model: &str,
+    endpoint: &Url,
+    system_prompt: &str,
+    num_ctx: usize,
+    num_predict: usize,
+) -> Result<String, String> {
+    let request = client.post(endpoint.clone()).json(&json!({
+        "model": model,
+        "stream": false,
+        "think": false,
+        "keep_alive": "10m",
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": text
+            }
+        ],
+        "options": {
+            "temperature": 0.1,
+            "num_ctx": num_ctx,
+            "num_predict": num_predict
+        }
+    }));
+    let request = configure_ollama_request(request)?;
     let label = safe_url_label(endpoint);
     let response = request.send().await.map_err(|error| {
         let error = error.without_url();
@@ -1108,11 +1850,11 @@ async fn summarize_with_ollama(
         .json::<OllamaChatResponse>()
         .await
         .map_err(|error| format!("Reponse Ollama illisible : {error}"))?;
-    let summary = strip_thinking(&payload.message.content);
-    if summary.is_empty() {
-        return Err("Ollama a renvoye un resume vide.".to_string());
+    let rewritten = strip_thinking(&payload.message.content);
+    if rewritten.is_empty() {
+        return Err("Ollama a renvoye un texte vide.".to_string());
     }
-    Ok(summary)
+    Ok(rewritten)
 }
 
 fn strip_thinking(value: &str) -> String {
@@ -1137,10 +1879,63 @@ mod tests {
     }
 
     #[test]
+    fn output_modes_default_to_clean_and_reject_unknown_values() {
+        assert_eq!(default_output_mode(), "clean");
+        assert_eq!(
+            normalize_output_mode("faithful").unwrap(),
+            VoiceOutputMode::Faithful
+        );
+        assert_eq!(
+            normalize_output_mode(" CLEAN ").unwrap(),
+            VoiceOutputMode::Clean
+        );
+        assert_eq!(
+            normalize_output_mode("summary").unwrap(),
+            VoiceOutputMode::Summary
+        );
+        assert!(normalize_output_mode("aggressive").is_err());
+    }
+
+    #[test]
+    fn long_transcripts_are_split_without_losing_words() {
+        let transcript = (0..120)
+            .map(|index| format!("mot-{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let chunks = split_transcript_for_ollama(&transcript, 90);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 90));
+        assert_eq!(chunks.join(" "), transcript);
+    }
+
+    #[test]
     fn wav_validation_rejects_non_audio_content() {
         let encoded = STANDARD.encode(b"not a wav file");
         assert!(decode_wav(&encoded, "audio/wav").is_err());
         assert!(decode_wav(&encoded, "audio/webm").is_err());
+    }
+
+    #[test]
+    fn uploaded_audio_metadata_accepts_common_formats_and_removes_paths() {
+        assert_eq!(
+            normalize_audio_file_metadata("../../reunion finale.MP3", "audio/mpeg; charset=utf-8")
+                .unwrap(),
+            ("reunion finale.MP3".to_string(), "audio/mpeg".to_string())
+        );
+        assert_eq!(
+            normalize_audio_file_metadata("sans-extension", "audio/x-m4a").unwrap(),
+            ("audio.m4a".to_string(), "audio/x-m4a".to_string())
+        );
+        assert!(normalize_audio_file_metadata("notes.txt", "text/plain").is_err());
+    }
+
+    #[test]
+    fn uploaded_audio_base64_is_bounded_and_validated() {
+        assert_eq!(
+            decode_audio_file_base64(&STANDARD.encode(b"audio")).unwrap(),
+            b"audio"
+        );
+        assert!(decode_audio_file_base64("pas du base64").is_err());
     }
 
     #[test]

@@ -76,6 +76,73 @@
         enabled: true
         state: started
 
+    - name: Valider la machine GPU demandee
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture == "x86_64"
+        fail_msg: >-
+          La transcription CUDA integree exige actuellement un VPS Linux x86_64.
+      when: cst_gpu_transcription | default(false) | bool
+
+    - name: Verifier le pilote NVIDIA du VPS
+      ansible.builtin.command: nvidia-smi
+      changed_when: false
+      when: cst_gpu_transcription | default(false) | bool
+
+    - name: Installer la cle du NVIDIA Container Toolkit
+      ansible.builtin.get_url:
+        url: https://nvidia.github.io/libnvidia-container/gpgkey
+        dest: /etc/apt/keyrings/nvidia-container-toolkit.asc
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+      when: cst_gpu_transcription | default(false) | bool
+
+    - name: Configurer le depot NVIDIA Container Toolkit
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit.asc]
+          https://nvidia.github.io/libnvidia-container/stable/deb/{{ docker_dpkg_arch.stdout }} /
+        filename: nvidia-container-toolkit
+        state: present
+        update_cache: true
+      when: cst_gpu_transcription | default(false) | bool
+
+    - name: Installer le NVIDIA Container Toolkit
+      ansible.builtin.apt:
+        name: nvidia-container-toolkit
+        state: present
+      when: cst_gpu_transcription | default(false) | bool
+
+    - name: Declarer le runtime NVIDIA dans Docker
+      ansible.builtin.command:
+        argv: [nvidia-ctk, runtime, configure, --runtime=docker]
+      register: cst_nvidia_runtime
+      changed_when: >-
+        'Wrote updated config' in cst_nvidia_runtime.stdout
+        or 'Wrote updated config' in cst_nvidia_runtime.stderr
+      when: cst_gpu_transcription | default(false) | bool
+
+    - name: Redemarrer Docker avec le runtime NVIDIA
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+      when: cst_gpu_transcription | default(false) | bool
+
+    - name: Tester CUDA depuis un conteneur
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --gpus
+          - all
+          - nvidia/cuda:12.6.3-base-ubuntu24.04
+          - nvidia-smi
+      changed_when: false
+      when: cst_gpu_transcription | default(false) | bool
+
     - name: Creer les dossiers persistants
       ansible.builtin.file:
         path: "{{ item.path }}"

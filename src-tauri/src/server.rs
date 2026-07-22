@@ -57,7 +57,10 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, Path as AxumPath, Query, Request, State,
     },
-    http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -1004,6 +1007,7 @@ pub async fn run_from_env() -> Result<(), String> {
     let settings = settings::load_settings_for_terminal()?;
     let pool_manager = Arc::new(PoolManager::build(&settings)?);
     let chat = ChatTurnManager::default();
+    crate::chat::start_orphan_chat_image_sweeper();
     let user_auth = AuthManager::load(config.data_dir.clone(), &config.public_base_url)?
         .with_runtime_sync(chat.runtime_sync());
     let autonomous =
@@ -1116,6 +1120,11 @@ pub async fn run_from_env() -> Result<(), String> {
             post(api_process_voice).layer(DefaultBodyLimit::max(voice::MAX_REQUEST_BYTES)),
         )
         .route("/voice/status", get(api_voice_runtime_status))
+        .route(
+            "/transcriptions",
+            post(api_transcribe_audio_file)
+                .layer(DefaultBodyLimit::max(voice::MAX_AUDIO_FILE_BYTES)),
+        )
         .route(
             "/creative/accounts",
             get(api_creative_accounts)
@@ -3339,6 +3348,59 @@ async fn api_voice_runtime_status(
         return response;
     }
     match voice::voice_runtime_status().await {
+        Ok(value) => json_response(value),
+        Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioTranscriptionQuery {
+    #[serde(default)]
+    file_name: String,
+    #[serde(default = "default_transcription_language")]
+    language: String,
+    #[serde(default = "default_transcription_output_mode")]
+    output_mode: String,
+}
+
+fn default_transcription_language() -> String {
+    "auto".to_string()
+}
+
+fn default_transcription_output_mode() -> String {
+    "clean".to_string()
+}
+
+async fn api_transcribe_audio_file(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<AudioTranscriptionQuery>,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = check_admin_header(&state, &headers) {
+        return response;
+    }
+    let mime_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let file_name = if query.file_name.trim().is_empty() {
+        "audio.bin".to_string()
+    } else {
+        query.file_name
+    };
+
+    match voice::transcribe_audio_file_bytes(
+        body.to_vec(),
+        file_name,
+        mime_type,
+        query.language,
+        query.output_mode,
+    )
+    .await
+    {
         Ok(value) => json_response(value),
         Err(error) => api_error(StatusCode::BAD_GATEWAY, &error, &state.config),
     }

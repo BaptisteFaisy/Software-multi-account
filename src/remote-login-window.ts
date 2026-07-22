@@ -6,7 +6,7 @@ type RemoteLoginPhase = "preparing" | "ready" | "success" | "error";
 type RemoteLoginWindowState = {
   accountId: string;
   accountLabel: string;
-  popup: Window;
+  popup: Window | null;
   output: string;
   phase: RemoteLoginPhase;
   userCode: string | null;
@@ -120,7 +120,7 @@ const copyDeviceCode = (userCode: string) => {
 const renderReady = (state: RemoteLoginWindowState) => {
   if (!state.userCode) return;
   copyDeviceCode(state.userCode);
-  state.popup.focus();
+  state.popup?.focus();
 };
 
 const renderTerminalState = (
@@ -172,7 +172,7 @@ export const openRemoteCodexLoginWindow = (
   }
   if (previous) {
     try {
-      previous.popup.close();
+      previous.popup?.close();
     } catch {
       // Rien a nettoyer si le navigateur a deja detruit la fenetre.
     }
@@ -199,10 +199,35 @@ export const openRemoteCodexLoginWindow = (
   return true;
 };
 
+// Les liens de la page Comptes ouvrent OpenAI nativement avec target="_blank".
+// Ils n'exposent pas de WindowProxy, mais le suivi du device-auth doit quand
+// meme rester actif pour copier le code et fermer le terminal apres validation.
+export const prepareRemoteCodexLoginTab = (
+  accountId: string,
+  accountLabel: string,
+): boolean => {
+  const previous = remoteLoginWindows.get(accountId);
+  if (previous?.phase === "preparing" || previous?.phase === "ready") {
+    if (previous.userCode) copyDeviceCode(previous.userCode);
+    return true;
+  }
+  remoteLoginWindows.set(accountId, {
+    accountId,
+    accountLabel,
+    popup: null,
+    output: "",
+    phase: "preparing",
+    userCode: null,
+    verificationUrl: CODEX_DEVICE_VERIFICATION_URL,
+  });
+  return true;
+};
+
 export const remoteCodexLoginWindowIsOpen = (accountId: string): boolean => {
   const state = remoteLoginWindows.get(accountId);
-  if (!state || !popupIsUsable(state.popup)) {
-    if (state) remoteLoginWindows.delete(accountId);
+  if (!state) return false;
+  if (state.popup && !popupIsUsable(state.popup)) {
+    remoteLoginWindows.delete(accountId);
     return false;
   }
   return state.phase === "preparing" || state.phase === "ready";
@@ -210,8 +235,40 @@ export const remoteCodexLoginWindowIsOpen = (accountId: string): boolean => {
 
 export const remoteCodexLoginWindowNeedsCode = (accountId: string): boolean => {
   const state = remoteLoginWindows.get(accountId);
-  if (!state || !popupIsUsable(state.popup)) return false;
+  if (!state || (state.popup && !popupIsUsable(state.popup))) return false;
   return state.phase === "preparing";
+};
+
+export type RemoteCodexLoginPanel = {
+  phase: "preparing" | "ready";
+  userCode: string | null;
+  verificationUrl: string;
+};
+
+// La page Comptes affiche un encadre permanent avec le code appareil tant que la
+// connexion Codex est en cours. Contrairement au toast de statut, il ne disparait
+// pas : l'utilisateur doit pouvoir relire puis recopier ce code a tout moment
+// pour le saisir sur la page OpenAI.
+export const remoteCodexLoginPanel = (
+  accountId: string,
+): RemoteCodexLoginPanel | null => {
+  const state = remoteLoginWindows.get(accountId);
+  if (!state || (state.popup && !popupIsUsable(state.popup))) return null;
+  if (state.phase !== "preparing" && state.phase !== "ready") return null;
+  return {
+    phase: state.phase,
+    userCode: state.userCode,
+    verificationUrl: state.verificationUrl ?? CODEX_DEVICE_VERIFICATION_URL,
+  };
+};
+
+// Recopie le code courant a la demande (bouton « Copier »). L'auto-copie initiale
+// peut avoir ete perdue si l'utilisateur a copie autre chose entre-temps.
+export const copyRemoteCodexLoginCode = (accountId: string): string | null => {
+  const state = remoteLoginWindows.get(accountId);
+  if (!state?.userCode) return null;
+  copyDeviceCode(state.userCode);
+  return state.userCode;
 };
 
 export const focusRemoteCodexLoginWindow = (accountId: string): boolean => {
@@ -226,7 +283,7 @@ export const consumeRemoteCodexLoginOutput = (
   chunk: string,
 ): RemoteLoginWindowUpdate => {
   const state = remoteLoginWindows.get(accountId);
-  if (!state || !popupIsUsable(state.popup)) return { type: "none" };
+  if (!state || (state.popup && !popupIsUsable(state.popup))) return { type: "none" };
   state.output = `${state.output}${chunk}`.slice(-LOGIN_OUTPUT_LIMIT);
   const parsed = parseRemoteCodexLoginOutput(state.output);
 
@@ -235,7 +292,7 @@ export const consumeRemoteCodexLoginOutput = (
     renderTerminalState(state, "success", "Votre compte est maintenant enregistré sur le VPS.");
     window.setTimeout(() => {
       try {
-        state.popup.close();
+        state.popup?.close();
       } catch {
         // La page OpenAI peut deja avoir ferme sa fenetre.
       }

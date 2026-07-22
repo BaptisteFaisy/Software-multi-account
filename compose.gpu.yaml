@@ -1,0 +1,42 @@
+name: codex-switch-terminal
+
+# Extension GPU de compose.yaml. Le moteur n'est jamais publie sur l'hote :
+# seul cst-server peut lui transmettre les fichiers audio.
+services:
+  cst:
+    environment:
+      CST_VOICE_TRANSCRIPTION_MODE: remote
+      CST_VOICE_TRANSCRIPTION_URL: http://speaches:8000/v1/audio/transcriptions
+      CST_VOICE_TRANSCRIPTION_MODEL: ${CST_TRANSCRIPTION_MODEL:-Systran/faster-whisper-small}
+      CST_VOICE_TRANSCRIPTION_ACCELERATOR: gpu
+      CST_VOICE_ALLOW_INSECURE_REMOTE: "1"
+    depends_on:
+      speaches:
+        condition: service_healthy
+
+  speaches:
+    image: ${CST_SPEACHES_IMAGE:-ghcr.io/speaches-ai/speaches:latest-cuda-12.6.3}
+    restart: unless-stopped
+    init: true
+    expose:
+      - "8000"
+    volumes:
+      - speaches-models:/home/ubuntu/.cache/huggingface/hub
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  speaches-models:

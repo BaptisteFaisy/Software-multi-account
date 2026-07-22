@@ -270,14 +270,16 @@ const jsonFor = (path) => {
   if (path.includes("doctolib")) return { state: "demo", proposals: [] };
   if (path.includes("voice") || path.includes("gpu")) {
     return {
-      mode: "local",
-      state: "unavailable",
+      mode: "remote",
+      state: "ready",
       stage: "idle",
-      transcriptionModel: "whisper",
+      transcriptionModel: "Systran/faster-whisper-small",
       summaryModel: "llama",
-      transcriptionTarget: "local",
+      transcriptionTarget: "remote",
       summaryTarget: "unknown",
-      whisperReady: false,
+      transcriptionAccelerator: "gpu",
+      transcriptionReady: true,
+      whisperReady: true,
       ollamaReachable: false,
       summaryModelLoaded: false,
       summaryModelOnGpu: false,
@@ -1106,6 +1108,7 @@ try {
     ["#dashboardToggle", "dashboard"],
     ["#limitsToggle", "limits"],
     ["#promptsToggle", "prompts"],
+    ["#transcriptionToggle", "transcription"],
     ["#skillsToggle", "skills"],
     ["#settingsToggle", "settings"],
     ["#designToggle", "design"],
@@ -1120,6 +1123,7 @@ try {
         ["#tasksToggle", "tasks"],
         ["#scheduledChatToggle", "scheduled-chat"],
         ["#promptsToggle", "prompts"],
+        ["#transcriptionToggle", "transcription"],
         ["#autonomousToggle", "autonomous"],
         ["#designToggle", "design"],
         ["#videoToggle", "video"],
@@ -1160,6 +1164,14 @@ try {
   }
 
   if (navigationOnly) {
+    const screenshotDir = process.env.CST_SMOKE_SCREENSHOT_DIR?.trim();
+    if (screenshotDir && navigationTarget) {
+      mkdirSync(screenshotDir, { recursive: true });
+      await page.screenshot({ path: `${screenshotDir}/${navigationTarget}-1440.png` });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.waitForTimeout(200);
+      await page.screenshot({ path: `${screenshotDir}/${navigationTarget}-390.png` });
+    }
     const duplicateIds = await page.evaluate(() => {
       const counts = new Map();
       for (const element of document.querySelectorAll("[id]")) {

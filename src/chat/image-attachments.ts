@@ -1,6 +1,6 @@
 export const MAX_CHAT_IMAGE_ATTACHMENTS = 4;
-export const MAX_CHAT_IMAGE_BYTES = 8 * 1024 * 1024;
-export const MAX_CHAT_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
+export const MAX_CHAT_IMAGE_BYTES = 100 * 1024 * 1024;
+export const MAX_CHAT_IMAGE_TOTAL_BYTES = 100 * 1024 * 1024;
 
 export type ChatImageMimeType = "image/png" | "image/jpeg" | "image/webp";
 
@@ -83,12 +83,12 @@ export const readChatImageAttachments = async (
     }
     if (!file.size) throw new Error("L'image collee est vide.");
     if (file.size > MAX_CHAT_IMAGE_BYTES) {
-      throw new Error("Chaque image doit peser 8 Mo ou moins.");
+      throw new Error("Chaque image doit peser 100 Mo ou moins.");
     }
     selectedBytes += file.size;
   }
   if (existingBytes + selectedBytes > MAX_CHAT_IMAGE_TOTAL_BYTES) {
-    throw new Error("Les images d'un message ne peuvent pas depasser 20 Mo au total.");
+    throw new Error("Les images d'un message ne peuvent pas depasser 100 Mo au total.");
   }
 
   const attachments: ChatImageAttachment[] = [];
