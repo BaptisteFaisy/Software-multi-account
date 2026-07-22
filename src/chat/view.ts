@@ -121,6 +121,12 @@ export type ChatPanelModel = {
   thoughts: ChatThought[];
   parts: ChatPart[];
   turnStatus: ChatTurnStatus;
+  /** Statut du tour tel que reporte par le serveur pour cette discussion, quand
+   *  il differe du tour local. `pane.turn` repasse a null a chaque changement de
+   *  discussion et la reconciliation peut tarder : sans ce repli, le badge du
+   *  panneau afficherait « Disponible » alors que le tour tourne encore cote
+   *  serveur (le bandeau lateral, lui, consulte deja le tour serveur). */
+  serverTurnStatus?: ChatTurnStatus | null;
   turnStartedAt: number | null;
   turnFinishedAt: number | null;
   turnError: string | null;
@@ -693,7 +699,16 @@ const renderLegacyChatRuntimeStatus = (model: ChatPanelModel): string => {
 
 export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
   const waitingForUser = model.waitingForUser;
-  const showStateLabel = chatRuntimeShowsStateLabel(model.turnStatus, waitingForUser);
+  // Replie sur le tour serveur quand le tour local est absent/stale, pour ne pas
+  // afficher un runtime « au repos » alors que le serveur execute encore le tour.
+  const serverBusy =
+    model.serverTurnStatus === "running" || model.serverTurnStatus === "finalizing";
+  const effectiveStatus: ChatTurnStatus = chatTurnIsBusy(model.turnStatus)
+    ? model.turnStatus
+    : serverBusy
+      ? (model.serverTurnStatus as ChatTurnStatus)
+      : model.turnStatus;
+  const showStateLabel = chatRuntimeShowsStateLabel(effectiveStatus, waitingForUser);
   const runningActivity = [...model.activities]
     .reverse()
     .find((activity) => activity.status === "running" || activity.status === "queued");
@@ -714,15 +729,15 @@ export const renderChatRuntimeStatus = (model: ChatPanelModel): string => {
 
   let stateLabel: string | null = null;
   if (waitingForUser) stateLabel = "Question";
-  else if (model.turnStatus === "running") {
+  else if (effectiveStatus === "running") {
     stateLabel = latestPart?.title || runningActivity?.label || "Thinking";
-  } else if (model.turnStatus === "finalizing") {
+  } else if (effectiveStatus === "finalizing") {
     stateLabel = "Réponse terminée, synchronisation en cours";
   }
-  else if (model.turnStatus === "failed") stateLabel = "Echec";
-  else if (model.turnStatus === "cancelled") stateLabel = "Arrete";
+  else if (effectiveStatus === "failed") stateLabel = "Echec";
+  else if (effectiveStatus === "cancelled") stateLabel = "Arrete";
 
-  return `<div data-chat-control="runtime" class="chat-runtime-inline chat-runtime-inline--${waitingForUser ? "waiting" : escapeHtml(model.turnStatus)}" aria-live="polite">
+  return `<div data-chat-control="runtime" class="chat-runtime-inline chat-runtime-inline--${waitingForUser ? "waiting" : escapeHtml(effectiveStatus)}" aria-live="polite">
     ${showStateLabel && stateLabel ? `<span class="chat-runtime-state" title="${escapeHtml(stateLabel)}">
       <span class="chat-runtime-dot" aria-hidden="true"></span>
       <span>${escapeHtml(stateLabel)}</span>
@@ -746,9 +761,11 @@ export const renderChatTurnParts = (
 ): string => renderOpenCodeParts(parts, providerLabel, 0, startedAt, finishedAt);
 
 export const renderChatTurnStatus = (model: ChatPanelModel): string => {
+  const serverBusy =
+    model.serverTurnStatus === "running" || model.serverTurnStatus === "finalizing";
   const state = model.waitingForUser
     ? "question"
-    : chatTurnIsBusy(model.turnStatus)
+    : chatTurnIsBusy(model.turnStatus) || serverBusy
       ? "running"
       : "idle";
   const label = state === "question" ? "Question" : state === "running" ? "En cours" : "Disponible";

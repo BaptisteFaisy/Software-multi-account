@@ -182,6 +182,24 @@ test("le chat expose le chronometre, le quota et la reponse classique", () => {
   assert.match(main, /reconcileChatMessages\(/);
 });
 
+test("le badge du panneau reflete le tour serveur quand pane.turn est stale (plus de « Disponible » a tort)", () => {
+  // Le modele du panneau resout le tour serveur comme le bandeau lateral...
+  assert.match(
+    main,
+    /const paneServerTurn\s*=\s*activeChatTurnForDiscussion\(activeChatTurns, discussion\)\s*\?\?\s*activeChatTurnBySourceKey\(activeChatTurns, pane\)/,
+  );
+  assert.match(main, /serverTurnStatus: paneServerTurn\?\.status \?\? null/);
+  assert.match(main, /paneLocalWaitsForUser \|\| paneServerWaitsForUser/);
+  // ...et le rendu du panneau traite le tour comme « En cours » des que le
+  // serveur l'execute, meme sans tour local (badge plus jamais « Disponible »
+  // a tort pendant qu'un tour tourne).
+  assert.match(
+    view,
+    /model\.serverTurnStatus === "running" \|\| model\.serverTurnStatus === "finalizing"/,
+  );
+  assert.match(view, /chatTurnIsBusy\(model\.turnStatus\) \|\| serverBusy/);
+});
+
 test("le bandeau et la colonne de gauche portent les statuts du chat", () => {
   assert.match(view, /data-chat-control="turn-status"/);
   assert.match(view, /"En cours" : "Disponible"/);

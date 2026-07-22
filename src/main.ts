@@ -9666,6 +9666,21 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
         requestedTargetLabel ? `Cible ${requestedTargetLabel}` : "Cible automatique",
         workspace ? displayProjectDir(workspace) : "Environnement a choisir",
       ];
+  // Tour serveur de cette discussion (meme resolution que le bandeau lateral).
+  // pane.turn repasse a null a chaque changement de discussion et la
+  // reconciliation peut tarder : sans ce repli, le badge du panneau afficherait
+  // « Disponible » alors que le tour tourne encore cote serveur.
+  const paneServerTurn =
+    activeChatTurnForDiscussion(activeChatTurns, discussion)
+    ?? activeChatTurnBySourceKey(activeChatTurns, pane);
+  const paneLocalWaitsForUser = conversationWaitsForUser(
+    pane.messages,
+    pane.turn?.parts ?? [],
+  );
+  const paneServerWaitsForUser =
+    !!paneServerTurn
+    && (!pane.turn || paneServerTurn.id !== pane.turn.id || chatTurnIsBusy(pane.turn.status))
+    && paneServerTurn.waitingForUser;
   return {
     title:
       pane.orchestrationRole === "orchestrator"
@@ -9692,6 +9707,7 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     thoughts: pane.turn?.thoughts ?? [],
     parts: pane.turn?.parts ?? [],
     turnStatus: pane.turn?.status ?? "idle",
+    serverTurnStatus: paneServerTurn?.status ?? null,
     turnStartedAt: pane.turn?.startedAt ?? null,
     turnFinishedAt: pane.turn?.finishedAt ?? null,
     turnError: modelCapacityTurnError(
@@ -9700,7 +9716,7 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
       pane.capacityRetryAttempt,
       pane.capacityRetryTimer !== null,
     ),
-    waitingForUser: conversationWaitsForUser(pane.messages, pane.turn?.parts ?? []),
+    waitingForUser: paneLocalWaitsForUser || paneServerWaitsForUser,
     turnStatusDisplayMode: chatTurnStatusDisplayMode,
     quotaStatus: chatQuotaStatusFor(account),
     quotaSuggestion: managedByOrchestration ? null : quotaSuggestionFor(pane.turn, discussion),

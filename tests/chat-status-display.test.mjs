@@ -45,7 +45,9 @@ test("les etats passifs redondants disparaissent du runtime", () => {
   assert.equal(chatRuntimeShowsStateLabel("failed", false), true);
   assert.equal(chatRuntimeShowsStateLabel("cancelled", false), true);
   assert.equal(chatRuntimeShowsStateLabel("completed", true), true);
-  assert.match(view, /chatRuntimeShowsStateLabel\(model\.turnStatus, waitingForUser\)/);
+  // Le statut effectif replie sur le tour serveur quand le tour local est stale,
+  // pour ne pas masquer un tour encore en cours (badge « Disponible » a tort).
+  assert.match(view, /chatRuntimeShowsStateLabel\(effectiveStatus, waitingForUser\)/);
   assert.match(view, /showStateLabel && stateLabel/);
   assert.doesNotMatch(view, /turnStatus === "completed"\) stateLabel = "Termine"/);
 });
