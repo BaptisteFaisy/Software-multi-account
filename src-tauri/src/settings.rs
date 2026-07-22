@@ -260,6 +260,13 @@ pub struct AppSettings {
     /// recreer automatiquement ; une ouverture explicite retire le tombstone.
     #[serde(default)]
     pub closed_workspace_ids: Vec<String>,
+    /// Maintient un process `claude` vivant par conversation (mode entree
+    /// stream-json) au lieu d'un process one-shot par tour. Evite l'orphelinage
+    /// des taches shell en arriere-plan entre deux tours (voir chat.rs, session
+    /// Claude persistante). Desactive par defaut : opt-in tant que le mode n'est
+    /// pas eprouve sur tous les parcours.
+    #[serde(default)]
+    pub claude_persistent_session: bool,
 }
 
 /// Reglages du VS Code embarque (code-server) qui heberge l'extension Kombai
@@ -1404,6 +1411,7 @@ mod tests {
             expired_unconnected_account_homes: Vec::new(),
             workspaces: Vec::new(),
             closed_workspace_ids: Vec::new(),
+            claude_persistent_session: false,
         }
     }
 
@@ -1993,6 +2001,7 @@ fn discover_initial_settings() -> Result<AppSettings, String> {
         expired_unconnected_account_homes: Vec::new(),
         workspaces: Vec::new(),
         closed_workspace_ids: Vec::new(),
+        claude_persistent_session: false,
     };
 
     if env::var_os("CST_DATA_DIR").is_none() {

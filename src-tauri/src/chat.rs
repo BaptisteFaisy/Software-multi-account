@@ -25,13 +25,13 @@ use std::{
     env,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+        mpsc, Arc, Mutex, Once, Weak,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 #[cfg(feature = "desktop")]
 use tauri::State;
@@ -39,9 +39,12 @@ use uuid::Uuid;
 
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
 const MAX_CHAT_IMAGES: usize = 4;
-const MAX_CHAT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_CHAT_IMAGE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
-pub(crate) const MAX_CHAT_TURN_REQUEST_BYTES: usize = 28 * 1024 * 1024;
+const MAX_CHAT_IMAGE_BYTES: usize = 100 * 1024 * 1024;
+const MAX_CHAT_IMAGE_TOTAL_BYTES: usize = 100 * 1024 * 1024;
+// Le corps HTTP transporte les images en base64 (~+33 %) : 100 Mo bruts pesent
+// ~133 Mo une fois encodes. Le plafond de requete doit donc rester au-dessus,
+// avec une marge pour le prompt, les skills et la structure JSON.
+pub(crate) const MAX_CHAT_TURN_REQUEST_BYTES: usize = 150 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 24 * 1024;
 const MAX_ACTIVITIES: usize = 32;
 const MAX_THOUGHTS: usize = 32;
@@ -53,6 +56,30 @@ const MAX_RETAINED_TURNS: usize = 500;
 const PROVIDER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const COMPACT_TIMEOUT: Duration = Duration::from_secs(180);
 const RESPONSE_QUALITY_INSTRUCTIONS: &str = "Avant toute réponse finale destinée à l'utilisateur, effectue une relecture silencieuse. Corrige les fautes de grammaire, de syntaxe, d'orthographe, d'accord et de ponctuation, puis vérifie que les phrases sont naturelles et non ambiguës dans la langue de l'utilisateur, sauf demande contraire. Pour le code, les commandes et les formats structurés, préserve les éléments littéraux et vérifie que la syntaxe ainsi que tous les délimiteurs et blocs sont complets. Ne modifie pas les citations ou les contenus demandés mot pour mot et ne mentionne pas cette relecture.";
+
+/// Filet applique aux tours Claude one-shot : chaque tour est un process
+/// `claude --print` distinct qui meurt a la fin du tour. Toute commande lancee
+/// en arriere-plan (`run_in_background`) est donc orpheline et resurgit au tour
+/// suivant sous forme de `<task-notification>` "no completion record", que le
+/// modele traite a la place de la demande. Tant que la session persistante
+/// n'est pas active pour ce tour, on interdit l'arriere-plan.
+const CLAUDE_FOREGROUND_SHELL_INSTRUCTIONS: &str = "N'exécute jamais de commande shell en arrière-plan : n'utilise pas l'option d'exécution en tâche de fond (run_in_background). Lance chaque commande au premier plan et attends sa fin avant de continuer. Pour une commande longue, augmente son délai d'attente au lieu de la détacher.";
+
+/// Duree d'inactivite au-dela de laquelle une session Claude persistante est
+/// recyclee (le process est arrete pour liberer la memoire du noeud). Volontai-
+/// rement genereux : une conversation active reste chaude entre deux messages.
+const LIVE_CLAUDE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Plafond de sessions Claude persistantes vivantes simultanement sur le noeud.
+/// Au-dela, la plus ancienne inactive est recyclee. Borne la consommation
+/// memoire sur un VPS partage ; le durcissement fin est prevu en phase 3.
+const LIVE_CLAUDE_MAX_SESSIONS: usize = 8;
+
+/// Delai d'attente laisse au process pour finaliser un tour apres une demande
+/// d'interruption (control_request `interrupt`) avant de basculer sur l'arret
+/// complet du process. En pratique l'avortement emet un `result` en une fraction
+/// de seconde ; la marge couvre un noeud charge. Au-dela, interruption echouee.
+const LIVE_CLAUDE_INTERRUPT_DRAIN: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -132,6 +159,11 @@ pub struct ChatTurnSnapshot {
     pub id: u64,
     pub account_id: String,
     pub session_id: Option<String>,
+    /// Cle du chat (pane) a l'origine du tour. Permet au client de reconcilier un
+    /// tour serveur deja lance meme quand la reponse HTTP de `start_chat_turn`
+    /// s'est perdue et que le tour n'a pas encore de `session_id`.
+    #[serde(default)]
+    pub source_chat_key: Option<String>,
     pub status: ChatTurnStatus,
     pub started_at: i64,
     pub finished_at: Option<i64>,
@@ -155,6 +187,7 @@ pub struct ActiveChatTurnSummary {
     pub id: u64,
     pub account_id: String,
     pub session_id: Option<String>,
+    pub source_chat_key: Option<String>,
     pub status: ChatTurnStatus,
     pub started_at: i64,
     pub waiting_for_user: bool,
@@ -226,6 +259,11 @@ struct ChatTurn {
     child: Mutex<Option<Child>>,
     provider_terminal: Mutex<Option<ProviderTerminalEvent>>,
     runtime_sync: RuntimeSync,
+    /// Session Claude persistante qui pilote ce tour, le cas echeant. Vide pour
+    /// les tours one-shot (le process vit alors dans `child`). Reference faible :
+    /// un tour termine et conserve dans l'historique ne doit pas empecher le
+    /// recyclage de la session.
+    live_session: Weak<LiveClaudeSession>,
 }
 
 struct TemporaryChatSkillsFile {
@@ -259,6 +297,15 @@ impl Drop for TemporaryChatSkillsFile {
     }
 }
 
+/// Repertoire des images de chat temporaires. Chaque image y vit le temps d'un
+/// tour (supprimee par `Drop` en fin de tour) ; le balayeur y efface aussi les
+/// orphelines laissees par un tour qui a plante avant son nettoyage.
+fn chat_images_dir() -> PathBuf {
+    env::temp_dir()
+        .join("codex-switch-terminal")
+        .join("chat-images")
+}
+
 struct TemporaryChatImages {
     paths: Vec<PathBuf>,
 }
@@ -270,9 +317,7 @@ impl TemporaryChatImages {
                 "Un message peut contenir au maximum {MAX_CHAT_IMAGES} images"
             ));
         }
-        let directory = env::temp_dir()
-            .join("codex-switch-terminal")
-            .join("chat-images");
+        let directory = chat_images_dir();
         std::fs::create_dir_all(&directory)
             .map_err(|error| format!("Preparation des images impossible : {error}"))?;
         let mut images = Self { paths: Vec::new() };
@@ -286,17 +331,17 @@ impl TemporaryChatImages {
             let encoded = attachment.data_base64.trim();
             let max_encoded_bytes = ((MAX_CHAT_IMAGE_BYTES + 2) / 3) * 4;
             if encoded.is_empty() || encoded.len() > max_encoded_bytes {
-                return Err(format!("L'image {} depasse 8 Mo", index + 1));
+                return Err(format!("L'image {} depasse 100 Mo", index + 1));
             }
             let bytes = BASE64_STANDARD
                 .decode(encoded)
                 .map_err(|_| format!("Donnees de l'image {} invalides", index + 1))?;
             if bytes.is_empty() || bytes.len() > MAX_CHAT_IMAGE_BYTES {
-                return Err(format!("L'image {} depasse 8 Mo", index + 1));
+                return Err(format!("L'image {} depasse 100 Mo", index + 1));
             }
             total_bytes = total_bytes.saturating_add(bytes.len());
             if total_bytes > MAX_CHAT_IMAGE_TOTAL_BYTES {
-                return Err("Les images d'un message depassent 20 Mo au total".to_string());
+                return Err("Les images d'un message depassent 100 Mo au total".to_string());
             }
             let extension = validated_chat_image_extension(&attachment.mime_type, &bytes)
                 .ok_or_else(|| format!("Format de l'image {} invalide", index + 1))?;
@@ -337,6 +382,52 @@ impl Drop for TemporaryChatImages {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// Efface les images de chat orphelines : fichiers qu'un tour n'a pas pu nettoyer
+/// (process tue, crash) et qui resteraient sinon indefiniment sur le disque.
+/// `max_age` borne la suppression afin de ne jamais toucher l'image d'un tour
+/// encore en cours (dont le fichier vient tout juste d'etre ecrit).
+fn sweep_orphan_chat_images_in(directory: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return; // Dossier absent : rien a nettoyer.
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .map(|age| age >= max_age)
+            .unwrap_or(false); // Age illisible : on ne supprime pas par prudence.
+        if expired {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Demarre le nettoyage automatique des images orphelines : un balayage immediat
+/// au demarrage (tout residu vient forcement d'un run precedent), puis un passage
+/// horaire. Le seuil d'age genereux garantit qu'un tour en cours n'est jamais
+/// touche. Idempotent : un seul balayeur par processus.
+pub(crate) fn start_orphan_chat_image_sweeper() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        let directory = chat_images_dir();
+        // Au demarrage, aucun tour de ce processus n'a encore ecrit d'image :
+        // tout fichier de plus de 2 min provient d'un run precedent.
+        sweep_orphan_chat_images_in(&directory, Duration::from_secs(2 * 60));
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(60 * 60));
+            // Un tour ne conserve jamais une image 6 h : au-dela, c'est un orphelin.
+            sweep_orphan_chat_images_in(&directory, Duration::from_secs(6 * 60 * 60));
+        });
+    });
 }
 
 fn validated_chat_image_extension(mime_type: &str, bytes: &[u8]) -> Option<&'static str> {
@@ -420,6 +511,10 @@ pub struct ChatTurnManager {
     /// administratives internes, qui ne sont jamais exposees a un autre compte.
     owners: Arc<Mutex<HashMap<u64, String>>>,
     claims: Arc<Mutex<HashSet<String>>>,
+    /// Sessions Claude persistantes vivantes, indexees par `account_id\0session_id`.
+    /// Un seul process par conversation ; les taches shell en arriere-plan y
+    /// survivent d'un tour a l'autre.
+    live_claude: Arc<Mutex<HashMap<String, Arc<LiveClaudeSession>>>>,
     next_id: Arc<AtomicU64>,
     runtime_sync: RuntimeSync,
 }
@@ -430,6 +525,7 @@ impl Default for ChatTurnManager {
             turns: Arc::new(Mutex::new(HashMap::new())),
             owners: Arc::new(Mutex::new(HashMap::new())),
             claims: Arc::new(Mutex::new(HashSet::new())),
+            live_claude: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(0)),
             runtime_sync: RuntimeSync::default(),
         }
@@ -554,6 +650,28 @@ impl ChatTurnManager {
             account.reasoning_effort.as_deref(),
         )?;
 
+        // Phase 1 de la session Claude persistante : volontairement restreinte
+        // aux tours "simples" ou aucun outil interactif ne peut declencher une
+        // demande d'approbation (`can_use_tool`) qui figerait le flux stream-json.
+        // - `session_id` connu => tour 2+, on peut `--resume` dans le process vif ;
+        // - mode Build en bypass => aucune approbation d'outil demandee ;
+        // - pas d'images / skills / MCP autonome => aucune instruction ni fichier
+        //   temporaire propre au tour a injecter apres le lancement du process.
+        // Tout le reste retombe sur le chemin one-shot habituel, protege par le
+        // filet anti-arriere-plan ci-dessous.
+        let use_persistent_claude = app_settings.claude_persistent_session
+            && account.provider == Provider::Claude
+            && request.session_id.is_some()
+            && request.mode == ChatTurnMode::Build
+            && account.bypass
+            && request.image_attachments.is_empty()
+            && request.agent_skills.is_empty()
+            && model_tool_server.is_none()
+            && filesystem_scope == ChatFilesystemScope::Default;
+        // Filet (Option A) : hors session persistante, un tour Claude one-shot ne
+        // doit pas lancer de tache en arriere-plan, sous peine de l'orpheliner.
+        let apply_foreground_net = account.provider == Provider::Claude && !use_persistent_claude;
+
         let claim = self.reserve_turn(&request)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let image_files = TemporaryChatImages::create(id, &request.image_attachments)?;
@@ -616,8 +734,12 @@ impl ChatTurnManager {
             model_tool_instructions,
             selected_agent_instructions.as_deref(),
         );
-        let turn_instructions = merge_turn_instructions(
+        let base_instructions = merge_turn_instructions(
             Some(RESPONSE_QUALITY_INSTRUCTIONS),
+            apply_foreground_net.then_some(CLAUDE_FOREGROUND_SHELL_INSTRUCTIONS),
+        );
+        let turn_instructions = merge_turn_instructions(
+            base_instructions.as_deref(),
             environment_instructions.as_deref(),
         );
         let turn_instructions =
@@ -641,64 +763,108 @@ impl ChatTurnManager {
             }
         });
 
-        let mut command = resolved_provider_command(
-            &settings::command_for_provider(&app_settings, account.provider),
-            account.provider,
-        )?;
-        configure_environment(
-            &mut command,
-            &app_settings,
-            &account,
-            &canonical_home,
-            execution_dir,
-        );
-        configure_provider_command_with_images_and_scope(
-            &mut command,
-            &account,
-            request.session_id.as_deref(),
-            request.mode,
-            model.as_deref(),
-            reasoning_effort.as_deref(),
-            request.app_connectors.as_deref(),
-            request.app_write_approved,
-            provider_instructions.as_deref(),
-            model_tool_server.as_ref(),
-            model_tool_file.as_ref().map(|file| file.path.as_path()),
-            image_files.paths(),
-            effective_filesystem_scope,
-        );
+        // Configure une commande fournisseur neuve et complete. Reutilisee pour
+        // le lancement one-shot et, pour Claude, pour (re)demarrer le process
+        // persistant : un repli sur one-shot doit pouvoir la reconstruire.
+        let build_provider_command = || -> Result<Command, String> {
+            let mut command = resolved_provider_command(
+                &settings::command_for_provider(&app_settings, account.provider),
+                account.provider,
+            )?;
+            configure_environment(
+                &mut command,
+                &app_settings,
+                &account,
+                &canonical_home,
+                execution_dir,
+            );
+            configure_provider_command_with_images_and_scope(
+                &mut command,
+                &account,
+                request.session_id.as_deref(),
+                request.mode,
+                model.as_deref(),
+                reasoning_effort.as_deref(),
+                request.app_connectors.as_deref(),
+                request.app_write_approved,
+                provider_instructions.as_deref(),
+                model_tool_server.as_ref(),
+                model_tool_file.as_ref().map(|file| file.path.as_path()),
+                image_files.paths(),
+                effective_filesystem_scope,
+            );
+            Ok(command)
+        };
+
+        // Session Claude persistante : tente de router le tour vers un process
+        // `claude` deja vivant (ou d'en demarrer un) plutot que de spawn/kill un
+        // process par tour. En cas d'echec, on retombe proprement sur le
+        // one-shot ci-dessous sans avoir consomme la reservation ni cree de tour.
+        if use_persistent_claude {
+            if let Some(session_id) = request.session_id.clone() {
+                match build_provider_command() {
+                    Ok(mut persistent_command) => {
+                        persistent_command
+                            .arg("--input-format")
+                            .arg("stream-json")
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped());
+                        hide_process_window(&mut persistent_command);
+                        let profile = live_claude_profile(
+                            &canonical_home,
+                            execution_dir,
+                            request.mode,
+                            model.as_deref(),
+                            reasoning_effort.as_deref(),
+                            provider_instructions.as_deref(),
+                        );
+                        let detail = project_dir.as_ref().map(|path| display_path(path));
+                        match self.start_persistent_claude_turn(
+                            persistent_command,
+                            &account,
+                            &session_id,
+                            &profile,
+                            id,
+                            detail,
+                            &prompt,
+                            request.source_chat_key.clone(),
+                        ) {
+                            Ok(snapshot) => {
+                                claim.commit();
+                                self.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
+                                return Ok(snapshot);
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[chat] session Claude persistante indisponible, repli one-shot : {error}"
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[chat] preparation de la session Claude persistante impossible, repli one-shot : {error}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut command = build_provider_command()?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         hide_process_window(&mut command);
 
-        let snapshot = ChatTurnSnapshot {
+        let snapshot = seed_turn_snapshot(
             id,
-            account_id: account.id.clone(),
-            session_id: request.session_id.clone(),
-            status: ChatTurnStatus::Running,
-            started_at: metrics::now_ts(),
-            finished_at: None,
-            error: None,
-            activities: vec![ChatActivity {
-                id: "agent-start".to_string(),
-                kind: "think".to_string(),
-                label: format!("{} prépare la réponse", provider_label(account.provider)),
-                detail: project_dir.as_ref().map(|path| display_path(path)),
-                status: "running".to_string(),
-            }],
-            thoughts: vec![ChatThought {
-                id: "agent-thinking".to_string(),
-                kind: "reasoning".to_string(),
-                text: format!(
-                    "{} analyse la demande et prépare la prochaine étape.",
-                    provider_label(account.provider)
-                ),
-                status: "running".to_string(),
-            }],
-            parts: Vec::new(),
-        };
+            &account,
+            request.session_id.clone(),
+            project_dir.as_ref().map(|path| display_path(path)),
+            request.source_chat_key.clone(),
+        );
         let turn = Arc::new(ChatTurn {
             snapshot: Mutex::new(snapshot.clone()),
             archived_snapshot: Mutex::new(None),
@@ -706,6 +872,7 @@ impl ChatTurnManager {
             child: Mutex::new(None),
             provider_terminal: Mutex::new(None),
             runtime_sync: self.runtime_sync.clone(),
+            live_session: Weak::new(),
         });
 
         let mut child = match command.spawn() {
@@ -881,6 +1048,7 @@ impl ChatTurnManager {
                     id: snapshot.id,
                     account_id: snapshot.account_id.clone(),
                     session_id: snapshot.session_id.clone(),
+                    source_chat_key: snapshot.source_chat_key.clone(),
                     status: snapshot.status,
                     started_at: snapshot.started_at,
                     waiting_for_user: snapshot.parts.iter().any(part_waits_for_user_input),
@@ -941,6 +1109,21 @@ impl ChatTurnManager {
         }
         if active_catalog_changed {
             self.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
+        }
+        // Tour pilote par une session Claude persistante : on interrompt le tour
+        // courant SANS tuer le process (control_request `interrupt`), pour que la
+        // session et ses taches de fond survivent. C'est essentiel sur un VPS
+        // partage, ou relancer un process `claude` a chaque annulation gaspille
+        // memoire et temps de reprise. Si le tour ne se draine pas a temps, on
+        // bascule sur l'arret complet (repli sur.) pour ne jamais laisser une
+        // session bloquee.
+        if let Some(session) = turn.live_session.upgrade() {
+            let drained = session.request_interrupt().is_ok()
+                && session.wait_until_parked(LIVE_CLAUDE_INTERRUPT_DRAIN);
+            if !drained {
+                session.shutdown();
+                self.forget_live_session(session.key());
+            }
         }
         if let Ok(mut child) = turn.child.lock() {
             if let Some(child) = child.as_mut() {
@@ -1044,6 +1227,129 @@ impl ChatTurnManager {
             }
         }
     }
+
+    /// Route un tour Claude vers le process persistant de la conversation, en
+    /// (re)demarrant ce process au besoin. Le tour n'est enregistre (et donc
+    /// visible via `status`) qu'apres l'ecriture reussie du message : un echec
+    /// anterieur laisse l'appelant retomber sur le one-shot sans effet de bord
+    /// (ni reservation consommee, ni tour fantome).
+    #[allow(clippy::too_many_arguments)]
+    fn start_persistent_claude_turn(
+        &self,
+        command: Command,
+        account: &AccountProfile,
+        session_id: &str,
+        profile: &str,
+        id: u64,
+        detail: Option<String>,
+        prompt: &str,
+        source_chat_key: Option<String>,
+    ) -> Result<ChatTurnSnapshot, String> {
+        let key = live_claude_key(&account.id, session_id);
+        let session = self.acquire_live_claude_session(&key, profile, command)?;
+
+        let snapshot = seed_turn_snapshot(
+            id,
+            account,
+            Some(session_id.to_string()),
+            detail,
+            source_chat_key,
+        );
+        let turn = Arc::new(ChatTurn {
+            snapshot: Mutex::new(snapshot.clone()),
+            archived_snapshot: Mutex::new(None),
+            output_closed: AtomicBool::new(false),
+            child: Mutex::new(None),
+            provider_terminal: Mutex::new(None),
+            runtime_sync: self.runtime_sync.clone(),
+            live_session: Arc::downgrade(&session),
+        });
+
+        // Prise de tour atomique : le lecteur doit connaitre le tour courant
+        // avant tout evenement, et un tour precedent en cours de drain (apres une
+        // annulation) ne doit pas etre ecrase. Si la session est encore occupee,
+        // l'appelant repart proprement en one-shot.
+        if !session.try_begin_turn(turn.clone()) {
+            return Err("Session Claude persistante occupée (tour précédent en cours de libération)".to_string());
+        }
+        if let Err(error) = session.submit_user_message(prompt) {
+            // Le process vient probablement de mourir : on le recycle et on
+            // laisse l'appelant repartir en one-shot.
+            session.clear_current_turn(&turn);
+            session.shutdown();
+            self.forget_live_session(&key);
+            return Err(error);
+        }
+
+        self.turns
+            .lock()
+            .map_err(|_| "Etat des conversations verrouillé".to_string())?
+            .insert(id, turn);
+        Ok(snapshot)
+    }
+
+    /// Recupere une session vivante compatible (meme profil de lancement) ou en
+    /// demarre une neuve. Recycle au passage les sessions mortes ou inactives et
+    /// applique le plafond memoire du noeud.
+    fn acquire_live_claude_session(
+        &self,
+        key: &str,
+        profile: &str,
+        command: Command,
+    ) -> Result<Arc<LiveClaudeSession>, String> {
+        let mut registry = self
+            .live_claude
+            .lock()
+            .map_err(|_| "Registre des sessions Claude verrouillé".to_string())?;
+
+        registry.retain(|_, session| {
+            if session.is_dead() || session.is_idle(LIVE_CLAUDE_IDLE_TIMEOUT) {
+                session.shutdown();
+                false
+            } else {
+                true
+            }
+        });
+
+        if let Some(existing) = registry.get(key) {
+            if !existing.is_dead() && existing.profile() == profile {
+                existing.touch();
+                return Ok(existing.clone());
+            }
+            // Un flag de lancement a change (mode, modele, instructions, MCP) :
+            // le process en cours ne peut pas etre reconfigure a chaud en phase 1,
+            // on le relance via `--resume`.
+            if let Some(stale) = registry.remove(key) {
+                stale.shutdown();
+            }
+        }
+
+        // Plafond memoire : recycle la session inactive la plus ancienne.
+        while registry.len() >= LIVE_CLAUDE_MAX_SESSIONS {
+            let victim = registry
+                .iter()
+                .min_by_key(|(_, session)| session.last_activity())
+                .map(|(victim_key, _)| victim_key.clone());
+            match victim {
+                Some(victim_key) => {
+                    if let Some(session) = registry.remove(&victim_key) {
+                        session.shutdown();
+                    }
+                }
+                None => break,
+            }
+        }
+
+        let session = LiveClaudeSession::launch(key.to_string(), profile.to_string(), command)?;
+        registry.insert(key.to_string(), session.clone());
+        Ok(session)
+    }
+
+    fn forget_live_session(&self, key: &str) {
+        if let Ok(mut registry) = self.live_claude.lock() {
+            registry.remove(key);
+        }
+    }
 }
 
 impl ChatClaim {
@@ -1061,6 +1367,397 @@ impl Drop for ChatClaim {
             claims.remove(key);
         }
     }
+}
+
+/// Clef de registre d'une session Claude persistante : couple
+/// `(compte, session)`. Le `\0` ne peut apparaitre ni dans un id de compte ni
+/// dans un id de session.
+fn live_claude_key(account_id: &str, session_id: &str) -> String {
+    format!("{account_id}\u{0}{session_id}")
+}
+
+/// Une ligne stream-json de message utilisateur, envoyee sur le stdin du process
+/// persistant. Le contenu est un texte simple ; l'echappement JSON garantit une
+/// unique ligne physique meme si le prompt contient des sauts de ligne.
+fn live_claude_user_message_line(prompt: &str) -> String {
+    let payload = json!({
+        "type": "user",
+        "message": { "role": "user", "content": prompt },
+    });
+    format!("{payload}\n")
+}
+
+/// Empreinte des parametres de lancement figes du process Claude (non modifia-
+/// bles a chaud en phase 1). Deux tours au meme profil partagent le meme
+/// process ; un profil different force un relance via `--resume`.
+fn live_claude_profile(
+    canonical_home: &Path,
+    execution_dir: Option<&Path>,
+    mode: ChatTurnMode,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    provider_instructions: Option<&str>,
+) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{:?}\u{0}{}\u{0}{}\u{0}{}",
+        canonical_home.display(),
+        execution_dir
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default(),
+        mode,
+        model.unwrap_or(""),
+        reasoning_effort.unwrap_or(""),
+        provider_instructions.unwrap_or(""),
+    )
+}
+
+/// Snapshot initial commun aux tours one-shot et persistants : etat `Running`
+/// avec l'activite et la pensee d'amorce affichees pendant la preparation.
+fn seed_turn_snapshot(
+    id: u64,
+    account: &AccountProfile,
+    session_id: Option<String>,
+    detail: Option<String>,
+    source_chat_key: Option<String>,
+) -> ChatTurnSnapshot {
+    ChatTurnSnapshot {
+        id,
+        account_id: account.id.clone(),
+        session_id,
+        source_chat_key,
+        status: ChatTurnStatus::Running,
+        started_at: metrics::now_ts(),
+        finished_at: None,
+        error: None,
+        activities: vec![ChatActivity {
+            id: "agent-start".to_string(),
+            kind: "think".to_string(),
+            label: format!("{} prépare la réponse", provider_label(account.provider)),
+            detail,
+            status: "running".to_string(),
+        }],
+        thoughts: vec![ChatThought {
+            id: "agent-thinking".to_string(),
+            kind: "reasoning".to_string(),
+            text: format!(
+                "{} analyse la demande et prépare la prochaine étape.",
+                provider_label(account.provider)
+            ),
+            status: "running".to_string(),
+        }],
+        parts: Vec::new(),
+    }
+}
+
+/// Un process `claude --print --input-format stream-json` maintenu vivant pour
+/// toute une conversation. Les tours y sont ecrits en serie (un seul actif a la
+/// fois, garanti par `reserve_session`) ; un lecteur permanent route chaque
+/// evenement vers le tour courant et finalise ce dernier sur l'evenement
+/// `result` sans arreter le process, de sorte que les taches shell en
+/// arriere-plan survivent d'un tour a l'autre.
+struct LiveClaudeSession {
+    key: String,
+    profile: String,
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<Option<ChildStdin>>,
+    current_turn: Mutex<Option<Arc<ChatTurn>>>,
+    stderr_tail: Arc<Mutex<String>>,
+    dead: Arc<AtomicBool>,
+    last_activity: AtomicI64,
+}
+
+impl LiveClaudeSession {
+    fn launch(key: String, profile: String, mut command: Command) -> Result<Arc<Self>, String> {
+        let mut child = command.spawn().map_err(|error| {
+            format!("Impossible de lancer la session Claude persistante : {error}")
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Session Claude sans sortie standard".to_string())?;
+        let stderr = child.stderr.take();
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Session Claude sans entrée standard".to_string())?;
+
+        let session = Arc::new(Self {
+            key,
+            profile,
+            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(Some(stdin)),
+            current_turn: Mutex::new(None),
+            stderr_tail: Arc::new(Mutex::new(String::new())),
+            dead: Arc::new(AtomicBool::new(false)),
+            last_activity: AtomicI64::new(metrics::now_ts()),
+        });
+
+        spawn_live_claude_reader(session.clone(), stdout);
+        if let Some(stderr) = stderr {
+            spawn_live_claude_stderr(session.stderr_tail.clone(), stderr);
+        }
+        Ok(session)
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    fn touch(&self) {
+        self.last_activity.store(metrics::now_ts(), Ordering::Release);
+    }
+
+    fn last_activity(&self) -> i64 {
+        self.last_activity.load(Ordering::Acquire)
+    }
+
+    /// Vrai si le process est arrete (drapeau pose par le lecteur/`shutdown`) ou
+    /// s'il s'est termine sans que l'EOF ait encore ete observe.
+    fn is_dead(&self) -> bool {
+        if self.dead.load(Ordering::Acquire) {
+            return true;
+        }
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+                    self.dead.store(true, Ordering::Release);
+                    return true;
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Inactive depuis plus de `timeout` ET sans tour en cours : recyclable.
+    fn is_idle(&self, timeout: Duration) -> bool {
+        let idle_secs = metrics::now_ts().saturating_sub(self.last_activity());
+        idle_secs >= timeout.as_secs() as i64 && self.current_turn_is_empty()
+    }
+
+    fn current_turn_is_empty(&self) -> bool {
+        self.current_turn
+            .lock()
+            .map(|guard| guard.is_none())
+            .unwrap_or(true)
+    }
+
+    /// Prend le tour comme tour courant seulement si aucun autre ne l'occupe
+    /// (test-et-pose atomique sous le meme verrou). Empeche d'ecraser un tour
+    /// precedent encore en cours de drain apres une interruption.
+    fn try_begin_turn(&self, turn: Arc<ChatTurn>) -> bool {
+        if let Ok(mut guard) = self.current_turn.lock() {
+            if guard.is_some() {
+                return false;
+            }
+            *guard = Some(turn);
+            self.touch();
+            return true;
+        }
+        false
+    }
+
+    /// Retire le tour courant seulement s'il s'agit toujours du meme (evite
+    /// d'ecraser un tour suivant deja soumis dans une course).
+    fn clear_current_turn(&self, turn: &Arc<ChatTurn>) {
+        if let Ok(mut guard) = self.current_turn.lock() {
+            if guard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, turn))
+            {
+                guard.take();
+            }
+        }
+    }
+
+    fn submit_user_message(&self, prompt: &str) -> Result<(), String> {
+        let line = live_claude_user_message_line(prompt);
+        let mut guard = self
+            .stdin
+            .lock()
+            .map_err(|_| "Entrée de la session Claude verrouillée".to_string())?;
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| "Session Claude déjà fermée".to_string())?;
+        if let Err(error) = writer
+            .write_all(line.as_bytes())
+            .and_then(|_| writer.flush())
+        {
+            self.dead.store(true, Ordering::Release);
+            return Err(format!("Écriture du message impossible : {error}"));
+        }
+        self.touch();
+        Ok(())
+    }
+
+    /// Demande au process d'interrompre le tour en cours sans le tuer. En mode
+    /// stream-json, le CLI lit stdin en continu (meme pendant un tour) et traite
+    /// ce control_request : il avorte le tour puis emet un evenement `result`,
+    /// que le lecteur utilise comme frontiere pour liberer la session.
+    fn request_interrupt(&self) -> Result<(), String> {
+        let payload = json!({
+            "type": "control_request",
+            "request_id": Uuid::new_v4().to_string(),
+            "request": { "subtype": "interrupt" },
+        });
+        let line = format!("{payload}\n");
+        let mut guard = self
+            .stdin
+            .lock()
+            .map_err(|_| "Entrée de la session Claude verrouillée".to_string())?;
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| "Session Claude déjà fermée".to_string())?;
+        writer
+            .write_all(line.as_bytes())
+            .and_then(|_| writer.flush())
+            .map_err(|error| {
+                self.dead.store(true, Ordering::Release);
+                format!("Interruption impossible : {error}")
+            })
+    }
+
+    /// Attend (borne) que le lecteur ait finalise et libere le tour courant apres
+    /// une interruption. Vrai si la session est de nouveau libre et vivante.
+    fn wait_until_parked(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.is_dead() {
+                return false;
+            }
+            if self.current_turn_is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn stderr_snapshot(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default()
+    }
+
+    /// Arrete definitivement le process (et ses taches de fond) puis le reape.
+    fn shutdown(&self) {
+        self.dead.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.stdin.lock() {
+            guard.take();
+        }
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = terminate_chat_process_tree(&mut child);
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+/// Vrai si la ligne stream-json est l'evenement `result` de Claude, qui clot un
+/// tour (succes, erreur ou interruption). C'est la frontiere fiable entre deux
+/// tours d'un meme process persistant.
+fn claude_line_is_turn_boundary(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|event_type| event_type == "result")
+        })
+        .unwrap_or(false)
+}
+
+/// Lecteur permanent d'une session Claude persistante. Route chaque evenement
+/// stream-json vers le tour courant, finalise ce tour sur l'evenement terminal
+/// (`result`) sans arreter le process, puis attend le tour suivant. A la
+/// fermeture du flux (process termine), marque la session morte et fait echouer
+/// un eventuel tour encore en cours.
+fn spawn_live_claude_reader(session: Arc<LiveClaudeSession>, stdout: ChildStdout) {
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let Some(turn) = session
+                .current_turn
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            else {
+                // Aucun tour actif : evenement inter-tours, ignore.
+                continue;
+            };
+            apply_provider_event(&turn, Provider::Claude, &line);
+            // Frontiere de tour = evenement `result` de Claude. On le detecte sur
+            // la ligne elle-meme plutot que via le statut : un tour deja passe en
+            // `Cancelled` (interruption) n'ecrit pas d'evenement terminal, mais
+            // doit tout de meme liberer la session a l'arrivee de son `result`.
+            if claude_line_is_turn_boundary(&line) {
+                // Finalise le tour mais garde le process (les taches de fond
+                // continuent d'exister). `finish_turn` respecte un statut deja
+                // terminal (tour annule) et le laisse tel quel.
+                turn.output_closed.store(true, Ordering::Release);
+                finish_turn(&turn, Err(String::new()), &session.stderr_snapshot());
+                session.clear_current_turn(&turn);
+                session.touch();
+            }
+        }
+
+        // Flux ferme => le process `claude` s'est arrete.
+        session.dead.store(true, Ordering::Release);
+        if let Ok(mut guard) = session.current_turn.lock() {
+            if let Some(turn) = guard.take() {
+                let still_running = turn
+                    .snapshot
+                    .lock()
+                    .map(|snapshot| {
+                        matches!(
+                            snapshot.status,
+                            ChatTurnStatus::Running | ChatTurnStatus::Finalizing
+                        )
+                    })
+                    .unwrap_or(false);
+                if still_running {
+                    turn.output_closed.store(true, Ordering::Release);
+                    finish_turn(
+                        &turn,
+                        Err("Le processus Claude persistant s'est arrêté".to_string()),
+                        &session.stderr_snapshot(),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Accumule la sortie d'erreur du process persistant dans un tampon borne, pour
+/// l'associer a un tour qui echouerait.
+fn spawn_live_claude_stderr(stderr_tail: Arc<Mutex<String>>, stderr: std::process::ChildStderr) {
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(mut tail) = stderr_tail.lock() {
+                if !tail.is_empty() {
+                    tail.push('\n');
+                }
+                tail.push_str(&line);
+                if tail.len() > MAX_ERROR_BYTES {
+                    // Ne garde que la fin, en s'alignant sur une frontiere de
+                    // caractere pour ne jamais couper au milieu d'un UTF-8.
+                    let mut cut = tail.len() - MAX_ERROR_BYTES;
+                    while cut < tail.len() && !tail.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    *tail = tail.split_off(cut);
+                }
+            }
+        }
+    });
 }
 
 #[cfg(feature = "desktop")]
@@ -3209,6 +3906,7 @@ mod tests {
                 id: 1,
                 account_id: "account".to_string(),
                 session_id: None,
+                source_chat_key: None,
                 status: ChatTurnStatus::Running,
                 started_at: 0,
                 finished_at: None,
@@ -3222,7 +3920,133 @@ mod tests {
             child: Mutex::new(None),
             provider_terminal: Mutex::new(None),
             runtime_sync: RuntimeSync::default(),
+            live_session: Weak::new(),
         })
+    }
+
+    #[test]
+    fn live_claude_key_pairs_account_and_session() {
+        assert_eq!(live_claude_key("acc", "sess"), "acc\u{0}sess");
+        // Le meme couple (compte, session) donne toujours la meme clef.
+        assert_eq!(
+            live_claude_key("acc", "sess"),
+            live_claude_key("acc", "sess")
+        );
+        // Des ids reels distincts (jamais de `\0`) ne collisionnent pas.
+        assert_ne!(live_claude_key("acc", "sess-1"), live_claude_key("acc", "sess-2"));
+        assert_ne!(live_claude_key("acc-1", "sess"), live_claude_key("acc-2", "sess"));
+    }
+
+    #[test]
+    fn live_claude_user_message_line_is_single_json_line() {
+        let line = live_claude_user_message_line("Bonjour\nseconde ligne");
+        assert!(line.ends_with('\n'));
+        // Une seule ligne physique malgre le saut de ligne du prompt.
+        assert_eq!(line.trim_end_matches('\n').lines().count(), 1);
+        let value: Value = serde_json::from_str(line.trim_end()).expect("ligne JSON valide");
+        assert_eq!(value["type"], "user");
+        assert_eq!(value["message"]["role"], "user");
+        assert_eq!(value["message"]["content"], "Bonjour\nseconde ligne");
+    }
+
+    #[test]
+    fn live_claude_profile_changes_when_launch_flags_change() {
+        let home = Path::new("/home/acc");
+        let base = live_claude_profile(
+            home,
+            Some(Path::new("/proj")),
+            ChatTurnMode::Build,
+            Some("modele"),
+            Some("high"),
+            Some("instructions"),
+        );
+        // Meme entree => meme empreinte (reutilise le process).
+        assert_eq!(
+            base,
+            live_claude_profile(
+                home,
+                Some(Path::new("/proj")),
+                ChatTurnMode::Build,
+                Some("modele"),
+                Some("high"),
+                Some("instructions"),
+            )
+        );
+        // Un modele different => empreinte differente (force le relance).
+        assert_ne!(
+            base,
+            live_claude_profile(
+                home,
+                Some(Path::new("/proj")),
+                ChatTurnMode::Build,
+                Some("autre-modele"),
+                Some("high"),
+                Some("instructions"),
+            )
+        );
+        // Des instructions differentes => empreinte differente.
+        assert_ne!(
+            base,
+            live_claude_profile(
+                home,
+                Some(Path::new("/proj")),
+                ChatTurnMode::Build,
+                Some("modele"),
+                Some("high"),
+                Some("autres instructions"),
+            )
+        );
+    }
+
+    #[test]
+    fn foreground_shell_net_targets_run_in_background() {
+        // Le filet nomme explicitement l'option a bannir pour etre efficace.
+        assert!(CLAUDE_FOREGROUND_SHELL_INSTRUCTIONS.contains("run_in_background"));
+        // Il s'insere avant les instructions d'environnement, apres la relecture.
+        let merged = merge_turn_instructions(
+            Some(RESPONSE_QUALITY_INSTRUCTIONS),
+            Some(CLAUDE_FOREGROUND_SHELL_INSTRUCTIONS),
+        )
+        .expect("fusion non vide");
+        assert!(merged.contains("run_in_background"));
+        assert!(merged.contains("relecture"));
+    }
+
+    #[test]
+    fn claude_result_line_is_the_turn_boundary() {
+        assert!(claude_line_is_turn_boundary(
+            r#"{"type":"result","subtype":"success","session_id":"s"}"#
+        ));
+        // Une interruption clot aussi le tour par un `result` (sous-type erreur).
+        assert!(claude_line_is_turn_boundary(
+            r#"{"type":"result","subtype":"error_during_execution","session_id":"s"}"#
+        ));
+        // Les evenements intermediaires ne sont pas des frontieres.
+        assert!(!claude_line_is_turn_boundary(
+            r#"{"type":"assistant","message":{"content":"salut"}}"#
+        ));
+        assert!(!claude_line_is_turn_boundary(r#"{"type":"system","session_id":"s"}"#));
+        assert!(!claude_line_is_turn_boundary("pas du json"));
+    }
+
+    #[test]
+    fn seed_turn_snapshot_starts_running_with_agent_start_activity() {
+        let account = test_account(Provider::Claude);
+        let snapshot = seed_turn_snapshot(
+            7,
+            &account,
+            Some("sess-1".to_string()),
+            Some("/proj".to_string()),
+            Some("chat-7".to_string()),
+        );
+        assert_eq!(snapshot.id, 7);
+        assert_eq!(snapshot.source_chat_key.as_deref(), Some("chat-7"));
+        assert_eq!(snapshot.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(snapshot.status, ChatTurnStatus::Running);
+        assert!(snapshot
+            .activities
+            .iter()
+            .any(|activity| activity.id == "agent-start" && activity.status == "running"));
     }
 
     #[test]
@@ -3735,6 +4559,24 @@ mod tests {
             data_base64: BASE64_STANDARD.encode(b"pas une image"),
         };
         assert!(TemporaryChatImages::create(92, &[invalid]).is_err());
+    }
+
+    #[test]
+    fn orphan_sweep_removes_only_files_past_the_age_threshold() {
+        let directory = env::temp_dir().join(format!("cst-image-sweep-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let orphan = directory.join("turn-42-orphan.png");
+        std::fs::write(&orphan, b"x").unwrap();
+
+        // Seuil large : une image tout juste ecrite (tour en cours) est conservee.
+        sweep_orphan_chat_images_in(&directory, Duration::from_secs(3600));
+        assert!(orphan.exists());
+
+        // Seuil nul : tout fichier (age >= 0) est considere orphelin et efface.
+        sweep_orphan_chat_images_in(&directory, Duration::from_secs(0));
+        assert!(!orphan.exists());
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
