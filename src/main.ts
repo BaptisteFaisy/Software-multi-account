@@ -1178,30 +1178,6 @@ type WorkspaceAccessView = {
   updatedAt: number;
 };
 
-type GitDockerEnvironmentMode = "analyze" | "build" | "deploy";
-type GitDockerEnvironmentDraft = {
-  repositoryUrl: string;
-  refName: string;
-  mode: GitDockerEnvironmentMode;
-  deployTarget: string;
-  sshKey: string;
-  sshPort: string;
-  installDocker: boolean;
-  acceptNewHostKey: boolean;
-  containerPort: string;
-  hostPort: string;
-};
-type GitDockerEnvironmentResult = {
-  repositoryUrl: string;
-  workspacePath: string;
-  bundlePath: string | null;
-  commit: string;
-  mode: GitDockerEnvironmentMode;
-  dockerStatus: "analyzed" | "built" | "deployed" | "failed";
-  message: string;
-  log: string;
-};
-
 type AppSettings = {
   accounts: AccountProfile[];
   proxies: ProxyProfile[];
@@ -2319,21 +2295,6 @@ let workspaceBrowseError = "";
 let workspaceCreateBusy = false;
 let workspaceCreateName = "";
 let terminalEnvironmentMenuOpen = false;
-let gitDockerEnvironmentModalOpen = false;
-let gitDockerEnvironmentSubmitting = false;
-let gitDockerEnvironmentError = "";
-let gitDockerEnvironmentDraft: GitDockerEnvironmentDraft = {
-  repositoryUrl: "",
-  refName: "",
-  mode: "analyze",
-  deployTarget: "",
-  sshKey: "",
-  sshPort: "22",
-  installDocker: false,
-  acceptNewHostKey: false,
-  containerPort: "",
-  hostPort: "",
-};
 let environmentMemoryTargetId: string | null = null;
 let environmentMemoryDraftId: string | null = null;
 let environmentMemoryDraft = "";
@@ -4603,107 +4564,6 @@ const closeTerminalEnvironmentMenu = () => {
   clearEnvironmentMemoryDraft();
   render();
   restoreDialogTrigger(returnFocus);
-};
-
-const emptyGitDockerEnvironmentDraft = (): GitDockerEnvironmentDraft => ({
-  repositoryUrl: "",
-  refName: "",
-  mode: "analyze",
-  deployTarget: "",
-  sshKey: "",
-  sshPort: "22",
-  installDocker: false,
-  acceptNewHostKey: false,
-  containerPort: "",
-  hostPort: "",
-});
-
-const openGitDockerEnvironmentModal = () => {
-  terminalEnvironmentMenuOpen = false;
-  clearEnvironmentMemoryDraft();
-  gitDockerEnvironmentDraft = emptyGitDockerEnvironmentDraft();
-  gitDockerEnvironmentError = "";
-  gitDockerEnvironmentSubmitting = false;
-  gitDockerEnvironmentModalOpen = true;
-  statusText = "Nouvel environnement depuis GitHub";
-  render();
-  requestAnimationFrame(() => {
-    document.querySelector<HTMLInputElement>("#gitDockerRepositoryUrl")?.focus();
-  });
-};
-
-const closeGitDockerEnvironmentModal = () => {
-  if (!gitDockerEnvironmentModalOpen || gitDockerEnvironmentSubmitting) return;
-  gitDockerEnvironmentModalOpen = false;
-  gitDockerEnvironmentError = "";
-  terminalEnvironmentMenuOpen = true;
-  statusText = "Menu des environnements";
-  render();
-};
-
-const readGitDockerEnvironmentForm = () => {
-  const mode = document.querySelector<HTMLSelectElement>("#gitDockerMode")?.value;
-  gitDockerEnvironmentDraft = {
-    repositoryUrl:
-      document.querySelector<HTMLInputElement>("#gitDockerRepositoryUrl")?.value ?? "",
-    refName: document.querySelector<HTMLInputElement>("#gitDockerRef")?.value ?? "",
-    mode: mode === "build" || mode === "deploy" ? mode : "analyze",
-    deployTarget:
-      document.querySelector<HTMLInputElement>("#gitDockerDeployTarget")?.value ?? "",
-    sshKey: document.querySelector<HTMLInputElement>("#gitDockerSshKey")?.value ?? "",
-    sshPort: document.querySelector<HTMLInputElement>("#gitDockerSshPort")?.value ?? "22",
-    installDocker:
-      document.querySelector<HTMLInputElement>("#gitDockerInstallDocker")?.checked ?? false,
-    acceptNewHostKey:
-      document.querySelector<HTMLInputElement>("#gitDockerAcceptHostKey")?.checked ?? false,
-    containerPort:
-      document.querySelector<HTMLInputElement>("#gitDockerContainerPort")?.value ?? "",
-    hostPort: document.querySelector<HTMLInputElement>("#gitDockerHostPort")?.value ?? "",
-  };
-};
-
-const optionalGitDockerPort = (value: string): number | undefined => {
-  const trimmed = value.trim();
-  return trimmed ? Number(trimmed) : undefined;
-};
-
-const submitGitDockerEnvironment = async (form: HTMLFormElement) => {
-  if (gitDockerEnvironmentSubmitting || !form.reportValidity()) return;
-  readGitDockerEnvironmentForm();
-  gitDockerEnvironmentSubmitting = true;
-  gitDockerEnvironmentError = "";
-  statusText = "Clonage du dépôt GitHub et préparation...";
-  render();
-
-  try {
-    const draft = gitDockerEnvironmentDraft;
-    const result = await invoke<GitDockerEnvironmentResult>("create_git_docker_environment", {
-      request: {
-        repositoryUrl: draft.repositoryUrl.trim(),
-        refName: draft.refName.trim(),
-        mode: draft.mode,
-        deployTarget: draft.deployTarget.trim(),
-        sshKey: draft.sshKey.trim(),
-        sshPort: Number(draft.sshPort || "22"),
-        installDocker: draft.installDocker,
-        acceptNewHostKey: draft.acceptNewHostKey,
-        containerPort: optionalGitDockerPort(draft.containerPort),
-        hostPort: optionalGitDockerPort(draft.hostPort),
-      },
-    });
-    gitDockerEnvironmentSubmitting = false;
-    gitDockerEnvironmentModalOpen = false;
-    terminalEnvironmentMenuOpen = false;
-    statusText = result.bundlePath
-      ? `${result.message} · paquet: ${result.bundlePath}`
-      : result.message;
-    selectEnvironment(result.workspacePath);
-  } catch (error) {
-    gitDockerEnvironmentSubmitting = false;
-    gitDockerEnvironmentError = String(error);
-    statusText = "Création de l'environnement GitHub impossible";
-    render();
-  }
 };
 
 const toggleTerminalEnvironmentMenu = () => {
@@ -9278,7 +9138,9 @@ const createExpertChatPane = (
     pendingWorkspace:
       discussionFolderPath(discussion) ?? capturedWorkspace ?? currentWorkspace(),
     autonomousAgentId: persisted.autonomousAgentId ?? null,
-    automaticOrchestrationEnabled: persisted.automaticOrchestrationEnabled === true,
+    // Le bouton « Orchestration auto » a été retiré : un ancien reglage persiste
+    // ne doit pas reactiver silencieusement le routage automatique.
+    automaticOrchestrationEnabled: false,
     automaticOrchestrationLaunching: false,
     orchestrationId: persisted.orchestrationId ?? null,
     orchestrationRole:
@@ -9590,25 +9452,6 @@ const expertChatAutonomousOption = (
       : "Créer un agent autonome à partir de ce chat sans fermer la conversation.",
     tone: "paused",
     disabled: busy,
-  };
-};
-
-const expertChatAutomaticOrchestrationOption = (
-  pane: ExpertChatPane,
-): NonNullable<Parameters<typeof renderChatPanel>[1]>["automaticOrchestration"] => {
-  if (
-    pane.orchestrationRole
-    || autonomousAgentForPane(pane)
-    || (pane.autonomousAgentId && !autonomousAgentsLoaded)
-  ) {
-    return undefined;
-  }
-  return {
-    enabled: pane.automaticOrchestrationEnabled,
-    detail: pane.automaticOrchestrationEnabled
-      ? "Mode actif : chaque demande est évaluée et une équipe est lancée seulement si elle apporte un vrai gain."
-      : "Mode inactif : activer l'évaluation automatique avant chaque demande.",
-    disabled: pane.automaticOrchestrationLaunching,
   };
 };
 
@@ -9942,7 +9785,6 @@ const renderExpertChatPane = (pane: ExpertChatPane): string =>
     fullscreen: pane.key === expertChatFullscreenKey,
     autonomous: expertChatAutonomousOption(pane),
     orchestration: expertChatOrchestrationOption(pane),
-    automaticOrchestration: expertChatAutomaticOrchestrationOption(pane),
     accountTransition: expertChatAccountTransitions.get(pane.key),
   });
 
@@ -11644,16 +11486,6 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
     .forEach((button) => {
       button.addEventListener("click", () => openAutonomousChatEditor(pane));
     });
-  root.querySelector<HTMLButtonElement>("[data-chat-action='toggle-automatic-orchestration']")?.addEventListener("click", () => {
-    if (pane.automaticOrchestrationLaunching || pane.orchestrationRole) return;
-    pane.automaticOrchestrationEnabled = !pane.automaticOrchestrationEnabled;
-    persistExpertChats();
-    statusText = pane.automaticOrchestrationEnabled
-      ? "Orchestration automatique active : chaque demande sera évaluée"
-      : "Orchestration automatique inactive";
-    refreshExpertChatPane(pane);
-    focusExpertChatPrompt(pane);
-  });
   root.querySelector<HTMLButtonElement>("[data-chat-action='orchestrate']")?.addEventListener("click", () => {
     openOrchestrationConversion(pane);
   });
@@ -20637,9 +20469,6 @@ const renderTerminalEnvironmentMenu = (): string => {
       <footer class="terminal-environment-menu-actions">
         <span><i data-lucide="folder-plus"></i>Vous pouvez créer autant d'environnements privés que nécessaire.</span>
         <div class="terminal-environment-menu-create-actions">
-          <button type="button" class="tool-button" id="createGitDockerEnvironmentFromMenu" title="Cloner un dépôt GitHub dans votre espace privé">
-            <i data-lucide="folder-git-2"></i><span>Depuis GitHub</span>
-          </button>
           <button type="button" class="tool-button primary" id="createEnvironmentFromMenu" title="${createEnvironmentLabel}">
             <i data-lucide="folder-plus"></i><span>${createEnvironmentLabel}</span>
           </button>
@@ -21234,7 +21063,6 @@ const renderChatFirstShell = () => {
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
     ${renderTerminalEnvironmentMenu()}
-    ${renderGitDockerEnvironmentModal()}
     ${renderCodexModelSuggestions()}
     ${renderUserProfileModal()}
   `;
@@ -21584,7 +21412,6 @@ const renderLegacyTerminalShell = () => {
     ${renderAgentsModal()}
     ${renderWorkspaceModal()}
     ${renderTerminalEnvironmentMenu()}
-    ${renderGitDockerEnvironmentModal()}
     ${renderCodexModelSuggestions()}
   `;
 
@@ -23478,107 +23305,6 @@ const renderAgentsModal = () => {
   `;
 };
 
-const renderGitDockerEnvironmentModal = () => {
-  if (!gitDockerEnvironmentModalOpen) return "";
-  const draft = gitDockerEnvironmentDraft;
-  const disabled = gitDockerEnvironmentSubmitting ? "disabled" : "";
-  const modeHint = draft.mode === "analyze"
-    ? "Clone le projet, detecte sa technologie et genere les fichiers sans exiger Docker."
-    : draft.mode === "build"
-      ? "Construit l'image sur cette machine et cree un paquet portable image.tar.gz."
-      : "Construit nativement sur le VPS, lance le conteneur puis verifie son etat.";
-
-  return `
-    <div class="modal-backdrop git-docker-environment-backdrop" id="gitDockerEnvironmentBackdrop">
-      <section class="modal git-docker-environment-modal" role="dialog" aria-modal="true" aria-labelledby="gitDockerEnvironmentTitle" tabindex="-1">
-        <header class="modal-head">
-          <div class="git-docker-environment-title">
-            <span><i data-lucide="folder-git-2"></i></span>
-            <div>
-              <h2 id="gitDockerEnvironmentTitle">Créer un environnement depuis GitHub</h2>
-              <p>Chaque import crée un nouveau dossier dans l'espace privé du compte connecté.</p>
-            </div>
-          </div>
-          <button class="icon-button" type="button" id="closeGitDockerEnvironment" title="Fermer" aria-label="Fermer" ${disabled}>
-            <i data-lucide="x"></i>
-          </button>
-        </header>
-        <form id="gitDockerEnvironmentForm" class="git-docker-environment-form">
-          <div class="modal-body git-docker-environment-body">
-            <label class="git-docker-field git-docker-field-wide">
-              <span>Lien du dépôt GitHub <b>requis</b></span>
-              <input id="gitDockerRepositoryUrl" value="${escapeAttr(draft.repositoryUrl)}" placeholder="https://github.com/BaptisteFaisy/Software-multi-account.git" inputmode="url" autocomplete="off" maxlength="2048" required ${disabled} />
-              <small>HTTPS ou SSH. Les jetons intégrés dans l'URL sont refusés.</small>
-            </label>
-            <div class="git-docker-form-grid">
-              <label class="git-docker-field">
-                <span>Branche, tag ou commit <small>facultatif</small></span>
-                <input id="gitDockerRef" value="${escapeAttr(draft.refName)}" placeholder="main" autocomplete="off" maxlength="200" ${disabled} />
-              </label>
-              <label class="git-docker-field">
-                <span>Action Docker</span>
-                <select id="gitDockerMode" ${disabled}>
-                  <option value="analyze" ${draft.mode === "analyze" ? "selected" : ""}>Analyser et preparer</option>
-                  <option value="build" ${draft.mode === "build" ? "selected" : ""}>Construire et exporter l'image</option>
-                  <option value="deploy" ${draft.mode === "deploy" ? "selected" : ""}>Deployer et lancer sur un VPS</option>
-                </select>
-              </label>
-            </div>
-            <div class="git-docker-mode-hint" aria-live="polite">
-              <i data-lucide="info"></i><span>${escapeHtml(modeHint)}</span>
-            </div>
-            <fieldset class="git-docker-ports">
-              <legend>Ports <small>facultatifs, detection automatique sinon</small></legend>
-              <label class="git-docker-field">
-                <span>Port du conteneur</span>
-                <input id="gitDockerContainerPort" type="number" min="1" max="65535" step="1" value="${escapeAttr(draft.containerPort)}" placeholder="3000" ${disabled} />
-              </label>
-              <label class="git-docker-field">
-                <span>Port public</span>
-                <input id="gitDockerHostPort" type="number" min="1" max="65535" step="1" value="${escapeAttr(draft.hostPort)}" placeholder="8080" ${disabled} />
-              </label>
-            </fieldset>
-            ${draft.mode === "deploy" ? `
-              <fieldset class="git-docker-vps-fields">
-                <legend>Connexion VPS</legend>
-                <div class="git-docker-form-grid">
-                  <label class="git-docker-field">
-                    <span>Cible SSH <b>requise</b></span>
-                    <input id="gitDockerDeployTarget" value="${escapeAttr(draft.deployTarget)}" placeholder="ubuntu@203.0.113.10" autocomplete="off" maxlength="255" required ${disabled} />
-                  </label>
-                  <label class="git-docker-field git-docker-ssh-port">
-                    <span>Port SSH</span>
-                    <input id="gitDockerSshPort" type="number" min="1" max="65535" step="1" value="${escapeAttr(draft.sshPort)}" required ${disabled} />
-                  </label>
-                </div>
-                <label class="git-docker-field git-docker-field-wide">
-                  <span>Chemin de la cle SSH <small>facultatif si l'agent SSH est actif</small></span>
-                  <input id="gitDockerSshKey" value="${escapeAttr(draft.sshKey)}" placeholder="C:\\Users\\moi\\.ssh\\id_ed25519" autocomplete="off" ${disabled} />
-                </label>
-                <div class="git-docker-checks">
-                  <label><input id="gitDockerInstallDocker" type="checkbox" ${draft.installDocker ? "checked" : ""} ${disabled} /><span>Installer Docker si absent <small>Debian/Ubuntu avec sudo sans mot de passe</small></span></label>
-                  <label><input id="gitDockerAcceptHostKey" type="checkbox" ${draft.acceptNewHostKey ? "checked" : ""} ${disabled} /><span>Accepter une nouvelle empreinte SSH <small>uniquement apres verification chez l'hebergeur</small></span></label>
-                </div>
-              </fieldset>` : ""}
-            <div class="git-docker-safety-note">
-              <i data-lucide="shield-check"></i>
-              <span><strong>Environnement isolé</strong><small>Le dépôt est cloné dans votre espace personnel et enregistré pour votre compte uniquement.</small></span>
-            </div>
-            ${gitDockerEnvironmentError ? `<div class="git-docker-error" role="alert"><i data-lucide="triangle-alert"></i><span>${escapeHtml(gitDockerEnvironmentError)}</span></div>` : ""}
-            ${gitDockerEnvironmentSubmitting ? `<div class="git-docker-progress" role="status"><i data-lucide="loader-circle"></i><span>Clonage, analyse et preparation en cours. Cette operation peut prendre plusieurs minutes.</span></div>` : ""}
-          </div>
-          <footer class="modal-actions">
-            <button class="tool-button" type="button" id="cancelGitDockerEnvironment" ${disabled}>Annuler</button>
-            <button class="tool-button primary" type="submit" ${disabled}>
-              <i data-lucide="${gitDockerEnvironmentSubmitting ? "loader-circle" : "folder-git-2"}"></i>
-              <span>${gitDockerEnvironmentSubmitting ? "Création en cours..." : "Créer depuis GitHub"}</span>
-            </button>
-          </footer>
-        </form>
-      </section>
-    </div>`;
-};
-
 const renderWorkspaceModal = () => {
   if (!workspaceModalOpen) return "";
 
@@ -23661,12 +23387,7 @@ const renderWorkspaceModal = () => {
           ${creatingPersonalEnvironment ? `<form id="createPersonalWorkspaceForm" class="ws-create-environment-form">
             <label for="newPersonalWorkspaceName"><span>Nom du nouvel environnement</span><small>Un dossier distinct sera créé uniquement dans votre espace.</small></label>
             <div><input id="newPersonalWorkspaceName" name="name" value="${escapeAttr(workspaceCreateName)}" maxlength="120" placeholder="Ex. Site vitrine" autocomplete="off" required ${createDisabled} /><button class="tool-button primary" type="submit" ${createDisabled}><i data-lucide="${workspaceCreateBusy ? "loader-circle" : "folder-plus"}"></i><span>${workspaceCreateBusy ? "Création..." : "Créer"}</span></button></div>
-          </form>
-          <section class="ws-create-github-option" aria-label="Créer depuis GitHub">
-            <span class="ws-create-github-icon"><i data-lucide="folder-git-2"></i></span>
-            <span><strong>Depuis un lien GitHub</strong><small>Clonez le dépôt dans un autre environnement privé, sans afficher les dossiers des autres comptes.</small></span>
-            <button type="button" class="tool-button" id="createWorkspaceFromGitHub" ${createDisabled}><i data-lucide="folder-git-2"></i><span>Importer</span></button>
-          </section>` : ""}
+          </form>` : ""}
           ${breadcrumbTrail ? `<nav class="ws-breadcrumb" aria-label="Chemin du dossier">${breadcrumbTrail}</nav>` : ""}
           <div class="ws-path-row">
             <input id="workspacePathInput" value="${escapeAttr(data?.path ?? "")}" placeholder="Chemin du dossier" spellcheck="false" aria-label="Chemin du dossier" />
@@ -26332,30 +26053,6 @@ const bindUi = () => {
       void openWorkspacePicker("create");
     });
   document
-    .querySelector<HTMLButtonElement>("#createGitDockerEnvironmentFromMenu")
-    ?.addEventListener("click", openGitDockerEnvironmentModal);
-  document
-    .querySelector<HTMLFormElement>("#gitDockerEnvironmentForm")
-    ?.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void submitGitDockerEnvironment(event.currentTarget as HTMLFormElement);
-    });
-  document.querySelector<HTMLSelectElement>("#gitDockerMode")?.addEventListener("change", () => {
-    readGitDockerEnvironmentForm();
-    render();
-  });
-  document
-    .querySelector<HTMLButtonElement>("#closeGitDockerEnvironment")
-    ?.addEventListener("click", closeGitDockerEnvironmentModal);
-  document
-    .querySelector<HTMLButtonElement>("#cancelGitDockerEnvironment")
-    ?.addEventListener("click", closeGitDockerEnvironmentModal);
-  document
-    .querySelector<HTMLDivElement>("#gitDockerEnvironmentBackdrop")
-    ?.addEventListener("click", (event) => {
-      if (event.target === event.currentTarget) closeGitDockerEnvironmentModal();
-    });
-  document
     .querySelector<HTMLDivElement>("#terminalEnvironmentMenuBackdrop")
     ?.addEventListener("click", (event) => {
       if (event.target === event.currentTarget) closeTerminalEnvironmentMenu();
@@ -26743,15 +26440,6 @@ const bindUi = () => {
     ?.addEventListener("submit", (event) => {
       event.preventDefault();
       void createPersonalWorkspace(event.currentTarget as HTMLFormElement);
-    });
-
-  document
-    .querySelector<HTMLButtonElement>("#createWorkspaceFromGitHub")
-    ?.addEventListener("click", () => {
-      workspaceModalOpen = false;
-      workspaceBrowse = null;
-      workspaceBrowseError = "";
-      openGitDockerEnvironmentModal();
     });
 
   document
@@ -28067,8 +27755,7 @@ const mountExpertTerminals = () => {
     newTerminalModalOpen ||
     agentsModalOpen ||
     workspaceModalOpen ||
-    terminalEnvironmentMenuOpen ||
-    gitDockerEnvironmentModalOpen;
+    terminalEnvironmentMenuOpen;
   const focusKey = requestTerminalFocusKey ?? focusedTerminalKeyBeforeRender;
   if (!modalOpen && focusKey) {
     const claudeCodeInput = Array.from(
@@ -28801,8 +28488,7 @@ const setupEvents = async () => {
       !terminalEnvironmentMenuOpen &&
       (newTerminalModalOpen ||
         agentsModalOpen ||
-        workspaceModalOpen ||
-        gitDockerEnvironmentModalOpen)
+        workspaceModalOpen)
     ) {
       return;
     }
@@ -28911,12 +28597,6 @@ const setupEvents = async () => {
     if (event.key === "Escape" && discussionArchiveCandidate) {
       event.preventDefault();
       closeDiscussionArchiveModal();
-      return;
-    }
-
-    if (event.key === "Escape" && gitDockerEnvironmentModalOpen) {
-      event.preventDefault();
-      closeGitDockerEnvironmentModal();
       return;
     }
 

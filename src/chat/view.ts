@@ -174,11 +174,6 @@ export type ChatPanelRenderOptions = {
     detail: string;
     disabled?: boolean;
   };
-  automaticOrchestration?: {
-    enabled: boolean;
-    detail: string;
-    disabled?: boolean;
-  };
   accountTransition?: {
     label: string;
     detail: string;
@@ -985,7 +980,6 @@ export const renderChatPanel = (
   const fullscreen = options.fullscreen === true;
   const autonomous = options.autonomous;
   const orchestration = options.orchestration;
-  const automaticOrchestration = options.automaticOrchestration;
   const managedByOrchestration =
     orchestration?.role === "orchestrator" || orchestration?.role === "worker";
   const expertClass = instanceId
@@ -1126,18 +1120,6 @@ export const renderChatPanel = (
           </div>
           <div class="chat-agent-tools" role="group" aria-label="Outils de conduite de l'agent">
             ${renderChatAgentTools(model.agentTools, model.enabledTools)}
-            ${automaticOrchestration ? `<button
-              id="${id("chatAutomaticOrchestration")}"
-              data-chat-action="toggle-automatic-orchestration"
-              type="button"
-              class="chat-agent-tool chat-agent-tool--orchestration"
-              title="${escapeHtml(automaticOrchestration.detail)}"
-              aria-label="Orchestration automatique ${automaticOrchestration.enabled ? "active" : "inactive"}. ${escapeHtml(automaticOrchestration.detail)}"
-              aria-pressed="${automaticOrchestration.enabled}"
-              ${automaticOrchestration.disabled || accountTransition ? "disabled" : ""}
-            >
-              <i data-lucide="users"></i><span>Orchestration auto · ${automaticOrchestration.enabled ? "Actif" : "Inactif"}</span>
-            </button>` : ""}
           </div>
           ${renderChatRuntimeStatus(model)}
           <div class="chat-voice-control">

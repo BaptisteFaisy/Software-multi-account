@@ -178,24 +178,19 @@ test("les backends desktop et serveur refusent un environnement implicite", () =
   assert.doesNotMatch(server, /prepare_local\(&agent_id, &canonical_home, None\)/);
 });
 
-test("un nouvel environnement peut etre cree directement depuis un lien Git Docker", () => {
+test("le bouton Git Docker est retire de l'UI mais le backend reste disponible", () => {
+  // Plus aucun point d'entree UI : ni le bouton du menu environnements, ni
+  // l'import GitHub du modal workspace, ni le modal lui-meme.
   for (const marker of [
     'id="createGitDockerEnvironmentFromMenu"',
     'id="createWorkspaceFromGitHub"',
     'id="gitDockerRepositoryUrl"',
-    'id="gitDockerMode"',
-    "Créer un environnement depuis GitHub",
-    "https://github.com/BaptisteFaisy/Software-multi-account.git",
-    "Analyser et preparer",
-    "Construire et exporter l'image",
-    "Deployer et lancer sur un VPS",
-    'invoke<GitDockerEnvironmentResult>("create_git_docker_environment"',
-    "selectEnvironment(result.workspacePath)",
+    "renderGitDockerEnvironmentModal",
+    "create_git_docker_environment",
   ]) {
-    assert.ok(main.includes(marker), `parcours Git Docker incomplet: ${marker}`);
+    assert.ok(!main.includes(marker), `UI Git Docker encore presente: ${marker}`);
   }
-  assert.match(style, /\.git-docker-environment-modal/);
-  assert.match(style, /\.git-docker-form-grid/);
+  // La route reste cablee cote transport et backend (API directe).
   assert.match(platform, /case "create_git_docker_environment":\s*return api<T>\("POST", "\/api\/workspaces\/git-docker", args\.request\)/);
   assert.match(desktopApp, /git_docker_environment::create_git_docker_environment/);
   assert.match(server, /"\/workspaces\/git-docker",\s*post\(api_create_git_docker_environment\)/);

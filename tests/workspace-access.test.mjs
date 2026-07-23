@@ -44,13 +44,12 @@ test("un import GitHub exige un compte et rejoint uniquement son espace personne
   const end = server.indexOf("async fn api_delete_workspace", start);
   const implementation = server.slice(start, end);
 
+  // La route d'import GitHub reste protegee cote serveur meme si le bouton UI a
+  // ete retire : compte requis, espace personnel uniquement, jamais admin.
   assert.match(implementation, /require_user_actor\(&state, &headers\)/);
   assert.match(implementation, /personal_root\(&identity\)/);
   assert.match(implementation, /claim_or_authorize_environment\(&identity/);
   assert.doesNotMatch(implementation, /RequestActor::Administrator|PROJECTS_DIRECTORY/);
-  assert.match(main, /id="createWorkspaceFromGitHub"/);
-  assert.match(main, /Créer un environnement depuis GitHub/);
-  assert.match(style, /\.ws-create-github-option/);
 });
 
 test("un partage accepte ne devient pas une porte d'entree du navigateur", () => {

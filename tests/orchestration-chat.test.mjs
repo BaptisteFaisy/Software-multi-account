@@ -104,7 +104,9 @@ test("la vue dédiée crée et expose chaque chat de l'équipe", () => {
   assert.match(main, /id="orchestrationWorkerCount"[^>]*min="1"[^>]*max="12"/);
   assert.match(main, /id="orchestrationConvertWorkerCount"[^>]*min="1"[^>]*max="12"/);
   assert.match(main, /orchestratorSessionId: sessionId,[\s\S]*?workerCount|workerCount,[\s\S]*?orchestratorSessionId: sessionId/);
-  assert.match(main, /automaticOrchestrationEnabled: persisted\.automaticOrchestrationEnabled === true/);
+  // Le bouton « Orchestration auto » a ete retire : un reglage persiste ne doit
+  // plus reactiver silencieusement le routage automatique.
+  assert.match(main, /automaticOrchestrationEnabled: false,/);
   assert.match(main, /testCommand: orchestrationTestCommandDraft\.trim\(\) \|\| "git diff --check"/);
   assert.match(main, /discussionForSession\(allDiscussions\(\), accountId, sessionId\)/);
   assert.match(main, /workerCount,/);
@@ -132,9 +134,11 @@ test("la vue dédiée crée et expose chaque chat de l'équipe", () => {
 });
 
 test("un chat normal route automatiquement ses demandes sans ancien bouton dans le bandeau", () => {
-  assert.match(chatView, /data-chat-action="toggle-automatic-orchestration"/);
-  assert.match(chatView, /aria-pressed="\$\{automaticOrchestration\.enabled\}"/);
-  assert.match(chatView, /Orchestration auto · \$\{automaticOrchestration\.enabled \? "Actif" : "Inactif"\}/);
+  // Le bouton « Orchestration auto » du composer a ete retire de l'UI ; la
+  // machinerie d'orchestration (manuelle et systeme) reste en place.
+  assert.doesNotMatch(chatView, /toggle-automatic-orchestration/);
+  assert.doesNotMatch(chatView, /Orchestration auto ·/);
+  assert.doesNotMatch(main, /toggle-automatic-orchestration/);
   assert.match(chatView, /data-chat-action="open-orchestration"/);
   assert.doesNotMatch(chatView, /data-chat-action="[^"\n]*orchestrate/);
   assert.doesNotMatch(chatView, /role: "available" \| "orchestrator" \| "worker"/);
@@ -143,8 +147,6 @@ test("un chat normal route automatiquement ses demandes sans ancien bouton dans 
   assert.match(main, /automaticOrchestrationRoutingSkill/);
   assert.match(main, /parseAutomaticOrchestrationDecision/);
   assert.match(main, /launchAutomaticOrchestration/);
-  assert.match(main, /data-chat-action='toggle-automatic-orchestration'/);
-  assert.match(main, /pane\.automaticOrchestrationEnabled = !pane\.automaticOrchestrationEnabled/);
   const routingDecision = main.indexOf("const shouldLaunchAutomaticOrchestration");
   const launchReservation = main.indexOf("pane.automaticOrchestrationLaunching = true", routingDecision);
   const sessionAttachment = main.indexOf("await attachCreatedExpertChat", routingDecision);
