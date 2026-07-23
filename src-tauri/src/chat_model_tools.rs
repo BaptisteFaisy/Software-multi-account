@@ -1301,6 +1301,30 @@ pub(crate) fn tool_pending_action_response(
     id: Value,
     action: &crate::microsoft::PendingMicrosoftAction,
 ) -> Value {
+    if action.requires_link {
+        // Le brouillon est garde : dire au modele d'en rediger un autre ferait
+        // perdre le travail et agacerait l'utilisateur pour rien.
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "Brouillon conserve : {}. Aucun compte Microsoft n'est encore lie : l'interface propose a l'utilisateur de connecter son compte dans la conversation, et le brouillon partira apres cette connexion et sa confirmation. Invite-le a cliquer sur « Connecter Microsoft 365 » dans la carte affichee, et ne prepare pas de nouveau brouillon.",
+                        action.summary
+                    )
+                }],
+                "structuredContent": {
+                    "actionId": action.id,
+                    "status": "awaiting_account_link",
+                    "kind": action.kind,
+                    "summary": action.summary,
+                },
+                "isError": false
+            }
+        });
+    }
     let text = match action.kind.as_str() {
         "sendEmail" => format!(
             "Brouillon prepare : {}. L'e-mail N'EST PAS envoye : une carte de confirmation attend la validation de l'utilisateur dans la conversation.",

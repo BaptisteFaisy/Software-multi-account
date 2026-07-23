@@ -7377,6 +7377,37 @@ body.chat-dragging .chat-side-drag-handle {
 }
 .microsoft-action-invite svg,
 .microsoft-action-guard svg { width: 13px; height: 13px; flex: none; margin-top: 1px; color: #f0be76; }
+.microsoft-action-guard.is-blocked svg { color: #8ad4ff; }
+.microsoft-action.is-blocked { border-color: rgba(0, 164, 239, .3); }
+
+.microsoft-link-request {
+  margin: 12px 0 0;
+  padding: 15px;
+  border: 1px solid rgba(0, 164, 239, .32);
+  border-radius: 14px;
+  background: linear-gradient(145deg, rgba(0, 164, 239, .09), rgba(255, 255, 255, .012));
+}
+.microsoft-link-request header { display: flex; align-items: center; gap: 11px; }
+.microsoft-link-request header > div { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.microsoft-link-request header strong { font-size: 12px; }
+.microsoft-link-request header small { color: var(--muted); font-size: 9px; }
+.microsoft-link-request header .microsoft-action-mark { background: rgba(0, 164, 239, .14); }
+.microsoft-link-request header button {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.microsoft-link-request header button:hover { color: inherit; background: rgba(255, 255, 255, .06); }
+.microsoft-link-request header button svg { width: 14px; height: 14px; }
+.microsoft-link-request p { margin: 11px 0 13px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.microsoft-link-request code { font-size: 9px; }
 .microsoft-action-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .microsoft-action-buttons button {
   display: inline-flex;

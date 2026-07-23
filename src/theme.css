@@ -917,6 +917,15 @@
 }
 :root[data-theme="light"] .microsoft-action-feedback.is-success { color: #0a5d86; }
 :root[data-theme="light"] .microsoft-action-feedback.is-error { color: #9c312d; }
+:root[data-theme="light"] .microsoft-link-request {
+  border-color: rgba(0, 108, 158, .26);
+  background: linear-gradient(145deg, #ffffff, #eef5fb);
+}
+:root[data-theme="light"] .microsoft-link-request header .microsoft-action-mark { background: rgba(0, 164, 239, .12); }
+:root[data-theme="light"] .microsoft-link-request header button:hover { background: rgba(0, 0, 0, .05); }
+:root[data-theme="light"] .microsoft-action-guard.is-blocked svg { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-action.is-blocked { border-color: rgba(0, 108, 158, .3); }
+
 :root[data-theme="light"] .microsoft-shortcut {
   border-color: var(--chat-border);
   background: linear-gradient(145deg, #ffffff, #eef5fb);

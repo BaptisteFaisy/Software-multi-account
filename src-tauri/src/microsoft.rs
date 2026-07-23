@@ -69,6 +69,10 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 6 * 60 * 60;
 /// que l'intervalle n'executerait jamais le renouvellement preventif.
 const KEEPALIVE_STARTUP_DELAY_SECS: u64 = 5 * 60;
 const ACTION_TTL_SECONDS: i64 = 6 * 60 * 60;
+/// Duree pendant laquelle la conversation continue de proposer la liaison apres
+/// qu'un outil l'a reclamee. Assez longue pour survivre a l'aller-retour vers
+/// Microsoft, assez courte pour ne pas harceler quelqu'un qui a renonce.
+const LINK_REQUEST_TTL_SECONDS: i64 = 60 * 60;
 const MAX_PENDING_ACTIONS_PER_OWNER: usize = 20;
 const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com";
 const DEFAULT_GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -262,6 +266,27 @@ pub(crate) struct PendingMicrosoftAction {
     pub source_chat_key: Option<String>,
     pub created_at: i64,
     pub expires_at: i64,
+    /// Brouillon prepare alors qu'aucun compte n'etait lie. Le contenu est
+    /// conserve : perdre un e-mail deja redige parce que la liaison manquait
+    /// obligerait a tout refaire apres la connexion.
+    pub requires_link: bool,
+}
+
+/// Trace d'un outil qui a reclame la boite Microsoft sans la trouver. Elle
+/// remonte a l'interface pour que la conversation propose la liaison, au lieu
+/// de laisser le modele annoncer un echec que l'utilisateur ne sait pas reparer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MicrosoftLinkRequest {
+    requested_at: i64,
+    expires_at: i64,
+    /// Vrai quand le serveur porte bien une configuration Entra : sinon la
+    /// carte doit expliquer que rien ne peut etre lie ici, plutot que d'offrir
+    /// un bouton qui ne menerait nulle part.
+    configured: bool,
+    /// Vrai quand un compte existe mais que son autorisation est morte.
+    needs_relink: bool,
+    login_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +315,8 @@ struct MicrosoftState {
     store: MicrosoftStore,
     pending_links: HashMap<String, PendingLink>,
     actions: Vec<PendingMicrosoftAction>,
+    /// Derniere reclamation de liaison, par proprietaire.
+    link_requests: HashMap<String, i64>,
     /// Un verrou asynchrone par proprietaire. Entra invalide l'ancien jeton de
     /// renouvellement a chaque echange : deux renouvellements simultanes en
     /// perdraient un, et la liaison mourrait sans que personne n'ait rien fait.
@@ -419,6 +446,7 @@ impl MicrosoftManager {
                 store,
                 pending_links: HashMap::new(),
                 actions: Vec::new(),
+                link_requests: HashMap::new(),
                 refresh_locks: HashMap::new(),
             })),
             config: Arc::new(RuntimeConfig {
@@ -503,6 +531,7 @@ impl MicrosoftManager {
         let previous = state.store.links.len();
         state.store.links.retain(|link| link.owner_id != owner_id);
         state.actions.retain(|action| action.owner_id != owner_id);
+        state.link_requests.remove(owner_id);
         state.refresh_locks.remove(owner_id);
         if state.store.links.len() != previous {
             self.persist_locked(&state)
@@ -777,6 +806,69 @@ impl MicrosoftManager {
     /// si necessaire. Le `Mutex` synchrone n'est jamais tenu a travers un
     /// `.await` : on clone, on relache, on appelle le reseau, puis on relock.
     async fn access_token_for_owner(&self, owner_id: &str) -> Result<String, MicrosoftError> {
+        match self.resolve_access_token(owner_id).await {
+            Ok(token) => Ok(token),
+            Err(error) => {
+                // Aucun compte lie, ou autorisation morte : la conversation doit
+                // pouvoir proposer la liaison. Une panne reseau ou un refus de
+                // Graph ne declenche rien — proposer de relier un compte deja
+                // valide ne ferait qu'egarer l'utilisateur.
+                if matches!(
+                    error.status,
+                    StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+                ) {
+                    self.note_link_request(owner_id);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Marque que la boite Microsoft a ete reclamee sans etre disponible.
+    fn note_link_request(&self, owner_id: &str) {
+        let now = metrics::now_ts();
+        if let Ok(mut state) = self.inner.lock() {
+            state.link_requests.retain(|_, expires| *expires > now);
+            state
+                .link_requests
+                .insert(owner_id.to_string(), now + LINK_REQUEST_TTL_SECONDS);
+        }
+    }
+
+    fn clear_link_request(&self, owner_id: &str) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.link_requests.remove(owner_id);
+        }
+    }
+
+    fn link_request(&self, owner_id: &str) -> Result<Option<MicrosoftLinkRequest>, MicrosoftError> {
+        let now = metrics::now_ts();
+        let provider = self.config.provider.as_ref();
+        let mut state = self.lock()?;
+        state.link_requests.retain(|_, expires| *expires > now);
+        let Some(expires_at) = state.link_requests.get(owner_id).copied() else {
+            return Ok(None);
+        };
+        let link = state
+            .store
+            .links
+            .iter()
+            .find(|link| link.owner_id == owner_id);
+        // Le compte a ete lie entre-temps : la demande n'a plus d'objet.
+        if link.is_some_and(|link| !link.needs_relink) {
+            state.link_requests.remove(owner_id);
+            return Ok(None);
+        }
+        Ok(Some(MicrosoftLinkRequest {
+            requested_at: expires_at - LINK_REQUEST_TTL_SECONDS,
+            expires_at,
+            configured: provider.is_some(),
+            needs_relink: link.is_some_and(|link| link.needs_relink),
+            login_url: provider.map(|provider| provider.login_url.clone()),
+        }))
+    }
+
+    async fn resolve_access_token(&self, owner_id: &str) -> Result<String, MicrosoftError> {
         if let Some(token) = self.cached_access_token(owner_id)? {
             return Ok(token);
         }
@@ -1171,16 +1263,29 @@ impl MicrosoftManager {
         draft: MicrosoftDraft,
         source_chat_key: Option<String>,
     ) -> Result<PendingMicrosoftAction, String> {
-        // Echoue tout de suite si le compte n'est pas lie ou si l'autorisation
-        // est morte : le modele apprend le probleme maintenant, pas au moment
-        // ou l'utilisateur clique sur « Envoyer ».
-        self.access_token_for_owner(owner_id)
-            .await
-            .map_err(|error| error.message)?;
+        // Un compte manquant ne fait pas perdre le brouillon : il est conserve
+        // et la conversation propose la liaison. Redemander au modele de tout
+        // reecrire apres la connexion serait la pire des reponses.
+        let requires_link = match self.access_token_for_owner(owner_id).await {
+            Ok(_) => false,
+            Err(error)
+                if matches!(
+                    error.status,
+                    StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+                ) =>
+            {
+                true
+            }
+            // Panne reseau ou refus de Graph : la liaison est probablement
+            // intacte, mieux vaut echouer que promettre un envoi.
+            Err(error) => return Err(error.message),
+        };
 
         let draft = match draft {
             MicrosoftDraft::UpdateEvent(mut update) => {
-                update.current_subject = self.event_subject(owner_id, &update.event_id).await;
+                if !requires_link {
+                    update.current_subject = self.event_subject(owner_id, &update.event_id).await;
+                }
                 MicrosoftDraft::UpdateEvent(update)
             }
             other => other,
@@ -1196,6 +1301,7 @@ impl MicrosoftManager {
             source_chat_key,
             created_at: now,
             expires_at: now + ACTION_TTL_SECONDS,
+            requires_link,
         };
         let mut state = self.lock().map_err(|error| error.message)?;
         state.actions.retain(|entry| entry.expires_at > now);
@@ -1606,6 +1712,7 @@ pub(crate) fn router(manager: MicrosoftManager) -> Router {
         .route("/pending-actions", get(api_pending_actions))
         .route("/pending-actions/:id/confirm", post(api_confirm))
         .route("/pending-actions/:id/cancel", post(api_cancel))
+        .route("/link-request", axum::routing::delete(api_dismiss_link_request))
         .with_state(manager)
 }
 
@@ -1689,8 +1796,21 @@ async fn api_pending_actions(
 ) -> Result<Response, MicrosoftError> {
     let identity = manager.identity(&headers)?;
     let actions = manager.pending_actions(&identity.id)?;
+    let link_request = manager.link_request(&identity.id)?;
     Ok(no_store(
-        Json(json!({ "actions": actions })).into_response(),
+        Json(json!({ "actions": actions, "linkRequest": link_request })).into_response(),
+    ))
+}
+
+async fn api_dismiss_link_request(
+    State(manager): State<MicrosoftManager>,
+    headers: HeaderMap,
+) -> Result<Response, MicrosoftError> {
+    let identity = manager.identity(&headers)?;
+    require_same_site(&headers)?;
+    manager.clear_link_request(&identity.id);
+    Ok(no_store(
+        Json(json!({ "status": "dismissed" })).into_response(),
     ))
 }
 
@@ -2258,6 +2378,56 @@ mod tests {
         assert!(link.access_token.is_empty());
         assert!(link.refresh_token.is_empty());
         assert_eq!(relink_required().status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn a_draft_prepared_without_a_linked_account_is_kept_and_flagged() {
+        let action = PendingMicrosoftAction {
+            id: "action-1".into(),
+            owner_id: "user-1".into(),
+            kind: "sendEmail".into(),
+            summary: "E-mail « Point » a jean@example.fr".into(),
+            draft: SendEmailArguments {
+                to: vec!["jean@example.fr".into()],
+                cc: vec![],
+                subject: "Point".into(),
+                body: "Bonjour".into(),
+            }
+            .into_draft()
+            .unwrap(),
+            source_chat_key: Some("chat-1".into()),
+            created_at: 1,
+            expires_at: 2,
+            requires_link: true,
+        };
+        let serialized = serde_json::to_value(&action).unwrap();
+        // L'interface s'appuie sur ce drapeau pour desactiver l'envoi et
+        // proposer la liaison plutot que de laisser cliquer dans le vide.
+        assert_eq!(serialized["requiresLink"], true);
+        // Le corps redige doit survivre : c'est tout l'interet de conserver le
+        // brouillon au lieu de refuser l'appel de l'outil.
+        assert_eq!(serialized["draft"]["body"], "Bonjour");
+        assert_eq!(serialized["draft"]["kind"], "sendEmail");
+        // Le proprietaire ne sort jamais : la liste est deja filtree par
+        // session, l'exposer ne servirait qu'a fuiter un identifiant.
+        assert!(serialized.get("ownerId").is_none());
+    }
+
+    #[test]
+    fn a_link_request_says_whether_anything_can_be_linked_at_all() {
+        let request = MicrosoftLinkRequest {
+            requested_at: 10,
+            expires_at: 10 + LINK_REQUEST_TTL_SECONDS,
+            configured: false,
+            needs_relink: false,
+            login_url: None,
+        };
+        let serialized = serde_json::to_value(&request).unwrap();
+        // Sans configuration serveur, la carte doit expliquer la situation au
+        // lieu d'afficher un bouton qui ne menerait nulle part.
+        assert_eq!(serialized["configured"], false);
+        assert!(serialized["loginUrl"].is_null());
+        assert!(LINK_REQUEST_TTL_SECONDS < ACTION_TTL_SECONDS);
     }
 
     #[test]

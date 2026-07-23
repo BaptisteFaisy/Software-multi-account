@@ -59,6 +59,12 @@ Trois autres ne font que **proposer** : `send_outlook_email`, `create_calendar_e
 
 La carte survit à un rechargement de page et reste valable six heures. Elle affiche le brouillon complet — destinataires, objet, corps, créneau converti dans le fuseau local — et propose aussi de l’annuler.
 
+### Connecter son compte sans quitter la conversation
+
+Si un outil réclame la boîte ou l’agenda alors qu’aucun compte n’est lié, une carte **Compte Microsoft à connecter** apparaît directement dans le fil, avec le bouton de liaison. Elle sert aussi quand Microsoft a révoqué l’autorisation, et explique la situation sans proposer de bouton quand le serveur n’a pas de configuration Entra.
+
+Un e-mail rédigé avant la liaison **n’est pas perdu** : le brouillon est conservé, son envoi reste fermé, et il redevient confirmable dès le compte connecté. La proposition de liaison s’efface d’elle-même une fois le compte lié, expire au bout d’une heure, et peut être masquée à la main.
+
 ## Utilisation depuis un agent autonome
 
 Un agent autonome créé par un utilisateur connecté hérite de son propriétaire et reçoit les mêmes cinq outils, **et uniquement ceux-là** : il ne peut ni créer d’autres agents, ni ouvrir des chats. Un agent créé avant cette version, ou avec le jeton administrateur, n’a aucun propriétaire et n’obtient donc aucun accès — il faut le recréer depuis un compte connecté.

@@ -49,13 +49,13 @@ const microsoft = await import(
 );
 
 /// Rend les cartes reellement produites pour une liste d'actions donnee.
-const renderPendingActions = async (actions) => {
+const renderPendingActions = async (actions, linkRequest = null) => {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async () => ({
     ok: true,
     status: 200,
     statusText: "OK",
-    text: async () => JSON.stringify({ actions }),
+    text: async () => JSON.stringify({ actions, linkRequest }),
   });
   try {
     await microsoft.refreshMicrosoftPendingActions();
@@ -108,7 +108,7 @@ const microsoftEnvironment = [
   "CST_MICROSOFT_REDIRECT_URI",
 ];
 
-test("les sept routes Microsoft sont montees sous /api/microsoft", () => {
+test("les huit routes Microsoft sont montees sous /api/microsoft", () => {
   const router = between(backend, "fn router(manager: MicrosoftManager)", ".with_state(manager)");
   assert.match(router, /\.route\("\/connection", get\(api_connection\)\.delete\(api_disconnect\)\)/);
   assert.match(router, /\.route\("\/start", get\(api_start\)\)/);
@@ -442,4 +442,98 @@ test("un agent autonome n'agit que pour un proprietaire nominatif et sur les seu
   // Sans proprietaire, aucun outil : deviner une boite reviendrait a ecrire
   // depuis celle de quelqu'un d'autre.
   assert.match(server, /let owner_id = agent\.owner_id\.clone\(\)\?;/);
+});
+
+test("une conversation qui reclame la boite propose de connecter le compte", async () => {
+  // Sans cette carte, le modele annonce un echec et l'utilisateur n'a aucun
+  // moyen, depuis la ou il est, de le reparer : il doit deviner qu'il faut
+  // ouvrir Mon compte.
+  const html = await renderPendingActions([], {
+    requestedAt: 1_800_000_000,
+    expiresAt: 1_800_003_600,
+    configured: true,
+    needsRelink: false,
+    loginUrl: "https://cst.example.test/api/microsoft/start",
+  });
+  assert.match(html, /microsoft-link-request/);
+  assert.match(html, /Connecter Microsoft 365/);
+  assert.match(html, /href="https:\/\/cst\.example\.test\/api\/microsoft\/start"/);
+
+  // Serveur sans configuration Entra : proposer un bouton mènerait l'utilisateur
+  // vers une page d'erreur Microsoft. La carte doit l'expliquer.
+  const unconfigured = await renderPendingActions([], {
+    requestedAt: 1_800_000_000,
+    expiresAt: 1_800_003_600,
+    configured: false,
+    needsRelink: false,
+    loginUrl: null,
+  });
+  assert.match(unconfigured, /microsoft-link-request/);
+  assert.doesNotMatch(unconfigured, /microsoft-connect-button/);
+  assert.match(unconfigured, /docs\/microsoft-365\.md/);
+
+  // Aucune demande : aucune carte, la conversation reste propre.
+  assert.equal(await renderPendingActions([], null), "");
+});
+
+test("un brouillon prepare sans compte lie garde son contenu et bloque l'envoi", async () => {
+  const body = "Bonjour,\n\nVoici le point demande.\n\nSIGNATURE";
+  const html = await renderPendingActions(
+    [
+      {
+        id: "action-9",
+        kind: "sendEmail",
+        summary: "E-mail « Point » a client@example.com",
+        sourceChatKey: "chat-1",
+        createdAt: 1_800_000_000,
+        expiresAt: 1_800_021_600,
+        requiresLink: true,
+        draft: {
+          kind: "sendEmail",
+          to: ["client@example.com"],
+          cc: [],
+          subject: "Point",
+          body,
+        },
+      },
+    ],
+    {
+      requestedAt: 1_800_000_000,
+      expiresAt: 1_800_003_600,
+      configured: true,
+      needsRelink: false,
+      loginUrl: "https://cst.example.test/api/microsoft/start",
+    },
+  );
+
+  // Le travail du modele n'est pas perdu : le corps redige est toujours la.
+  assert.ok(html.includes("SIGNATURE"), "le corps du brouillon a disparu");
+  assert.match(html, /is-blocked/);
+
+  // Le bouton d'envoi doit etre ferme : laisser cliquer produirait une erreur
+  // que rien dans la carte n'aurait annoncee.
+  const confirm = between(html, 'data-microsoft-action="confirm"', "</button>");
+  assert.match(confirm, /disabled/);
+  // Annuler reste possible : on doit pouvoir jeter un brouillon sans lier de compte.
+  const cancel = between(html, 'data-microsoft-action="cancel"', "</button>");
+  assert.doesNotMatch(cancel, /disabled/);
+
+  // La proposition de liaison precede le brouillon qu'elle debloque.
+  assert.ok(
+    html.indexOf("microsoft-link-request") < html.indexOf("data-microsoft-pending-action"),
+    "la carte de liaison doit preceder les brouillons",
+  );
+});
+
+test("la demande de liaison a une route dediee et n'echappe pas au garde CSRF", () => {
+  assert.match(backend, /\.route\("\/link-request", axum::routing::delete\(api_dismiss_link_request\)\)/);
+  const handler = between(backend, "async fn api_dismiss_link_request", "\n}\n");
+  assert.match(handler, /require_same_site\(&headers\)\?/);
+  assert.match(handler, /manager\.identity\(&headers\)\?/);
+
+  // La demande ne doit naitre que d'un compte absent ou revoque : un 502 de
+  // Graph proposerait de relier un compte pourtant valide.
+  const noted = between(backend, "async fn access_token_for_owner", "async fn resolve_access_token");
+  assert.match(noted, /StatusCode::NOT_FOUND \| StatusCode::UNAUTHORIZED/);
+  assert.match(noted, /self\.note_link_request\(owner_id\)/);
 });

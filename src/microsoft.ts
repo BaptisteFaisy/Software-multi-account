@@ -64,6 +64,16 @@ export type MicrosoftPendingAction = {
   createdAt: number;
   expiresAt: number;
   draft: MicrosoftDraft;
+  /** Brouillon prepare alors qu'aucun compte n'etait lie : a connecter avant envoi. */
+  requiresLink?: boolean;
+};
+
+export type MicrosoftLinkRequest = {
+  requestedAt: number;
+  expiresAt: number;
+  configured: boolean;
+  needsRelink: boolean;
+  loginUrl: string | null;
 };
 
 type Feedback = { tone: "success" | "error"; message: string };
@@ -99,6 +109,7 @@ let connectionFeedback: Feedback | null = null;
 let unlinkPending = false;
 let unlinking = false;
 let pendingActions: MicrosoftPendingAction[] = [];
+let linkRequest: MicrosoftLinkRequest | null = null;
 let pendingActionsLoaded = false;
 let pendingActionsInFlight: Promise<void> | null = null;
 let busyActionId: string | null = null;
@@ -515,8 +526,12 @@ export const refreshMicrosoftPendingActions = (): Promise<void> => {
   }
   const pending = (async () => {
     try {
-      const response = await microsoftApi<{ actions: MicrosoftPendingAction[] }>("/pending-actions");
+      const response = await microsoftApi<{
+        actions: MicrosoftPendingAction[];
+        linkRequest: MicrosoftLinkRequest | null;
+      }>("/pending-actions");
       pendingActions = Array.isArray(response?.actions) ? response.actions : [];
+      linkRequest = response?.linkRequest ?? null;
     } catch {
       // Une file momentanement injoignable ne doit pas effacer les cartes deja
       // affichees : l'utilisateur perdrait de vue un envoi encore en attente.
@@ -534,9 +549,15 @@ export const refreshMicrosoftPendingActions = (): Promise<void> => {
 /** Signature du bloc de confirmation, pour le patch cible du fil de discussion. */
 export const microsoftPendingActionsSignature = (): string =>
   JSON.stringify([
-    pendingActions.map((action) => action.id),
+    pendingActions.map((action) => `${action.id}:${action.requiresLink === true}`),
     busyActionId,
     actionFeedback,
+    // La proposition de liaison et l'etat de connexion font partie du bloc :
+    // sans eux, la carte n'apparaitrait pas et les brouillons resteraient
+    // bloques a l'ecran apres une connexion reussie.
+    linkRequest?.requestedAt ?? null,
+    linkRequest?.needsRelink ?? null,
+    connection?.connected ?? null,
   ]);
 
 const ACTION_TITLES: Record<MicrosoftDraft["kind"], string> = {
@@ -619,9 +640,13 @@ const renderPendingAction = (action: MicrosoftPendingAction): string => {
   const busy = busyActionId === action.id;
   // Une seule action a la fois : un double clic ne doit pas partir deux fois.
   const disabled = busyActionId !== null;
+  // Un brouillon prepare sans compte lie garde son contenu, mais son envoi
+  // reste ferme : laisser cliquer produirait une erreur que rien dans la carte
+  // n'aurait annoncee.
+  const blocked = action.requiresLink === true && connection?.connected !== true;
   const confirmLabel = action.kind === "sendEmail" ? "Envoyer" : "Confirmer";
   const confirmIcon = action.kind === "sendEmail" ? "send" : "calendar-check";
-  return `<article class="microsoft-action is-${escapeHtml(action.kind)}" data-microsoft-pending-action="${escapeHtml(action.id)}">
+  return `<article class="microsoft-action is-${escapeHtml(action.kind)}${blocked ? " is-blocked" : ""}" data-microsoft-pending-action="${escapeHtml(action.id)}">
     <header>
       <span class="microsoft-action-mark"><i data-lucide="${escapeHtml(ACTION_ICONS[action.kind] ?? "mail")}"></i></span>
       <div>
@@ -631,15 +656,49 @@ const renderPendingAction = (action: MicrosoftPendingAction): string => {
       <span class="microsoft-action-expiry">Expire le ${escapeHtml(formatUnixSeconds(action.expiresAt))}</span>
     </header>
     ${renderDraft(action.draft)}
-    <p class="microsoft-action-guard"><i data-lucide="shield-alert"></i><span>Rien n’est envoyé tant que vous n’avez pas confirmé ici. Relisez le contenu complet avant de valider.</span></p>
+    ${blocked
+      ? `<p class="microsoft-action-guard is-blocked"><i data-lucide="link-2-off"></i><span>Ce brouillon a été préparé avant que votre compte Microsoft ne soit lié. Connectez-le ci-dessus : le contenu est conservé et vous pourrez l’envoyer ensuite.</span></p>`
+      : `<p class="microsoft-action-guard"><i data-lucide="shield-alert"></i><span>Rien n’est envoyé tant que vous n’avez pas confirmé ici. Relisez le contenu complet avant de valider.</span></p>`}
     <footer class="microsoft-action-buttons">
-      <button type="button" class="primary${busy ? " is-busy" : ""}" data-microsoft-action="confirm" data-microsoft-action-id="${escapeHtml(action.id)}" ${disabled ? "disabled" : ""}>
+      <button type="button" class="primary${busy ? " is-busy" : ""}" data-microsoft-action="confirm" data-microsoft-action-id="${escapeHtml(action.id)}" ${disabled || blocked ? "disabled" : ""}>
         <i data-lucide="${busy ? "loader-circle" : confirmIcon}"></i><span>${busy ? "Envoi en cours…" : confirmLabel}</span>
       </button>
       <button type="button" data-microsoft-action="cancel" data-microsoft-action-id="${escapeHtml(action.id)}" ${disabled ? "disabled" : ""}>
         <i data-lucide="x"></i><span>Annuler</span>
       </button>
     </footer>
+  </article>`;
+};
+
+/**
+ * Carte de liaison affichee dans la conversation. Elle apparait quand un outil
+ * a reclame la boite Microsoft sans la trouver : sans elle, le modele annonce un
+ * echec et l'utilisateur n'a aucun moyen, depuis la ou il est, de le reparer.
+ */
+const renderLinkRequest = (): string => {
+  if (!linkRequest || connection?.connected === true) return "";
+  const target = linkRequest.loginUrl || connection?.loginUrl || "";
+  const body = !linkRequest.configured
+    ? `<p>Microsoft 365 n’est pas configuré sur ce serveur : personne ne peut lier de compte ici pour l’instant. La procédure est décrite dans <code>docs/microsoft-365.md</code>.</p>`
+    : linkRequest.needsRelink
+      ? `<p>Microsoft a révoqué l’autorisation de votre compte. Reliez-le pour rendre Outlook et l’Agenda de nouveau accessibles depuis vos conversations.</p>`
+      : `<p>Cette conversation a besoin de votre boîte Outlook ou de votre agenda. Connectez votre compte Microsoft 365 pour continuer : vous êtes redirigé vers la page officielle Microsoft, l’application ne voit ni votre mot de passe ni votre second facteur.</p>`;
+  const action = linkRequest.configured && target
+    ? `<a class="microsoft-connect-button" href="${escapeHtml(target)}">
+         ${microsoftMark()}<span>${linkRequest.needsRelink ? "Relier de nouveau Microsoft 365" : "Connecter Microsoft 365"}</span>
+       </a>`
+    : "";
+  return `<article class="microsoft-link-request">
+    <header>
+      <span class="microsoft-action-mark">${microsoftMark()}</span>
+      <div>
+        <strong>${linkRequest.needsRelink ? "Compte Microsoft à relier" : "Compte Microsoft à connecter"}</strong>
+        <small>Demandé par cette conversation</small>
+      </div>
+      <button type="button" data-microsoft-action="dismiss-link" aria-label="Masquer cette proposition"><i data-lucide="x"></i></button>
+    </header>
+    ${body}
+    ${action}
   </article>`;
 };
 
@@ -656,9 +715,9 @@ export const startMicrosoftPendingPolling = (onChange: () => void): void => {
   if (pendingPollTimer !== null) return;
   pendingPollTimer = setInterval(() => {
     if (document.hidden) return;
-    const before = pendingActions.length;
+    const before = microsoftPendingActionsSignature();
     void refreshMicrosoftPendingActions().then(() => {
-      if (pendingActions.length !== before) onChange();
+      if (microsoftPendingActionsSignature() !== before) onChange();
     });
   }, 90_000);
 };
@@ -673,15 +732,18 @@ export const startMicrosoftPendingPolling = (onChange: () => void): void => {
 export const microsoftPendingActionCount = (): number => pendingActions.length;
 
 export const renderMicrosoftPendingActions = (): string => {
-  if (!pendingActions.length && !actionFeedback) return "";
+  const link = renderLinkRequest();
+  if (!pendingActions.length && !actionFeedback && !link) return "";
   const notice = actionFeedback
     ? `<p class="microsoft-action-feedback is-${actionFeedback.tone}" role="status">
         <span>${escapeHtml(actionFeedback.message)}</span>
         <button type="button" data-microsoft-action="dismiss" aria-label="Masquer ce message"><i data-lucide="x"></i></button>
       </p>`
     : "";
+  // La proposition de liaison passe avant les brouillons : c'est elle qui
+  // debloque leur envoi.
   return `<section class="microsoft-pending" aria-label="Actions Microsoft 365 à confirmer">
-    ${notice}${pendingActions.map(renderPendingAction).join("")}
+    ${notice}${link}${pendingActions.map(renderPendingAction).join("")}
   </section>`;
 };
 
@@ -729,6 +791,14 @@ export const handleMicrosoftPendingActionClick = (target: EventTarget | null): b
   if (mode === "dismiss") {
     actionFeedback = null;
     rerender();
+    return true;
+  }
+  if (mode === "dismiss-link") {
+    // Efface la demande cote serveur, sinon elle reviendrait au rechargement
+    // suivant et donnerait l'impression d'un bouton sans effet.
+    linkRequest = null;
+    rerender();
+    void microsoftApi("/link-request", { method: "DELETE", confirm: true }).catch(() => {});
     return true;
   }
   const id = button.dataset.microsoftActionId ?? "";
