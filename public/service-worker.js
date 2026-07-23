@@ -1,4 +1,11 @@
 const CACHE_PREFIX = "codex-terminal-static-";
+// Version du worker. Toute modification de cette valeur suffit a forcer le
+// navigateur a installer un nouveau service worker : il re-telecharge ce script
+// hors du cache HTTP (`updateViaCache: "none"`) et le compare octet par octet a
+// celui installe. C'est le levier qui sort un onglet d'un cache PWA fige sans
+// aucune manipulation de l'utilisateur, meme si l'URL enregistree pointe encore
+// vers un ancien build.
+const SW_VERSION = "2";
 const BUILD_ID = new URL(self.location.href).searchParams.get("build") || "legacy";
 const CACHE_NAME = `${CACHE_PREFIX}${BUILD_ID}`;
 const NAVIGATION_NETWORK_TIMEOUT_MS = 5_000;
@@ -18,16 +25,35 @@ self.addEventListener("install", (event) => {
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches
-      .keys()
-      .then((keys) =>
-        Promise.all(
-          keys
-            .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
-            .map((key) => caches.delete(key)),
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys
+          .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
+          .map((key) => caches.delete(key)),
+      );
+      // Un index.html perime conserve dans le cache courant est la cause typique
+      // d'un cache PWA fige : il reference d'anciens chunks /assets/ et se
+      // ressert en boucle. On le purge pour que la prochaine navigation reparte
+      // du reseau (les assets hashes restants sont simplement inutilises).
+      const current = await caches.open(CACHE_NAME);
+      await current.delete("/");
+      await self.clients.claim();
+      // Recharge une seule fois les onglets ouverts pour qu'ils reprennent
+      // l'index et le JS frais. Le build-id frais re-enregistre ce meme worker
+      // (contenu identique) : aucune nouvelle activation, donc aucune boucle.
+      const windows = await self.clients.matchAll({
+        type: "window",
+        includeUncontrolled: true,
+      });
+      await Promise.all(
+        windows.map((client) =>
+          client.url.includes("/reset-update.html")
+            ? undefined
+            : client.navigate(client.url).catch(() => undefined),
         ),
-      )
-      .then(() => self.clients.claim()),
+      );
+    })(),
   );
 });
 

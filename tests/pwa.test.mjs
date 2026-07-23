@@ -45,6 +45,24 @@ test("le service worker ne met jamais les API privees en cache", async () => {
   assert.match(worker, /caches\.match\("\/offline\.html"\)/);
 });
 
+test("un cache PWA fige se repare tout seul au prochain chargement", async () => {
+  const worker = await read("public/service-worker.js");
+  // Une version de worker permet de forcer un nouveau script (compare octet par
+  // octet, re-telecharge hors cache), meme si l'URL enregistree garde un vieux build.
+  assert.match(worker, /const SW_VERSION = /);
+  // A l'activation : purge l'index perime du cache courant puis recharge les
+  // onglets ouverts pour reprendre l'index et le JS frais.
+  assert.match(worker, /await current\.delete\("\/"\)/);
+  assert.match(worker, /self\.clients\.matchAll\(\{\s*type: "window",\s*includeUncontrolled: true,?\s*\}\)/);
+  assert.match(worker, /client\.navigate\(client\.url\)/);
+  assert.match(worker, /client\.url\.includes\("\/reset-update\.html"\)/);
+
+  // Cote page : une verification du script est forcee a chaque chargement pour
+  // ne pas attendre le throttle de 24 h du navigateur.
+  const source = await read("src/pwa.ts");
+  assert.match(source, /registration\.update\(\)/);
+});
+
 test("l'aide Safari reconnait aussi le user-agent iPad de bureau", async () => {
   const source = await read("src/pwa.ts");
   assert.match(source, /Macintosh/);

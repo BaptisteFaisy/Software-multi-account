@@ -83,6 +83,13 @@ const registerServiceWorker = () => {
     scope: "/",
     updateViaCache: "none",
   })
+    .then((registration) => {
+      // Force une verification du script a chaque chargement : un nouveau build
+      // (ou une nouvelle version du worker) est ainsi detecte et installe sans
+      // attendre le throttle de 24 h du navigateur. Le worker se charge ensuite
+      // de purger l'index perime et de recharger l'onglet.
+      void registration.update().catch(() => undefined);
+    })
     .catch(() => {
       // Le serveur reste utilisable si Safari refuse le service worker.
     });
