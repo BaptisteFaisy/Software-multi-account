@@ -28,11 +28,20 @@ pub const PAUSE_AUTONOMOUS_AGENT_TOOL_NAME: &str = "pause_autonomous_agent";
 pub const APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME: &str = "apply_autonomous_agent_policy";
 pub const ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME: &str = "activate_supervisor_general_report";
 pub const CREATE_CHAT_TOOL_NAME: &str = "create_chat";
+pub const LIST_OUTLOOK_MESSAGES_TOOL_NAME: &str = "list_outlook_messages";
+pub const LIST_CALENDAR_EVENTS_TOOL_NAME: &str = "list_calendar_events";
+pub const SEND_OUTLOOK_EMAIL_TOOL_NAME: &str = "send_outlook_email";
+pub const CREATE_CALENDAR_EVENT_TOOL_NAME: &str = "create_calendar_event";
+pub const UPDATE_CALENDAR_EVENT_TOOL_NAME: &str = "update_calendar_event";
 pub const MCP_SERVER_NAME: &str = "cst_chat";
 pub const MCP_BEARER_ENV: &str = "CST_CHAT_AUTONOMOUS_TOOL_TOKEN";
 const CAPABILITY_TTL_SECONDS: i64 = 2 * 60 * 60;
 const MAX_TOOL_CALLS_PER_TURN: u8 = 8;
 const MAX_CHAT_CREATIONS_PER_TURN: u8 = 1;
+/// Sous-quota des actions qui sortent de l'application (e-mail, agenda). Le
+/// budget global de 8 appels est partage avec les outils d'agents : sans ce
+/// plafond, une boucle de redaction epuiserait le tour a elle seule.
+const MAX_EXTERNAL_ACTIONS_PER_TURN: u8 = 3;
 const CHAT_OPEN_REQUEST_TTL_SECONDS: i64 = 2 * 60 * 60;
 const MAX_PENDING_CHAT_OPEN_REQUESTS: usize = 32;
 const MAX_CHAT_PROMPT_LENGTH: usize = 32_768;
@@ -43,9 +52,45 @@ pub(crate) struct ChatModelToolServerConfig {
     pub bearer_token: String,
 }
 
+/// Etendue des outils accordee a un porteur de capacite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatToolScope {
+    /// Chat interactif : un humain lit la reponse et peut reagir.
+    Full,
+    /// Cycle d'agent autonome : uniquement les outils qui touchent aux donnees
+    /// personnelles de son proprietaire. Un agent qui tourne seul, sans personne
+    /// devant l'ecran, n'a rien a faire avec la creation d'autres agents ou
+    /// l'ouverture de chats — il se dupliquerait sans controle.
+    PersonalDataOnly,
+}
+
+/// Outils qui travaillent sur le compte Microsoft de l'utilisateur.
+pub(crate) const MICROSOFT_TOOL_NAMES: [&str; 5] = [
+    LIST_OUTLOOK_MESSAGES_TOOL_NAME,
+    LIST_CALENDAR_EVENTS_TOOL_NAME,
+    SEND_OUTLOOK_EMAIL_TOOL_NAME,
+    CREATE_CALENDAR_EVENT_TOOL_NAME,
+    UPDATE_CALENDAR_EVENT_TOOL_NAME,
+];
+
+impl ChatToolScope {
+    pub fn allows(&self, tool_name: &str) -> bool {
+        match self {
+            Self::Full => true,
+            Self::PersonalDataOnly => MICROSOFT_TOOL_NAMES.contains(&tool_name),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AutonomousAgentToolContext {
     pub account_id: String,
+    pub scope: ChatToolScope,
+    /// Compte utilisateur nominatif (`AuthIdentity.id`) qui a demarre le tour.
+    /// `None` pour un tour lance avec le jeton administrateur. C'est la seule
+    /// cle acceptable pour retrouver une boite Microsoft : `account_id` designe
+    /// un profil CLI, partageable entre plusieurs personnes.
+    pub user_id: Option<String>,
     pub source_chat_key: Option<String>,
     pub project_dir: Option<String>,
     pub mode: ChatTurnMode,
@@ -59,6 +104,7 @@ struct ChatToolCapability {
     expires_at: i64,
     calls: u8,
     chat_creations: u8,
+    external_actions: u8,
 }
 
 #[derive(Clone, Default)]
@@ -82,6 +128,7 @@ impl ChatToolCapabilityRegistry {
                 expires_at: now.saturating_add(CAPABILITY_TTL_SECONDS),
                 calls: 0,
                 chat_creations: 0,
+                external_actions: 0,
             },
         );
         Ok(token)
@@ -135,6 +182,37 @@ impl ChatToolCapabilityRegistry {
         }
         entry.calls = entry.calls.saturating_add(1);
         entry.chat_creations = entry.chat_creations.saturating_add(1);
+        Ok(entry.context.clone())
+    }
+
+    /// Consomme un appel ET une action externe. Utilise par les outils qui
+    /// preparent un e-mail ou une ecriture d'agenda : ils ne partent qu'apres
+    /// confirmation humaine, mais chaque brouillon coute a l'utilisateur une
+    /// carte a relire.
+    pub fn claim_external_action(
+        &self,
+        token: &str,
+    ) -> Result<AutonomousAgentToolContext, String> {
+        let now = metrics::now_ts();
+        let mut entries = self
+            .inner
+            .lock()
+            .map_err(|_| "Registre des outils du chat verrouille".to_string())?;
+        entries.retain(|_, entry| entry.expires_at > now);
+        let entry = entries
+            .get_mut(token)
+            .ok_or_else(|| "Capacite MCP absente ou expiree".to_string())?;
+        if entry.calls >= MAX_TOOL_CALLS_PER_TURN {
+            return Err("Limite d'actions autonomes atteinte pour ce tour".to_string());
+        }
+        if entry.external_actions >= MAX_EXTERNAL_ACTIONS_PER_TURN {
+            return Err(
+                "Limite d'actions Microsoft atteinte pour ce tour ; traite les brouillons en attente avant d'en preparer d'autres"
+                    .to_string(),
+            );
+        }
+        entry.calls = entry.calls.saturating_add(1);
+        entry.external_actions = entry.external_actions.saturating_add(1);
         Ok(entry.context.clone())
     }
 
@@ -272,6 +350,10 @@ impl CreateAutonomousAgentToolArguments {
             source_report_id: None,
             source_report_idea_index: None,
             account_id: context.account_id,
+            // L'agent cree depuis un chat herite du proprietaire de ce chat :
+            // il travaillera plus tard sur la boite de cette personne, pas sur
+            // une autre, et un tour administrateur n'en designe aucune.
+            owner_id: context.user_id,
             project_dir: context.project_dir,
             mode: self.mode.unwrap_or(context.mode),
             require_user_review: self.require_user_review.unwrap_or(true),
@@ -535,11 +617,31 @@ pub(crate) fn linked_agent_for_context(
         })
 }
 
-pub(crate) fn initialize_response(id: Value, requested_version: Option<&str>) -> Value {
+pub(crate) fn initialize_response(
+    id: Value,
+    requested_version: Option<&str>,
+    scope: ChatToolScope,
+) -> Value {
     let protocol_version = requested_version
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("2025-06-18");
+    if scope == ChatToolScope::PersonalDataOnly {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": protocol_version,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": {
+                    "name": "codex-switch-terminal-chat-tools",
+                    "title": "Outils du chat Codex Switch Terminal",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "instructions": "Ces outils donnent acces au compte Microsoft 365 de l'utilisateur qui a cree cet agent : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous, update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux de ce proprietaire : ne demande jamais d'adresse, d'identifiant ni de boite cible. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils deposent une carte que le proprietaire devra confirmer dans l'application. Comme personne ne lit ce cycle en direct, ecris des brouillons complets et autonomes, et indique clairement dans ton compte rendu ce qui attend une validation."
+            }
+        });
+    }
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -551,12 +653,29 @@ pub(crate) fn initialize_response(id: Value, requested_version: Option<&str>) ->
                 "title": "Outils du chat Codex Switch Terminal",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle create_chat avec son message initial. Le nouveau chat herite du compte, du modele et de l'environnement courants ; un seul peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer ou demarrer un nouvel agent autonome, appelle create_autonomous_agent. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle pause_autonomous_agent sans demander d'identifiant. Quand il demande explicitement de modifier l'agent autonome lie a ce chat, appelle update_autonomous_agent. Quand il demande au superviseur d'activer, produire ou relancer le compte rendu general des rapports non lus, appelle activate_supervisor_general_report ; cet outil fonctionne depuis n'importe quel chat et ne demande aucun identifiant. Quand il demande d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle apply_autonomous_agent_policy ; cet outil fonctionne sans cle de chat et reste limite au compte et, par defaut, au projet courants. Deduis une configuration sure, conserve les valeurs existantes et ne demande jamais d'identifiant d'agent. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. N'appelle pas ces outils pour une question theorique."
+            "instructions": "Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle create_chat avec son message initial. Le nouveau chat herite du compte, du modele et de l'environnement courants ; un seul peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer ou demarrer un nouvel agent autonome, appelle create_autonomous_agent. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle pause_autonomous_agent sans demander d'identifiant. Quand il demande explicitement de modifier l'agent autonome lie a ce chat, appelle update_autonomous_agent. Quand il demande au superviseur d'activer, produire ou relancer le compte rendu general des rapports non lus, appelle activate_supervisor_general_report ; cet outil fonctionne depuis n'importe quel chat et ne demande aucun identifiant. Quand il demande d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle apply_autonomous_agent_policy ; cet outil fonctionne sans cle de chat et reste limite au compte et, par defaut, au projet courants. Deduis une configuration sure, conserve les valeurs existantes et ne demande jamais d'identifiant d'agent. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. N'appelle pas ces outils pour une question theorique. Cinq outils supplementaires donnent acces au compte Microsoft 365 lie a l'utilisateur connecte : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous et update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux du compte connecte : ne demande jamais d'adresse, d'identifiant, de mot de passe ni de boite cible. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils preparent une carte que l'utilisateur doit confirmer. N'affirme donc jamais qu'un e-mail est parti ou qu'un rendez-vous est cree ; dis qu'il attend sa validation."
         }
     })
 }
 
-pub(crate) fn tools_list_response(id: Value) -> Value {
+pub(crate) fn tools_list_response(id: Value, scope: ChatToolScope) -> Value {
+    let mut response = all_tools_response(id);
+    if scope != ChatToolScope::Full {
+        if let Some(tools) = response
+            .pointer_mut("/result/tools")
+            .and_then(Value::as_array_mut)
+        {
+            tools.retain(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| scope.allows(name))
+            });
+        }
+    }
+    response
+}
+
+fn all_tools_response(id: Value) -> Value {
     let output_schema = json!({
         "type": "object",
         "properties": {
@@ -619,6 +738,77 @@ pub(crate) fn tools_list_response(id: Value) -> Value {
         },
         "required": ["requestId", "status", "mode", "sourceChatKey"]
     });
+    let messages_output_schema = json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer" },
+            "messages": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "subject": { "type": "string" },
+                        "from": { "type": "string" },
+                        "fromName": { "type": "string" },
+                        "receivedAt": { "type": "string" },
+                        "preview": { "type": "string" },
+                        "isRead": { "type": "boolean" },
+                        "hasAttachments": { "type": "boolean" }
+                    },
+                    "required": ["id", "subject", "from", "receivedAt", "preview"]
+                }
+            }
+        },
+        "required": ["count", "messages"]
+    });
+    let events_output_schema = json!({
+        "type": "object",
+        "properties": {
+            "count": { "type": "integer" },
+            "window": {
+                "type": "object",
+                "properties": {
+                    "start": { "type": "string" },
+                    "end": { "type": "string" },
+                    "timeZone": { "type": "string" }
+                },
+                "required": ["start", "end", "timeZone"]
+            },
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "subject": { "type": "string" },
+                        "start": { "type": "string" },
+                        "end": { "type": "string" },
+                        "timeZone": { "type": "string" },
+                        "location": { "type": "string" },
+                        "organizer": { "type": "string" },
+                        "attendees": { "type": "array", "items": { "type": "string" } },
+                        "isAllDay": { "type": "boolean" },
+                        "isCancelled": { "type": "boolean" }
+                    },
+                    "required": ["id", "subject", "start", "end", "timeZone"]
+                }
+            }
+        },
+        "required": ["count", "events", "window"]
+    });
+    let pending_action_output_schema = json!({
+        "type": "object",
+        "properties": {
+            "actionId": { "type": "string" },
+            "status": { "type": "string" },
+            "kind": { "type": "string" },
+            "summary": { "type": "string" }
+        },
+        "required": ["actionId", "status", "kind", "summary"]
+    });
+    let instant_description =
+        "Date et heure ISO 8601 avec decalage horaire explicite, par exemple 2026-07-25T14:00:00+02:00. Un instant sans decalage est refuse.";
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -867,8 +1057,276 @@ pub(crate) fn tools_list_response(id: Value) -> Value {
                         "idempotentHint": false,
                         "openWorldHint": false
                     }
+                },
+                {
+                    "name": LIST_OUTLOOK_MESSAGES_TOOL_NAME,
+                    "title": "Lire la boite Outlook de l'utilisateur",
+                    "description": "Liste les e-mails de la boite Microsoft 365 liee au compte de l'utilisateur connecte. Utilise cet outil quand l'utilisateur demande de consulter, chercher, resumer ou verifier ses e-mails. La boite est deduite du compte connecte : ne demande jamais d'adresse, d'identifiant ni de mot de passe. Les corps complets ne sont pas retournes : appuie-toi sur l'objet, l'expediteur et l'apercu.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "maxLength": 200,
+                                "description": "Recherche plein texte facultative, par exemple « facture » ou « from:jean@example.fr ». Sans guillemet."
+                            },
+                            "folder": {
+                                "type": "string",
+                                "enum": ["inbox", "sentitems", "drafts", "archive"],
+                                "description": "Dossier a lire. Par defaut : inbox."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 25,
+                                "description": "Nombre de messages a retourner. Par defaut : 10."
+                            }
+                        }
+                    },
+                    "outputSchema": messages_output_schema,
+                    "annotations": {
+                        "title": "Lire la boite Outlook",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": LIST_CALENDAR_EVENTS_TOOL_NAME,
+                    "title": "Consulter l'agenda Microsoft de l'utilisateur",
+                    "description": "Liste les evenements de l'agenda Microsoft 365 lie au compte de l'utilisateur connecte, y compris les occurrences des series recurrentes. Utilise cet outil quand l'utilisateur demande son planning, ses rendez-vous, ses disponibilites ou un creneau libre. Les horaires renvoyes sont en UTC : convertis-les avant de les presenter. L'agenda est deduit du compte connecte et ne doit jamais etre demande.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "start": {
+                                "type": "string",
+                                "description": instant_description
+                            },
+                            "end": {
+                                "type": "string",
+                                "description": instant_description
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 50,
+                                "description": "Nombre d'evenements a retourner. Par defaut : 20."
+                            }
+                        }
+                    },
+                    "outputSchema": events_output_schema,
+                    "annotations": {
+                        "title": "Consulter l'agenda Microsoft",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": SEND_OUTLOOK_EMAIL_TOOL_NAME,
+                    "title": "Preparer un e-mail Outlook a confirmer",
+                    "description": "Prepare un e-mail depuis la boite Microsoft 365 de l'utilisateur connecte et l'affiche dans la conversation pour validation. CET OUTIL N'ENVOIE RIEN : l'e-mail ne part que si l'utilisateur clique sur Envoyer dans la carte de confirmation. Ne dis donc jamais que le message est parti ; annonce qu'il attend sa validation. Utilise cet outil quand l'utilisateur demande d'ecrire ou d'envoyer un e-mail. L'expediteur est le compte lie et ne doit jamais etre demande.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "to": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 25,
+                                "items": { "type": "string" },
+                                "description": "Adresses des destinataires. Utilise uniquement des adresses fournies par l'utilisateur ou lues dans ses e-mails : n'en invente aucune."
+                            },
+                            "cc": {
+                                "type": "array",
+                                "maxItems": 25,
+                                "items": { "type": "string" },
+                                "description": "Adresses en copie."
+                            },
+                            "subject": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255,
+                                "description": "Objet du message."
+                            },
+                            "body": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 20000,
+                                "description": "Corps du message en texte brut, redige et pret a partir, dans la langue de l'utilisateur."
+                            }
+                        },
+                        "required": ["to", "subject", "body"]
+                    },
+                    "outputSchema": pending_action_output_schema.clone(),
+                    "annotations": {
+                        "title": "Preparer un e-mail Outlook",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": CREATE_CALENDAR_EVENT_TOOL_NAME,
+                    "title": "Preparer un evenement d'agenda a confirmer",
+                    "description": "Prepare un evenement dans l'agenda Microsoft 365 de l'utilisateur connecte et l'affiche dans la conversation pour validation. CET OUTIL NE CREE RIEN : l'evenement n'est ajoute et les invitations ne partent que si l'utilisateur confirme. Annonce donc une proposition en attente, jamais un rendez-vous cree. Verifie les disponibilites avec list_calendar_events avant de proposer un creneau.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "subject": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 255,
+                                "description": "Titre de l'evenement."
+                            },
+                            "start": {
+                                "type": "string",
+                                "description": instant_description
+                            },
+                            "end": {
+                                "type": "string",
+                                "description": instant_description
+                            },
+                            "attendees": {
+                                "type": "array",
+                                "maxItems": 25,
+                                "items": { "type": "string" },
+                                "description": "Adresses des participants a inviter. N'en invente aucune."
+                            },
+                            "location": {
+                                "type": "string",
+                                "maxLength": 255,
+                                "description": "Lieu affiche dans l'invitation."
+                            },
+                            "body": {
+                                "type": "string",
+                                "maxLength": 20000,
+                                "description": "Description en texte brut."
+                            },
+                            "onlineMeeting": {
+                                "type": "boolean",
+                                "description": "true pour joindre un lien Teams a l'invitation."
+                            }
+                        },
+                        "required": ["subject", "start", "end"]
+                    },
+                    "outputSchema": pending_action_output_schema.clone(),
+                    "annotations": {
+                        "title": "Preparer un evenement d'agenda",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": UPDATE_CALENDAR_EVENT_TOOL_NAME,
+                    "title": "Preparer la modification d'un evenement",
+                    "description": "Prepare la modification d'un evenement existant de l'agenda Microsoft 365 et l'affiche dans la conversation pour validation. CET OUTIL NE MODIFIE RIEN sans confirmation de l'utilisateur. L'identifiant provient obligatoirement d'un appel prealable a list_calendar_events : ne l'invente jamais et ne le demande pas a l'utilisateur. Un deplacement d'horaire exige start et end ensemble. Cet outil ne supprime ni n'annule un evenement.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "minProperties": 2,
+                        "properties": {
+                            "eventId": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512,
+                                "description": "Identifiant retourne par list_calendar_events."
+                            },
+                            "subject": {
+                                "type": "string",
+                                "maxLength": 255,
+                                "description": "Nouveau titre."
+                            },
+                            "start": {
+                                "type": "string",
+                                "description": instant_description
+                            },
+                            "end": {
+                                "type": "string",
+                                "description": instant_description
+                            },
+                            "location": {
+                                "type": "string",
+                                "maxLength": 255,
+                                "description": "Nouveau lieu."
+                            },
+                            "body": {
+                                "type": "string",
+                                "maxLength": 20000,
+                                "description": "Nouvelle description en texte brut."
+                            }
+                        },
+                        "required": ["eventId"]
+                    },
+                    "outputSchema": pending_action_output_schema,
+                    "annotations": {
+                        "title": "Preparer la modification d'un evenement",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": true
+                    }
                 }
             ]
+        }
+    })
+}
+
+/// Reponse des outils Microsoft en lecture seule. Le texte est ce que le modele
+/// lit ; `structuredContent` porte les donnees exploitables.
+pub(crate) fn tool_microsoft_data_response(id: Value, text: &str, structured: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": structured,
+            "isError": false
+        }
+    })
+}
+
+/// Reponse des outils Microsoft qui sortent de l'application. Le texte insiste
+/// sur le fait que rien n'est parti : c'est la seule protection contre un
+/// modele qui annoncerait un envoi imaginaire a l'utilisateur.
+pub(crate) fn tool_pending_action_response(
+    id: Value,
+    action: &crate::microsoft::PendingMicrosoftAction,
+) -> Value {
+    let text = match action.kind.as_str() {
+        "sendEmail" => format!(
+            "Brouillon prepare : {}. L'e-mail N'EST PAS envoye : une carte de confirmation attend la validation de l'utilisateur dans la conversation.",
+            action.summary
+        ),
+        "createEvent" => format!(
+            "Proposition preparee : {}. L'evenement N'EST PAS cree tant que l'utilisateur n'a pas confirme dans la conversation.",
+            action.summary
+        ),
+        _ => format!(
+            "Modification preparee : {}. Elle N'EST PAS appliquee tant que l'utilisateur n'a pas confirme dans la conversation.",
+            action.summary
+        ),
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": text }],
+            "structuredContent": {
+                "actionId": action.id,
+                "status": "awaiting_confirmation",
+                "kind": action.kind,
+                "summary": action.summary,
+            },
+            "isError": false
         }
     })
 }
@@ -1098,6 +1556,8 @@ mod tests {
     fn context() -> AutonomousAgentToolContext {
         AutonomousAgentToolContext {
             account_id: "account-1".to_string(),
+            scope: ChatToolScope::Full,
+            user_id: Some("user-1".to_string()),
             source_chat_key: Some("chat-1".to_string()),
             project_dir: Some("C:/project".to_string()),
             mode: ChatTurnMode::Build,
@@ -1146,6 +1606,31 @@ mod tests {
     }
 
     #[test]
+    fn capability_carries_the_authenticated_user() {
+        let registry = ChatToolCapabilityRegistry::default();
+        let token = registry.issue(context()).unwrap();
+        assert_eq!(
+            registry.claim_call(&token).unwrap().user_id.as_deref(),
+            Some("user-1")
+        );
+    }
+
+    #[test]
+    fn capability_bounds_external_actions_below_the_call_budget() {
+        let registry = ChatToolCapabilityRegistry::default();
+        let token = registry.issue(context()).unwrap();
+        for _ in 0..MAX_EXTERNAL_ACTIONS_PER_TURN {
+            assert!(registry.claim_external_action(&token).is_ok());
+        }
+        assert!(registry
+            .claim_external_action(&token)
+            .unwrap_err()
+            .contains("Limite d'actions Microsoft"));
+        // Le budget global reste disponible pour les autres outils.
+        assert!(registry.claim_call(&token).is_ok());
+    }
+
+    #[test]
     fn capability_allows_only_one_chat_creation_per_turn() {
         let registry = ChatToolCapabilityRegistry::default();
         let token = registry.issue(context()).unwrap();
@@ -1191,6 +1676,19 @@ mod tests {
         assert_eq!(request.project_dir.as_deref(), Some("C:/project"));
         assert_eq!(request.interval_seconds, Some(1800));
         assert!(request.require_user_review);
+        // L'agent herite du proprietaire du chat : c'est ce qui lui donnera plus
+        // tard acces a la boite mail de cette personne, et d'aucune autre.
+        assert_eq!(request.owner_id.as_deref(), Some("user-1"));
+
+        // Un tour lance au jeton administrateur ne designe personne : l'agent
+        // cree ne doit alors heriter d'aucune boite.
+        let mut anonymous = context();
+        anonymous.user_id = None;
+        let arguments: CreateAutonomousAgentToolArguments = serde_json::from_value(json!({
+            "objective": "Surveiller les regressions"
+        }))
+        .unwrap();
+        assert!(arguments.into_request(anonymous).unwrap().owner_id.is_none());
     }
 
     #[test]
@@ -1296,7 +1794,7 @@ mod tests {
 
     #[test]
     fn mcp_schema_teaches_the_model_when_to_control_an_agent() {
-        let response = tools_list_response(json!(1));
+        let response = tools_list_response(json!(1), ChatToolScope::Full);
         let tools = response["result"]["tools"].as_array().unwrap();
         assert!(tools.len() >= 6);
         let tool = tools
@@ -1391,5 +1889,99 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Un seul nouveau chat"));
+    }
+
+    #[test]
+    fn an_autonomous_agent_only_sees_the_microsoft_tools() {
+        let response = tools_list_response(json!(1), ChatToolScope::PersonalDataOnly);
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), MICROSOFT_TOOL_NAMES.len());
+        for name in MICROSOFT_TOOL_NAMES {
+            assert!(names.contains(&name), "{name} manquant pour un agent");
+        }
+        // Un agent autonome qui pourrait se dupliquer ou ouvrir des chats
+        // echapperait a tout controle : ces outils lui restent fermes.
+        for forbidden in [
+            AUTONOMOUS_AGENT_TOOL_NAME,
+            UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
+            PAUSE_AUTONOMOUS_AGENT_TOOL_NAME,
+            APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME,
+            ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME,
+            CREATE_CHAT_TOOL_NAME,
+        ] {
+            assert!(!names.contains(&forbidden), "{forbidden} accessible a un agent");
+            assert!(!ChatToolScope::PersonalDataOnly.allows(forbidden));
+        }
+        // La liste et le dispatch doivent refuser exactement les memes outils.
+        assert!(ChatToolScope::Full.allows(CREATE_CHAT_TOOL_NAME));
+        assert!(ChatToolScope::PersonalDataOnly.allows(SEND_OUTLOOK_EMAIL_TOOL_NAME));
+    }
+
+    #[test]
+    fn microsoft_tools_never_expose_a_mailbox_selector() {
+        let response = tools_list_response(json!(1), ChatToolScope::Full);
+        let tools = response["result"]["tools"].as_array().unwrap();
+        for name in [
+            LIST_OUTLOOK_MESSAGES_TOOL_NAME,
+            LIST_CALENDAR_EVENTS_TOOL_NAME,
+            SEND_OUTLOOK_EMAIL_TOOL_NAME,
+            CREATE_CALENDAR_EVENT_TOOL_NAME,
+            UPDATE_CALENDAR_EVENT_TOOL_NAME,
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("outil {name} absent de tools/list"));
+            let properties = &tool["inputSchema"]["properties"];
+            // La boite vient du compte connecte : aucun champ ne doit permettre
+            // au modele de viser une autre identite.
+            for forbidden in ["userId", "accountId", "mailbox", "from", "sender", "owner"] {
+                assert!(
+                    properties.get(forbidden).is_none(),
+                    "{name} expose {forbidden}"
+                );
+            }
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            // Ces outils sortent de l'application : annoncer un monde ferme au
+            // client MCP masquerait le risque reel.
+            assert_eq!(tool["annotations"]["openWorldHint"], true);
+        }
+
+        for name in [
+            SEND_OUTLOOK_EMAIL_TOOL_NAME,
+            CREATE_CALENDAR_EVENT_TOOL_NAME,
+            UPDATE_CALENDAR_EVENT_TOOL_NAME,
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+                .unwrap();
+            let description = tool["description"].as_str().unwrap();
+            assert!(
+                description.contains("N'ENVOIE RIEN")
+                    || description.contains("NE CREE RIEN")
+                    || description.contains("NE MODIFIE RIEN"),
+                "{name} ne previent pas le modele que rien ne part sans confirmation"
+            );
+        }
+
+        // Les pieces jointes sont volontairement absentes : le corps MCP est
+        // plafonne a 64 Kio et un fichier encode en base64 serait rejete par
+        // axum avant meme d'atteindre le dispatch.
+        let send = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(SEND_OUTLOOK_EMAIL_TOOL_NAME))
+            .unwrap();
+        assert!(send["inputSchema"]["properties"]
+            .get("attachments")
+            .is_none());
+        assert_eq!(
+            send["inputSchema"]["required"],
+            json!(["to", "subject", "body"])
+        );
     }
 }

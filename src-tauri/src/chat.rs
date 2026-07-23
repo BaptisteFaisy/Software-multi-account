@@ -6,9 +6,11 @@
 use crate::{
     chat_model_tools::{
         ChatModelToolServerConfig, ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME,
-        APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME,
-        MCP_BEARER_ENV, MCP_SERVER_NAME, PAUSE_AUTONOMOUS_AGENT_TOOL_NAME,
-        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
+        APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME,
+        CREATE_CALENDAR_EVENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME, LIST_CALENDAR_EVENTS_TOOL_NAME,
+        LIST_OUTLOOK_MESSAGES_TOOL_NAME, MCP_BEARER_ENV, MCP_SERVER_NAME,
+        PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
+        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME, UPDATE_CALENDAR_EVENT_TOOL_NAME,
     },
     chat_tools::{chat_skills_document, chat_tool_instructions, ChatAgentSkill, ChatAgentTool},
     discussions::{self, DiscussionContextUsage},
@@ -2234,7 +2236,7 @@ fn configure_provider_command_with_images_and_scope(
                     .arg(path)
                     .arg("--allowedTools")
                     .arg(format!(
-                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CHAT_TOOL_NAME}"
+                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CHAT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_OUTLOOK_MESSAGES_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_CALENDAR_EVENTS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_OUTLOOK_EMAIL_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_CALENDAR_EVENT_TOOL_NAME}"
                     ));
             }
         }
@@ -2273,7 +2275,7 @@ fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelTo
         format!("{prefix}.url={url}"),
         format!("{prefix}.bearer_token_env_var=\"{MCP_BEARER_ENV}\""),
         format!(
-            "{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\",\"{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}\",\"{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}\",\"{CREATE_CHAT_TOOL_NAME}\"]"
+            "{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\",\"{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}\",\"{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}\",\"{CREATE_CHAT_TOOL_NAME}\",\"{LIST_OUTLOOK_MESSAGES_TOOL_NAME}\",\"{LIST_CALENDAR_EVENTS_TOOL_NAME}\",\"{SEND_OUTLOOK_EMAIL_TOOL_NAME}\",\"{CREATE_CALENDAR_EVENT_TOOL_NAME}\",\"{UPDATE_CALENDAR_EVENT_TOOL_NAME}\"]"
         ),
         format!("{prefix}.enabled=true"),
         format!("{prefix}.required=true"),
@@ -2294,6 +2296,11 @@ fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelTo
             "{prefix}.tools.{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}.approval_mode=\"approve\""
         ),
         format!("{prefix}.tools.{CREATE_CHAT_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{LIST_OUTLOOK_MESSAGES_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{LIST_CALENDAR_EVENTS_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{SEND_OUTLOOK_EMAIL_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{CREATE_CALENDAR_EVENT_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{UPDATE_CALENDAR_EVENT_TOOL_NAME}.approval_mode=\"approve\""),
     ] {
         command.arg("-c").arg(value);
     }
@@ -2353,7 +2360,7 @@ Utilise-la comme contexte durable dans cette conversation. Une demande explicite
 }
 
 fn autonomous_agent_tool_instructions() -> &'static str {
-    "Capacite native Codex Switch Terminal : six outils MCP permettent d'ouvrir un autre chat et de piloter les agents autonomes depuis un chat normal. Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle `create_chat` avec son message initial. Le nouveau chat herite du compte, du modele, de l'effort de raisonnement et de l'environnement courants ; un seul chat peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer, demarrer ou rendre autonome un nouvel agent, appelle `create_autonomous_agent` avec un objectif precis. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle `pause_autonomous_agent` sans demander d'identifiant ; cette pause arrete le cycle courant et empeche toute nouvelle planification jusqu'a une reprise explicite depuis l'interface. Quand il demande explicitement de modifier l'agent autonome lie a ce chat (nom, objectif, role, mode, frequence, validation humaine ou tests), appelle `update_autonomous_agent` avec uniquement les champs a changer. Quand il demande explicitement au superviseur d'activer, produire ou relancer le compte rendu general qui compile les rapports non lus par priorite, appelle `activate_supervisor_general_report` sans demander d'identifiant ; cet outil fonctionne depuis n'importe quel chat. Quand il demande explicitement d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle `apply_autonomous_agent_policy` avec une instruction precise et verifiable ; cet outil ne depend pas de la cle du chat, reste limite au compte courant et cible par defaut uniquement le projet courant. Utilise la portee `account` seulement si l'utilisateur vise explicitement tous ses projets. Pour une politique de validation visuelle, passe `requireVisualEvidence: true`, exige une capture ou maquette fidele avant autorisation, une capture du rendu reel apres implementation et une comparaison explicite avec correction des ecarts significatifs. Pour une politique non visuelle, passe `requireVisualEvidence: false`. Ne demande jamais d'identifiant d'agent. Deduis les reglages non critiques et conserve les objectifs, roles, frequences et garde-fous existants. N'appelle pas ces outils pour une question theorique. Ne pretends jamais qu'une creation, une modification ou une mise en pause a reussi si l'appel correspondant n'a pas reussi."
+    "Capacite native Codex Switch Terminal : onze outils MCP permettent d'ouvrir un autre chat, de piloter les agents autonomes et d'utiliser le compte Microsoft 365 de l'utilisateur depuis un chat normal. Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle `create_chat` avec son message initial. Le nouveau chat herite du compte, du modele, de l'effort de raisonnement et de l'environnement courants ; un seul chat peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer, demarrer ou rendre autonome un nouvel agent, appelle `create_autonomous_agent` avec un objectif precis. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle `pause_autonomous_agent` sans demander d'identifiant ; cette pause arrete le cycle courant et empeche toute nouvelle planification jusqu'a une reprise explicite depuis l'interface. Quand il demande explicitement de modifier l'agent autonome lie a ce chat (nom, objectif, role, mode, frequence, validation humaine ou tests), appelle `update_autonomous_agent` avec uniquement les champs a changer. Quand il demande explicitement au superviseur d'activer, produire ou relancer le compte rendu general qui compile les rapports non lus par priorite, appelle `activate_supervisor_general_report` sans demander d'identifiant ; cet outil fonctionne depuis n'importe quel chat. Quand il demande explicitement d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle `apply_autonomous_agent_policy` avec une instruction precise et verifiable ; cet outil ne depend pas de la cle du chat, reste limite au compte courant et cible par defaut uniquement le projet courant. Utilise la portee `account` seulement si l'utilisateur vise explicitement tous ses projets. Pour une politique de validation visuelle, passe `requireVisualEvidence: true`, exige une capture ou maquette fidele avant autorisation, une capture du rendu reel apres implementation et une comparaison explicite avec correction des ecarts significatifs. Pour une politique non visuelle, passe `requireVisualEvidence: false`. Ne demande jamais d'identifiant d'agent. Deduis les reglages non critiques et conserve les objectifs, roles, frequences et garde-fous existants. N'appelle pas ces outils pour une question theorique. Ne pretends jamais qu'une creation, une modification ou une mise en pause a reussi si l'appel correspondant n'a pas reussi. Cinq outils supplementaires ouvrent le compte Microsoft 365 lie a l'utilisateur connecte. Quand il demande de consulter, chercher ou resumer ses e-mails, appelle `list_outlook_messages`. Quand il demande son planning, ses rendez-vous ou une disponibilite, appelle `list_calendar_events` ; les horaires retournes sont en UTC, convertis-les avant de les presenter et n'annonce jamais une heure sans avoir verifie le fuseau. Quand il demande d'ecrire ou d'envoyer un e-mail, appelle `send_outlook_email` avec un message complet et pret a partir. Quand il demande de poser un rendez-vous, appelle `create_calendar_event` apres avoir verifie le creneau avec `list_calendar_events`. Quand il demande de deplacer ou de modifier un evenement, appelle `update_calendar_event` avec l'identifiant obtenu par `list_calendar_events`. Ces trois derniers outils NE FONT PARTIR NI N'ECRIVENT RIEN : ils affichent une carte que l'utilisateur doit confirmer dans la conversation. N'ecris donc jamais que l'e-mail est parti, que l'invitation est envoyee ou que l'agenda est a jour ; dis que la proposition attend sa validation. La boite et l'agenda sont ceux du compte connecte : ne demande jamais d'adresse d'expediteur, d'identifiant, de mot de passe ni de boite cible, et n'invente aucune adresse de destinataire."
 }
 
 fn merge_turn_instructions(
@@ -4688,7 +4695,7 @@ mod tests {
         for expected in [
             "mcp_servers.cst_chat.url=\"http://127.0.0.1:8080/mcp/chat-tools\"",
             "mcp_servers.cst_chat.bearer_token_env_var=\"CST_CHAT_AUTONOMOUS_TOOL_TOKEN\"",
-            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\",\"update_autonomous_agent\",\"pause_autonomous_agent\",\"activate_supervisor_general_report\",\"apply_autonomous_agent_policy\",\"create_chat\"]",
+            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\",\"update_autonomous_agent\",\"pause_autonomous_agent\",\"activate_supervisor_general_report\",\"apply_autonomous_agent_policy\",\"create_chat\",\"list_outlook_messages\",\"list_calendar_events\",\"send_outlook_email\",\"create_calendar_event\",\"update_calendar_event\"]",
             "mcp_servers.cst_chat.required=true",
             "mcp_servers.cst_chat.default_tools_approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.create_autonomous_agent.approval_mode=\"approve\"",
@@ -4697,6 +4704,11 @@ mod tests {
             "mcp_servers.cst_chat.tools.activate_supervisor_general_report.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.apply_autonomous_agent_policy.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.create_chat.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.list_outlook_messages.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.list_calendar_events.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.send_outlook_email.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.create_calendar_event.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.update_calendar_event.approval_mode=\"approve\"",
         ] {
             assert!(args
                 .windows(2)
@@ -4725,6 +4737,20 @@ mod tests {
         assert!(autonomous_agent_tool_instructions()
             .to_ascii_lowercase()
             .contains("ne demande jamais d'identifiant"));
+        for tool in [
+            "list_outlook_messages",
+            "list_calendar_events",
+            "send_outlook_email",
+            "create_calendar_event",
+            "update_calendar_event",
+        ] {
+            assert!(autonomous_agent_tool_instructions().contains(&format!("appelle `{tool}`")));
+        }
+        // Le garde-fou central : le modele ne doit jamais annoncer un envoi que
+        // seule la confirmation humaine declenche reellement.
+        assert!(
+            autonomous_agent_tool_instructions().contains("NE FONT PARTIR NI N'ECRIVENT RIEN")
+        );
     }
 
     #[test]

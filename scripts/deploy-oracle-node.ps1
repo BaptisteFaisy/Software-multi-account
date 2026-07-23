@@ -115,6 +115,11 @@ try {
     'CST_GOOGLE_CLIENT_ID'
     'CST_GOOGLE_CLIENT_SECRET'
     'CST_GOOGLE_REDIRECT_URI'
+    'CST_MICROSOFT_CLIENT_ID'
+    'CST_MICROSOFT_CLIENT_SECRET'
+    'CST_MICROSOFT_TENANT_ID'
+    'CST_MICROSOFT_REDIRECT_URI'
+    'CST_MICROSOFT_SCOPES'
   )) {
     $value = [Environment]::GetEnvironmentVariable($name)
     if ($null -ne $value -and $value.Trim()) {

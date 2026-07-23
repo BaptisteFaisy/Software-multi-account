@@ -16,6 +16,7 @@ mod git_docker_environment;
 mod image_generation;
 mod kombai;
 mod metrics;
+mod microsoft;
 mod mobile_push;
 mod orchestration;
 mod pool;

@@ -13,6 +13,7 @@ use crate::{
         is_model_capacity_message, is_quota_exhaustion_message, ChatAppConnector, ChatTurnManager,
         ChatTurnMode, ChatTurnSnapshot, ChatTurnStatus, StartChatTurnRequest,
     },
+    chat_model_tools::ChatModelToolServerConfig,
     discussions, fs_util, metrics, mobile_push, settings, telegram_notifications,
     whatsapp_notifications,
 };
@@ -337,6 +338,12 @@ pub struct AutonomousAgentSnapshot {
     #[serde(default)]
     pub source_report_idea_index: Option<u32>,
     pub account_id: String,
+    /// Compte utilisateur nominatif au nom duquel l'agent travaille, fixe par le
+    /// serveur a la creation. `account_id` ne convient pas : c'est un profil CLI
+    /// partageable. Sans proprietaire, l'agent ne recoit aucun acces aux
+    /// donnees personnelles (boite mail, agenda) : on ne devine pas une boite.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     #[serde(default)]
     pub project_dir: Option<String>,
     #[serde(default)]
@@ -482,6 +489,11 @@ pub struct CreateAutonomousAgentRequest {
     #[serde(default)]
     pub source_report_idea_index: Option<u32>,
     pub account_id: String,
+    /// Toujours impose par le serveur depuis la session appelante, jamais lu
+    /// depuis le corps de la requete : un client ne doit pas pouvoir creer un
+    /// agent qui agirait au nom d'un autre utilisateur.
+    #[serde(skip)]
+    pub owner_id: Option<String>,
     #[serde(default)]
     pub project_dir: Option<String>,
     #[serde(default)]
@@ -674,7 +686,16 @@ struct AutonomousAgentInner {
     storage_path: PathBuf,
     store: Mutex<AutonomousAgentStore>,
     validation_runs: Mutex<HashMap<String, Arc<ValidationRun>>>,
+    tool_server: std::sync::OnceLock<AutonomousToolServerFactory>,
 }
+
+/// Construit le serveur d'outils MCP d'un cycle d'agent. La fabrique vit dans
+/// `server.rs`, seul endroit qui connaisse le registre de capacites et l'URL du
+/// serveur MCP ; le moteur d'agents se contente de l'appeler. Elle renvoie
+/// `None` quand l'agent n'a pas de proprietaire nominatif : sans lui, aucun
+/// acces aux donnees personnelles n'est possible, et c'est voulu.
+pub(crate) type AutonomousToolServerFactory =
+    Arc<dyn Fn(&AutonomousAgentSnapshot) -> Option<ChatModelToolServerConfig> + Send + Sync>;
 
 struct ValidationRun {
     id: String,
@@ -802,6 +823,11 @@ fn new_system_supervisor(source: &AutonomousAgentSnapshot, now: i64) -> Autonomo
         source_report_id: None,
         source_report_idea_index: None,
         account_id: source.account_id.clone(),
+        // Le superviseur est un singleton du noeud, partage par tous les
+        // comptes : lui attribuer un proprietaire lui donnerait la boite mail
+        // du premier utilisateur venu. Il compile des rapports internes et n'a
+        // aucun besoin d'acceder a des donnees personnelles.
+        owner_id: None,
         project_dir: source.project_dir.clone(),
         session_id: None,
         mode: ChatTurnMode::Build,
@@ -1238,12 +1264,21 @@ impl AutonomousAgentManager {
             storage_path,
             store: Mutex::new(store),
             validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
         });
         spawn_worker(Arc::downgrade(&inner));
         for (account_id, session_id) in stale_discussions {
             remove_autonomous_discussion(account_id, session_id);
         }
         Ok(Self { inner })
+    }
+
+    /// Accorde aux cycles d'agents l'acces au serveur d'outils MCP. Sans cet
+    /// appel — c'est le cas de l'application de bureau — les agents tournent
+    /// exactement comme avant, sans aucun outil.
+    pub(crate) fn with_model_tools(self, factory: AutonomousToolServerFactory) -> Self {
+        let _ = self.inner.tool_server.set(factory);
+        self
     }
 
     pub fn list(&self) -> Result<Vec<AutonomousAgentSnapshot>, String> {
@@ -1542,6 +1577,7 @@ impl AutonomousAgentManager {
             source_report_id: source_report_id.clone(),
             source_report_idea_index,
             account_id,
+            owner_id: normalize_optional(request.owner_id),
             project_dir,
             session_id: None,
             mode: request.mode,
@@ -3724,9 +3760,15 @@ fn start_agent_run(inner: &Arc<AutonomousAgentInner>, agent_id: &str) {
 
     let review_planning = agent.require_user_review && agent.approved_review.is_none();
     let started = if review_planning {
+        // Le cycle de planification produit un plan a valider, pas des actions :
+        // il n'a pas besoin d'atteindre la boite mail du proprietaire.
         inner.chat.start_review_planning(request)
     } else {
-        inner.chat.start(request)
+        let tool_server = inner
+            .tool_server
+            .get()
+            .and_then(|factory| factory(&agent));
+        inner.chat.start_with_model_tools(request, tool_server)
     };
 
     match started {
@@ -8606,6 +8648,7 @@ mod tests {
             source_report_id: None,
             source_report_idea_index: None,
             account_id: "account-1".to_string(),
+            owner_id: Some("user-1".to_string()),
             project_dir: Some("/project".to_string()),
             session_id: None,
             mode: ChatTurnMode::Build,
@@ -8712,6 +8755,7 @@ mod tests {
                     agents: vec![initial],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -9227,6 +9271,7 @@ mod tests {
                 agents: vec![agent],
             }),
             validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
         });
         let capacity_error =
             "Selected model is at capacity. Please try a different model.".to_string();
@@ -9720,6 +9765,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -9768,6 +9814,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
         let snapshot = |id, text: &str| ChatTurnSnapshot {
@@ -9964,6 +10011,7 @@ mod tests {
                     agents: vec![active, running, paused],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
         let scheduled_at = metrics::now_ts() + 3_600;
@@ -10013,6 +10061,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -10346,6 +10395,7 @@ mod tests {
                     agents: vec![agent, authorization_agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -10461,6 +10511,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -10514,6 +10565,7 @@ mod tests {
                     agents: vec![approved, rejected],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -10630,6 +10682,7 @@ mod tests {
                 agents: vec![agent],
             }),
             validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
         });
 
         finish_validation(
@@ -10683,6 +10736,7 @@ mod tests {
                 agents: vec![sample_agent(AutonomousAgentStatus::Active)],
             }),
             validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
         };
 
         let result: Result<(), String> = inner.mutate_store(|store| {
@@ -10713,6 +10767,7 @@ mod tests {
                 agents: vec![agent],
             }),
             validation_runs: Mutex::new(HashMap::new()),
+            tool_server: std::sync::OnceLock::new(),
         });
 
         assert!(inner.work_items(metrics::now_ts()).is_empty());

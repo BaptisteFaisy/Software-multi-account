@@ -1,4 +1,13 @@
 import { remoteBaseUrl, repairRemoteConnection } from "./platform";
+import {
+  consumeMicrosoftOAuthResult,
+  handleMicrosoftPendingActionClick,
+  microsoftPendingActionCount,
+  refreshMicrosoftConnection,
+  refreshMicrosoftPendingActions,
+  renderMicrosoftConnectionSettings,
+  renderMicrosoftPendingActions,
+} from "./microsoft";
 
 export type AuthUser = {
   id: string;
@@ -101,6 +110,10 @@ const authApi = async <T>(
 };
 
 const consumeOAuthResult = () => {
+  // Le retour de liaison Microsoft arrive sur la meme page que celui de Google
+  // et n'a de sens qu'en mode distant : il se consomme donc au meme endroit,
+  // sinon les parametres resteraient dans l'URL apres un rechargement.
+  consumeMicrosoftOAuthResult();
   const url = new URL(window.location.href);
   const oauthError = url.searchParams.get("auth_error");
   if (oauthError) authGateError = oauthError;
@@ -307,9 +320,17 @@ const avatarMarkup = (user: AuthUser, className: string) =>
 
 export const renderUserAccountButton = () => {
   if (!currentUser) return "";
+  const pending = microsoftPendingActionCount();
+  // Un agent autonome depose ses brouillons sans que personne ne regarde. Le
+  // compteur sur le bouton de compte est le seul endroit visible depuis
+  // n'importe quelle vue : sans lui, un e-mail prepare expirerait en silence.
+  const badge = pending
+    ? `<span class="user-profile-pending" title="${pending} action Microsoft à confirmer" aria-label="${pending} action Microsoft à confirmer">${pending}</span>`
+    : "";
   return `<button type="button" id="userProfileToggle" class="user-profile-toggle" title="Gérer mon profil">
     ${avatarMarkup(currentUser, "user-profile-avatar")}
     <span><strong>${escapeHtml(currentUser.username)}</strong><small>${escapeHtml(currentUser.email)}</small></span>
+    ${badge}
   </button>`;
 };
 
@@ -355,17 +376,43 @@ export const renderUserProfileModal = () => {
           <button type="submit" class="tool-button primary"><i data-lucide="save"></i><span>Enregistrer</span></button>
         </div>
       </form>
+      <div class="user-profile-services">
+        ${renderMicrosoftConnectionSettings()}
+        ${renderMicrosoftPendingActions()}
+      </div>
     </section>
   </div>`;
 };
 
+export const openUserProfileModal = () => {
+  profileOpen = true;
+  profileError = null;
+  profileSuccess = null;
+  void refreshMicrosoftConnection();
+  void refreshMicrosoftPendingActions();
+};
+
+export const closeUserProfileModal = () => {
+  profileOpen = false;
+  profileError = null;
+  profileSuccess = null;
+};
+
 export const bindUserAccountUi = (rerender: () => void) => {
   document.querySelector<HTMLButtonElement>("#userProfileToggle")?.addEventListener("click", () => {
-    profileOpen = true;
-    profileError = null;
-    profileSuccess = null;
+    openUserProfileModal();
     rerender();
   });
+
+  // Les cartes de confirmation vivent aussi dans cette modale : sans relais ici,
+  // les boutons Envoyer et Annuler seraient inertes hors d'une conversation.
+  document
+    .querySelector<HTMLElement>(".user-profile-services")
+    ?.addEventListener("click", (event) => {
+      if (handleMicrosoftPendingActionClick(event.target as HTMLElement | null)) {
+        event.preventDefault();
+      }
+    });
 
   document.querySelectorAll<HTMLElement>("[data-user-profile-close]").forEach((element) => {
     element.addEventListener("click", (event) => {
@@ -373,9 +420,7 @@ export const bindUserAccountUi = (rerender: () => void) => {
         element.hasAttribute("data-user-profile-dialog") ||
         (element.classList.contains("user-profile-backdrop") && event.target !== element)
       ) return;
-      profileOpen = false;
-      profileError = null;
-      profileSuccess = null;
+      closeUserProfileModal();
       rerender();
     });
   });

@@ -166,6 +166,7 @@ cle API n'est jamais copiee dans `settings.json`.
 - import de comptes depuis des exports JSON ;
 - suivi des quotas et selection d'un compte disponible ;
 - onglet **Transcrire** pour envoyer WAV, MP3, M4A, FLAC, OGG, OPUS ou WebM au GPU du VPS ;
+- lecture des e-mails et de l'agenda Microsoft 365 depuis un chat, envois confirmes a la main ;
 - chats autonomes persistants avec reprise, pause et planification ;
 - interface desktop, web et mobile.
 
@@ -840,6 +841,36 @@ utilise le flux serveur avec `state`, PKCE et les scopes
 `openid email profile`; seules les adresses Google verifiees sont acceptees.
 Avec une URL publique HTTPS, les cookies de session recoivent automatiquement
 l'attribut `Secure`.
+
+### Connexion Microsoft 365 (mail et agenda)
+
+Un utilisateur connecte peut lier son compte Microsoft 365 depuis **Mon compte**
+(la liaison est nominative ; **Parametres** n'affiche qu'un raccourci). Un chat
+normal, comme un agent autonome, lit alors sa boite Outlook et son agenda, et
+prepare e-mails et rendez-vous sous forme de cartes : rien ne part sans un clic
+de confirmation. Un agent autonome ne recoit que ces cinq outils Microsoft, et
+seulement s'il a un proprietaire nominatif.
+
+Cote Entra ID, enregistre une application, ajoute une URI de redirection de type
+**Web** identique a celle du serveur, cree un secret client et accorde les
+permissions Microsoft Graph deleguees `User.Read`, `Mail.Read`, `Mail.Send`,
+`Calendars.ReadWrite` et `offline_access`. Configure ensuite le serveur :
+
+```bash
+CST_MICROSOFT_CLIENT_ID="00000000-0000-0000-0000-000000000000"
+CST_MICROSOFT_CLIENT_SECRET="..."
+# Facultatifs : locataire "common" par defaut, redirection deduite de
+# CST_PUBLIC_BASE_URL. Hors boucle locale elle doit etre en HTTPS.
+CST_MICROSOFT_TENANT_ID="common"
+CST_MICROSOFT_REDIRECT_URI="https://VOTRE_DOMAINE/api/microsoft/callback"
+```
+
+L'identifiant et le secret vont ensemble : sans les deux, l'integration reste
+eteinte et l'interface annonce qu'elle n'est pas configuree sur ce serveur. Les
+jetons restent cote serveur dans le `CST_DATA_DIR` du noeud, une liaison ne vaut
+donc que pour ce noeud. Le guide [Microsoft 365](docs/microsoft-365.md) detaille
+l'inscription Entra, la liaison, la securite du stockage des jetons et les
+limites connues.
 
 Lancement manuel :
 

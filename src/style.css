@@ -7144,6 +7144,314 @@ body.chat-dragging .chat-side-drag-handle {
   .telegram-settings .telegram-managed-bot-grid { grid-template-columns: 1fr; }
 }
 
+@keyframes microsoft-spin { to { transform: rotate(360deg); } }
+.microsoft-mark { width: 15px; height: 15px; flex: none; }
+.microsoft-settings {
+  width: min(760px, 100%);
+  margin: 6px 0 16px;
+  padding: 16px;
+  border: 1px solid var(--chat-border);
+  border-radius: 14px;
+  background: linear-gradient(145deg, rgba(0, 164, 239, .06), rgba(255, 255, 255, .012));
+}
+.microsoft-settings-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.microsoft-settings-head .settings-card-icon { background: rgba(0, 164, 239, .12); }
+.microsoft-settings-head .settings-card-icon .microsoft-mark { width: 18px; height: 18px; }
+.microsoft-state-pill {
+  padding: 5px 9px;
+  border: 1px solid var(--chat-border);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, .04);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+.microsoft-state-pill.is-connected {
+  border-color: rgba(0, 164, 239, .28);
+  color: #8ad4ff;
+  background: rgba(0, 164, 239, .1);
+}
+.microsoft-loading { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--muted); font-size: 11px; }
+.microsoft-loading svg { width: 15px; height: 15px; animation: microsoft-spin 1s linear infinite; }
+.microsoft-unavailable {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 13px;
+  border: 1px solid var(--chat-border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, .1);
+}
+.microsoft-unavailable > span {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  border-radius: 9px;
+  color: #8ad4ff;
+  background: rgba(0, 164, 239, .12);
+}
+.microsoft-unavailable svg { width: 16px; height: 16px; }
+.microsoft-unavailable strong { font-size: 12px; }
+.microsoft-unavailable p { margin: 4px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.microsoft-unavailable code { color: #a9dcff; font: 9px var(--font-mono); }
+.microsoft-connection-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 13px;
+  border: 1px solid rgba(0, 164, 239, .2);
+  border-radius: 12px;
+  background: rgba(0, 164, 239, .05);
+}
+.microsoft-connection-state {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  place-items: center;
+  border-radius: 10px;
+  color: #6cc8ff;
+  background: rgba(0, 164, 239, .13);
+}
+.microsoft-connection-state svg { width: 18px; height: 18px; }
+.microsoft-connection-summary.is-stale { border-color: rgba(242, 174, 67, .32); background: rgba(242, 174, 67, .05); }
+.microsoft-connection-summary.is-stale .microsoft-connection-state { color: #f0be76; background: rgba(242, 174, 67, .13); }
+.microsoft-relink-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+.microsoft-relink-note svg { width: 13px; height: 13px; flex: none; margin-top: 1px; color: #f0be76; }
+.microsoft-connection-summary > span:nth-child(2) { display: flex; min-width: 145px; flex: 1; flex-direction: column; gap: 2px; }
+.microsoft-connection-summary small,
+.microsoft-connection-summary em { color: var(--muted); font-size: 10px; font-style: normal; }
+.microsoft-connection-summary strong { font-size: 13px; }
+.microsoft-connection-summary dl { display: grid; min-width: min(300px, 46%); margin: 0; gap: 5px; }
+.microsoft-connection-summary dl div { display: flex; justify-content: space-between; gap: 14px; }
+.microsoft-connection-summary dt,
+.microsoft-connection-summary dd { margin: 0; font-size: 10px; }
+.microsoft-connection-summary dt { color: var(--muted); }
+.microsoft-connection-summary dd { text-align: right; }
+.microsoft-scopes { margin-top: 10px; }
+.microsoft-scopes > span { color: var(--muted); font-size: 9px; font-weight: 650; }
+.microsoft-scopes > div { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.microsoft-scopes em {
+  padding: 4px 8px;
+  border: 1px solid var(--chat-border);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, .035);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 600;
+}
+.microsoft-connection-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+.microsoft-connection-actions button,
+.microsoft-connect-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 7px 10px;
+  border: 1px solid var(--chat-border);
+  border-radius: 8px;
+  color: inherit;
+  background: rgba(255, 255, 255, .035);
+  font: 600 10px var(--font-body);
+  text-decoration: none;
+  cursor: pointer;
+}
+.microsoft-connection-actions button:hover:not(:disabled),
+.microsoft-connect-button:hover { border-color: rgba(0, 164, 239, .45); background: rgba(0, 164, 239, .09); }
+.microsoft-connection-actions button.danger { color: #ffaaa6; }
+.microsoft-connection-actions svg { width: 13px; height: 13px; }
+.microsoft-connection-actions button.is-busy svg { animation: microsoft-spin 1s linear infinite; }
+.microsoft-connect { margin-top: 14px; }
+.microsoft-connect-button { min-height: 38px; padding: 9px 14px; font-size: 11px; }
+.microsoft-connect > p { margin: 8px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.microsoft-redirect {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 9px;
+}
+.microsoft-redirect code {
+  overflow: hidden;
+  padding: 7px 8px;
+  border: 1px solid var(--chat-border);
+  border-radius: 7px;
+  color: inherit;
+  background: rgba(0, 0, 0, .14);
+  font: 9px var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.microsoft-redirect button {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  place-items: center;
+  border: 1px solid var(--chat-border);
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.microsoft-redirect button:hover { color: #6cc8ff; border-color: rgba(0, 164, 239, .4); }
+.microsoft-redirect button svg { width: 13px; height: 13px; }
+.microsoft-feedback { margin: 10px 0 0; padding: 8px 10px; border-radius: 8px; font-size: 10px; line-height: 1.45; }
+.microsoft-feedback.is-success { color: #8ad4ff; background: rgba(0, 164, 239, .1); }
+.microsoft-feedback.is-error { color: #ffaaa6; background: rgba(240, 83, 76, .09); }
+
+/* Cartes de confirmation dans le fil : dernier garde-fou avant un envoi reel. */
+.microsoft-pending { display: grid; gap: 10px; margin: 14px 0 4px; }
+.microsoft-action {
+  padding: 14px;
+  border: 1px solid rgba(242, 174, 67, .34);
+  border-radius: 14px;
+  background: rgba(242, 174, 67, .05);
+}
+.microsoft-action > header { display: flex; align-items: flex-start; gap: 10px; }
+.microsoft-action-mark {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  place-items: center;
+  border-radius: 9px;
+  color: #f0be76;
+  background: rgba(242, 174, 67, .13);
+}
+.microsoft-action-mark svg { width: 17px; height: 17px; }
+.microsoft-action > header > div { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.microsoft-action > header strong { font-size: 12px; }
+.microsoft-action > header small { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.microsoft-action-expiry { flex: none; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.microsoft-action-fields { display: grid; margin: 12px 0 0; gap: 6px; }
+.microsoft-action-fields > div { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 10px; }
+.microsoft-action-fields dt { margin: 0; color: var(--muted); font-size: 10px; }
+.microsoft-action-fields dd { overflow-wrap: anywhere; margin: 0; font-size: 10px; line-height: 1.5; }
+.microsoft-action-fields s { color: var(--muted); }
+.microsoft-action-fields b { color: #f0be76; font-weight: 700; }
+.microsoft-unchanged { color: var(--muted); font-style: italic; }
+.microsoft-action-longtext { margin-top: 10px; }
+.microsoft-action-longtext > span { color: var(--muted); font-size: 9px; font-weight: 650; }
+/* Le corps est montre en entier : l'utilisateur ne peut pas approuver ce qu'il
+   ne voit pas. Au-dela de la hauteur maximale le bloc defile, jamais tronque. */
+.microsoft-action-longtext pre {
+  overflow: auto;
+  max-height: 320px;
+  margin: 6px 0 0;
+  padding: 10px;
+  border: 1px solid var(--chat-border);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .16);
+  font: 10px/1.55 var(--font-mono);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.microsoft-action-invite,
+.microsoft-action-guard {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.5;
+}
+.microsoft-action-invite svg,
+.microsoft-action-guard svg { width: 13px; height: 13px; flex: none; margin-top: 1px; color: #f0be76; }
+.microsoft-action-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.microsoft-action-buttons button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 8px 14px;
+  border: 1px solid var(--chat-border);
+  border-radius: 9px;
+  color: inherit;
+  background: rgba(255, 255, 255, .035);
+  font: 650 11px var(--font-body);
+  cursor: pointer;
+}
+.microsoft-action-buttons button svg { width: 14px; height: 14px; }
+.microsoft-action-buttons button.primary {
+  border-color: rgba(242, 174, 67, .5);
+  color: #1c1a15;
+  background: #f2ae43;
+}
+.microsoft-action-buttons button.primary:hover:not(:disabled) { background: #f7bd60; }
+.microsoft-action-buttons button:disabled { opacity: .6; cursor: progress; }
+.microsoft-action-buttons button.is-busy svg { animation: microsoft-spin 1s linear infinite; }
+.microsoft-action-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0;
+  padding: 9px 11px;
+  border-radius: 10px;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.microsoft-action-feedback.is-success { color: #8ad4ff; background: rgba(0, 164, 239, .1); }
+.microsoft-action-feedback.is-error { color: #ffaaa6; background: rgba(240, 83, 76, .1); }
+.microsoft-action-feedback button {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+.microsoft-action-feedback button svg { width: 12px; height: 12px; }
+
+.user-profile-provider.microsoft { gap: 5px; }
+.user-profile-provider.microsoft .microsoft-mark { width: 13px; height: 13px; }
+.user-profile-provider.microsoft button {
+  padding: 0 6px;
+  border: 0;
+  border-radius: 999px;
+  color: #8ad4ff;
+  background: rgba(0, 164, 239, .14);
+  font: 650 9px var(--font-body);
+  cursor: pointer;
+}
+
+@media (max-width: 720px) {
+  .microsoft-settings { padding: 13px; }
+  .microsoft-settings-head { align-items: flex-start; }
+  .microsoft-connection-summary { flex-wrap: wrap; }
+  .microsoft-connection-summary dl { width: 100%; min-width: 0; }
+  .microsoft-redirect { grid-template-columns: minmax(0, 1fr) 30px; }
+  .microsoft-redirect > span { grid-column: 1 / -1; }
+  .microsoft-action-fields > div { grid-template-columns: 1fr; gap: 2px; }
+  .microsoft-action-buttons button { flex: 1 1 100%; }
+}
+
 .chat-ready-sound-settings {
   width: min(760px, 100%);
   margin: 6px 0 16px;
@@ -7917,11 +8225,81 @@ body:has(.account-auth) .m-chrome {
 }
 
 .user-profile-modal {
-  width: min(560px, calc(100vw - 28px));
-  max-height: min(760px, calc(100vh - 28px));
+  /* La liaison Microsoft vit dans cette modale : elle porte des cartes de
+     confirmation qui doivent montrer un e-mail entier avant envoi. */
+  width: min(680px, calc(100vw - 28px));
+  max-height: min(820px, calc(100vh - 28px));
   overflow: auto;
   padding: 0;
   border-radius: 18px;
+}
+
+.user-profile-services {
+  padding: 0 22px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.user-profile-services .microsoft-settings {
+  width: 100%;
+  margin: 18px 0 0;
+}
+
+.user-profile-services .microsoft-pending {
+  margin-top: 16px;
+}
+
+.user-profile-toggle {
+  position: relative;
+}
+
+.user-profile-pending {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  display: grid;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  place-items: center;
+  border-radius: 999px;
+  color: #04121c;
+  background: #00a4ef;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.microsoft-shortcut {
+  display: flex;
+  width: min(760px, 100%);
+  align-items: center;
+  gap: 12px;
+  margin: 6px 0 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--chat-border);
+  border-radius: 14px;
+  background: linear-gradient(145deg, rgba(0, 164, 239, .06), rgba(255, 255, 255, .012));
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.microsoft-shortcut:hover { border-color: rgba(0, 164, 239, .3); }
+.microsoft-shortcut .settings-card-icon { background: rgba(0, 164, 239, .12); }
+.microsoft-shortcut .microsoft-mark { width: 18px; height: 18px; }
+.microsoft-shortcut-copy { display: grid; min-width: 0; gap: 3px; flex: 1; }
+.microsoft-shortcut-copy strong { font-size: 12px; }
+.microsoft-shortcut-copy small { color: var(--muted); font-size: 10px; }
+.microsoft-shortcut-copy b { color: #8ad4ff; font-weight: 700; }
+.microsoft-shortcut > svg { width: 16px; height: 16px; flex: none; color: var(--muted); }
+
+.microsoft-shortcut-pending {
+  padding: 4px 9px;
+  border-radius: 999px;
+  color: #04121c;
+  background: #00a4ef;
+  font-size: 9px;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 .user-profile-head {

@@ -5,6 +5,10 @@
 // maniere ciblee pour conserver le scroll et le brouillon pendant le streaming.
 
 import { escapeHtml, renderMarkdown } from "./markdown";
+// Seule entorse a la purete du module : les cartes de confirmation Microsoft
+// 365 sont le dernier garde-fou avant un envoi irreversible et doivent vivre
+// dans le fil lui-meme, y compris dans les panneaux experts.
+import { renderMicrosoftPendingActions } from "../microsoft";
 import type { ChatImageAttachment } from "./image-attachments";
 import { resolveChatTurnWindow } from "./render-window";
 import { chatRuntimeShowsStateLabel } from "./status-display";
@@ -886,6 +890,7 @@ export const renderChatFeedInner = (model: ChatPanelModel, instanceId = ""): str
         ${visibleTurns.map((turn, index) => renderOpenCodeTurn(turn, index, visibleTurns.length, model, instanceId)).join("")}
       </div>`
     : renderWelcome();
+  const microsoftPendingActions = renderMicrosoftPendingActions();
   const turnError = model.turnError
     ? `<div class="chat-error chat-turn-error"><i data-lucide="circle-alert"></i><span>${escapeHtml(model.turnError)}</span></div>`
     : "";
@@ -894,7 +899,7 @@ export const renderChatFeedInner = (model: ChatPanelModel, instanceId = ""): str
         <span><strong>Continuité automatique.</strong> Une capacité compatible prend le relais...</span>
       </div>`
     : "";
-  return notice + olderTurns + conversation + turnError + quotaSuggestion;
+  return notice + olderTurns + conversation + microsoftPendingActions + turnError + quotaSuggestion;
 };
 
 const modelSuggestions = (model: ChatPanelModel): string =>

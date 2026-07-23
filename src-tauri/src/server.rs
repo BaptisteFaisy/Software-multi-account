@@ -3,7 +3,8 @@ use crate::{
     auth::{self, AuthIdentity, AuthManager},
     autonomous::{
         AddAutonomousMemoryRequest, ApplyAutonomousReviewPolicyRequest, AutonomousAgentAction,
-        AutonomousAgentManager, AutonomousAgentStatus, ControlAutonomousAgentRequest,
+        AutonomousAgentManager, AutonomousAgentSnapshot, AutonomousAgentStatus,
+        ControlAutonomousAgentRequest,
         CreateAutonomousAgentRequest, ReassignAutonomousAgentAccountRequest,
         ScheduleAutonomousAgentRequest, SendAutonomousAgentMessageRequest,
         UpdateAutonomousAgentRequest,
@@ -12,10 +13,13 @@ use crate::{
     chat_model_tools::{
         self, ApplyAutonomousAgentPolicyToolArguments, AutonomousAgentToolContext,
         ChatModelToolServerConfig, ChatOpenRequestRegistry, ChatToolCapabilityRegistry,
-        CreateAutonomousAgentToolArguments, CreateChatToolArguments,
+        ChatToolScope, CreateAutonomousAgentToolArguments, CreateChatToolArguments,
         UpdateAutonomousAgentToolArguments, ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME,
-        APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME,
-        PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
+        APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME,
+        CREATE_CALENDAR_EVENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME, LIST_CALENDAR_EVENTS_TOOL_NAME,
+        LIST_OUTLOOK_MESSAGES_TOOL_NAME, PAUSE_AUTONOMOUS_AGENT_TOOL_NAME,
+        SEND_OUTLOOK_EMAIL_TOOL_NAME, UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
+        UPDATE_CALENDAR_EVENT_TOOL_NAME,
     },
     creative_accounts::{self, ConnectCreativeAccountRequest, CreativeAccountIdRequest},
     discussions,
@@ -25,6 +29,10 @@ use crate::{
     image_generation::{self, ImageGenerationRequest, ImageGenerationStatusRequest},
     kombai::{KombaiManager, KombaiStatus},
     metrics,
+    microsoft::{
+        self, CreateEventArguments, ListEventsArguments, ListMessagesArguments, MicrosoftManager,
+        SendEmailArguments, UpdateEventArguments,
+    },
     mobile_push::{self, ConfigureMobilePushRequest, RegisterMobilePushDeviceRequest},
     orchestration::{
         ControlOrchestrationRequest, CreateOrchestrationRequest, OrchestrationManager,
@@ -69,7 +77,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -97,6 +105,11 @@ const MAX_DRAIN_LEASE_SECS: u64 = 60;
 const TERMINAL_EVENT_BUFFER: usize = 2_048;
 
 /// Version du binaire, exposee par `/healthz`, `/api/health` et `--version`.
+/// Un tour lance avec le jeton administrateur n'a pas de compte nominatif :
+/// aucune boite Microsoft ne peut alors etre choisie sans deviner, et deviner
+/// reviendrait a envoyer un e-mail depuis la boite de quelqu'un d'autre.
+const MICROSOFT_NO_NOMINAL_USER: &str = "Ce chat n'est rattache a aucun compte utilisateur nominatif : la boite Microsoft ne peut pas etre determinee. Demande a l'utilisateur de se connecter a l'application, puis de lier son compte Microsoft dans les parametres.";
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Commit git embarque au build (voir `build.rs`). "unknown" si indisponible.
 pub const COMMIT: &str = match option_env!("CST_GIT_COMMIT") {
@@ -131,6 +144,7 @@ struct ServerState {
     chat: ChatTurnManager,
     chat_tool_capabilities: ChatToolCapabilityRegistry,
     chat_open_requests: ChatOpenRequestRegistry,
+    microsoft: MicrosoftManager,
     autonomous: AutonomousAgentManager,
     orchestration: OrchestrationManager,
     forum: ForumManager,
@@ -1010,21 +1024,59 @@ pub async fn run_from_env() -> Result<(), String> {
     crate::chat::start_orphan_chat_image_sweeper();
     let user_auth = AuthManager::load(config.data_dir.clone(), &config.public_base_url)?
         .with_runtime_sync(chat.runtime_sync());
+    // Le registre est cree ici, avant le moteur d'agents : chaque cycle d'agent
+    // recoit sa propre capacite MCP, portee par le proprietaire de l'agent.
+    let chat_tool_capabilities = ChatToolCapabilityRegistry::default();
+    let agent_tools_url = config.chat_tools_mcp_url().ok();
+    let agent_capabilities = chat_tool_capabilities.clone();
     let autonomous =
-        AutonomousAgentManager::new(chat.clone(), config.data_dir.join("autonomous-agents.json"))?;
+        AutonomousAgentManager::new(chat.clone(), config.data_dir.join("autonomous-agents.json"))?
+            .with_model_tools(Arc::new(move |agent: &AutonomousAgentSnapshot| {
+                // Agent sans proprietaire nominatif (cree avant cette version,
+                // ou par le jeton administrateur) : aucun outil. Deviner une
+                // boite reviendrait a ecrire depuis celle de quelqu'un d'autre.
+                let owner_id = agent.owner_id.clone()?;
+                let url = agent_tools_url.clone()?;
+                let token = agent_capabilities
+                    .issue(AutonomousAgentToolContext {
+                        account_id: agent.account_id.clone(),
+                        scope: ChatToolScope::PersonalDataOnly,
+                        user_id: Some(owner_id),
+                        source_chat_key: agent.source_chat_key.clone(),
+                        project_dir: agent.project_dir.clone(),
+                        mode: agent.mode,
+                        model: agent.model.clone(),
+                        reasoning_effort: agent.reasoning_effort.clone(),
+                    })
+                    .ok()?;
+                Some(ChatModelToolServerConfig {
+                    url,
+                    bearer_token: token,
+                })
+            }));
     let orchestration =
         OrchestrationManager::new(chat.clone(), config.data_dir.join("orchestrated-runs.json"))?;
     let forum = ForumManager::new(config.data_dir.join("forum.json"))?;
     let private_messages =
         PrivateMessageManager::new(config.data_dir.join("private-messages.json"))?;
     let workspace_access = WorkspaceAccessManager::load(config.data_dir.clone())?;
+    // Les jetons Microsoft vivent dans `config.data_dir`, comme `user-auth.json`
+    // et contrairement aux autres integrations qui passent par
+    // `settings::runtime_data_path` : un `CST_ACCOUNTS_DIR` partage entre
+    // noeuds rattacherait des jetons a des identifiants utilisateurs locaux.
+    let microsoft = MicrosoftManager::load(
+        config.data_dir.clone(),
+        &config.public_base_url,
+        user_auth.clone(),
+    )?;
     let state = Arc::new(ServerState {
         config: config.clone(),
         auth: user_auth.clone(),
         terminals: RemoteTerminalManager::default(),
         chat,
-        chat_tool_capabilities: ChatToolCapabilityRegistry::default(),
+        chat_tool_capabilities,
         chat_open_requests: ChatOpenRequestRegistry::default(),
+        microsoft: microsoft.clone(),
         autonomous,
         orchestration,
         forum,
@@ -1038,6 +1090,7 @@ pub async fn run_from_env() -> Result<(), String> {
         drain_until: Arc::new(AtomicI64::new(0)),
     });
     telegram_notifications::start_polling(state.autonomous.clone());
+    state.microsoft.start_keepalive();
 
     spawn_workspace_cleanup(config.data_dir.clone(), state.terminals.clone());
 
@@ -1385,6 +1438,7 @@ pub async fn run_from_env() -> Result<(), String> {
         .merge(health)
         .merge(mcp)
         .nest("/api/auth", auth::router(user_auth))
+        .nest("/api/microsoft", microsoft::router(microsoft))
         .nest("/api", api)
         .nest("/ws", ws)
         .merge(pool::router(pool_manager, Some(config.admin_token.clone())))
@@ -2880,10 +2934,17 @@ async fn api_start_chat_turn(
         Ok(value) => value,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, &error, &state.config),
     };
+    // L'identite nominative est calculee AVANT l'emission de la capacite : elle
+    // est la seule cle qui permette a un outil de retrouver la boite Microsoft
+    // du demandeur. `actor.owner_id()` ne conviendrait pas, il renvoie le
+    // pseudo-compte "server-admin" pour un tour lance au jeton administrateur.
+    let owner_id = actor.user().map(|identity| identity.id.clone());
     let token = match state
         .chat_tool_capabilities
         .issue(AutonomousAgentToolContext {
             account_id: request.account_id.clone(),
+            scope: ChatToolScope::Full,
+            user_id: owner_id.clone(),
             source_chat_key: request.source_chat_key.clone(),
             project_dir: request.project_dir.clone(),
             mode: request.mode,
@@ -2903,7 +2964,6 @@ async fn api_start_chat_turn(
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error, &state.config);
         }
     };
-    let owner_id = actor.user().map(|identity| identity.id.clone());
     let start_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let value = start_state
@@ -2962,9 +3022,10 @@ async fn mcp_chat_tools(
         return StatusCode::FORBIDDEN.into_response();
     }
     let token = bearer_from_headers(&headers);
-    if state.chat_tool_capabilities.authorize(token).is_err() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    let capability = match state.chat_tool_capabilities.authorize(token) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
 
     let id = payload
         .get("id")
@@ -2988,14 +3049,21 @@ async fn mcp_chat_tools(
             let requested_version = payload
                 .pointer("/params/protocolVersion")
                 .and_then(serde_json::Value::as_str);
-            json_response(chat_model_tools::initialize_response(id, requested_version))
+            json_response(chat_model_tools::initialize_response(
+                id,
+                requested_version,
+                capability.scope,
+            ))
         }
         "ping" => json_response(json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {}
         })),
-        "tools/list" => json_response(chat_model_tools::tools_list_response(id)),
+        "tools/list" => json_response(chat_model_tools::tools_list_response(
+            id,
+            capability.scope,
+        )),
         "tools/call" => {
             let name = payload
                 .pointer("/params/name")
@@ -3007,6 +3075,11 @@ async fn mcp_chat_tools(
                 && name != ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME
                 && name != APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME
                 && name != CREATE_CHAT_TOOL_NAME
+                && name != LIST_OUTLOOK_MESSAGES_TOOL_NAME
+                && name != LIST_CALENDAR_EVENTS_TOOL_NAME
+                && name != SEND_OUTLOOK_EMAIL_TOOL_NAME
+                && name != CREATE_CALENDAR_EVENT_TOOL_NAME
+                && name != UPDATE_CALENDAR_EVENT_TOOL_NAME
             {
                 return json_response(chat_model_tools::protocol_error(
                     id,
@@ -3014,10 +3087,26 @@ async fn mcp_chat_tools(
                     "Outil MCP inconnu",
                 ));
             }
-            let context_result = if name == CREATE_CHAT_TOOL_NAME {
-                state.chat_tool_capabilities.claim_chat_creation(token)
-            } else {
-                state.chat_tool_capabilities.claim_call(token)
+            // Meme reponse qu'un outil inexistant : un agent autonome ne doit
+            // pas pouvoir deduire de la reponse qu'il existe des outils qu'on
+            // lui refuse, ni les sonder un par un.
+            if !capability.scope.allows(name) {
+                return json_response(chat_model_tools::protocol_error(
+                    id,
+                    -32602,
+                    "Outil MCP inconnu",
+                ));
+            }
+            let context_result = match name {
+                CREATE_CHAT_TOOL_NAME => state.chat_tool_capabilities.claim_chat_creation(token),
+                // Les brouillons qui sortent de l'application consomment le
+                // sous-quota d'actions externes en plus du budget global.
+                SEND_OUTLOOK_EMAIL_TOOL_NAME
+                | CREATE_CALENDAR_EVENT_TOOL_NAME
+                | UPDATE_CALENDAR_EVENT_TOOL_NAME => {
+                    state.chat_tool_capabilities.claim_external_action(token)
+                }
+                _ => state.chat_tool_capabilities.claim_call(token),
             };
             let context = match context_result {
                 Ok(value) => value,
@@ -3313,6 +3402,118 @@ async fn mcp_chat_tools(
                             id,
                             &format!("Application de la politique interrompue : {error}"),
                         )),
+                    }
+                }
+                LIST_OUTLOOK_MESSAGES_TOOL_NAME => {
+                    let Some(owner_id) = context.user_id.clone() else {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            MICROSOFT_NO_NOMINAL_USER,
+                        ));
+                    };
+                    let arguments =
+                        match serde_json::from_value::<ListMessagesArguments>(arguments) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return json_response(chat_model_tools::tool_error_response(
+                                    id,
+                                    &format!("Arguments invalides pour la lecture des e-mails : {error}"),
+                                ))
+                            }
+                        };
+                    match state.microsoft.list_messages(&owner_id, &arguments).await {
+                        Ok(data) => {
+                            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "{count} e-mail(s) lu(s) dans la boite Microsoft de l'utilisateur."
+                                ),
+                                data,
+                            ))
+                        }
+                        Err(error) => {
+                            json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    }
+                }
+                LIST_CALENDAR_EVENTS_TOOL_NAME => {
+                    let Some(owner_id) = context.user_id.clone() else {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            MICROSOFT_NO_NOMINAL_USER,
+                        ));
+                    };
+                    let arguments = match serde_json::from_value::<ListEventsArguments>(arguments) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &format!("Arguments invalides pour la lecture de l'agenda : {error}"),
+                            ))
+                        }
+                    };
+                    match state.microsoft.list_events(&owner_id, &arguments).await {
+                        Ok(data) => {
+                            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "{count} evenement(s) dans l'agenda Microsoft de l'utilisateur. Les horaires sont en UTC."
+                                ),
+                                data,
+                            ))
+                        }
+                        Err(error) => {
+                            json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    }
+                }
+                SEND_OUTLOOK_EMAIL_TOOL_NAME
+                | CREATE_CALENDAR_EVENT_TOOL_NAME
+                | UPDATE_CALENDAR_EVENT_TOOL_NAME => {
+                    let Some(owner_id) = context.user_id.clone() else {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            MICROSOFT_NO_NOMINAL_USER,
+                        ));
+                    };
+                    let draft = match name {
+                        SEND_OUTLOOK_EMAIL_TOOL_NAME => {
+                            serde_json::from_value::<SendEmailArguments>(arguments)
+                                .map_err(|error| format!("Arguments invalides pour l'e-mail : {error}"))
+                                .and_then(SendEmailArguments::into_draft)
+                        }
+                        CREATE_CALENDAR_EVENT_TOOL_NAME => {
+                            serde_json::from_value::<CreateEventArguments>(arguments)
+                                .map_err(|error| {
+                                    format!("Arguments invalides pour l'evenement : {error}")
+                                })
+                                .and_then(CreateEventArguments::into_draft)
+                        }
+                        _ => serde_json::from_value::<UpdateEventArguments>(arguments)
+                            .map_err(|error| {
+                                format!("Arguments invalides pour la modification : {error}")
+                            })
+                            .and_then(UpdateEventArguments::into_draft),
+                    };
+                    let draft = match draft {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    };
+                    match state
+                        .microsoft
+                        .enqueue(&owner_id, draft, context.source_chat_key.clone())
+                        .await
+                    {
+                        Ok(action) => json_response(
+                            chat_model_tools::tool_pending_action_response(id, &action),
+                        ),
+                        Err(error) => {
+                            json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
                     }
                 }
                 _ => unreachable!("outil valide avant le dispatch"),
@@ -4608,6 +4809,11 @@ async fn api_create_autonomous_agent(
             &state.config,
         );
     }
+
+    // Impose depuis la session, jamais lu depuis le corps de la requete : c'est
+    // ce qui autorisera plus tard l'agent a lire la boite mail de cette
+    // personne, et d'aucune autre.
+    request.owner_id = actor.user().map(|identity| identity.id.clone());
 
     let manager = state.autonomous.clone();
     match tokio::task::spawn_blocking(move || manager.create(request)).await {

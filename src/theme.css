@@ -864,6 +864,67 @@
 :root[data-theme="light"] .whatsapp-feedback.is-success { color: #176b36; }
 :root[data-theme="light"] .whatsapp-feedback.is-error { color: #9c312d; }
 
+:root[data-theme="light"] .microsoft-settings {
+  border-color: var(--chat-border);
+  background: linear-gradient(145deg, #ffffff, #eef5fb);
+}
+:root[data-theme="light"] .microsoft-state-pill { background: rgba(0, 0, 0, .035); }
+:root[data-theme="light"] .microsoft-state-pill.is-connected {
+  border-color: rgba(0, 108, 158, .24);
+  color: #0a5d86;
+  background: rgba(0, 164, 239, .1);
+}
+:root[data-theme="light"] .microsoft-unavailable { background: rgba(255, 255, 255, .78); }
+:root[data-theme="light"] .microsoft-unavailable > span,
+:root[data-theme="light"] .microsoft-connection-state { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-unavailable code { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-connection-summary {
+  border-color: rgba(0, 108, 158, .18);
+  background: rgba(0, 164, 239, .07);
+}
+:root[data-theme="light"] .microsoft-connection-summary.is-stale {
+  border-color: rgba(176, 116, 15, .26);
+  background: rgba(242, 174, 67, .1);
+}
+:root[data-theme="light"] .microsoft-connection-summary.is-stale .microsoft-connection-state,
+:root[data-theme="light"] .microsoft-relink-note svg { color: #96620b; }
+:root[data-theme="light"] .microsoft-scopes em { background: rgba(0, 0, 0, .035); }
+:root[data-theme="light"] .microsoft-connection-actions button,
+:root[data-theme="light"] .microsoft-connect-button { background: rgba(255, 255, 255, .86); }
+:root[data-theme="light"] .microsoft-connection-actions button.danger { color: #9c312d; }
+:root[data-theme="light"] .microsoft-redirect code { background: rgba(255, 255, 255, .82); }
+:root[data-theme="light"] .microsoft-redirect button:hover { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-feedback.is-success { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-feedback.is-error { color: #9c312d; }
+
+:root[data-theme="light"] .microsoft-action {
+  border-color: rgba(176, 116, 15, .3);
+  background: #fffaf0;
+}
+:root[data-theme="light"] .microsoft-action-mark { color: #96620b; background: rgba(242, 174, 67, .18); }
+:root[data-theme="light"] .microsoft-action-fields b,
+:root[data-theme="light"] .microsoft-action-invite svg,
+:root[data-theme="light"] .microsoft-action-guard svg { color: #96620b; }
+:root[data-theme="light"] .microsoft-action-longtext pre {
+  color: #202722;
+  background: #ffffff;
+}
+:root[data-theme="light"] .microsoft-action-buttons button { background: rgba(255, 255, 255, .9); }
+:root[data-theme="light"] .microsoft-action-buttons button.primary {
+  border-color: rgba(176, 116, 15, .45);
+  color: #241d0c;
+  background: #f0ab3c;
+}
+:root[data-theme="light"] .microsoft-action-feedback.is-success { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-action-feedback.is-error { color: #9c312d; }
+:root[data-theme="light"] .microsoft-shortcut {
+  border-color: var(--chat-border);
+  background: linear-gradient(145deg, #ffffff, #eef5fb);
+}
+:root[data-theme="light"] .microsoft-shortcut:hover { border-color: rgba(0, 108, 158, .3); }
+:root[data-theme="light"] .microsoft-shortcut-copy b { color: #0a5d86; }
+:root[data-theme="light"] .user-profile-services { border-top-color: rgba(0, 0, 0, .08); }
+
 :root[data-theme="light"] .chat-app-layout .chat-head,
 :root[data-theme="light"] .expert-chat-toolbar {
   background: rgba(250, 251, 249, 0.94);

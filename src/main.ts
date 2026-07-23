@@ -50,11 +50,23 @@ import {
 import {
   authenticatedUser,
   bindUserAccountUi,
+  closeUserProfileModal,
   initializeUserAuth,
+  openUserProfileModal,
   renderUserAccountButton,
   renderUserAuthGate,
   renderUserProfileModal,
 } from "./user-auth";
+import {
+  bindMicrosoftConnectionUi,
+  handleMicrosoftPendingActionClick,
+  microsoftPendingActionsSignature,
+  refreshMicrosoftConnection,
+  refreshMicrosoftPendingActions,
+  renderMicrosoftAccountShortcut,
+  startMicrosoftPendingPolling,
+  takeMicrosoftOAuthResultRedirect,
+} from "./microsoft";
 import {
   accountScopedStorage,
   setAccountStorageScope,
@@ -2783,6 +2795,10 @@ const chatFeedSnapshot = (model: ChatPanelModel): ChatFeedSnapshot => {
       model.turnError,
       model.quotaSuggestion,
       model.visibleTurnLimit,
+      // Les cartes de confirmation Microsoft vivent dans le fil sans passer par
+      // le modele : sans leur signature, une action en attente resterait
+      // invisible jusqu'au prochain message.
+      microsoftPendingActionsSignature(),
     ]),
     // Seul le tour courant varie pendant le streaming. Les longs tours restent
     // serialises, mais tout l'historique stable ne l'est plus a chaque trame.
@@ -6134,7 +6150,9 @@ const setActiveView = (view: AppView) => {
     void refreshVoiceRuntimeStatus();
     if (!telegramConnectionLoaded) void refreshTelegramConnection(true);
     if (!whatsappConnectionLoaded) void refreshWhatsAppConnection(true);
+    void refreshMicrosoftConnection();
   }
+  if (activeView === "chat") void refreshMicrosoftPendingActions();
   if (activeView === "autonomous" && !telegramConnectionLoaded) {
     void refreshTelegramConnection();
   }
@@ -8381,6 +8399,11 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   ) {
     void refreshLimitStatus(true, true);
   }
+  if (chatTurnIsBusy(previousStatus) && !chatTurnIsBusy(snapshot.status)) {
+    // Les outils Microsoft mettent une action en file sans rien envoyer : la
+    // carte de confirmation doit apparaitre des la fin du tour.
+    void refreshMicrosoftPendingActions();
+  }
   if (chatBecameAvailable(previousStatus, snapshot.status)) {
     void playChatReadySound(chatReadySoundPreferences);
   }
@@ -10252,6 +10275,11 @@ const applyExpertChatTurnSnapshot = async (
   ) {
     void refreshLimitStatus(true, true);
   }
+  if (chatTurnIsBusy(previousStatus) && !chatTurnIsBusy(snapshot.status)) {
+    // Meme garde-fou que le chat principal : une action Microsoft mise en file
+    // pendant ce tour doit etre proposee immediatement a la confirmation.
+    void refreshMicrosoftPendingActions();
+  }
   if (chatBecameAvailable(previousStatus, snapshot.status)) {
     void playChatReadySound(chatReadySoundPreferences);
   }
@@ -11457,6 +11485,10 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
   });
   root.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
+    if (handleMicrosoftPendingActionClick(target)) {
+      event.preventDefault();
+      return;
+    }
     if (target?.closest("[data-chat-action='show-older-turns']")) {
       event.preventDefault();
       pane.visibleTurnLimit = (pane.visibleTurnLimit ?? 0) + chatTurnBatchForViewport();
@@ -20128,6 +20160,7 @@ const renderSettingsPanel = (): string => {
       ${renderChatReadySoundSettings()}
       ${renderTelegramConnectionSettings()}
       ${renderWhatsAppConnectionSettings()}
+      ${renderMicrosoftAccountShortcut()}
       <section id="voiceRuntimeStatus" class="voice-runtime-card" aria-live="polite">
         ${renderVoiceRuntimeStatusContent()}
       </section>
@@ -26748,6 +26781,11 @@ const bindUi = () => {
   });
   bindTelegramConnectionUi();
   bindWhatsAppConnectionUi();
+  bindMicrosoftConnectionUi(render);
+  document.querySelector<HTMLButtonElement>("#settingsMicrosoftAccount")?.addEventListener("click", () => {
+    openUserProfileModal();
+    render();
+  });
   document.querySelector<HTMLButtonElement>("#themeToggle")?.addEventListener("click", () => {
     setAppTheme(oppositeTheme(activeTheme));
   });
@@ -27318,6 +27356,10 @@ const bindUi = () => {
     });
   mainChatPanel?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
+    if (handleMicrosoftPendingActionClick(target)) {
+      event.preventDefault();
+      return;
+    }
     if (target?.closest("[data-chat-action='show-older-turns']")) {
       event.preventDefault();
       chatVisibleTurnLimit = (chatVisibleTurnLimit ?? 0) + chatTurnBatchForViewport();
@@ -28843,6 +28885,9 @@ const boot = async () => {
   if (recoveredLazyView && recoveredLazyView !== "chat") {
     setActiveView(recoveredLazyView);
   }
+  // La liaison se pilote depuis Mon compte : au retour de Microsoft, on rouvre
+  // cette modale, sinon les messages de succes et d'echec ne seraient jamais lus.
+  if (takeMicrosoftOAuthResultRedirect()) openUserProfileModal();
   if (isRemoteMode()) {
     scheduleIdleTask(() => {
       void loadMessagingModule()
@@ -28875,6 +28920,8 @@ const boot = async () => {
     void refreshSkills();
     void refreshAutonomousAgents();
     void refreshLimitStatus(true);
+    void refreshMicrosoftPendingActions();
+    startMicrosoftPendingPolling(render);
   });
 };
 
