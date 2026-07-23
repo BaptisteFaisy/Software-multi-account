@@ -944,13 +944,20 @@ type AccountProfile = {
 const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
 const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "medium";
 // Claude Code : alias de modele (pas d'intensite de raisonnement).
+// Les alias `sonnet`/`opus`/`haiku` suivent automatiquement le modele courant de
+// chaque palier ; les IDs exacts permettent d'epingler une version precise.
+// Le champ accepte aussi tout autre ID tape manuellement.
 const DEFAULT_CLAUDE_MODEL = "sonnet";
 const CLAUDE_MODEL_SUGGESTIONS = [
   "sonnet",
   "opus",
   "haiku",
-  "claude-sonnet-4-5",
-  "claude-opus-4-1",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-5",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
 ];
 const CODEX_MODEL_SUGGESTIONS = [
   "gpt-5.6-sol",

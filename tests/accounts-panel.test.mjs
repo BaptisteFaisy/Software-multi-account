@@ -60,6 +60,28 @@ test("la connexion API annexe passe par OpenCode et cible le bon provider", () =
   assert.match(main, /agentProvider\(agent\) === "opencode"/);
 });
 
+test("les suggestions de modeles Claude proposent les alias CLI et les modeles actuels", () => {
+  const start = main.indexOf("const CLAUDE_MODEL_SUGGESTIONS = [");
+  const end = main.indexOf("];", start);
+  assert.ok(start >= 0 && end > start, "liste CLAUDE_MODEL_SUGGESTIONS introuvable");
+  const block = main.slice(start, end);
+  for (const model of [
+    '"sonnet"',
+    '"opus"',
+    '"haiku"',
+    '"claude-opus-4-8"',
+    '"claude-sonnet-5"',
+    '"claude-haiku-4-5"',
+  ]) {
+    assert.ok(block.includes(model), `${model} manquant dans CLAUDE_MODEL_SUGGESTIONS`);
+  }
+  // Les modeles retires/deprecies ne doivent plus etre proposes.
+  assert.ok(!block.includes('"claude-opus-4-1"'), "claude-opus-4-1 est deprecie");
+  // La liste alimente bien le champ modele des comptes Claude, et le modele
+  // choisi est materialise dans le settings.json du home Claude (terminaux).
+  assert.match(main, /if \(provider === "claude"\) return \[\.\.\.CLAUDE_MODEL_SUGGESTIONS\];/);
+});
+
 test("le terminal OpenCode reprend le modele du compte", () => {
   assert.match(main, /if \(agentProvider\(agent\) === "opencode"\)/);
   assert.match(main, /safeCliModel\(accountModel\(account\)\)/);
