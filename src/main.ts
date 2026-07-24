@@ -964,6 +964,7 @@ const CLAUDE_MODEL_SUGGESTIONS = [
   "sonnet",
   "opus",
   "haiku",
+  "claude-fable-5",
   "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-opus-4-6",
