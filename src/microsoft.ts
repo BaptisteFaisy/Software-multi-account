@@ -32,6 +32,12 @@ export type MicrosoftConnectionView = {
   tenant: string | null;
   redirectUri: string | null;
   loginUrl: string | null;
+  /** Identifiant d'application Entra courant (jamais le secret). */
+  clientId: string | null;
+  /** URI de redirection a declarer dans Entra, connue meme avant configuration. */
+  defaultRedirectUri: string;
+  /** "env", "app", ou null. "app" = modifiable depuis l'interface. */
+  providerSource: string | null;
 };
 
 export type MicrosoftEmailDraft = {
@@ -116,6 +122,9 @@ const OFFLINE_CONNECTION: MicrosoftConnectionView = {
   tenant: null,
   redirectUri: null,
   loginUrl: null,
+  clientId: null,
+  defaultRedirectUri: "",
+  providerSource: null,
 };
 
 let connection: MicrosoftConnectionView | null = null;
@@ -127,6 +136,9 @@ let unlinkPending: string | null = null;
 let unlinking = false;
 /** Oid en cours d'action (defaut/deliaison), pour l'etat occupe des boutons. */
 let accountBusyOid: string | null = null;
+/** Formulaire de configuration Entra ouvert (saisie client id/secret). */
+let providerFormOpen = false;
+let providerSaving = false;
 let pendingActions: MicrosoftPendingAction[] = [];
 let linkRequest: MicrosoftLinkRequest | null = null;
 let pendingActionsLoaded = false;
@@ -362,12 +374,67 @@ const renderScopes = (scopes: string[]): string => {
   </div>`;
 };
 
-const renderRedirectUri = (redirectUri: string): string => `
-  <label class="microsoft-redirect">
-    <span>URI de redirection à déclarer dans Entra</span>
-    <code>${escapeHtml(redirectUri)}</code>
-    <button type="button" id="microsoftCopyRedirect" aria-label="Copier l’URI de redirection"><i data-lucide="copy"></i></button>
-  </label>`;
+/**
+ * Formulaire de configuration Entra saisi dans l'application. Evite de poser
+ * les variables serveur puis de redeployer : les identifiants sont persistes
+ * cote serveur (0600) et survivent aux redeploiements. `initial` distingue la
+ * premiere configuration (aucun compte lie possible) d'une reconfiguration.
+ */
+const renderProviderForm = (view: MicrosoftConnectionView | null, initial: boolean): string => {
+  const redirect = view?.redirectUri || view?.defaultRedirectUri || "";
+  const clientId = view?.clientId ?? "";
+  const tenant = view?.tenant ?? "common";
+  return `<form id="microsoftProviderForm" class="microsoft-provider-form">
+    <div class="microsoft-provider-head">
+      <span><i data-lucide="settings"></i></span>
+      <div>
+        <strong>${initial ? "Configurer Microsoft 365" : "Reconfigurer Microsoft 365"}</strong>
+        <p>Collez ici les identifiants de votre application Entra ID. Ils sont enregistrés sur le serveur et ne réclament aucun redéploiement. ${initial ? `La procédure d’inscription est décrite dans <code>docs/microsoft-365.md</code>.` : ""}</p>
+      </div>
+    </div>
+    <label class="microsoft-provider-redirect">
+      <span>URI de redirection à déclarer dans Entra (type « Web »)</span>
+      <code>${escapeHtml(redirect)}</code>
+      <button type="button" id="microsoftCopyRedirect" aria-label="Copier l’URI de redirection"><i data-lucide="copy"></i></button>
+    </label>
+    <label>
+      <span>ID d’application (client)</span>
+      <input id="microsoftProviderClientId" name="clientId" autocomplete="off" spellcheck="false" value="${escapeHtml(clientId)}" placeholder="00000000-0000-0000-0000-000000000000" required />
+    </label>
+    <label>
+      <span>Secret client</span>
+      <input id="microsoftProviderClientSecret" name="clientSecret" type="password" autocomplete="off" spellcheck="false" placeholder="${initial ? "Collez la valeur du secret" : "Laisser vide pour conserver le secret actuel"}" ${initial ? "required" : ""} />
+      <small>${initial ? "La valeur (pas l’identifiant) du secret, affichée une seule fois dans Entra." : "Renseignez-le seulement pour le remplacer."}</small>
+    </label>
+    <label>
+      <span>Tenant</span>
+      <input id="microsoftProviderTenant" name="tenant" autocomplete="off" spellcheck="false" value="${escapeHtml(tenant)}" placeholder="common" />
+      <small><code>common</code> pour les comptes personnels et pro, ou l’identifiant de votre annuaire.</small>
+    </label>
+    <div class="microsoft-provider-actions">
+      <button type="submit" class="primary${providerSaving ? " is-busy" : ""}" ${providerSaving ? "disabled" : ""}>
+        <i data-lucide="${providerSaving ? "loader-circle" : "check"}"></i><span>${providerSaving ? "Enregistrement…" : "Enregistrer"}</span>
+      </button>
+      ${initial ? "" : `<button type="button" id="microsoftProviderCancel" ${providerSaving ? "disabled" : ""}>Annuler</button>`}
+    </div>
+  </form>`;
+};
+
+/** Bandeau d'état de la configuration Entra quand elle est active. */
+const renderProviderStatus = (view: MicrosoftConnectionView): string => {
+  const bySource =
+    view.providerSource === "app"
+      ? "Configuré depuis l’application"
+      : "Configuré par les variables du serveur";
+  return `<div class="microsoft-provider-status">
+    <span><i data-lucide="shield-check"></i></span>
+    <div>
+      <strong>${escapeHtml(bySource)}</strong>
+      <small>${view.clientId ? `Application ${escapeHtml(view.clientId)}` : ""}${view.tenant ? ` · tenant ${escapeHtml(view.tenant)}` : ""}</small>
+    </div>
+    <button type="button" id="microsoftProviderReconfigure">Reconfigurer</button>
+  </div>`;
+};
 
 export const renderMicrosoftConnectionSettings = (): string => {
   const view = connection;
@@ -388,15 +455,14 @@ export const renderMicrosoftConnectionSettings = (): string => {
     ? `<div class="microsoft-loading"><i data-lucide="loader-circle"></i><span>Lecture de la liaison Microsoft 365…</span></div>`
     : "";
 
-  const unavailable = connectionLoaded && !configured
-    ? `<div class="microsoft-unavailable">
-        <span><i data-lucide="info"></i></span>
-        <div>
-          <strong>Microsoft 365 n’est pas configuré sur ce serveur.</strong>
-          <p>Renseignez <code>CST_MICROSOFT_CLIENT_ID</code> et <code>CST_MICROSOFT_CLIENT_SECRET</code> côté serveur, puis déclarez l’application dans Entra ID. La procédure complète est décrite dans <code>docs/microsoft-365.md</code>.</p>
-        </div>
-      </div>`
-    : "";
+  // Non configuré : au lieu de renvoyer vers les variables serveur et un
+  // redéploiement, on propose de saisir les identifiants Entra directement ici.
+  const unavailable =
+    connectionLoaded && !configured
+      ? renderProviderForm(view, true)
+      : configured && providerFormOpen
+        ? renderProviderForm(view, false)
+        : "";
 
   const accounts = view?.accounts ?? [];
   const multiple = accounts.length > 1;
@@ -441,10 +507,11 @@ export const renderMicrosoftConnectionSettings = (): string => {
       </div>
       <span class="microsoft-state-pill ${connected ? "is-connected" : ""}">${escapeHtml(stateLabel)}</span>
     </header>
-    ${loading}${unavailable}${accountList}
+    ${loading}${unavailable}
+    ${configured && !providerFormOpen && view ? renderProviderStatus(view) : ""}
+    ${accountList}
     ${hasLink ? renderScopes(view?.scopes ?? []) : ""}
     ${connect}${unlinkAll}
-    ${configured && view?.redirectUri ? renderRedirectUri(view.redirectUri) : ""}
     ${feedback}
   </section>`;
 };
@@ -513,7 +580,7 @@ export const bindMicrosoftConnectionUi = (nextRerender: () => void): void => {
   rerender = nextRerender;
 
   document.querySelector<HTMLButtonElement>("#microsoftCopyRedirect")?.addEventListener("click", async () => {
-    const value = connection?.redirectUri || "";
+    const value = connection?.redirectUri || connection?.defaultRedirectUri || "";
     if (!value) return;
     try {
       await navigator.clipboard.writeText(value);
@@ -532,6 +599,55 @@ export const bindMicrosoftConnectionUi = (nextRerender: () => void): void => {
     ?.addEventListener("click", (event) => {
       void handleMicrosoftSettingsClick(event.target as HTMLElement | null);
     });
+
+  document
+    .querySelector<HTMLFormElement>("#microsoftProviderForm")
+    ?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void submitMicrosoftProvider(event.currentTarget as HTMLFormElement);
+    });
+};
+
+/** Enregistre la configuration Entra saisie dans le formulaire. */
+const submitMicrosoftProvider = async (form: HTMLFormElement): Promise<void> => {
+  if (providerSaving) return;
+  const clientId = form.querySelector<HTMLInputElement>("#microsoftProviderClientId")?.value.trim() ?? "";
+  const clientSecret = form.querySelector<HTMLInputElement>("#microsoftProviderClientSecret")?.value ?? "";
+  const tenant = form.querySelector<HTMLInputElement>("#microsoftProviderTenant")?.value.trim() ?? "";
+  // En reconfiguration (compte deja configure), un secret vide conserve
+  // l'ancien : on ne l'exige qu'a la premiere configuration.
+  const alreadyConfigured = connection?.configured === true;
+  if (!clientId || (!clientSecret && !alreadyConfigured)) {
+    connectionFeedback = {
+      tone: "error",
+      message: "L’identifiant d’application et le secret client sont requis.",
+    };
+    rerender();
+    return;
+  }
+  providerSaving = true;
+  connectionFeedback = null;
+  rerender();
+  try {
+    connection = await microsoftApi<MicrosoftConnectionView>("/provider", {
+      method: "PUT",
+      confirm: true,
+      // clientSecret peut etre vide en reconfiguration : le serveur conserve
+      // alors le secret existant.
+      body: { clientId, clientSecret, tenant: tenant || undefined },
+    });
+    connectionLoaded = true;
+    providerFormOpen = false;
+    connectionFeedback = {
+      tone: "success",
+      message: "Microsoft 365 configuré. Vous pouvez maintenant connecter une boîte.",
+    };
+  } catch (error) {
+    connectionFeedback = { tone: "error", message: errorMessage(error) };
+  } finally {
+    providerSaving = false;
+    rerender();
+  }
 };
 
 /**
@@ -541,8 +657,20 @@ export const bindMicrosoftConnectionUi = (nextRerender: () => void): void => {
  */
 const handleMicrosoftSettingsClick = async (target: HTMLElement | null): Promise<void> => {
   const element = target instanceof Element ? target : null;
-  const button = element?.closest<HTMLElement>("[data-microsoft-account-default],[data-microsoft-account-unlink],[data-microsoft-account-unlink-confirm],[data-microsoft-account-unlink-cancel],#microsoftUnlinkAll,#microsoftUnlinkAllConfirm,#microsoftUnlinkCancel");
+  const button = element?.closest<HTMLElement>("[data-microsoft-account-default],[data-microsoft-account-unlink],[data-microsoft-account-unlink-confirm],[data-microsoft-account-unlink-cancel],#microsoftUnlinkAll,#microsoftUnlinkAllConfirm,#microsoftUnlinkCancel,#microsoftProviderReconfigure,#microsoftProviderCancel");
   if (!button) return;
+
+  if (button.id === "microsoftProviderReconfigure") {
+    providerFormOpen = true;
+    connectionFeedback = null;
+    rerender();
+    return;
+  }
+  if (button.id === "microsoftProviderCancel") {
+    providerFormOpen = false;
+    rerender();
+    return;
+  }
 
   const setDefaultOid = button.getAttribute("data-microsoft-account-default");
   const unlinkOid = button.getAttribute("data-microsoft-account-unlink");
@@ -830,7 +958,7 @@ const renderLinkRequest = (): string => {
   if (!linkRequest || connection?.connected === true) return "";
   const target = linkRequest.loginUrl || connection?.loginUrl || "";
   const body = !linkRequest.configured
-    ? `<p>Microsoft 365 n’est pas configuré sur ce serveur : personne ne peut lier de compte ici pour l’instant. La procédure est décrite dans <code>docs/microsoft-365.md</code>.</p>`
+    ? `<p>Microsoft 365 n’est pas encore configuré. Ouvrez <b>Mon compte → Microsoft 365</b> pour saisir les identifiants de l’application Entra, puis revenez lier votre boîte. La procédure est décrite dans <code>docs/microsoft-365.md</code>.</p>`
     : linkRequest.needsRelink
       ? `<p>Microsoft a révoqué l’autorisation de votre compte. Reliez-le pour rendre Outlook et l’Agenda de nouveau accessibles depuis vos conversations.</p>`
       : `<p>Cette conversation a besoin de votre boîte Outlook ou de votre agenda. Connectez votre compte Microsoft 365 pour continuer : vous êtes redirigé vers la page officielle Microsoft, l’application ne voit ni votre mot de passe ni votre second facteur.</p>`;

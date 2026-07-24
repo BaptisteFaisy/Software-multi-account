@@ -939,6 +939,15 @@
 :root[data-theme="light"] .microsoft-action-guard.is-blocked svg { color: #0a5d86; }
 :root[data-theme="light"] .microsoft-action.is-blocked { border-color: rgba(0, 108, 158, .3); }
 
+:root[data-theme="light"] .microsoft-provider-form { background: rgba(255, 255, 255, .78); }
+:root[data-theme="light"] .microsoft-provider-head > span { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-provider-form input { background: rgba(255, 255, 255, .9); }
+:root[data-theme="light"] .microsoft-provider-redirect code { background: rgba(0, 0, 0, .06); }
+:root[data-theme="light"] .microsoft-provider-status { background: rgba(0, 164, 239, .07); }
+:root[data-theme="light"] .microsoft-provider-status > span { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-provider-status button,
+:root[data-theme="light"] .microsoft-provider-actions button:not(.primary) { background: rgba(255, 255, 255, .86); }
+
 :root[data-theme="light"] .microsoft-shortcut {
   border-color: var(--chat-border);
   background: linear-gradient(145deg, #ffffff, #eef5fb);

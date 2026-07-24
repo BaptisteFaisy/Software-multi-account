@@ -27,7 +27,7 @@ use axum::{
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -45,6 +45,12 @@ use uuid::Uuid;
 
 const STORE_VERSION: u32 = 1;
 const STORE_FILE: &str = "microsoft-connections.json";
+/// Configuration Entra persistee (contient le secret client, 0600). Survit aux
+/// redeploiements car il vit dans le dossier de donnees, contrairement aux
+/// variables d'environnement que le playbook reecrit a chaque deploiement.
+const PROVIDER_FILE: &str = "microsoft-provider.json";
+const MAX_CLIENT_ID_CHARS: usize = 200;
+const MAX_CLIENT_SECRET_CHARS: usize = 512;
 /// Cookie distinct de `cst_oauth_state` : un flux Google ouvert dans un autre
 /// onglet ecraserait sinon l'etat Microsoft, produisant des « Etat invalide »
 /// intermittents et incomprehensibles.
@@ -179,6 +185,16 @@ pub(crate) struct MicrosoftConnectionView {
     /// client ouvert derriere un tunnel local bascule ainsi sur la bonne
     /// origine avant de contacter Microsoft.
     login_url: Option<String>,
+    /// Identifiant d'application Entra courant (jamais le secret). Sert a
+    /// pre-remplir le formulaire de configuration dans l'application.
+    client_id: Option<String>,
+    /// URI de redirection a declarer dans Entra, calculee des l'origine publique
+    /// meme quand rien n'est encore configure : l'utilisateur en a besoin pour
+    /// remplir son inscription Entra AVANT de coller ses identifiants ici.
+    default_redirect_uri: String,
+    /// `env`, `app`, ou null quand rien n'est configure. Indique a l'interface
+    /// si la configuration peut etre modifiee depuis l'application.
+    provider_source: Option<String>,
 }
 
 struct PendingLink {
@@ -337,7 +353,12 @@ pub(crate) struct MicrosoftLinkRequest {
 // Configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+/// Configuration de l'application Entra (client_id/secret/tenant). Contient le
+/// secret client : jamais serialisee dans une reponse `/api`, mais persistee
+/// sur disque (0600) pour survivre a un redemarrage et a un redeploiement, sans
+/// repasser par les variables d'environnement du serveur.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProviderConfig {
     client_id: String,
     client_secret: String,
@@ -345,18 +366,45 @@ struct ProviderConfig {
     redirect_uri: String,
     login_url: String,
     scopes: String,
+    /// `env` = venue des variables serveur au demarrage ; `app` = saisie dans
+    /// l'application. Sert seulement a informer l'interface.
+    #[serde(default = "provider_source_env")]
+    source: String,
+}
+
+fn provider_source_env() -> String {
+    "env".to_string()
+}
+
+/// Enveloppe persistee du provider, versionnee comme le store des liaisons.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderStore {
+    #[serde(default = "store_version")]
+    version: u32,
+    provider: ProviderConfig,
+}
+
+fn store_version() -> u32 {
+    STORE_VERSION
 }
 
 struct RuntimeConfig {
     store_path: PathBuf,
+    provider_path: PathBuf,
     secure_cookie: bool,
     authority_base: String,
     graph_base: String,
-    provider: Option<ProviderConfig>,
+    /// Origine publique du noeud, pour recalculer l'URI de redirection par
+    /// defaut quand l'utilisateur configure Entra depuis l'application.
+    public_base_url: String,
 }
 
 struct MicrosoftState {
     store: MicrosoftStore,
+    /// Configuration Entra courante. Mutable a chaud : l'utilisateur peut la
+    /// saisir dans l'application sans redemarrer ni redeployer le serveur.
+    provider: Option<ProviderConfig>,
     pending_links: HashMap<String, PendingLink>,
     actions: Vec<PendingMicrosoftAction>,
     /// Derniere reclamation de liaison, par proprietaire.
@@ -474,15 +522,34 @@ impl MicrosoftManager {
         let mut store = store;
         normalize_defaults(&mut store.links);
 
-        // Une faute de frappe dans la configuration Microsoft desactive
-        // l'integration mais ne doit jamais empecher le noeud de demarrer :
-        // c'est la divergence assumee avec le flux Google d'`auth.rs`, qui lui
-        // fait echouer `run_from_env`.
-        let provider = match build_provider_config(public_base_url) {
+        // Deux sources possibles pour la configuration Entra, dans cet ordre :
+        // 1. le fichier persiste ecrit depuis l'application (il survit aux
+        //    redeploiements, contrairement aux variables d'environnement que le
+        //    playbook reecrit) ;
+        // 2. a defaut, les variables d'environnement du serveur.
+        // Une faute de frappe desactive l'integration mais n'empeche jamais le
+        // noeud de demarrer : divergence assumee avec le flux Google d'auth.rs.
+        let provider_path = data_dir.join(PROVIDER_FILE);
+        // Repli sur les variables d'environnement, avec un message clair.
+        let provider_from_env = || match build_provider_config(public_base_url) {
             Ok(value) => value,
             Err(error) => {
                 eprintln!("Microsoft 365 desactive : {error}");
                 None
+            }
+        };
+        let provider = match load_persisted_provider(&provider_path) {
+            Ok(Some(provider)) => Some(provider),
+            Ok(None) => provider_from_env(),
+            // Fichier present mais illisible (tronque, schema incompatible, copie
+            // d'un autre noeud) : on ne desactive PAS l'integration en silence,
+            // on retombe sur les variables d'environnement — precisement le cas
+            // ou ce repli sert. La corruption reste signalee a l'operateur.
+            Err(error) => {
+                eprintln!(
+                    "Configuration Microsoft persistee illisible ({error}) — repli sur les variables d'environnement"
+                );
+                provider_from_env()
             }
         };
 
@@ -495,6 +562,7 @@ impl MicrosoftManager {
         Ok(Self {
             inner: Arc::new(Mutex::new(MicrosoftState {
                 store,
+                provider,
                 pending_links: HashMap::new(),
                 actions: Vec::new(),
                 link_requests: HashMap::new(),
@@ -502,10 +570,11 @@ impl MicrosoftManager {
             })),
             config: Arc::new(RuntimeConfig {
                 store_path,
+                provider_path,
                 secure_cookie,
                 authority_base: authority_base.trim_end_matches('/').to_string(),
                 graph_base: graph_base.trim_end_matches('/').to_string(),
-                provider,
+                public_base_url: public_base_url.trim_end_matches('/').to_string(),
             }),
             // Timeout plus court que les 15 s d'`auth.rs` : un outil MCP doit
             // rendre une erreur lisible avant le `tool_timeout_sec=30` du CLI.
@@ -523,13 +592,158 @@ impl MicrosoftManager {
             .map_err(|_| MicrosoftError::internal("Verrou Microsoft indisponible"))
     }
 
-    fn provider(&self) -> Result<&ProviderConfig, MicrosoftError> {
-        self.config.provider.as_ref().ok_or_else(|| {
+    /// Renvoie une COPIE de la configuration Entra courante. La config vit
+    /// desormais derriere le `Mutex` (elle est modifiable a chaud), donc on ne
+    /// peut pas rendre une reference : chaque appelant travaillait deja sur un
+    /// clone.
+    fn provider(&self) -> Result<ProviderConfig, MicrosoftError> {
+        self.provider_opt()?.ok_or_else(|| {
             MicrosoftError::new(
                 StatusCode::NOT_FOUND,
                 "Connexion Microsoft 365 non configuree sur ce serveur",
             )
         })
+    }
+
+    fn provider_opt(&self) -> Result<Option<ProviderConfig>, MicrosoftError> {
+        Ok(self.lock()?.provider.clone())
+    }
+
+    /// Persiste la configuration Entra sur disque (0600). Ecrase le fichier ; un
+    /// `provider` `None` le supprime.
+    fn persist_provider(&self, provider: Option<&ProviderConfig>) -> Result<(), String> {
+        match provider {
+            Some(provider) => {
+                let store = ProviderStore {
+                    version: STORE_VERSION,
+                    provider: provider.clone(),
+                };
+                let content =
+                    serde_json::to_vec_pretty(&store).map_err(|error| error.to_string())?;
+                fs_util::atomic_write(&self.config.provider_path, content).map_err(|error| {
+                    format!(
+                        "ecriture de {} impossible: {error}",
+                        self.config.provider_path.display()
+                    )
+                })?;
+                restrict_permissions(&self.config.provider_path)
+            }
+            None => {
+                if self.config.provider_path.exists() {
+                    fs::remove_file(&self.config.provider_path)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Origine publique du noeud, pour l'URI de redirection par defaut.
+    fn default_redirect_uri(&self) -> String {
+        format!("{}/api/microsoft/callback", self.config.public_base_url)
+    }
+
+    /// Configure Entra depuis l'application : valide les entrees, construit la
+    /// config, la met en service a chaud et la persiste (0600).
+    fn set_provider(
+        &self,
+        input: ProviderInput,
+    ) -> Result<(), MicrosoftError> {
+        let client_id = input
+            .client_id
+            .trim()
+            .to_string();
+        if client_id.is_empty() || client_id.chars().count() > MAX_CLIENT_ID_CHARS {
+            return Err(MicrosoftError::bad_request(
+                "L'identifiant d'application (client ID) est requis",
+            ));
+        }
+        // Un secret vide en reconfiguration conserve le secret existant : on ne
+        // le renvoie jamais a l'interface, l'utilisateur ne peut donc pas le
+        // recopier. C'est ce que promet le libelle « laisser vide pour
+        // conserver ». Sans config prealable, il reste obligatoire.
+        let secret_input = input.client_secret.trim();
+        let client_secret = if secret_input.is_empty() {
+            self.lock()?
+                .provider
+                .as_ref()
+                .map(|provider| provider.client_secret.clone())
+                .ok_or_else(|| MicrosoftError::bad_request("Le secret client est requis"))?
+        } else {
+            if secret_input.chars().count() > MAX_CLIENT_SECRET_CHARS {
+                return Err(MicrosoftError::bad_request("Le secret client est trop long"));
+            }
+            secret_input.to_string()
+        };
+        let tenant = input
+            .tenant
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("common")
+            .to_string();
+        if !tenant
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+        {
+            return Err(MicrosoftError::bad_request(
+                "Le tenant ne peut contenir que lettres, chiffres, tiret et point",
+            ));
+        }
+        let redirect_uri = input
+            .redirect_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_redirect_uri());
+        // Le point de depart de la liaison (login_url) derive de l'origine du
+        // redirect_uri et est propose a TOUS les utilisateurs via la vue de
+        // connexion. Comme la configuration est saisissable par toute session
+        // (choix assume pour un reseau ferme), on VERROUILLE le redirect_uri sur
+        // l'origine publique du noeud : sans ce garde, un utilisateur pourrait
+        // pointer le bouton « Connecter » des autres vers un serveur tiers et
+        // hameçonner leur consentement Microsoft. Entra n'accepte de toute façon
+        // que le callback du noeud, il n'y a donc aucune raison legitime d'en
+        // viser un autre.
+        if !same_origin(&redirect_uri, &self.config.public_base_url) {
+            return Err(MicrosoftError::bad_request(
+                "L'URI de redirection doit rester sur l'origine publique de ce serveur",
+            ));
+        }
+        // Meme validation que pour la config par variables d'environnement :
+        // HTTPS hors boucle locale, sinon Entra refusera le retour.
+        let login_url = microsoft_login_url(&redirect_uri).map_err(MicrosoftError::bad_request)?;
+
+        let provider = ProviderConfig {
+            client_id,
+            client_secret,
+            tenant,
+            redirect_uri,
+            login_url,
+            scopes: input
+                .scopes
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(DEFAULT_SCOPES)
+                .to_string(),
+            source: "app".to_string(),
+        };
+
+        self.persist_provider(Some(&provider))
+            .map_err(MicrosoftError::internal)?;
+        self.lock()?.provider = Some(provider);
+        Ok(())
+    }
+
+    /// Retire la configuration Entra. Les boites liees sont conservees mais
+    /// deviennent inutilisables jusqu'a une reconfiguration.
+    fn clear_provider(&self) -> Result<(), MicrosoftError> {
+        self.persist_provider(None)
+            .map_err(MicrosoftError::internal)?;
+        self.lock()?.provider = None;
+        Ok(())
     }
 
     fn persist_locked(&self, state: &MicrosoftState) -> Result<(), String> {
@@ -555,8 +769,8 @@ impl MicrosoftManager {
     // -----------------------------------------------------------------------
 
     fn connection_view(&self, owner_id: &str) -> Result<MicrosoftConnectionView, MicrosoftError> {
-        let provider = self.config.provider.as_ref();
         let state = self.lock()?;
+        let provider = state.provider.as_ref();
         let mut accounts = state
             .store
             .links
@@ -579,14 +793,18 @@ impl MicrosoftManager {
                 .cmp(&a.is_default)
                 .then(a.linked_at.cmp(&b.linked_at))
         });
-        let connected = accounts.iter().any(|account| !account.needs_relink);
-        let needs_relink = !connected && !accounts.is_empty();
+        // Sans configuration Entra, aucune boite n'est utilisable meme si des
+        // liaisons subsistent : elles ne peuvent plus ni se rafraichir ni
+        // servir. L'interface affiche alors « a configurer », pas « connecte ».
+        let configured = provider.is_some();
+        let connected = configured && accounts.iter().any(|account| !account.needs_relink);
+        let needs_relink = configured && !connected && !accounts.is_empty();
         let default = accounts
             .iter()
             .find(|account| account.is_default)
             .or_else(|| accounts.first());
         Ok(MicrosoftConnectionView {
-            configured: provider.is_some(),
+            configured,
             connected,
             needs_relink,
             email: default.map(|account| account.email.clone()),
@@ -597,6 +815,9 @@ impl MicrosoftManager {
             tenant: provider.map(|provider| provider.tenant.clone()),
             redirect_uri: provider.map(|provider| provider.redirect_uri.clone()),
             login_url: provider.map(|provider| provider.login_url.clone()),
+            client_id: provider.map(|provider| provider.client_id.clone()),
+            default_redirect_uri: self.default_redirect_uri(),
+            provider_source: provider.map(|provider| provider.source.clone()),
         })
     }
 
@@ -756,7 +977,7 @@ impl MicrosoftManager {
 
     fn begin_link(&self, headers: &HeaderMap) -> Result<(String, String), MicrosoftError> {
         let identity = self.identity(headers)?;
-        let provider = self.provider()?.clone();
+        let provider = self.provider()?;
         let state_token = random_secret();
         let code_verifier = format!("{}{}", random_secret(), random_secret()).replace('-', "");
         let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
@@ -801,7 +1022,7 @@ impl MicrosoftManager {
         state_token: &str,
     ) -> Result<(), MicrosoftError> {
         let identity = self.identity(headers)?;
-        let provider = self.provider()?.clone();
+        let provider = self.provider()?;
 
         let cookie_state = cookie_value(headers, LINK_STATE_COOKIE)
             .ok_or_else(|| MicrosoftError::bad_request("Session de liaison Microsoft absente"))?;
@@ -1034,6 +1255,16 @@ impl MicrosoftManager {
         owner_id: &str,
         account_hint: Option<&str>,
     ) -> Result<ResolvedAccount, MicrosoftError> {
+        // Sans configuration Entra (jamais posee, ou retiree apres avoir lie des
+        // boites), rien n'est utilisable. On le signale comme une demande de
+        // liaison pour que la conversation propose de (re)configurer plutot que
+        // de renvoyer une erreur brute « non configure ».
+        if self.provider_opt()?.is_none() {
+            self.note_link_request(owner_id);
+            return Err(MicrosoftError::not_found(
+                "Microsoft 365 n'est pas configure. Ouvrez Mon compte pour saisir les identifiants de l'application.",
+            ));
+        }
         let oid = match self.resolve_oid(owner_id, account_hint) {
             Ok(oid) => oid,
             Err(error) => {
@@ -1086,12 +1317,13 @@ impl MicrosoftManager {
 
     fn link_request(&self, owner_id: &str) -> Result<Option<MicrosoftLinkRequest>, MicrosoftError> {
         let now = metrics::now_ts();
-        let provider = self.config.provider.as_ref();
         let mut state = self.lock()?;
         state.link_requests.retain(|_, expires| *expires > now);
         let Some(expires_at) = state.link_requests.get(owner_id).copied() else {
             return Ok(None);
         };
+        let configured = state.provider.is_some();
+        let login_url = state.provider.as_ref().map(|provider| provider.login_url.clone());
         let owner_links = state
             .store
             .links
@@ -1100,17 +1332,19 @@ impl MicrosoftManager {
             .collect::<Vec<_>>();
         // Une boite utilisable existe : la demande n'a plus d'objet. Un envoi qui
         // echoue encore vise une boite precise et se regle sur sa carte, pas ici.
-        if owner_links.iter().any(|link| !link.needs_relink) {
+        let has_usable = owner_links.iter().any(|link| !link.needs_relink);
+        let has_any = !owner_links.is_empty();
+        if has_usable {
             state.link_requests.remove(owner_id);
             return Ok(None);
         }
         Ok(Some(MicrosoftLinkRequest {
             requested_at: expires_at - LINK_REQUEST_TTL_SECONDS,
             expires_at,
-            configured: provider.is_some(),
+            configured,
             // Au moins une boite existe mais toutes sont a relier.
-            needs_relink: !owner_links.is_empty(),
-            login_url: provider.map(|provider| provider.login_url.clone()),
+            needs_relink: has_any,
+            login_url,
         }))
     }
 
@@ -1164,7 +1398,7 @@ impl MicrosoftManager {
     /// Appele aussi par le renouvellement preventif : c'est cet echange, et lui
     /// seul, qui repousse la fenetre d'inactivite de 90 jours d'Entra.
     async fn refresh_now(&self, oid: &str) -> Result<String, MicrosoftError> {
-        let provider = self.provider()?.clone();
+        let provider = self.provider()?;
         let refresh_token = {
             let state = self.lock()?;
             let link = state
@@ -1272,9 +1506,10 @@ impl MicrosoftManager {
     /// compte sans comprendre pourquoi. Avec lui, la liaison est permanente tant
     /// que le serveur tourne et que l'utilisateur ne revoque rien cote Microsoft.
     pub(crate) fn start_keepalive(&self) {
-        if self.config.provider.is_none() {
-            return;
-        }
+        // On demarre toujours la boucle : la configuration Entra peut etre
+        // saisie dans l'application apres le lancement du serveur. Sans provider,
+        // `oids_to_keep_alive` reste vide (aucune boite ne peut etre liee) et la
+        // boucle ne fait rien.
         let manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(KEEPALIVE_STARTUP_DELAY_SECS)).await;
@@ -2080,6 +2315,8 @@ impl UpdateEventArguments {
 pub(crate) fn router(manager: MicrosoftManager) -> Router {
     Router::new()
         .route("/connection", get(api_connection).delete(api_disconnect))
+        // Configuration Entra saisie dans l'application (client id/secret/tenant).
+        .route("/provider", put(api_set_provider).delete(api_clear_provider))
         // Une boite precise : la retirer, ou en faire la boite par defaut.
         .route("/connection/:oid", axum::routing::delete(api_disconnect_account))
         .route("/connection/:oid/default", post(api_set_default))
@@ -2105,6 +2342,45 @@ async fn api_connection(
     headers: HeaderMap,
 ) -> Result<Response, MicrosoftError> {
     let identity = manager.identity(&headers)?;
+    let view = manager.connection_view(&identity.id)?;
+    Ok(no_store(Json(view).into_response()))
+}
+
+/// Entrees du formulaire de configuration Entra saisi dans l'application.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderInput {
+    client_id: String,
+    client_secret: String,
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
+    scopes: Option<String>,
+}
+
+async fn api_set_provider(
+    State(manager): State<MicrosoftManager>,
+    headers: HeaderMap,
+    Json(input): Json<ProviderInput>,
+) -> Result<Response, MicrosoftError> {
+    // Configuration a l'echelle de l'instance : une session nominative suffit
+    // (reseau ferme, choix explicite de l'utilisateur), pas le jeton admin.
+    let identity = manager.identity(&headers)?;
+    require_same_site(&headers)?;
+    manager.set_provider(input)?;
+    let view = manager.connection_view(&identity.id)?;
+    Ok(no_store(Json(view).into_response()))
+}
+
+async fn api_clear_provider(
+    State(manager): State<MicrosoftManager>,
+    headers: HeaderMap,
+) -> Result<Response, MicrosoftError> {
+    let identity = manager.identity(&headers)?;
+    require_same_site(&headers)?;
+    manager.clear_provider()?;
     let view = manager.connection_view(&identity.id)?;
     Ok(no_store(Json(view).into_response()))
 }
@@ -2393,12 +2669,47 @@ fn build_provider_config(public_base_url: &str) -> Result<Option<ProviderConfig>
         login_url,
         scopes: env_trimmed("CST_MICROSOFT_SCOPES")
             .unwrap_or_else(|| DEFAULT_SCOPES.to_string()),
+        source: "env".to_string(),
     }))
+}
+
+/// Relit la configuration Entra persistee par l'application. `Ok(None)` quand
+/// le fichier n'existe pas encore ; on retombe alors sur les variables
+/// d'environnement.
+fn load_persisted_provider(path: &std::path::Path) -> Result<Option<ProviderConfig>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("lecture de {} impossible: {error}", path.display()))?;
+    let store: ProviderStore = serde_json::from_str(&content)
+        .map_err(|error| format!("{} invalide: {error}", path.display()))?;
+    // On revalide l'URI de redirection : un fichier copie d'un autre noeud
+    // pourrait pointer une origine devenue invalide.
+    if microsoft_login_url(&store.provider.redirect_uri).is_err() {
+        return Err(format!(
+            "{} contient une URI de redirection invalide",
+            path.display()
+        ));
+    }
+    Ok(Some(store.provider))
 }
 
 /// Ramene le point de depart de la liaison sur l'origine du callback : un
 /// client ouvert sur `127.0.0.1` via un tunnel bascule ainsi sur l'origine
 /// publique avant de contacter Microsoft.
+/// Deux URLs partagent-elles schema, hote et port ? Sert a interdire un
+/// redirect_uri hors de l'origine du noeud. En cas d'URL illisible, `false` :
+/// on refuse par defaut plutot que d'ouvrir une origine douteuse.
+fn same_origin(candidate: &str, base: &str) -> bool {
+    let (Ok(candidate), Ok(base)) = (Url::parse(candidate), Url::parse(base)) else {
+        return false;
+    };
+    candidate.scheme() == base.scheme()
+        && candidate.host_str() == base.host_str()
+        && candidate.port_or_known_default() == base.port_or_known_default()
+}
+
 fn microsoft_login_url(redirect_uri: &str) -> Result<String, String> {
     let mut url = Url::parse(redirect_uri)
         .map_err(|error| format!("CST_MICROSOFT_REDIRECT_URI invalide: {error}"))?;
@@ -2946,11 +3257,41 @@ mod tests {
             tenant: Some("common".into()),
             redirect_uri: Some("https://cst.example.test/api/microsoft/callback".into()),
             login_url: Some("https://cst.example.test/api/microsoft/start".into()),
+            client_id: Some("00000000-0000-0000-0000-000000000000".into()),
+            default_redirect_uri: "https://cst.example.test/api/microsoft/callback".into(),
+            provider_source: Some("app".into()),
         };
         let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains("accessToken"));
         assert!(!serialized.contains("refreshToken"));
+        // La vue expose l'identifiant client (public) mais JAMAIS le secret.
         assert!(!serialized.to_lowercase().contains("secret"));
+        assert!(!serialized.contains("clientSecret"));
+    }
+
+    #[test]
+    fn a_provider_config_persists_its_secret_but_the_view_never_does() {
+        // Le secret client est persiste sur disque (0600) pour survivre a un
+        // redeploiement, mais ne doit jamais transiter par une reponse /api.
+        let provider = ProviderConfig {
+            client_id: "app-1".into(),
+            client_secret: "secret-entra".into(),
+            tenant: "common".into(),
+            redirect_uri: "https://cst.example.test/api/microsoft/callback".into(),
+            login_url: "https://cst.example.test/api/microsoft/start".into(),
+            scopes: DEFAULT_SCOPES.into(),
+            source: "app".into(),
+        };
+        let store = ProviderStore {
+            version: STORE_VERSION,
+            provider: provider.clone(),
+        };
+        let persisted = serde_json::to_string(&store).unwrap();
+        assert!(persisted.contains("secret-entra"));
+        // Round-trip : ce qu'on ecrit se relit a l'identique.
+        let back: ProviderStore = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(back.provider.client_id, "app-1");
+        assert_eq!(back.provider.source, "app");
     }
 
     #[test]

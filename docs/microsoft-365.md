@@ -13,9 +13,15 @@ Une fois un compte Microsoft 365 lié, un chat normal peut lire la boîte Outloo
 
 Relever enfin l’**ID d’application (client)** et, pour un locataire unique, l’**ID d’annuaire (locataire)**, appelé *tenant* dans le portail en anglais.
 
-## Variables d’environnement du serveur
+## Configurer depuis l’application (recommandé)
 
-Elles se posent avec les autres variables du nœud : `deploy/cst-server.env.example` pour une installation native, le fichier d’environnement du conteneur pour un déploiement Docker Compose.
+Le plus simple est de saisir les identifiants Entra directement dans l’application, sans toucher au serveur ni redéployer. Ouvrir **Mon compte → Microsoft 365** : tant que rien n’est configuré, un formulaire demande l’**ID d’application (client)**, le **secret client** et le **tenant**. Il affiche aussi l’**URI de redirection** à déclarer dans Entra — copiez-la avant de créer l’inscription. Une fois enregistrée, la configuration est persistée sur le serveur dans `<CST_DATA_DIR>/microsoft-provider.json` (`0600` sous Linux) et **survit aux redéploiements**, contrairement aux variables d’environnement que le playbook réécrit. Le bouton **Reconfigurer** permet d’en changer ; le secret n’est jamais renvoyé à l’interface.
+
+Cette configuration s’applique à tout le nœud : dans un réseau fermé et de confiance, n’importe quel utilisateur connecté peut la saisir. La configuration par formulaire l’emporte sur les variables d’environnement si les deux sont présentes.
+
+## Variables d’environnement du serveur (alternative)
+
+À défaut du formulaire, les identifiants peuvent venir des variables du nœud : `deploy/cst-server.env.example` pour une installation native, le fichier d’environnement du conteneur pour un déploiement Docker Compose.
 
 ```bash
 CST_MICROSOFT_CLIENT_ID=00000000-0000-0000-0000-000000000000
@@ -87,6 +93,7 @@ La boîte et l’agenda sont ceux du compte lié : il est inutile de préciser u
 ## Sécurité et fonctionnement
 
 - Les jetons d’accès et de renouvellement sont conservés côté serveur dans `<CST_DATA_DIR>/microsoft-connections.json`, **en clair**, protégés par les seules permissions du fichier : `0600` sous Linux. Sous Windows, ce durcissement n’est pas appliqué, exactement comme pour `user-auth.json`.
+- Si la configuration Entra est saisie dans l’application, l’identifiant client, le tenant et le secret client sont stockés dans `<CST_DATA_DIR>/microsoft-provider.json` avec la même protection (`0600`, secret en clair). Le secret n’est jamais renvoyé par l’API — l’interface ne connaît que l’identifiant client (public). Comme la configuration s’applique au nœud entier, ce mode suppose un réseau fermé et des utilisateurs de confiance.
 - Un jeton de renouvellement Entra donne accès à la boîte et à l’agenda pendant environ 90 jours. Quiconque lit ce fichier lit les e-mails et l’agenda du compte lié. Il faut donc protéger le dossier de données comme un secret de production, et délier le compte depuis l’application dès qu’on n’en a plus besoin.
 - Les jetons ne sont jamais renvoyés à l’interface ni exposés par l’API : celle-ci ne publie que l’adresse liée, le nom affiché, les portées et la date de liaison.
 - Le flux utilise `state` et PKCE, et le retour de Microsoft est traduit en cinq codes internes (`cancelled`, `invalid`, `conflict`, `session`, `failed`). Les messages bruts du fournisseur ne sont volontairement pas propagés : ils exposeraient le locataire et l’identifiant client dans l’URL de retour.

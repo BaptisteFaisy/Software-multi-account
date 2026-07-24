@@ -7175,6 +7175,120 @@ body.chat-dragging .chat-side-drag-handle {
 }
 .microsoft-loading { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--muted); font-size: 11px; }
 .microsoft-loading svg { width: 15px; height: 15px; animation: microsoft-spin 1s linear infinite; }
+.microsoft-provider-form {
+  display: grid;
+  gap: 11px;
+  margin-top: 14px;
+  padding: 15px;
+  border: 1px solid var(--chat-border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, .1);
+}
+.microsoft-provider-head { display: flex; align-items: flex-start; gap: 10px; }
+.microsoft-provider-head > span {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  border-radius: 9px;
+  color: #8ad4ff;
+  background: rgba(0, 164, 239, .12);
+}
+.microsoft-provider-head svg { width: 16px; height: 16px; }
+.microsoft-provider-head strong { font-size: 12px; }
+.microsoft-provider-head p { margin: 4px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.microsoft-provider-form label { display: grid; gap: 5px; }
+.microsoft-provider-form label > span { font-size: 10px; font-weight: 650; }
+.microsoft-provider-form label small { color: var(--muted); font-size: 9px; line-height: 1.4; }
+.microsoft-provider-form input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--chat-border);
+  border-radius: 8px;
+  color: inherit;
+  background: rgba(255, 255, 255, .04);
+  font: 11px var(--font-body);
+}
+.microsoft-provider-form input:focus { outline: none; border-color: rgba(0, 164, 239, .5); }
+.microsoft-provider-redirect { gap: 6px; }
+.microsoft-provider-redirect {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+}
+.microsoft-provider-redirect > span { grid-column: 1 / -1; color: var(--muted); font-size: 9px; font-weight: 650; }
+.microsoft-provider-redirect code {
+  overflow-x: auto;
+  padding: 7px 8px;
+  border: 1px solid var(--chat-border);
+  border-radius: 7px;
+  background: rgba(0, 0, 0, .18);
+  font: 9px var(--font-mono);
+  white-space: nowrap;
+}
+.microsoft-provider-redirect button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid var(--chat-border);
+  border-radius: 7px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.microsoft-provider-redirect button svg { width: 13px; height: 13px; }
+.microsoft-provider-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 3px; }
+.microsoft-provider-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 8px 12px;
+  border: 1px solid var(--chat-border);
+  border-radius: 8px;
+  color: inherit;
+  background: rgba(255, 255, 255, .04);
+  font: 650 10px var(--font-body);
+  cursor: pointer;
+}
+.microsoft-provider-actions button.primary {
+  border-color: rgba(0, 164, 239, .4);
+  color: #04121c;
+  background: #00a4ef;
+}
+.microsoft-provider-actions button:disabled { opacity: .6; cursor: default; }
+.microsoft-provider-actions button.is-busy svg { animation: microsoft-spin 1s linear infinite; }
+.microsoft-provider-actions svg { width: 13px; height: 13px; }
+
+.microsoft-provider-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 11px 13px;
+  border: 1px solid rgba(0, 164, 239, .24);
+  border-radius: 12px;
+  background: rgba(0, 164, 239, .06);
+}
+.microsoft-provider-status > span { color: #8ad4ff; }
+.microsoft-provider-status svg { width: 15px; height: 15px; }
+.microsoft-provider-status > div { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.microsoft-provider-status strong { font-size: 11px; }
+.microsoft-provider-status small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.microsoft-provider-status button {
+  flex: none;
+  padding: 6px 10px;
+  border: 1px solid var(--chat-border);
+  border-radius: 7px;
+  color: inherit;
+  background: rgba(255, 255, 255, .04);
+  font: 650 9px var(--font-body);
+  cursor: pointer;
+}
+.microsoft-provider-status button:hover { border-color: rgba(0, 164, 239, .45); }
+
 .microsoft-unavailable {
   display: flex;
   align-items: flex-start;

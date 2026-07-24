@@ -368,6 +368,38 @@
       delay: 3
       until: cst_health.status == 200 and (cst_health.json.ok | default(false))
 
+    # La sonde ci-dessus a valide la nouvelle image : on peut purger sans risque.
+    # Sans cette retention, chaque deploiement empilait une image ~3,9 Go et le
+    # disque (48 Go) saturait en deux deploiements, faisant echouer le build
+    # suivant sur « No space left on device » avant meme la compilation.
+    - name: Purger les anciennes images du runtime en gardant les deux plus recentes
+      ansible.builtin.shell:
+        # `docker images` liste du plus recent au plus ancien. On dedoublonne les
+        # IDs (plusieurs tags -> meme ID), on garde les deux premiers — dont
+        # l'image qui vient d'etre validee et qui tourne — et on supprime le
+        # reste. `docker rmi` refuse de toucher une image utilisee par un
+        # conteneur, donc l'image en service est protegee meme en cas de course.
+        cmd: |
+          set -o pipefail
+          keep="$(docker images codex-switch-terminal --format '{{ '{{' }}.ID{{ '}}' }}' | awk '!seen[$0]++' | head -2)"
+          docker images codex-switch-terminal --format '{{ '{{' }}.ID{{ '}}' }}' | awk '!seen[$0]++' | tail -n +3 | while read -r id; do
+            docker rmi "$id" >/dev/null 2>&1 || true
+          done
+          echo "gardees: $(echo "$keep" | tr '\n' ' ')"
+      args:
+        executable: /bin/bash
+      register: cst_image_retention
+      changed_when: false
+
+    - name: Recuperer le cache de build orphelin
+      # `builder prune` sans `--all` ne touche pas le cache encore reference par
+      # le graphe de build (le cache Cargo reste chaud pour le prochain build) ;
+      # il ne recupere que les couches devenues orphelines.
+      ansible.builtin.command:
+        argv: [docker, builder, prune, --force]
+      register: cst_builder_prune
+      changed_when: "'Total reclaimed space: 0B' not in cst_builder_prune.stdout"
+
     - name: Supprimer les archives temporaires sensibles
       ansible.builtin.file:
         path: "{{ item }}"

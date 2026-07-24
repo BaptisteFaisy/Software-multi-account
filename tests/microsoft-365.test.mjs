@@ -147,6 +147,11 @@ test("la vue publique de la liaison ne peut laisser fuir aucun jeton", () => {
     "tenant",
     "redirect_uri",
     "login_url",
+    // Config Entra exposee a l'interface : l'identifiant client (public) et
+    // l'URI de redirection par defaut, jamais le secret.
+    "client_id",
+    "default_redirect_uri",
+    "provider_source",
   ]);
   // La vue par boite ne porte que des champs d'affichage, jamais un jeton.
   assert.deepEqual(structFields(backend, "MicrosoftAccountView"), [
@@ -158,7 +163,9 @@ test("la vue publique de la liaison ne peut laisser fuir aucun jeton", () => {
     "scopes",
     "linked_at",
   ]);
-  const publicView = between(backend, "struct MicrosoftAccountView", "struct PendingLink");
+  // Borne au seul corps de MicrosoftAccountView : au-dela vit ProviderConfig,
+  // qui stocke legitimement le secret client (jamais serialise, lui).
+  const publicView = between(backend, "struct MicrosoftAccountView", "\n}");
   assert.doesNotMatch(publicView, /token/i);
   assert.doesNotMatch(publicView, /secret/i);
   // L'absence ci-dessus n'est pas un effet de bord d'une extraction vide : le
@@ -627,4 +634,72 @@ test("une boite revoquee parmi des saines ne casse ni la lecture ni l'envoi", ()
   const response = fnBody(modelTools, "tool_pending_action_response");
   assert.match(response, /action\.has_other_usable_account/);
   assert.match(response, /soit relier .*, soit choisir une autre de ses boites/);
+});
+
+test("la configuration Entra est saisissable dans l'application", () => {
+  // Routes de configuration a chaud, protegees par le meme garde CSRF.
+  const router = between(backend, "fn router(manager: MicrosoftManager)", ".with_state(manager)");
+  assert.match(router, /\.route\("\/provider", put\(api_set_provider\)\.delete\(api_clear_provider\)\)/);
+  for (const handler of ["api_set_provider", "api_clear_provider"]) {
+    const body = fnBody(backend, handler);
+    assert.match(body, /require_same_site\(&headers\)\?/, handler);
+  }
+
+  // Le secret est persiste (0600) pour survivre a un redeploiement, mais la vue
+  // publique ne l'expose jamais.
+  const setProvider = fnBody(backend, "set_provider");
+  assert.match(setProvider, /self\.persist_provider\(Some\(&provider\)\)/);
+  const persist = fnBody(backend, "persist_provider");
+  assert.match(persist, /restrict_permissions\(&self\.config\.provider_path\)/);
+  assert.match(backend, /const PROVIDER_FILE: &str = "microsoft-provider\.json";/);
+
+  // Priorite : le fichier persiste (saisi dans l'app) l'emporte sur l'env ;
+  // sinon on retombe sur les variables serveur. Un redeploiement (qui reecrit
+  // l'env) ne perd donc pas une config saisie dans l'app.
+  const load = fnBody(backend, "load");
+  // Le fichier persiste est lu en premier, et un fichier present (Ok(Some))
+  // l'emporte : l'env (provider_from_env) ne sert que si le fichier est absent
+  // ou corrompu.
+  assert.match(load, /load_persisted_provider\(&provider_path\)/);
+  assert.match(load, /Ok\(Some\(provider\)\) => Some\(provider\)/);
+
+  // Cote frontend : formulaire de saisie et appel PUT /provider.
+  assert.match(microsoftSource, /id="microsoftProviderForm"/);
+  assert.match(microsoftSource, /microsoftApi<MicrosoftConnectionView>\(\s*"\/provider"/);
+  // L'URI de redirection a declarer dans Entra est connue AVANT toute config,
+  // pour que l'utilisateur remplisse son inscription d'abord.
+  assert.match(microsoftSource, /defaultRedirectUri/);
+});
+
+test("la config in-app resiste aux abus et aux fichiers corrompus", () => {
+  // Le redirect_uri est verrouille sur l'origine du noeud : un utilisateur ne
+  // peut pas pointer le bouton « Connecter » des autres vers un serveur tiers.
+  const setProvider = fnBody(backend, "set_provider");
+  assert.match(setProvider, /same_origin\(&redirect_uri, &self\.config\.public_base_url\)/);
+  const sameOrigin = fnBody(backend, "same_origin");
+  assert.match(sameOrigin, /scheme\(\) == base\.scheme\(\)/);
+  assert.match(sameOrigin, /host_str\(\) == base\.host_str\(\)/);
+  assert.match(sameOrigin, /port_or_known_default\(\) == base\.port_or_known_default\(\)/);
+  // URL illisible -> refus par defaut.
+  assert.match(sameOrigin, /else \{\s*return false;/);
+
+  // Un secret vide en reconfiguration conserve l'ancien (jamais renvoye a l'UI).
+  assert.match(setProvider, /provider\.client_secret\.clone\(\)/);
+
+  // Un fichier provider corrompu retombe sur les variables d'env au lieu de
+  // desactiver l'integration en silence.
+  const load = fnBody(backend, "load");
+  assert.match(load, /repli sur les variables d'environnement/);
+  // Les deux branches (fichier absent, fichier corrompu) retombent sur l'env.
+  assert.match(load, /Ok\(None\) => provider_from_env\(\)/);
+  // Deux appels : fichier absent, et fichier corrompu.
+  assert.equal((load.match(/provider_from_env\(\)/g) || []).length, 2);
+
+  // Sans provider, aucune boite n'est « connectee » et une action de chat
+  // propose de reconfigurer au lieu de renvoyer une erreur brute.
+  const resolve = fnBody(backend, "resolve_account");
+  assert.match(resolve, /self\.provider_opt\(\)\?\.is_none\(\)/);
+  assert.match(resolve, /self\.note_link_request\(owner_id\)/);
+  const view = fnBody(backend, "connection_view");
+  assert.match(view, /let connected = configured &&/);
 });
