@@ -3,7 +3,10 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
 
-const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
+// Normalise les fins de ligne : le depot bascule entre LF et CRLF selon la
+// machine, et les ancres « \n\n » de ce fichier ne doivent pas en dependre.
+const read = (path) =>
+  readFileSync(new URL(path, import.meta.url), "utf8").replace(/\r\n/g, "\n");
 /// Un fichier absent doit faire echouer le seul test qui le couvre, pas rendre
 /// tout le module illisible : les autres proprietes restent verifiables.
 const readOptional = (path) => {
@@ -134,6 +137,9 @@ test("la vue publique de la liaison ne peut laisser fuir aucun jeton", () => {
     // l'autorisation. La liste reste exhaustive, donc tout futur champ — jeton
     // ou non — fait toujours echouer ce test tant qu'il n'a pas ete relu ici.
     "needs_relink",
+    // Liste des boites liees ; chaque entree est une MicrosoftAccountView, elle
+    // aussi verifiee ci-dessous pour n'exposer aucun jeton.
+    "accounts",
     "email",
     "display_name",
     "scopes",
@@ -142,7 +148,17 @@ test("la vue publique de la liaison ne peut laisser fuir aucun jeton", () => {
     "redirect_uri",
     "login_url",
   ]);
-  const publicView = between(backend, "struct MicrosoftConnectionView", "struct PendingLink");
+  // La vue par boite ne porte que des champs d'affichage, jamais un jeton.
+  assert.deepEqual(structFields(backend, "MicrosoftAccountView"), [
+    "oid",
+    "email",
+    "display_name",
+    "is_default",
+    "needs_relink",
+    "scopes",
+    "linked_at",
+  ]);
+  const publicView = between(backend, "struct MicrosoftAccountView", "struct PendingLink");
   assert.doesNotMatch(publicView, /token/i);
   assert.doesNotMatch(publicView, /secret/i);
   // L'absence ci-dessus n'est pas un effet de bord d'une extraction vide : le
@@ -198,7 +214,9 @@ test("les cinq outils Microsoft restent synchronises aux quatre endroits", () =>
 
 test("les trois outils d'ecriture n'aboutissent que par la file de confirmation", () => {
   const dispatch = between(server, "let arguments = payload", '_ => unreachable!("outil valide avant le dispatch")');
-  assert.match(dispatch, /\.microsoft\s*\.enqueue\(&owner_id, draft, context\.source_chat_key/);
+  // Les brouillons passent par la file (enqueue), avec la boite visee ; aucun
+  // bras du dispatch n'appelle un envoi direct.
+  assert.match(dispatch, /\.microsoft\s*\.enqueue\(\s*&owner_id,\s*draft,\s*account\.as_deref\(\),/);
   assert.doesNotMatch(dispatch, /sendMail|\.execute\(/);
   assert.doesNotMatch(server, /sendMail/);
 
@@ -532,8 +550,81 @@ test("la demande de liaison a une route dediee et n'echappe pas au garde CSRF", 
   assert.match(handler, /manager\.identity\(&headers\)\?/);
 
   // La demande ne doit naitre que d'un compte absent ou revoque : un 502 de
-  // Graph proposerait de relier un compte pourtant valide.
-  const noted = between(backend, "async fn access_token_for_owner", "async fn resolve_access_token");
-  assert.match(noted, /StatusCode::NOT_FOUND \| StatusCode::UNAUTHORIZED/);
+  // Graph proposerait de relier un compte pourtant valide. En multi-comptes,
+  // une seule boite morte parmi plusieurs saines ne declenche rien non plus.
+  const noted = between(backend, "async fn resolve_account", "fn email_for_oid");
+  assert.match(noted, /StatusCode::NOT_FOUND/);
+  assert.match(noted, /StatusCode::UNAUTHORIZED\s*\n\s*&&\s*self\.owner_has_no_usable_account\(owner_id\)/);
   assert.match(noted, /self\.note_link_request\(owner_id\)/);
+});
+
+test("plusieurs boites peuvent etre liees a un meme utilisateur", () => {
+  // La liaison ajoute une boite (par oid) au lieu de remplacer : c'est tout
+  // l'objet du multi-comptes. Meme oid => renouvellement ; oid different => ajout.
+  const finish = fnBody(backend, "finish_link");
+  assert.match(finish, /link\.owner_id == identity\.id && link\.oid == profile\.oid/);
+  assert.match(finish, /is_default: is_first/);
+  assert.match(finish, /normalize_defaults\(&mut state\.store\.links\)/);
+
+  // Un seul compte par defaut, garanti au chargement et apres suppression.
+  const load = fnBody(backend, "load");
+  assert.match(load, /normalize_defaults\(&mut store\.links\)/);
+
+  // Le selecteur d'outil ne cible que les propres boites de l'utilisateur : une
+  // adresse inconnue est refusee, jamais traitee comme un compte tiers.
+  const resolveOid = fnBody(backend, "resolve_oid");
+  assert.match(resolveOid, /eq_ignore_ascii_case\(hint\)/);
+  assert.match(resolveOid, /ne fait pas partie de vos boites Microsoft liees/);
+
+  // Routes de gestion par boite et de choix d'expediteur sur une action.
+  const router = between(backend, "fn router(manager: MicrosoftManager)", ".with_state(manager)");
+  assert.match(router, /\.route\("\/connection\/:oid", axum::routing::delete\(api_disconnect_account\)\)/);
+  assert.match(router, /\.route\("\/connection\/:oid\/default", post\(api_set_default\)\)/);
+  assert.match(router, /\.route\("\/pending-actions\/:id\/account", post\(api_set_action_account\)\)/);
+
+  // Chaque outil accepte un selecteur `account` optionnel (jamais requis).
+  const toolsList = between(
+    modelTools,
+    "fn tools_list_response(id: Value",
+    "\npub(crate) fn tool_microsoft_data_response",
+  );
+  assert.match(toolsList, /"account": account_property/);
+
+  // Cote frontend : liste des boites, changement d'expediteur, definir par defaut.
+  assert.match(microsoftSource, /accounts: MicrosoftAccount\[\]/);
+  assert.match(microsoftSource, /data-microsoft-account-default=/);
+  assert.match(microsoftSource, /data-microsoft-action="switch-account"/);
+  assert.match(microsoftSource, /\/pending-actions\/\$\{encodeURIComponent\(id\)\}\/account/);
+});
+
+test("une boite revoquee parmi des saines ne casse ni la lecture ni l'envoi", () => {
+  // Fix 1 : sans indice, la resolution prefere une boite utilisable au defaut
+  // mort, en restant dans les boites de l'owner.
+  const resolveOid = fnBody(backend, "resolve_oid");
+  assert.match(resolveOid, /\.find\(\|link\|\s*!link\.needs_relink\)/);
+  assert.match(resolveOid, /\.unwrap_or\(&links\[0\]\)/);
+
+  // Fix 2 backend : une confirmation qui echoue AVANT tout envoi (UNAUTHORIZED)
+  // remet le brouillon en file au lieu de le detruire.
+  const confirm = fnBody(backend, "api_confirm");
+  assert.match(confirm, /error\.status == StatusCode::UNAUTHORIZED/);
+  assert.match(confirm, /manager\.restore_action\(action\)/);
+  const restore = fnBody(backend, "restore_action");
+  // Ne remet rien apres expiration, et ne cree pas de doublon.
+  assert.match(restore, /if action\.expires_at <= now/);
+  assert.match(restore, /!state\.actions\.iter\(\)\.any\(\|entry\|\s*entry\.id == action\.id\)/);
+
+  // Fix 2 frontend : le blocage suit la sante de l'expediteur reel, pas l'etat
+  // global de connexion.
+  assert.match(microsoftSource, /const senderRevoked = sender\?\.needsRelink === true;/);
+  assert.match(
+    microsoftSource,
+    /action\.requiresLink === true && \(connection\?\.connected !== true \|\| senderRevoked\)/,
+  );
+
+  // Fix 3 : le texte pour le modele distingue « aucune boite utilisable » de
+  // « la boite visee est a relier alors qu'une autre marche ».
+  const response = fnBody(modelTools, "tool_pending_action_response");
+  assert.match(response, /action\.has_other_usable_account/);
+  assert.match(response, /soit relier .*, soit choisir une autre de ses boites/);
 });

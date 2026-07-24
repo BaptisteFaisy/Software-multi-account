@@ -917,6 +917,19 @@
 }
 :root[data-theme="light"] .microsoft-action-feedback.is-success { color: #0a5d86; }
 :root[data-theme="light"] .microsoft-action-feedback.is-error { color: #9c312d; }
+:root[data-theme="light"] .microsoft-account { background: rgba(0, 164, 239, .06); }
+:root[data-theme="light"] .microsoft-account.is-stale { border-color: rgba(176, 116, 15, .3); background: rgba(242, 174, 67, .1); }
+:root[data-theme="light"] .microsoft-account-state { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-account.is-stale .microsoft-account-state { color: #96620b; background: rgba(242, 174, 67, .16); }
+:root[data-theme="light"] .microsoft-account-badge { color: #0a5d86; }
+:root[data-theme="light"] .microsoft-account-actions button,
+:root[data-theme="light"] .microsoft-account-actions a { background: rgba(255, 255, 255, .82); }
+:root[data-theme="light"] .microsoft-account-actions .microsoft-account-unlink,
+:root[data-theme="light"] .microsoft-account-actions button.danger { color: #9c312d; }
+:root[data-theme="light"] .microsoft-sender-switch button { background: rgba(0, 164, 239, .08); }
+:root[data-theme="light"] .microsoft-sender.is-revoked { border-color: rgba(176, 116, 15, .4); }
+:root[data-theme="light"] .microsoft-sender-badge { color: #96620b; background: rgba(242, 174, 67, .18); }
+
 :root[data-theme="light"] .microsoft-link-request {
   border-color: rgba(0, 108, 158, .26);
   background: linear-gradient(145deg, #ffffff, #eef5fb);

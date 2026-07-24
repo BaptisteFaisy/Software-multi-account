@@ -7,11 +7,24 @@
 
 import { isRemoteMode, remoteBaseUrl } from "./platform";
 
+export type MicrosoftAccount = {
+  oid: string;
+  email: string;
+  displayName: string | null;
+  isDefault: boolean;
+  needsRelink: boolean;
+  scopes: string[];
+  linkedAt: number;
+};
+
 export type MicrosoftConnectionView = {
   configured: boolean;
+  /** Au moins une boite est utilisable. */
   connected: boolean;
-  /** Liaison existante mais revoquee cote Microsoft : il faut relier, pas connecter. */
+  /** Aucune boite utilisable, mais au moins une a relier. */
   needsRelink: boolean;
+  /** Toutes les boites liees par l'utilisateur, boite par defaut en tete. */
+  accounts: MicrosoftAccount[];
   email: string | null;
   displayName: string | null;
   scopes: string[];
@@ -64,8 +77,10 @@ export type MicrosoftPendingAction = {
   createdAt: number;
   expiresAt: number;
   draft: MicrosoftDraft;
-  /** Brouillon prepare alors qu'aucun compte n'etait lie : a connecter avant envoi. */
+  /** Brouillon prepare alors qu'aucune boite utilisable n'etait disponible. */
   requiresLink?: boolean;
+  /** Adresse de la boite expeditrice choisie pour cette action. */
+  accountEmail?: string | null;
 };
 
 export type MicrosoftLinkRequest = {
@@ -93,6 +108,7 @@ const OFFLINE_CONNECTION: MicrosoftConnectionView = {
   configured: false,
   connected: false,
   needsRelink: false,
+  accounts: [],
   email: null,
   displayName: null,
   scopes: [],
@@ -106,8 +122,11 @@ let connection: MicrosoftConnectionView | null = null;
 let connectionLoaded = false;
 let connectionInFlight: Promise<void> | null = null;
 let connectionFeedback: Feedback | null = null;
-let unlinkPending = false;
+/** Oid dont la deliaison attend confirmation ; "*" pour tout delier. */
+let unlinkPending: string | null = null;
 let unlinking = false;
+/** Oid en cours d'action (defaut/deliaison), pour l'etat occupe des boutons. */
+let accountBusyOid: string | null = null;
 let pendingActions: MicrosoftPendingAction[] = [];
 let linkRequest: MicrosoftLinkRequest | null = null;
 let pendingActionsLoaded = false;
@@ -130,14 +149,18 @@ const errorMessage = (error: unknown): string =>
 
 const microsoftApi = async <T>(
   path: string,
-  options: { method?: string; confirm?: boolean } = {},
+  options: { method?: string; confirm?: boolean; body?: unknown } = {},
 ): Promise<T> => {
   const response = await fetch(`${remoteBaseUrl()}/api/microsoft${path}`, {
     method: options.method ?? "GET",
     credentials: "include",
     // Les mutations exigent cet en-tete applicatif : sans lui le serveur refuse
     // l'envoi, precisement pour qu'un formulaire tiers ne puisse pas le declencher.
-    headers: options.confirm ? { "X-CST-Confirm": "1" } : {},
+    headers: {
+      ...(options.confirm ? { "X-CST-Confirm": "1" } : {}),
+      ...(options.body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
   const text = await response.text();
   let value: any = null;
@@ -375,37 +398,31 @@ export const renderMicrosoftConnectionSettings = (): string => {
       </div>`
     : "";
 
-  const summary = hasLink
-    ? `<div class="microsoft-connection-summary ${needsRelink ? "is-stale" : ""}">
-        <span class="microsoft-connection-state"><i data-lucide="${needsRelink ? "triangle-alert" : "badge-check"}"></i></span>
-        <span>
-          <small>${needsRelink ? "Autorisation expirée" : "Compte lié"}</small>
-          <strong>${escapeHtml(view?.displayName || view?.email || "Compte Microsoft")}</strong>
-          <em>${escapeHtml(view?.email || "Adresse indisponible")}</em>
-        </span>
-        <dl>
-          <div><dt>Liaison</dt><dd>${escapeHtml(formatUnixSeconds(view?.linkedAt ?? null))}</dd></div>
-          ${view?.tenant ? `<div><dt>Tenant</dt><dd>${escapeHtml(view.tenant)}</dd></div>` : ""}
-        </dl>
-      </div>
-      ${needsRelink
-        ? `<p class="microsoft-relink-note"><i data-lucide="info"></i><span>Microsoft a révoqué l’autorisation (mot de passe changé, consentement retiré ou 90 jours sans usage). Les jetons ont été effacés : reliez ce compte pour réactiver Outlook et l’Agenda.</span></p>`
-        : ""}
-      ${renderScopes(view?.scopes ?? [])}
-      <div class="microsoft-connection-actions">
-        ${unlinkPending
-          ? `<button type="button" id="microsoftUnlinkConfirm" class="danger${unlinking ? " is-busy" : ""}" ${unlinking ? "disabled" : ""}><i data-lucide="${unlinking ? "loader-circle" : "unlink"}"></i><span>${unlinking ? "Déliaison…" : "Confirmer la déliaison"}</span></button>
-             <button type="button" id="microsoftUnlinkCancel" ${unlinking ? "disabled" : ""}>Annuler</button>`
-          : `<button type="button" id="microsoftUnlink" class="danger"><i data-lucide="unlink"></i><span>Délier</span></button>`}
+  const accounts = view?.accounts ?? [];
+  const multiple = accounts.length > 1;
+  const accountList = hasLink
+    ? `<ul class="microsoft-account-list">
+        ${accounts.map((account) => renderAccountRow(account, multiple)).join("")}
+      </ul>`
+    : "";
+
+  // Le bouton de connexion sert aussi a AJOUTER une boite : la page Microsoft
+  // propose de choisir un autre compte (prompt=select_account).
+  const connect = configured
+    ? `<div class="microsoft-connect">
+        <a class="microsoft-connect-button" href="${escapeHtml(view?.loginUrl || `${remoteBaseUrl()}/api/microsoft/start`)}">
+          ${microsoftMark()}<span>${hasLink ? "Ajouter une autre boîte" : "Connecter Microsoft 365"}</span>
+        </a>
+        <p>Vous êtes redirigé vers la page officielle Microsoft. L’application ne voit ni votre mot de passe ni votre second facteur.${hasLink ? " Choisissez un autre compte pour l’ajouter à côté du premier." : ""}</p>
       </div>`
     : "";
 
-  const connect = configured && !connected
-    ? `<div class="microsoft-connect">
-        <a class="microsoft-connect-button" href="${escapeHtml(view?.loginUrl || `${remoteBaseUrl()}/api/microsoft/start`)}">
-          ${microsoftMark()}<span>${needsRelink ? "Relier de nouveau Microsoft 365" : "Connecter Microsoft 365"}</span>
-        </a>
-        <p>Vous êtes redirigé vers la page officielle Microsoft. L’application ne voit ni votre mot de passe ni votre second facteur.</p>
+  const unlinkAll = accounts.length > 1
+    ? `<div class="microsoft-connection-actions">
+        ${unlinkPending === "*"
+          ? `<button type="button" id="microsoftUnlinkAllConfirm" class="danger${unlinking ? " is-busy" : ""}" ${unlinking ? "disabled" : ""}><i data-lucide="${unlinking ? "loader-circle" : "unlink"}"></i><span>${unlinking ? "Déliaison…" : "Confirmer : tout délier"}</span></button>
+             <button type="button" id="microsoftUnlinkCancel" ${unlinking ? "disabled" : ""}>Annuler</button>`
+          : `<button type="button" id="microsoftUnlinkAll" class="danger ghost"><i data-lucide="unlink"></i><span>Délier toutes les boîtes</span></button>`}
       </div>`
     : "";
 
@@ -419,15 +436,45 @@ export const renderMicrosoftConnectionSettings = (): string => {
         <span class="settings-card-icon">${microsoftMark()}</span>
         <span>
           <strong id="microsoftSettingsTitle">Microsoft 365</strong>
-          <small>Le chat lit votre boîte Outlook et votre agenda, et prépare vos envois. Aucun e-mail ni rendez-vous n’est écrit sans votre confirmation dans la conversation.</small>
+          <small>Le chat lit vos boîtes Outlook et vos agendas, et prépare vos envois. Aucun e-mail ni rendez-vous n’est écrit sans votre confirmation dans la conversation.</small>
         </span>
       </div>
       <span class="microsoft-state-pill ${connected ? "is-connected" : ""}">${escapeHtml(stateLabel)}</span>
     </header>
-    ${loading}${unavailable}${summary}${connect}
+    ${loading}${unavailable}${accountList}
+    ${hasLink ? renderScopes(view?.scopes ?? []) : ""}
+    ${connect}${unlinkAll}
     ${configured && view?.redirectUri ? renderRedirectUri(view.redirectUri) : ""}
     ${feedback}
   </section>`;
+};
+
+/** Une boite dans la liste de Mon compte : etat, defaut, actions. */
+const renderAccountRow = (account: MicrosoftAccount, multiple: boolean): string => {
+  const busy = accountBusyOid === account.oid;
+  const unlinkThis = unlinkPending === account.oid;
+  const relinkHref = escapeHtml(connection?.loginUrl || `${remoteBaseUrl()}/api/microsoft/start`);
+  return `<li class="microsoft-account ${account.needsRelink ? "is-stale" : ""}">
+    <span class="microsoft-account-state"><i data-lucide="${account.needsRelink ? "triangle-alert" : "badge-check"}"></i></span>
+    <span class="microsoft-account-identity">
+      <strong>${escapeHtml(account.email)}</strong>
+      <small>${account.needsRelink ? "Autorisation expirée — à relier" : escapeHtml(account.displayName || "Compte Microsoft")} · lié le ${escapeHtml(formatUnixSeconds(account.linkedAt))}</small>
+    </span>
+    ${account.isDefault
+      ? `<span class="microsoft-account-badge">Par défaut</span>`
+      : ""}
+    <span class="microsoft-account-actions">
+      ${account.needsRelink
+        ? `<a class="microsoft-account-relink" href="${relinkHref}"><i data-lucide="refresh-cw"></i><span>Relier</span></a>`
+        : !account.isDefault && multiple
+          ? `<button type="button" class="microsoft-account-default" data-microsoft-account-default="${escapeHtml(account.oid)}" ${busy ? "disabled" : ""}>Par défaut</button>`
+          : ""}
+      ${unlinkThis
+        ? `<button type="button" class="danger" data-microsoft-account-unlink-confirm="${escapeHtml(account.oid)}" ${busy ? "disabled" : ""}><i data-lucide="${busy ? "loader-circle" : "unlink"}"></i><span>Confirmer</span></button>
+           <button type="button" data-microsoft-account-unlink-cancel="1" ${busy ? "disabled" : ""}>Annuler</button>`
+        : `<button type="button" class="microsoft-account-unlink" data-microsoft-account-unlink="${escapeHtml(account.oid)}" aria-label="Délier ${escapeHtml(account.email)}"><i data-lucide="unlink"></i></button>`}
+    </span>
+  </li>`;
 };
 
 /**
@@ -438,6 +485,7 @@ export const renderMicrosoftConnectionSettings = (): string => {
  */
 export const renderMicrosoftAccountShortcut = (): string => {
   const view = connection;
+  const count = view?.accounts?.length ?? 0;
   const state = !connectionLoaded
     ? ""
     : view?.configured !== true
@@ -445,7 +493,9 @@ export const renderMicrosoftAccountShortcut = (): string => {
       : view?.needsRelink === true
         ? "À relier"
         : view?.connected === true
-          ? escapeHtml(view.email || "Compte lié")
+          ? count > 1
+            ? `${count} boîtes liées`
+            : escapeHtml(view.email || "Compte lié")
           : "Aucun compte lié";
   const pending = pendingActions.length;
   return `<button type="button" id="settingsMicrosoftAccount" class="microsoft-shortcut">
@@ -477,40 +527,92 @@ export const bindMicrosoftConnectionUi = (nextRerender: () => void): void => {
     rerender();
   });
 
-  document.querySelector<HTMLButtonElement>("#microsoftUnlink")?.addEventListener("click", () => {
-    unlinkPending = true;
+  document
+    .querySelector<HTMLElement>("#microsoftConnectionSettings")
+    ?.addEventListener("click", (event) => {
+      void handleMicrosoftSettingsClick(event.target as HTMLElement | null);
+    });
+};
+
+/**
+ * Gestion des boites depuis Mon compte : definir la boite par defaut, delier
+ * une boite ou toutes. Delegation unique : les lignes sont re-rendues a chaque
+ * passe, un ecouteur par bouton se perdrait.
+ */
+const handleMicrosoftSettingsClick = async (target: HTMLElement | null): Promise<void> => {
+  const element = target instanceof Element ? target : null;
+  const button = element?.closest<HTMLElement>("[data-microsoft-account-default],[data-microsoft-account-unlink],[data-microsoft-account-unlink-confirm],[data-microsoft-account-unlink-cancel],#microsoftUnlinkAll,#microsoftUnlinkAllConfirm,#microsoftUnlinkCancel");
+  if (!button) return;
+
+  const setDefaultOid = button.getAttribute("data-microsoft-account-default");
+  const unlinkOid = button.getAttribute("data-microsoft-account-unlink");
+  const unlinkConfirmOid = button.getAttribute("data-microsoft-account-unlink-confirm");
+
+  if (unlinkOid) {
+    unlinkPending = unlinkOid;
     connectionFeedback = null;
     rerender();
-  });
-
-  document.querySelector<HTMLButtonElement>("#microsoftUnlinkCancel")?.addEventListener("click", () => {
-    unlinkPending = false;
+    return;
+  }
+  if (button.id === "microsoftUnlinkAll") {
+    unlinkPending = "*";
+    connectionFeedback = null;
     rerender();
-  });
+    return;
+  }
+  if (button.hasAttribute("data-microsoft-account-unlink-cancel") || button.id === "microsoftUnlinkCancel") {
+    unlinkPending = null;
+    rerender();
+    return;
+  }
 
-  document.querySelector<HTMLButtonElement>("#microsoftUnlinkConfirm")?.addEventListener("click", async () => {
-    if (unlinking) return;
-    unlinking = true;
+  if (setDefaultOid) {
+    accountBusyOid = setDefaultOid;
     connectionFeedback = null;
     rerender();
     try {
-      connection = await microsoftApi<MicrosoftConnectionView>("/connection", {
-        method: "DELETE",
-        confirm: true,
-      });
+      connection = await microsoftApi<MicrosoftConnectionView>(
+        `/connection/${encodeURIComponent(setDefaultOid)}/default`,
+        { method: "POST", confirm: true },
+      );
       connectionLoaded = true;
-      unlinkPending = false;
+      connectionFeedback = { tone: "success", message: "Boîte par défaut mise à jour." };
+    } catch (error) {
+      connectionFeedback = { tone: "error", message: errorMessage(error) };
+    } finally {
+      accountBusyOid = null;
+      rerender();
+    }
+    return;
+  }
+
+  if (unlinkConfirmOid || button.id === "microsoftUnlinkAllConfirm") {
+    if (unlinking) return;
+    unlinking = true;
+    accountBusyOid = unlinkConfirmOid;
+    connectionFeedback = null;
+    rerender();
+    try {
+      connection = await microsoftApi<MicrosoftConnectionView>(
+        unlinkConfirmOid ? `/connection/${encodeURIComponent(unlinkConfirmOid)}` : "/connection",
+        { method: "DELETE", confirm: true },
+      );
+      connectionLoaded = true;
+      unlinkPending = null;
       connectionFeedback = {
         tone: "success",
-        message: "Compte Microsoft délié. Les jetons ont été effacés du serveur.",
+        message: unlinkConfirmOid
+          ? "Boîte déliée. Ses jetons ont été effacés du serveur."
+          : "Toutes les boîtes ont été déliées. Les jetons ont été effacés du serveur.",
       };
     } catch (error) {
       connectionFeedback = { tone: "error", message: errorMessage(error) };
     } finally {
       unlinking = false;
+      accountBusyOid = null;
       rerender();
     }
-  });
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -549,15 +651,19 @@ export const refreshMicrosoftPendingActions = (): Promise<void> => {
 /** Signature du bloc de confirmation, pour le patch cible du fil de discussion. */
 export const microsoftPendingActionsSignature = (): string =>
   JSON.stringify([
-    pendingActions.map((action) => `${action.id}:${action.requiresLink === true}`),
+    pendingActions.map(
+      (action) => `${action.id}:${action.requiresLink === true}:${action.accountEmail ?? ""}`,
+    ),
     busyActionId,
     actionFeedback,
-    // La proposition de liaison et l'etat de connexion font partie du bloc :
-    // sans eux, la carte n'apparaitrait pas et les brouillons resteraient
+    // La proposition de liaison et la liste des boites font partie du bloc :
+    // sans eux, la carte n'apparaitrait pas, l'expediteur affiche ne suivrait
+    // pas un changement de boite par defaut, et les brouillons resteraient
     // bloques a l'ecran apres une connexion reussie.
     linkRequest?.requestedAt ?? null,
     linkRequest?.needsRelink ?? null,
     connection?.connected ?? null,
+    (connection?.accounts ?? []).map((account) => `${account.oid}:${account.isDefault}:${account.needsRelink}`),
   ]);
 
 const ACTION_TITLES: Record<MicrosoftDraft["kind"], string> = {
@@ -640,10 +746,17 @@ const renderPendingAction = (action: MicrosoftPendingAction): string => {
   const busy = busyActionId === action.id;
   // Une seule action a la fois : un double clic ne doit pas partir deux fois.
   const disabled = busyActionId !== null;
-  // Un brouillon prepare sans compte lie garde son contenu, mais son envoi
-  // reste ferme : laisser cliquer produirait une erreur que rien dans la carte
-  // n'aurait annoncee.
-  const blocked = action.requiresLink === true && connection?.connected !== true;
+  // Un brouillon dont l'expediteur n'est pas utilisable garde son contenu, mais
+  // son envoi reste ferme : laisser cliquer produirait une erreur que rien dans
+  // la carte n'aurait annoncee. On se base sur la sante de la boite REELLEMENT
+  // choisie, pas sur l'etat global : avec plusieurs boites, l'utilisateur peut
+  // etre « connecte » globalement tout en visant une boite morte.
+  const sender = (connection?.accounts ?? []).find(
+    (account) => account.email === action.accountEmail,
+  );
+  const senderRevoked = sender?.needsRelink === true;
+  const blocked =
+    action.requiresLink === true && (connection?.connected !== true || senderRevoked);
   const confirmLabel = action.kind === "sendEmail" ? "Envoyer" : "Confirmer";
   const confirmIcon = action.kind === "sendEmail" ? "send" : "calendar-check";
   return `<article class="microsoft-action is-${escapeHtml(action.kind)}${blocked ? " is-blocked" : ""}" data-microsoft-pending-action="${escapeHtml(action.id)}">
@@ -655,9 +768,12 @@ const renderPendingAction = (action: MicrosoftPendingAction): string => {
       </div>
       <span class="microsoft-action-expiry">Expire le ${escapeHtml(formatUnixSeconds(action.expiresAt))}</span>
     </header>
+    ${renderSender(action, disabled)}
     ${renderDraft(action.draft)}
     ${blocked
-      ? `<p class="microsoft-action-guard is-blocked"><i data-lucide="link-2-off"></i><span>Ce brouillon a été préparé avant que votre compte Microsoft ne soit lié. Connectez-le ci-dessus : le contenu est conservé et vous pourrez l’envoyer ensuite.</span></p>`
+      ? senderRevoked
+        ? `<p class="microsoft-action-guard is-blocked"><i data-lucide="link-2-off"></i><span>La boîte ${escapeHtml(action.accountEmail ?? "choisie")} doit être reliée avant l’envoi. Reliez-la dans Mon compte, ou choisissez une autre boîte comme expéditeur ci-dessus : le contenu est conservé.</span></p>`
+        : `<p class="microsoft-action-guard is-blocked"><i data-lucide="link-2-off"></i><span>Ce brouillon a été préparé avant que votre compte Microsoft ne soit lié. Connectez-le ci-dessus : le contenu est conservé et vous pourrez l’envoyer ensuite.</span></p>`
       : `<p class="microsoft-action-guard"><i data-lucide="shield-alert"></i><span>Rien n’est envoyé tant que vous n’avez pas confirmé ici. Relisez le contenu complet avant de valider.</span></p>`}
     <footer class="microsoft-action-buttons">
       <button type="button" class="primary${busy ? " is-busy" : ""}" data-microsoft-action="confirm" data-microsoft-action-id="${escapeHtml(action.id)}" ${disabled || blocked ? "disabled" : ""}>
@@ -668,6 +784,41 @@ const renderPendingAction = (action: MicrosoftPendingAction): string => {
       </button>
     </footer>
   </article>`;
+};
+
+/**
+ * Ligne « De : … » sur une carte de confirmation. Le garde-fou du multi-comptes :
+ * l'humain voit de quelle boite l'envoi partira, et peut en changer avant de
+ * valider — meme si le modele a choisi la mauvaise. Sans plusieurs boites liees,
+ * la ligne rappelle simplement l'expediteur.
+ */
+const renderSender = (action: MicrosoftPendingAction, disabled: boolean): string => {
+  const accounts = connection?.accounts ?? [];
+  if (!action.accountEmail && accounts.length <= 1) return "";
+  const current = action.accountEmail || accounts.find((a) => a.isDefault)?.email || "boîte par défaut";
+  const currentRevoked =
+    accounts.find((account) => account.email === action.accountEmail)?.needsRelink === true;
+  // Les autres boites saines vers lesquelles basculer l'expediteur.
+  const others = accounts.filter(
+    (account) => !account.needsRelink && account.email !== action.accountEmail,
+  );
+  const switcher = others.length
+    ? `<span class="microsoft-sender-switch">
+        <span>${currentRevoked ? "Envoyer plutôt depuis :" : "Changer :"}</span>
+        ${others
+          .map(
+            (account) =>
+              `<button type="button" data-microsoft-action="switch-account" data-microsoft-action-id="${escapeHtml(action.id)}" data-microsoft-oid="${escapeHtml(account.oid)}" ${disabled ? "disabled" : ""}>${escapeHtml(account.email)}</button>`,
+          )
+          .join("")}
+      </span>`
+    : "";
+  return `<div class="microsoft-sender${currentRevoked ? " is-revoked" : ""}">
+    <span class="microsoft-sender-label"><i data-lucide="mail"></i> De</span>
+    <strong>${escapeHtml(current)}</strong>
+    ${currentRevoked ? `<span class="microsoft-sender-badge">à relier</span>` : ""}
+    ${switcher}
+  </div>`;
 };
 
 /**
@@ -802,7 +953,36 @@ export const handleMicrosoftPendingActionClick = (target: EventTarget | null): b
     return true;
   }
   const id = button.dataset.microsoftActionId ?? "";
+  if (mode === "switch-account") {
+    const oid = button.dataset.microsoftOid ?? "";
+    if (id && oid) void switchMicrosoftSender(id, oid);
+    return true;
+  }
   if (!id || (mode !== "confirm" && mode !== "cancel")) return false;
   void resolveMicrosoftPendingAction(id, mode);
   return true;
+};
+
+/** Change la boite expeditrice d'un brouillon avant confirmation. */
+const switchMicrosoftSender = async (id: string, oid: string): Promise<void> => {
+  if (busyActionId) return;
+  busyActionId = id;
+  actionFeedback = null;
+  rerender();
+  try {
+    const updated = await microsoftApi<MicrosoftPendingAction>(
+      `/pending-actions/${encodeURIComponent(id)}/account`,
+      { method: "POST", confirm: true, body: { oid } },
+    );
+    // Remplace l'action mise a jour en place plutot que de tout recharger :
+    // l'expediteur bascule sans clignotement.
+    pendingActions = pendingActions.map((action) =>
+      action.id === id ? { ...action, ...updated } : action,
+    );
+  } catch (error) {
+    actionFeedback = { tone: "error", message: errorMessage(error) };
+  } finally {
+    busyActionId = null;
+    rerender();
+  }
 };

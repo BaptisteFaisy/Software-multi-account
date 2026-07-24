@@ -638,7 +638,7 @@ pub(crate) fn initialize_response(
                     "title": "Outils du chat Codex Switch Terminal",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Ces outils donnent acces au compte Microsoft 365 de l'utilisateur qui a cree cet agent : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous, update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux de ce proprietaire : ne demande jamais d'adresse, d'identifiant ni de boite cible. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils deposent une carte que le proprietaire devra confirmer dans l'application. Comme personne ne lit ce cycle en direct, ecris des brouillons complets et autonomes, et indique clairement dans ton compte rendu ce qui attend une validation."
+                "instructions": "Ces outils donnent acces au compte Microsoft 365 de l'utilisateur qui a cree cet agent : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous, update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux de ce proprietaire : ne demande jamais d'identifiant ni de boite tierce. S'il a plusieurs boites liees, sa boite principale est utilisee par defaut ; le champ account permet d'en viser une autre parmi les siennes. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils deposent une carte que le proprietaire devra confirmer dans l'application. Comme personne ne lit ce cycle en direct, ecris des brouillons complets et autonomes, et indique clairement dans ton compte rendu ce qui attend une validation."
             }
         });
     }
@@ -653,7 +653,7 @@ pub(crate) fn initialize_response(
                 "title": "Outils du chat Codex Switch Terminal",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle create_chat avec son message initial. Le nouveau chat herite du compte, du modele et de l'environnement courants ; un seul peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer ou demarrer un nouvel agent autonome, appelle create_autonomous_agent. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle pause_autonomous_agent sans demander d'identifiant. Quand il demande explicitement de modifier l'agent autonome lie a ce chat, appelle update_autonomous_agent. Quand il demande au superviseur d'activer, produire ou relancer le compte rendu general des rapports non lus, appelle activate_supervisor_general_report ; cet outil fonctionne depuis n'importe quel chat et ne demande aucun identifiant. Quand il demande d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle apply_autonomous_agent_policy ; cet outil fonctionne sans cle de chat et reste limite au compte et, par defaut, au projet courants. Deduis une configuration sure, conserve les valeurs existantes et ne demande jamais d'identifiant d'agent. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. N'appelle pas ces outils pour une question theorique. Cinq outils supplementaires donnent acces au compte Microsoft 365 lie a l'utilisateur connecte : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous et update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux du compte connecte : ne demande jamais d'adresse, d'identifiant, de mot de passe ni de boite cible. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils preparent une carte que l'utilisateur doit confirmer. N'affirme donc jamais qu'un e-mail est parti ou qu'un rendez-vous est cree ; dis qu'il attend sa validation."
+            "instructions": "Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle create_chat avec son message initial. Le nouveau chat herite du compte, du modele et de l'environnement courants ; un seul peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer ou demarrer un nouvel agent autonome, appelle create_autonomous_agent. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle pause_autonomous_agent sans demander d'identifiant. Quand il demande explicitement de modifier l'agent autonome lie a ce chat, appelle update_autonomous_agent. Quand il demande au superviseur d'activer, produire ou relancer le compte rendu general des rapports non lus, appelle activate_supervisor_general_report ; cet outil fonctionne depuis n'importe quel chat et ne demande aucun identifiant. Quand il demande d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle apply_autonomous_agent_policy ; cet outil fonctionne sans cle de chat et reste limite au compte et, par defaut, au projet courants. Deduis une configuration sure, conserve les valeurs existantes et ne demande jamais d'identifiant d'agent. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. N'appelle pas ces outils pour une question theorique. Cinq outils supplementaires donnent acces au compte Microsoft 365 lie a l'utilisateur connecte : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous et update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux du compte connecte : ne demande jamais d'identifiant, de mot de passe ni de boite tierce. L'utilisateur peut avoir lie plusieurs boites Microsoft : par defaut, sa boite principale est utilisee ; s'il precise laquelle (par exemple « depuis ma boite pro »), passe son adresse dans le champ account. N'utilise dans account qu'une de ses propres adresses liees, jamais celle d'un destinataire. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils preparent une carte que l'utilisateur doit confirmer, ou il voit et peut changer la boite expeditrice. N'affirme donc jamais qu'un e-mail est parti ou qu'un rendez-vous est cree ; dis qu'il attend sa validation."
         }
     })
 }
@@ -809,6 +809,13 @@ fn all_tools_response(id: Value) -> Value {
     });
     let instant_description =
         "Date et heure ISO 8601 avec decalage horaire explicite, par exemple 2026-07-25T14:00:00+02:00. Un instant sans decalage est refuse.";
+    // Selecteur de boite : l'utilisateur peut lier plusieurs comptes Microsoft.
+    // Le champ ne designe QUE l'une de SES boites deja liees ; une adresse
+    // inconnue est refusee, jamais utilisee comme un compte tiers.
+    let account_property = json!({
+        "type": "string",
+        "description": "Adresse de l'une de vos boites Microsoft liees, si vous en avez plusieurs. Par defaut : votre boite principale. Ne mets ici qu'une de tes propres adresses liees, jamais celle d'un destinataire."
+    });
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -1081,7 +1088,8 @@ fn all_tools_response(id: Value) -> Value {
                                 "minimum": 1,
                                 "maximum": 25,
                                 "description": "Nombre de messages a retourner. Par defaut : 10."
-                            }
+                            },
+                            "account": account_property.clone()
                         }
                     },
                     "outputSchema": messages_output_schema,
@@ -1114,7 +1122,8 @@ fn all_tools_response(id: Value) -> Value {
                                 "minimum": 1,
                                 "maximum": 50,
                                 "description": "Nombre d'evenements a retourner. Par defaut : 20."
-                            }
+                            },
+                            "account": account_property.clone()
                         }
                     },
                     "outputSchema": events_output_schema,
@@ -1158,7 +1167,8 @@ fn all_tools_response(id: Value) -> Value {
                                 "minLength": 1,
                                 "maxLength": 20000,
                                 "description": "Corps du message en texte brut, redige et pret a partir, dans la langue de l'utilisateur."
-                            }
+                            },
+                            "account": account_property.clone()
                         },
                         "required": ["to", "subject", "body"]
                     },
@@ -1212,7 +1222,8 @@ fn all_tools_response(id: Value) -> Value {
                             "onlineMeeting": {
                                 "type": "boolean",
                                 "description": "true pour joindre un lien Teams a l'invitation."
-                            }
+                            },
+                            "account": account_property.clone()
                         },
                         "required": ["subject", "start", "end"]
                     },
@@ -1262,7 +1273,8 @@ fn all_tools_response(id: Value) -> Value {
                                 "type": "string",
                                 "maxLength": 20000,
                                 "description": "Nouvelle description en texte brut."
-                            }
+                            },
+                            "account": account_property
                         },
                         "required": ["eventId"]
                     },
@@ -1303,18 +1315,28 @@ pub(crate) fn tool_pending_action_response(
 ) -> Value {
     if action.requires_link {
         // Le brouillon est garde : dire au modele d'en rediger un autre ferait
-        // perdre le travail et agacerait l'utilisateur pour rien.
+        // perdre le travail et agacerait l'utilisateur pour rien. Deux cas
+        // distincts, a ne pas confondre : soit aucune boite utilisable n'existe
+        // (il faut en connecter/relier une), soit la boite VISEE est a relier
+        // alors qu'une autre boite saine existe (relier celle-ci, ou changer
+        // d'expediteur sur la carte).
+        let text = if action.has_other_usable_account {
+            let mailbox = action.account_email.as_deref().unwrap_or("la boite choisie");
+            format!(
+                "Brouillon conserve : {}. La boite {} doit etre reliee avant de pouvoir l'utiliser, mais l'utilisateur a d'autres boites Microsoft actives. Sur la carte affichee, il peut soit relier {}, soit choisir une autre de ses boites comme expediteur, puis confirmer. Ne prepare pas de nouveau brouillon et n'affirme rien tant qu'il n'a pas confirme.",
+                action.summary, mailbox, mailbox
+            )
+        } else {
+            format!(
+                "Brouillon conserve : {}. Aucune boite Microsoft utilisable n'est liee : l'interface propose a l'utilisateur de connecter ou relier son compte dans la conversation, et le brouillon partira apres cela et sa confirmation. Invite-le a utiliser la carte affichee, et ne prepare pas de nouveau brouillon.",
+                action.summary
+            )
+        };
         return json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": {
-                "content": [{
-                    "type": "text",
-                    "text": format!(
-                        "Brouillon conserve : {}. Aucun compte Microsoft n'est encore lie : l'interface propose a l'utilisateur de connecter son compte dans la conversation, et le brouillon partira apres cette connexion et sa confirmation. Invite-le a cliquer sur « Connecter Microsoft 365 » dans la carte affichee, et ne prepare pas de nouveau brouillon.",
-                        action.summary
-                    )
-                }],
+                "content": [{ "type": "text", "text": text }],
                 "structuredContent": {
                     "actionId": action.id,
                     "status": "awaiting_account_link",
@@ -1961,14 +1983,30 @@ mod tests {
                 .find(|tool| tool["name"].as_str() == Some(name))
                 .unwrap_or_else(|| panic!("outil {name} absent de tools/list"));
             let properties = &tool["inputSchema"]["properties"];
-            // La boite vient du compte connecte : aucun champ ne doit permettre
-            // au modele de viser une autre identite.
+            // Aucun champ ne doit permettre de viser l'IDENTITE d'un autre
+            // utilisateur de l'application. `account` fait exception : il ne
+            // choisit qu'entre les boites deja liees par CET utilisateur, et une
+            // adresse inconnue est refusee cote serveur.
             for forbidden in ["userId", "accountId", "mailbox", "from", "sender", "owner"] {
                 assert!(
                     properties.get(forbidden).is_none(),
                     "{name} expose {forbidden}"
                 );
             }
+            // Le selecteur de boite existe, est optionnel, et cible les propres
+            // adresses de l'utilisateur.
+            assert!(
+                properties.get("account").is_some(),
+                "{name} n'expose pas le selecteur de boite"
+            );
+            let required = tool["inputSchema"]["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !required.iter().any(|value| value == "account"),
+                "{name} rend le selecteur de boite obligatoire"
+            );
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             // Ces outils sortent de l'application : annoncer un monde ferme au
             // client MCP masquerait le risque reel.

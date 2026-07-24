@@ -134,18 +134,41 @@ struct StoredLink {
     /// l'interface puisse proposer de relier CE compte, mais plus aucun jeton.
     #[serde(default)]
     needs_relink: bool,
+    /// Boite utilisee quand un outil ne precise pas laquelle. Un seul compte par
+    /// proprietaire peut l'etre ; la normalisation au chargement le garantit.
+    #[serde(default)]
+    is_default: bool,
+}
+
+/// Une boite liee, telle que vue par l'interface. Jamais de jeton ici.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MicrosoftAccountView {
+    oid: String,
+    email: String,
+    display_name: Option<String>,
+    is_default: bool,
+    needs_relink: bool,
+    scopes: Vec<String>,
+    linked_at: i64,
 }
 
 /// Vue publique de la liaison. N'y ajoutez jamais de champ de jeton : elle est
 /// serialisee sous `/api`, joignable depuis n'importe quelle origine.
+///
+/// Les champs de tete (`email`, `display_name`, `linked_at`, `scopes`) refletent
+/// la boite par defaut : ils gardent l'interface d'avant le multi-comptes
+/// fonctionnelle. `accounts` porte la liste complete.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MicrosoftConnectionView {
     configured: bool,
+    /// Au moins une boite est utilisable.
     connected: bool,
-    /// Vrai quand une liaison existe mais que Microsoft a revoque
-    /// l'autorisation : l'interface doit proposer de relier, pas de connecter.
+    /// Aucune boite utilisable, mais au moins une a relier : l'interface propose
+    /// de relier plutot que de connecter.
     needs_relink: bool,
+    accounts: Vec<MicrosoftAccountView>,
     email: Option<String>,
     display_name: Option<String>,
     scopes: Vec<String>,
@@ -266,10 +289,31 @@ pub(crate) struct PendingMicrosoftAction {
     pub source_chat_key: Option<String>,
     pub created_at: i64,
     pub expires_at: i64,
-    /// Brouillon prepare alors qu'aucun compte n'etait lie. Le contenu est
-    /// conserve : perdre un e-mail deja redige parce que la liaison manquait
-    /// obligerait a tout refaire apres la connexion.
+    /// Brouillon prepare alors qu'aucune boite utilisable n'etait disponible. Le
+    /// contenu est conserve : perdre un e-mail deja redige parce que la liaison
+    /// manquait obligerait a tout refaire apres la connexion.
     pub requires_link: bool,
+    /// Boite depuis laquelle l'action partira, resolue a la mise en file. Reste
+    /// interne : la liste est deja filtree par session.
+    #[serde(skip)]
+    pub account_oid: Option<String>,
+    /// Adresse de l'expediteur, affichee sur la carte de confirmation. Avec
+    /// plusieurs boites liees, l'humain doit voir laquelle partira, et pouvoir
+    /// en changer, avant de valider un envoi irreversible.
+    pub account_email: Option<String>,
+    /// Vrai quand `requires_link` vient d'une boite visee revoquee ALORS qu'une
+    /// autre boite saine existe. Le message au modele doit alors parler de
+    /// relier cette boite ou de changer d'expediteur, pas de « connecter un
+    /// compte » — il y en a deja un qui marche.
+    pub has_other_usable_account: bool,
+}
+
+/// Boite resolue pour une action : son identifiant immuable, son adresse et un
+/// jeton d'acces frais.
+struct ResolvedAccount {
+    oid: String,
+    email: String,
+    token: String,
 }
 
 /// Trace d'un outil qui a reclame la boite Microsoft sans la trouver. Elle
@@ -317,9 +361,10 @@ struct MicrosoftState {
     actions: Vec<PendingMicrosoftAction>,
     /// Derniere reclamation de liaison, par proprietaire.
     link_requests: HashMap<String, i64>,
-    /// Un verrou asynchrone par proprietaire. Entra invalide l'ancien jeton de
-    /// renouvellement a chaque echange : deux renouvellements simultanes en
-    /// perdraient un, et la liaison mourrait sans que personne n'ait rien fait.
+    /// Un verrou asynchrone par boite (`oid`). Entra invalide l'ancien jeton de
+    /// renouvellement a chaque echange : deux renouvellements simultanes de la
+    /// meme boite en perdraient un, et la liaison mourrait sans que personne
+    /// n'ait rien fait. Deux boites differentes se rafraichissent en parallele.
     refresh_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -423,6 +468,12 @@ impl MicrosoftManager {
             MicrosoftStore::default()
         };
 
+        // Les fichiers ecrits avant le multi-comptes n'ont pas de defaut, et un
+        // fichier trafique pourrait en marquer plusieurs : on garantit
+        // exactement une boite par defaut et par proprietaire avant de servir.
+        let mut store = store;
+        normalize_defaults(&mut store.links);
+
         // Une faute de frappe dans la configuration Microsoft desactive
         // l'integration mais ne doit jamais empecher le noeud de demarrer :
         // c'est la divergence assumee avec le flux Google d'`auth.rs`, qui lui
@@ -506,38 +557,197 @@ impl MicrosoftManager {
     fn connection_view(&self, owner_id: &str) -> Result<MicrosoftConnectionView, MicrosoftError> {
         let provider = self.config.provider.as_ref();
         let state = self.lock()?;
-        let link = state
+        let mut accounts = state
             .store
             .links
             .iter()
-            .find(|link| link.owner_id == owner_id);
-        let needs_relink = link.is_some_and(|link| link.needs_relink);
+            .filter(|link| link.owner_id == owner_id)
+            .map(|link| MicrosoftAccountView {
+                oid: link.oid.clone(),
+                email: link.email.clone(),
+                display_name: link.display_name.clone(),
+                is_default: link.is_default,
+                needs_relink: link.needs_relink,
+                scopes: link.scopes.clone(),
+                linked_at: link.linked_at,
+            })
+            .collect::<Vec<_>>();
+        // Defaut d'abord, puis par anciennete : la liste est stable d'un
+        // affichage a l'autre et l'expediteur par defaut saute aux yeux.
+        accounts.sort_by(|a, b| {
+            b.is_default
+                .cmp(&a.is_default)
+                .then(a.linked_at.cmp(&b.linked_at))
+        });
+        let connected = accounts.iter().any(|account| !account.needs_relink);
+        let needs_relink = !connected && !accounts.is_empty();
+        let default = accounts
+            .iter()
+            .find(|account| account.is_default)
+            .or_else(|| accounts.first());
         Ok(MicrosoftConnectionView {
             configured: provider.is_some(),
-            connected: link.is_some() && !needs_relink,
+            connected,
             needs_relink,
-            email: link.map(|link| link.email.clone()),
-            display_name: link.and_then(|link| link.display_name.clone()),
-            scopes: link.map(|link| link.scopes.clone()).unwrap_or_default(),
-            linked_at: link.map(|link| link.linked_at),
+            email: default.map(|account| account.email.clone()),
+            display_name: default.and_then(|account| account.display_name.clone()),
+            scopes: default.map(|account| account.scopes.clone()).unwrap_or_default(),
+            linked_at: default.map(|account| account.linked_at),
+            accounts,
             tenant: provider.map(|provider| provider.tenant.clone()),
             redirect_uri: provider.map(|provider| provider.redirect_uri.clone()),
             login_url: provider.map(|provider| provider.login_url.clone()),
         })
     }
 
+    /// Retire toutes les boites du proprietaire.
     fn disconnect(&self, owner_id: &str) -> Result<(), MicrosoftError> {
         let mut state = self.lock()?;
         let previous = state.store.links.len();
+        let removed_oids = state
+            .store
+            .links
+            .iter()
+            .filter(|link| link.owner_id == owner_id)
+            .map(|link| link.oid.clone())
+            .collect::<Vec<_>>();
         state.store.links.retain(|link| link.owner_id != owner_id);
         state.actions.retain(|action| action.owner_id != owner_id);
         state.link_requests.remove(owner_id);
-        state.refresh_locks.remove(owner_id);
+        for oid in &removed_oids {
+            state.refresh_locks.remove(oid);
+        }
         if state.store.links.len() != previous {
             self.persist_locked(&state)
                 .map_err(MicrosoftError::internal)?;
         }
         Ok(())
+    }
+
+    /// Retire une seule boite. Si c'etait la boite par defaut, la plus ancienne
+    /// des restantes prend le relais pour qu'un envoi sans precision reste
+    /// possible.
+    fn disconnect_account(&self, owner_id: &str, oid: &str) -> Result<(), MicrosoftError> {
+        let mut state = self.lock()?;
+        let existed = state
+            .store
+            .links
+            .iter()
+            .any(|link| link.owner_id == owner_id && link.oid == oid);
+        if !existed {
+            return Err(MicrosoftError::not_found("Cette boite n'est pas liee"));
+        }
+        state
+            .store
+            .links
+            .retain(|link| !(link.owner_id == owner_id && link.oid == oid));
+        // Les brouillons qui partaient de cette boite n'ont plus d'expediteur :
+        // les garder afficherait un envoi impossible.
+        state
+            .actions
+            .retain(|action| action.account_oid.as_deref() != Some(oid));
+        state.refresh_locks.remove(oid);
+        normalize_defaults(&mut state.store.links);
+        self.persist_locked(&state)
+            .map_err(MicrosoftError::internal)?;
+        Ok(())
+    }
+
+    /// Choisit la boite utilisee quand un outil ne precise rien.
+    fn set_default_account(&self, owner_id: &str, oid: &str) -> Result<(), MicrosoftError> {
+        let mut state = self.lock()?;
+        if !state
+            .store
+            .links
+            .iter()
+            .any(|link| link.owner_id == owner_id && link.oid == oid)
+        {
+            return Err(MicrosoftError::not_found("Cette boite n'est pas liee"));
+        }
+        for link in state
+            .store
+            .links
+            .iter_mut()
+            .filter(|link| link.owner_id == owner_id)
+        {
+            link.is_default = link.oid == oid;
+        }
+        self.persist_locked(&state)
+            .map_err(MicrosoftError::internal)?;
+        Ok(())
+    }
+
+    /// Boites du proprietaire, defaut en tete.
+    fn owner_links(&self, owner_id: &str) -> Vec<StoredLink> {
+        let Ok(state) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut links = state
+            .store
+            .links
+            .iter()
+            .filter(|link| link.owner_id == owner_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        links.sort_by(|a, b| {
+            b.is_default
+                .cmp(&a.is_default)
+                .then(a.linked_at.cmp(&b.linked_at))
+        });
+        links
+    }
+
+    fn owner_has_no_usable_account(&self, owner_id: &str) -> bool {
+        !self
+            .owner_links(owner_id)
+            .iter()
+            .any(|link| !link.needs_relink)
+    }
+
+    /// Resout la boite ciblee par un outil. Sans indice, la boite par defaut ;
+    /// avec un indice, la boite du proprietaire dont l'adresse correspond. Un
+    /// indice qui ne correspond a aucune de SES boites est une erreur explicite,
+    /// jamais une invitation a lier un compte tiers.
+    fn resolve_oid(
+        &self,
+        owner_id: &str,
+        account_hint: Option<&str>,
+    ) -> Result<String, MicrosoftError> {
+        let links = self.owner_links(owner_id);
+        if links.is_empty() {
+            return Err(MicrosoftError::not_found(
+                "Aucun compte Microsoft n'est lie a votre compte. Ouvrez Mon compte pour le connecter.",
+            ));
+        }
+        match account_hint.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(hint) => links
+                .iter()
+                .find(|link| link.email.eq_ignore_ascii_case(hint))
+                .map(|link| link.oid.clone())
+                .ok_or_else(|| {
+                    let available = links
+                        .iter()
+                        .map(|link| link.email.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    MicrosoftError::bad_request(format!(
+                        "« {hint} » ne fait pas partie de vos boites Microsoft liees. Boites disponibles : {available}."
+                    ))
+                }),
+            // Sans indice : la boite par defaut si elle est saine, sinon la plus
+            // ancienne boite utilisable. `owner_links` trie defaut d'abord puis
+            // par anciennete, donc `find(!needs_relink)` donne exactement cela.
+            // On ne retombe sur une boite morte que si TOUTES le sont — cas ou
+            // la carte « connecter » s'affiche de toute facon. Sans ce filtre,
+            // un defaut revoque ferait echouer une lecture alors qu'une boite
+            // saine existe, sans aucun recours pour l'utilisateur.
+            None => Ok(links
+                .iter()
+                .find(|link| !link.needs_relink)
+                .unwrap_or(&links[0])
+                .oid
+                .clone()),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -667,14 +877,21 @@ impl MicrosoftManager {
             })
             .unwrap_or_default();
         let expires_at = access_token_expiry(now, token.expires_in);
+        // Premiere boite de ce proprietaire : elle devient la boite par defaut.
+        let is_first = !state
+            .store
+            .links
+            .iter()
+            .any(|link| link.owner_id == identity.id);
 
         if let Some(existing) = state
             .store
             .links
             .iter_mut()
-            .find(|link| link.owner_id == identity.id)
+            // Relier la MEME boite (meme oid) renouvelle ses jetons ; une boite
+            // differente s'ajoute a cote. C'est ce qui permet plusieurs comptes.
+            .find(|link| link.owner_id == identity.id && link.oid == profile.oid)
         {
-            existing.oid = profile.oid;
             existing.tenant_id = profile.tenant_id;
             existing.email = profile.email;
             existing.display_name = profile.display_name;
@@ -699,8 +916,13 @@ impl MicrosoftManager {
                 linked_at: now,
                 updated_at: now,
                 needs_relink: false,
+                is_default: is_first,
             });
         }
+        // Relier une boite efface la demande de connexion en attente : la
+        // conversation ne doit plus proposer ce que l'utilisateur vient de faire.
+        state.link_requests.remove(&identity.id);
+        normalize_defaults(&mut state.store.links);
         self.persist_locked(&state)
             .map_err(MicrosoftError::internal)?;
         Ok(())
@@ -802,26 +1024,47 @@ impl MicrosoftManager {
     // Jeton d'acces
     // -----------------------------------------------------------------------
 
-    /// Renvoie un jeton d'acces valide pour ce proprietaire, en le renouvelant
-    /// si necessaire. Le `Mutex` synchrone n'est jamais tenu a travers un
-    /// `.await` : on clone, on relache, on appelle le reseau, puis on relock.
-    async fn access_token_for_owner(&self, owner_id: &str) -> Result<String, MicrosoftError> {
-        match self.resolve_access_token(owner_id).await {
-            Ok(token) => Ok(token),
+    /// Resout la boite ciblee (defaut ou indice) puis renvoie un jeton frais et
+    /// l'adresse correspondante. La conversation ne propose la liaison que si le
+    /// proprietaire n'a AUCUNE boite utilisable : quand une seule boite parmi
+    /// plusieurs est morte, c'est un probleme d'expediteur, traite sur la carte,
+    /// pas une invitation a tout reconnecter.
+    async fn resolve_account(
+        &self,
+        owner_id: &str,
+        account_hint: Option<&str>,
+    ) -> Result<ResolvedAccount, MicrosoftError> {
+        let oid = match self.resolve_oid(owner_id, account_hint) {
+            Ok(oid) => oid,
             Err(error) => {
-                // Aucun compte lie, ou autorisation morte : la conversation doit
-                // pouvoir proposer la liaison. Une panne reseau ou un refus de
-                // Graph ne declenche rien — proposer de relier un compte deja
-                // valide ne ferait qu'egarer l'utilisateur.
-                if matches!(
-                    error.status,
-                    StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
-                ) {
+                if error.status == StatusCode::NOT_FOUND {
+                    self.note_link_request(owner_id);
+                }
+                return Err(error);
+            }
+        };
+        let email = self.email_for_oid(&oid).unwrap_or_default();
+        match self.resolve_access_token(&oid).await {
+            Ok(token) => Ok(ResolvedAccount { oid, email, token }),
+            Err(error) => {
+                if error.status == StatusCode::UNAUTHORIZED
+                    && self.owner_has_no_usable_account(owner_id)
+                {
                     self.note_link_request(owner_id);
                 }
                 Err(error)
             }
         }
+    }
+
+    fn email_for_oid(&self, oid: &str) -> Option<String> {
+        let state = self.inner.lock().ok()?;
+        state
+            .store
+            .links
+            .iter()
+            .find(|link| link.oid == oid)
+            .map(|link| link.email.clone())
     }
 
     /// Marque que la boite Microsoft a ete reclamee sans etre disponible.
@@ -849,13 +1092,15 @@ impl MicrosoftManager {
         let Some(expires_at) = state.link_requests.get(owner_id).copied() else {
             return Ok(None);
         };
-        let link = state
+        let owner_links = state
             .store
             .links
             .iter()
-            .find(|link| link.owner_id == owner_id);
-        // Le compte a ete lie entre-temps : la demande n'a plus d'objet.
-        if link.is_some_and(|link| !link.needs_relink) {
+            .filter(|link| link.owner_id == owner_id)
+            .collect::<Vec<_>>();
+        // Une boite utilisable existe : la demande n'a plus d'objet. Un envoi qui
+        // echoue encore vise une boite precise et se regle sur sa carte, pas ici.
+        if owner_links.iter().any(|link| !link.needs_relink) {
             state.link_requests.remove(owner_id);
             return Ok(None);
         }
@@ -863,43 +1108,40 @@ impl MicrosoftManager {
             requested_at: expires_at - LINK_REQUEST_TTL_SECONDS,
             expires_at,
             configured: provider.is_some(),
-            needs_relink: link.is_some_and(|link| link.needs_relink),
+            // Au moins une boite existe mais toutes sont a relier.
+            needs_relink: !owner_links.is_empty(),
             login_url: provider.map(|provider| provider.login_url.clone()),
         }))
     }
 
-    async fn resolve_access_token(&self, owner_id: &str) -> Result<String, MicrosoftError> {
-        if let Some(token) = self.cached_access_token(owner_id)? {
+    async fn resolve_access_token(&self, oid: &str) -> Result<String, MicrosoftError> {
+        if let Some(token) = self.cached_access_token(oid)? {
             return Ok(token);
         }
-        // Un seul renouvellement a la fois par compte. Sans ce verrou, deux
+        // Un seul renouvellement a la fois par boite. Sans ce verrou, deux
         // outils lances dans le meme tour echangeraient le meme jeton de
         // renouvellement : Entra invaliderait le premier resultat et la liaison
         // deviendrait irrecuperable sans intervention de l'utilisateur.
-        let gate = self.refresh_gate(owner_id)?;
+        let gate = self.refresh_gate(oid)?;
         let _guard = gate.lock().await;
         // Le detenteur precedent du verrou vient peut-etre de renouveler.
-        if let Some(token) = self.cached_access_token(owner_id)? {
+        if let Some(token) = self.cached_access_token(oid)? {
             return Ok(token);
         }
-        self.refresh_now(owner_id).await
+        self.refresh_now(oid).await
     }
 
-    /// Jeton encore valide, s'il y en a un. `Err` distingue les deux situations
-    /// que l'interface doit traiter differemment : aucun compte lie, ou compte
-    /// lie dont l'autorisation est morte.
-    fn cached_access_token(&self, owner_id: &str) -> Result<Option<String>, MicrosoftError> {
+    /// Jeton encore valide pour cette boite, s'il y en a un. `Err` distingue les
+    /// deux situations que l'interface traite differemment : boite absente, ou
+    /// boite dont l'autorisation est morte.
+    fn cached_access_token(&self, oid: &str) -> Result<Option<String>, MicrosoftError> {
         let state = self.lock()?;
         let link = state
             .store
             .links
             .iter()
-            .find(|link| link.owner_id == owner_id)
-            .ok_or_else(|| {
-                MicrosoftError::not_found(
-                    "Aucun compte Microsoft n'est lie a votre compte. Ouvrez les parametres pour le connecter.",
-                )
-            })?;
+            .find(|link| link.oid == oid)
+            .ok_or_else(|| MicrosoftError::not_found("Cette boite Microsoft n'est plus liee."))?;
         if link.needs_relink {
             return Err(relink_required());
         }
@@ -909,22 +1151,19 @@ impl MicrosoftManager {
         )
     }
 
-    fn refresh_gate(
-        &self,
-        owner_id: &str,
-    ) -> Result<Arc<tokio::sync::Mutex<()>>, MicrosoftError> {
+    fn refresh_gate(&self, oid: &str) -> Result<Arc<tokio::sync::Mutex<()>>, MicrosoftError> {
         let mut state = self.lock()?;
         Ok(state
             .refresh_locks
-            .entry(owner_id.to_string())
+            .entry(oid.to_string())
             .or_default()
             .clone())
     }
 
-    /// Echange le jeton de renouvellement contre un jeton frais. Appele aussi
-    /// par le renouvellement preventif : c'est cet echange, et lui seul, qui
-    /// repousse la fenetre d'inactivite de 90 jours d'Entra.
-    async fn refresh_now(&self, owner_id: &str) -> Result<String, MicrosoftError> {
+    /// Echange le jeton de renouvellement d'une boite contre un jeton frais.
+    /// Appele aussi par le renouvellement preventif : c'est cet echange, et lui
+    /// seul, qui repousse la fenetre d'inactivite de 90 jours d'Entra.
+    async fn refresh_now(&self, oid: &str) -> Result<String, MicrosoftError> {
         let provider = self.provider()?.clone();
         let refresh_token = {
             let state = self.lock()?;
@@ -932,11 +1171,9 @@ impl MicrosoftManager {
                 .store
                 .links
                 .iter()
-                .find(|link| link.owner_id == owner_id)
+                .find(|link| link.oid == oid)
                 .ok_or_else(|| {
-                    MicrosoftError::not_found(
-                        "Aucun compte Microsoft n'est lie a votre compte. Ouvrez les parametres pour le connecter.",
-                    )
+                    MicrosoftError::not_found("Cette boite Microsoft n'est plus liee.")
                 })?;
             if link.needs_relink || link.refresh_token.is_empty() {
                 return Err(relink_required());
@@ -962,7 +1199,7 @@ impl MicrosoftManager {
                 // Autorisation morte cote Microsoft. On efface les jetons mais
                 // on conserve l'identite : l'utilisateur doit pouvoir relier
                 // le meme compte en un clic, pas repartir d'une page vide.
-                self.mark_needs_relink(owner_id)?;
+                self.mark_needs_relink(oid)?;
                 return Err(error);
             }
             // Panne reseau ou 5xx : surtout ne rien effacer, la liaison est
@@ -978,7 +1215,7 @@ impl MicrosoftManager {
             .store
             .links
             .iter_mut()
-            .find(|stored| stored.owner_id == owner_id)
+            .find(|stored| stored.oid == oid)
         {
             stored.access_token = refreshed.access_token;
             // Entra fait tourner le jeton de renouvellement a chaque echange :
@@ -998,14 +1235,9 @@ impl MicrosoftManager {
         Ok(access_token)
     }
 
-    fn mark_needs_relink(&self, owner_id: &str) -> Result<(), MicrosoftError> {
+    fn mark_needs_relink(&self, oid: &str) -> Result<(), MicrosoftError> {
         let mut state = self.lock()?;
-        if let Some(link) = state
-            .store
-            .links
-            .iter_mut()
-            .find(|link| link.owner_id == owner_id)
-        {
+        if let Some(link) = state.store.links.iter_mut().find(|link| link.oid == oid) {
             link.access_token.clear();
             link.refresh_token.clear();
             link.expires_at = 0;
@@ -1017,9 +1249,11 @@ impl MicrosoftManager {
         Ok(())
     }
 
-    /// Comptes dont le jeton de renouvellement n'a pas servi depuis assez
+    /// Boites dont le jeton de renouvellement n'a pas servi depuis assez
     /// longtemps pour que la fenetre d'inactivite d'Entra commence a compter.
-    fn owners_to_keep_alive(&self) -> Vec<String> {
+    /// Chaque boite est suivie separement : deux comptes du meme utilisateur ne
+    /// se rafraichissent pas au meme rythme.
+    fn oids_to_keep_alive(&self) -> Vec<String> {
         let now = metrics::now_ts();
         let Ok(state) = self.inner.lock() else {
             return Vec::new();
@@ -1029,7 +1263,7 @@ impl MicrosoftManager {
             .links
             .iter()
             .filter(|link| needs_keepalive(link.updated_at, link.needs_relink, now))
-            .map(|link| link.owner_id.clone())
+            .map(|link| link.oid.clone())
             .collect()
     }
 
@@ -1045,13 +1279,13 @@ impl MicrosoftManager {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(KEEPALIVE_STARTUP_DELAY_SECS)).await;
             loop {
-                for owner_id in manager.owners_to_keep_alive() {
-                    let gate = match manager.refresh_gate(&owner_id) {
+                for oid in manager.oids_to_keep_alive() {
+                    let gate = match manager.refresh_gate(&oid) {
                         Ok(gate) => gate,
                         Err(_) => continue,
                     };
                     let _guard = gate.lock().await;
-                    if let Err(error) = manager.refresh_now(&owner_id).await {
+                    if let Err(error) = manager.refresh_now(&oid).await {
                         // Pas d'identifiant dans le journal : un fichier de logs
                         // n'a pas a dire qui a lie quelle boite.
                         eprintln!(
@@ -1069,12 +1303,17 @@ impl MicrosoftManager {
     // Lectures Graph
     // -----------------------------------------------------------------------
 
-    async fn graph_get(&self, owner_id: &str, url: Url) -> Result<Value, MicrosoftError> {
-        let token = self.access_token_for_owner(owner_id).await?;
+    async fn graph_get(
+        &self,
+        owner_id: &str,
+        account_hint: Option<&str>,
+        url: Url,
+    ) -> Result<(Value, String), MicrosoftError> {
+        let account = self.resolve_account(owner_id, account_hint).await?;
         let response = self
             .http
             .get(url)
-            .bearer_auth(token)
+            .bearer_auth(&account.token)
             .header("Prefer", "outlook.timezone=\"UTC\", outlook.body-content-type=\"text\"")
             .send()
             .await
@@ -1086,9 +1325,10 @@ impl MicrosoftManager {
         if !status.is_success() {
             return Err(graph_error(status, &body));
         }
-        serde_json::from_str(&body).map_err(|_| {
+        let value = serde_json::from_str(&body).map_err(|_| {
             MicrosoftError::new(StatusCode::BAD_GATEWAY, "Reponse Microsoft Graph invalide")
-        })
+        })?;
+        Ok((value, account.email))
     }
 
     pub(crate) async fn list_messages(
@@ -1132,7 +1372,7 @@ impl MicrosoftManager {
             }
         }
 
-        let payload = self.graph_get(owner_id, url).await?;
+        let (payload, mailbox) = self.graph_get(owner_id, args.account.as_deref(), url).await?;
         let messages = payload
             .get("value")
             .and_then(Value::as_array)
@@ -1158,7 +1398,7 @@ impl MicrosoftManager {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({ "messages": messages, "count": messages.len() }))
+        Ok(json!({ "messages": messages, "count": messages.len(), "mailbox": mailbox }))
     }
 
     pub(crate) async fn list_events(
@@ -1189,7 +1429,7 @@ impl MicrosoftManager {
                 "id,subject,start,end,location,organizer,attendees,isAllDay,isCancelled,onlineMeetingUrl",
             );
 
-        let payload = self.graph_get(owner_id, url).await?;
+        let (payload, mailbox) = self.graph_get(owner_id, args.account.as_deref(), url).await?;
         let events = payload
             .get("value")
             .and_then(Value::as_array)
@@ -1233,20 +1473,36 @@ impl MicrosoftManager {
         Ok(json!({
             "events": events,
             "count": events.len(),
+            "mailbox": mailbox,
             "window": { "start": start, "end": end, "timeZone": "UTC" }
         }))
     }
 
-    /// Intitule courant d'un evenement, pour que la carte de confirmation dise
-    /// a l'humain ce qui va reellement changer.
-    async fn event_subject(&self, owner_id: &str, event_id: &str) -> Option<String> {
+    /// Intitule courant d'un evenement dans une boite donnee, pour que la carte
+    /// de confirmation dise a l'humain ce qui va reellement changer.
+    async fn event_subject(&self, oid: &str, event_id: &str) -> Option<String> {
         let url = Url::parse(&format!(
             "{}/me/events/{}",
             self.config.graph_base,
             urlencode(event_id)
         ))
         .ok()?;
-        let payload = self.graph_get(owner_id, url).await.ok()?;
+        let token = self.resolve_access_token(oid).await.ok()?;
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .header(
+                "Prefer",
+                "outlook.timezone=\"UTC\", outlook.body-content-type=\"text\"",
+            )
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let payload: Value = response.json().await.ok()?;
         payload
             .get("subject")
             .and_then(Value::as_str)
@@ -1261,35 +1517,49 @@ impl MicrosoftManager {
         &self,
         owner_id: &str,
         draft: MicrosoftDraft,
+        account_hint: Option<&str>,
         source_chat_key: Option<String>,
     ) -> Result<PendingMicrosoftAction, String> {
-        // Un compte manquant ne fait pas perdre le brouillon : il est conserve
-        // et la conversation propose la liaison. Redemander au modele de tout
-        // reecrire apres la connexion serait la pire des reponses.
-        let requires_link = match self.access_token_for_owner(owner_id).await {
-            Ok(_) => false,
-            Err(error)
-                if matches!(
-                    error.status,
-                    StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
-                ) =>
-            {
-                true
-            }
-            // Panne reseau ou refus de Graph : la liaison est probablement
-            // intacte, mieux vaut echouer que promettre un envoi.
-            Err(error) => return Err(error.message),
-        };
+        // Un compte manquant ou revoque ne fait pas perdre le brouillon : il est
+        // conserve, son envoi bloque, et la carte propose de connecter ou de
+        // changer d'expediteur. Redemander au modele de tout reecrire serait la
+        // pire des reponses.
+        let (requires_link, account_oid, account_email) =
+            match self.resolve_account(owner_id, account_hint).await {
+                Ok(account) => (false, Some(account.oid), Some(account.email)),
+                Err(error)
+                    if matches!(
+                        error.status,
+                        StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+                    ) =>
+                {
+                    // On retient tout de meme quelle boite etait visee, si elle
+                    // existe mais doit etre reliee, pour l'afficher sur la carte.
+                    let oid = self.resolve_oid(owner_id, account_hint).ok();
+                    let email = oid.as_deref().and_then(|oid| self.email_for_oid(oid));
+                    (true, oid, email)
+                }
+                // Panne reseau, refus de Graph, ou indice invalide : la liaison
+                // est probablement intacte, mieux vaut echouer que promettre un
+                // envoi impossible.
+                Err(error) => return Err(error.message),
+            };
 
         let draft = match draft {
             MicrosoftDraft::UpdateEvent(mut update) => {
-                if !requires_link {
-                    update.current_subject = self.event_subject(owner_id, &update.event_id).await;
+                if let Some(oid) = account_oid.as_deref().filter(|_| !requires_link) {
+                    update.current_subject = self.event_subject(oid, &update.event_id).await;
                 }
                 MicrosoftDraft::UpdateEvent(update)
             }
             other => other,
         };
+
+        // L'expediteur vise est mort mais une autre boite saine existe : le
+        // modele doit proposer de relier ou de changer d'expediteur, pas de
+        // connecter un compte inexistant.
+        let has_other_usable_account =
+            requires_link && account_oid.is_some() && !self.owner_has_no_usable_account(owner_id);
 
         let now = metrics::now_ts();
         let action = PendingMicrosoftAction {
@@ -1302,6 +1572,9 @@ impl MicrosoftManager {
             created_at: now,
             expires_at: now + ACTION_TTL_SECONDS,
             requires_link,
+            account_oid,
+            account_email,
+            has_other_usable_account,
         };
         let mut state = self.lock().map_err(|error| error.message)?;
         state.actions.retain(|entry| entry.expires_at > now);
@@ -1359,8 +1632,79 @@ impl MicrosoftManager {
         Ok(state.actions.remove(index))
     }
 
+    /// Change la boite d'ou partira une action en attente. Le garde-fou central
+    /// du multi-comptes : meme si le modele a choisi la mauvaise boite, l'humain
+    /// corrige l'expediteur sur la carte avant de valider un envoi irreversible.
+    fn set_action_account(
+        &self,
+        owner_id: &str,
+        action_id: &str,
+        oid: &str,
+    ) -> Result<PendingMicrosoftAction, MicrosoftError> {
+        let now = metrics::now_ts();
+        let mut state = self.lock()?;
+        state.actions.retain(|entry| entry.expires_at > now);
+        // La boite visee doit appartenir a ce proprietaire. On lit aussi, tant
+        // que le store est emprunte, s'il reste une autre boite saine.
+        let (email, needs_relink, other_usable) = {
+            let owned = state
+                .store
+                .links
+                .iter()
+                .filter(|link| link.owner_id == owner_id)
+                .collect::<Vec<_>>();
+            let chosen = owned
+                .iter()
+                .find(|link| link.oid == oid)
+                .ok_or_else(|| MicrosoftError::not_found("Cette boite n'est pas liee"))?;
+            let other_usable = owned
+                .iter()
+                .any(|link| link.oid != oid && !link.needs_relink);
+            (chosen.email.clone(), chosen.needs_relink, other_usable)
+        };
+        let action = state
+            .actions
+            .iter_mut()
+            .find(|entry| entry.id == action_id && entry.owner_id == owner_id)
+            .ok_or_else(|| {
+                MicrosoftError::not_found("Cette action a expire ou a deja ete traitee")
+            })?;
+        action.account_oid = Some(oid.to_string());
+        action.account_email = Some(email);
+        // Un envoi ne reste bloque que si la boite choisie doit etre reliee.
+        action.requires_link = needs_relink;
+        action.has_other_usable_account = needs_relink && other_usable;
+        Ok(action.clone())
+    }
+
+    /// Remet une action dans la file. Utilise quand une confirmation echoue sur
+    /// une boite a relier : l'echec survient AVANT tout envoi Graph, donc rien
+    /// n'a ete envoye et remettre le brouillon ne risque aucun doublon.
+    fn restore_action(&self, mut action: PendingMicrosoftAction) {
+        let now = metrics::now_ts();
+        if action.expires_at <= now {
+            return;
+        }
+        action.requires_link = true;
+        if let Ok(mut state) = self.inner.lock() {
+            if !state.actions.iter().any(|entry| entry.id == action.id) {
+                state.actions.push(action);
+            }
+        }
+    }
+
     async fn execute(&self, action: &PendingMicrosoftAction) -> Result<String, MicrosoftError> {
-        let token = self.access_token_for_owner(&action.owner_id).await?;
+        // Envoie depuis la boite fixee a la mise en file (ou choisie ensuite sur
+        // la carte). Si cette boite a disparu entre-temps, on retombe sur la
+        // boite par defaut plutot que d'echouer sans recours.
+        let token = match action
+            .account_oid
+            .as_deref()
+            .filter(|oid| self.email_for_oid(oid).is_some())
+        {
+            Some(oid) => self.resolve_access_token(oid).await?,
+            None => self.resolve_account(&action.owner_id, None).await?.token,
+        };
         match &action.draft {
             MicrosoftDraft::SendEmail(draft) => {
                 let payload = json!({
@@ -1488,6 +1832,10 @@ pub(crate) struct ListMessagesArguments {
     pub folder: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Adresse de la boite a lire, parmi celles de l'utilisateur. Absente : sa
+    /// boite par defaut.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl ListMessagesArguments {
@@ -1542,6 +1890,10 @@ pub(crate) struct ListEventsArguments {
     pub end: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Adresse de l'agenda a consulter, parmi les boites de l'utilisateur.
+    /// Absente : sa boite par defaut.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl ListEventsArguments {
@@ -1576,10 +1928,14 @@ pub(crate) struct SendEmailArguments {
     pub cc: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// Adresse de la boite expeditrice, parmi celles de l'utilisateur. Absente :
+    /// sa boite par defaut.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl SendEmailArguments {
-    pub(crate) fn into_draft(self) -> Result<MicrosoftDraft, String> {
+    pub(crate) fn into_draft(self) -> Result<(MicrosoftDraft, Option<String>), String> {
         let to = normalize_recipients(&self.to, "destinataire")?;
         if to.is_empty() {
             return Err("Au moins un destinataire est requis".to_string());
@@ -1590,12 +1946,15 @@ impl SendEmailArguments {
         }
         let subject = bounded_text(&self.subject, MAX_SUBJECT_CHARS, "L'objet")?;
         let body = bounded_text(&self.body, MAX_BODY_CHARS, "Le corps du message")?;
-        Ok(MicrosoftDraft::SendEmail(EmailDraft {
-            to,
-            cc,
-            subject,
-            body,
-        }))
+        Ok((
+            MicrosoftDraft::SendEmail(EmailDraft {
+                to,
+                cc,
+                subject,
+                body,
+            }),
+            normalize_account(self.account),
+        ))
     }
 }
 
@@ -1613,10 +1972,14 @@ pub(crate) struct CreateEventArguments {
     pub body: Option<String>,
     #[serde(default)]
     pub online_meeting: Option<bool>,
+    /// Agenda ou creer l'evenement, parmi les boites de l'utilisateur. Absent :
+    /// sa boite par defaut.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl CreateEventArguments {
-    pub(crate) fn into_draft(self) -> Result<MicrosoftDraft, String> {
+    pub(crate) fn into_draft(self) -> Result<(MicrosoftDraft, Option<String>), String> {
         let subject = bounded_text(&self.subject, MAX_SUBJECT_CHARS, "Le titre")?;
         let start = parse_instant(&self.start, "start").map_err(|error| error.message)?;
         let end = parse_instant(&self.end, "end").map_err(|error| error.message)?;
@@ -1625,15 +1988,18 @@ impl CreateEventArguments {
         if attendees.len() > MAX_RECIPIENTS {
             return Err(format!("Au maximum {MAX_RECIPIENTS} participants"));
         }
-        Ok(MicrosoftDraft::CreateEvent(EventDraft {
-            subject,
-            start,
-            end,
-            attendees,
-            location: optional_text(self.location.as_deref(), MAX_LOCATION_CHARS, "Le lieu")?,
-            body: optional_text(self.body.as_deref(), MAX_BODY_CHARS, "La description")?,
-            online_meeting: self.online_meeting.unwrap_or(false),
-        }))
+        Ok((
+            MicrosoftDraft::CreateEvent(EventDraft {
+                subject,
+                start,
+                end,
+                attendees,
+                location: optional_text(self.location.as_deref(), MAX_LOCATION_CHARS, "Le lieu")?,
+                body: optional_text(self.body.as_deref(), MAX_BODY_CHARS, "La description")?,
+                online_meeting: self.online_meeting.unwrap_or(false),
+            }),
+            normalize_account(self.account),
+        ))
     }
 }
 
@@ -1651,10 +2017,14 @@ pub(crate) struct UpdateEventArguments {
     pub location: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
+    /// Agenda contenant l'evenement, parmi les boites de l'utilisateur. Absent :
+    /// sa boite par defaut. L'evenement doit exister dans cette boite.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl UpdateEventArguments {
-    pub(crate) fn into_draft(self) -> Result<MicrosoftDraft, String> {
+    pub(crate) fn into_draft(self) -> Result<(MicrosoftDraft, Option<String>), String> {
         let event_id = self.event_id.trim().to_string();
         if event_id.is_empty() || event_id.chars().count() > 512 {
             return Err("L'identifiant de l'evenement est invalide".to_string());
@@ -1688,15 +2058,18 @@ impl UpdateEventArguments {
                 "Un deplacement d'horaire exige start et end ensemble".to_string(),
             );
         }
-        Ok(MicrosoftDraft::UpdateEvent(EventUpdateDraft {
-            event_id,
-            subject,
-            start,
-            end,
-            location,
-            body,
-            current_subject: None,
-        }))
+        Ok((
+            MicrosoftDraft::UpdateEvent(EventUpdateDraft {
+                event_id,
+                subject,
+                start,
+                end,
+                location,
+                body,
+                current_subject: None,
+            }),
+            normalize_account(self.account),
+        ))
     }
 }
 
@@ -1707,11 +2080,15 @@ impl UpdateEventArguments {
 pub(crate) fn router(manager: MicrosoftManager) -> Router {
     Router::new()
         .route("/connection", get(api_connection).delete(api_disconnect))
+        // Une boite precise : la retirer, ou en faire la boite par defaut.
+        .route("/connection/:oid", axum::routing::delete(api_disconnect_account))
+        .route("/connection/:oid/default", post(api_set_default))
         .route("/start", get(api_start))
         .route("/callback", get(api_callback))
         .route("/pending-actions", get(api_pending_actions))
         .route("/pending-actions/:id/confirm", post(api_confirm))
         .route("/pending-actions/:id/cancel", post(api_cancel))
+        .route("/pending-actions/:id/account", post(api_set_action_account))
         .route("/link-request", axum::routing::delete(api_dismiss_link_request))
         .with_state(manager)
 }
@@ -1741,6 +2118,47 @@ async fn api_disconnect(
     manager.disconnect(&identity.id)?;
     let view = manager.connection_view(&identity.id)?;
     Ok(no_store(Json(view).into_response()))
+}
+
+async fn api_disconnect_account(
+    State(manager): State<MicrosoftManager>,
+    headers: HeaderMap,
+    Path(oid): Path<String>,
+) -> Result<Response, MicrosoftError> {
+    let identity = manager.identity(&headers)?;
+    require_same_site(&headers)?;
+    manager.disconnect_account(&identity.id, &oid)?;
+    let view = manager.connection_view(&identity.id)?;
+    Ok(no_store(Json(view).into_response()))
+}
+
+async fn api_set_default(
+    State(manager): State<MicrosoftManager>,
+    headers: HeaderMap,
+    Path(oid): Path<String>,
+) -> Result<Response, MicrosoftError> {
+    let identity = manager.identity(&headers)?;
+    require_same_site(&headers)?;
+    manager.set_default_account(&identity.id, &oid)?;
+    let view = manager.connection_view(&identity.id)?;
+    Ok(no_store(Json(view).into_response()))
+}
+
+#[derive(Deserialize)]
+struct SetAccountBody {
+    oid: String,
+}
+
+async fn api_set_action_account(
+    State(manager): State<MicrosoftManager>,
+    headers: HeaderMap,
+    Path(action_id): Path<String>,
+    Json(body): Json<SetAccountBody>,
+) -> Result<Response, MicrosoftError> {
+    let identity = manager.identity(&headers)?;
+    require_same_site(&headers)?;
+    let action = manager.set_action_account(&identity.id, &action_id, &body.oid)?;
+    Ok(no_store(Json(action).into_response()))
 }
 
 async fn api_start(
@@ -1826,12 +2244,16 @@ async fn api_confirm(
         Ok(message) => Ok(no_store(
             Json(json!({ "status": "done", "message": message })).into_response(),
         )),
-        Err(error) => {
-            // L'action a quitte la file : la remettre permettrait de reessayer,
-            // mais un envoi partiellement abouti serait alors duplique. On
-            // prefere une erreur explicite et un nouveau brouillon.
+        // Boite a relier : l'echec est survenu AVANT tout envoi Graph, donc rien
+        // n'est parti. On remet le brouillon en file pour ne pas perdre le
+        // travail — l'utilisateur pourra relier la boite ou changer d'expediteur.
+        Err(error) if error.status == StatusCode::UNAUTHORIZED => {
+            manager.restore_action(action);
             Err(error)
         }
+        // Tout autre echec : un envoi a pu partiellement aboutir. Remettre le
+        // brouillon risquerait un doublon ; on prefere une erreur explicite.
+        Err(error) => Err(error),
     }
 }
 
@@ -2000,6 +2422,50 @@ fn microsoft_login_url(redirect_uri: &str) -> Result<String, String> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url.into())
+}
+
+/// Nettoie l'indice de compte fourni par un outil : une chaine vide vaut
+/// « boite par defaut ».
+fn normalize_account(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Garantit exactement une boite par defaut et par proprietaire. Appele au
+/// chargement (fichiers d'avant le multi-comptes, ou fichier trafique) et apres
+/// chaque suppression (l'ancien defaut a pu partir).
+fn normalize_defaults(links: &mut [StoredLink]) {
+    let mut owners = links
+        .iter()
+        .map(|link| link.owner_id.clone())
+        .collect::<Vec<_>>();
+    owners.sort();
+    owners.dedup();
+    for owner in owners {
+        let mut indexes = links
+            .iter()
+            .enumerate()
+            .filter(|(_, link)| link.owner_id == owner)
+            .map(|(index, link)| (index, link.linked_at))
+            .collect::<Vec<_>>();
+        if indexes.is_empty() {
+            continue;
+        }
+        let already_default = indexes
+            .iter()
+            .find(|(index, _)| links[*index].is_default)
+            .map(|(index, _)| *index);
+        // Un defaut existe : on garde le premier et on eteint les eventuels
+        // doublons. Sinon, la boite la plus ancienne devient le defaut.
+        let keep = already_default.unwrap_or_else(|| {
+            indexes.sort_by_key(|(_, linked_at)| *linked_at);
+            indexes[0].0
+        });
+        for (index, _) in &indexes {
+            links[*index].is_default = *index == keep;
+        }
+    }
 }
 
 fn relink_required() -> MicrosoftError {
@@ -2231,14 +2697,17 @@ mod tests {
 
     #[test]
     fn email_arguments_are_bounded() {
-        let draft = SendEmailArguments {
+        let (draft, account) = SendEmailArguments {
             to: vec!["jean@example.fr".into()],
             cc: vec![],
             subject: " Point projet ".into(),
             body: "Bonjour".into(),
+            account: Some("  ".into()),
         }
         .into_draft()
         .unwrap();
+        // Un indice de compte vide vaut « boite par defaut ».
+        assert_eq!(account, None);
         match draft {
             MicrosoftDraft::SendEmail(email) => {
                 assert_eq!(email.subject, "Point projet");
@@ -2247,11 +2716,25 @@ mod tests {
             _ => panic!("brouillon inattendu"),
         }
 
+        // Un indice de compte non vide est conserve tel quel (la validation
+        // contre les boites de l'utilisateur a lieu au moment de la resolution).
+        let (_, account) = SendEmailArguments {
+            to: vec!["jean@example.fr".into()],
+            cc: vec![],
+            subject: "Objet".into(),
+            body: "Corps".into(),
+            account: Some(" pro@example.fr ".into()),
+        }
+        .into_draft()
+        .unwrap();
+        assert_eq!(account.as_deref(), Some("pro@example.fr"));
+
         assert!(SendEmailArguments {
             to: vec![],
             cc: vec![],
             subject: "x".into(),
             body: "y".into(),
+            account: None,
         }
         .into_draft()
         .is_err());
@@ -2261,6 +2744,7 @@ mod tests {
             cc: vec![],
             subject: "x".repeat(MAX_SUBJECT_CHARS + 1),
             body: "y".into(),
+            account: None,
         }
         .into_draft()
         .is_err());
@@ -2275,6 +2759,7 @@ mod tests {
             end: None,
             location: None,
             body: None,
+            account: None,
         }
         .into_draft()
         .is_err());
@@ -2286,6 +2771,7 @@ mod tests {
             end: None,
             location: None,
             body: None,
+            account: None,
         }
         .into_draft()
         .is_err());
@@ -2297,6 +2783,7 @@ mod tests {
             end: None,
             location: None,
             body: None,
+            account: None,
         }
         .into_draft()
         .is_ok());
@@ -2367,6 +2854,7 @@ mod tests {
             linked_at: 1,
             updated_at: 1,
             needs_relink: false,
+            is_default: true,
         };
         // Meme transformation que `mark_needs_relink`, verifiee ici sans reseau.
         link.access_token.clear();
@@ -2392,13 +2880,18 @@ mod tests {
                 cc: vec![],
                 subject: "Point".into(),
                 body: "Bonjour".into(),
+                account: None,
             }
             .into_draft()
-            .unwrap(),
+            .unwrap()
+            .0,
             source_chat_key: Some("chat-1".into()),
             created_at: 1,
             expires_at: 2,
             requires_link: true,
+            account_oid: None,
+            account_email: None,
+            has_other_usable_account: false,
         };
         let serialized = serde_json::to_value(&action).unwrap();
         // L'interface s'appuie sur ce drapeau pour desactiver l'envoi et
@@ -2408,9 +2901,10 @@ mod tests {
         // brouillon au lieu de refuser l'appel de l'outil.
         assert_eq!(serialized["draft"]["body"], "Bonjour");
         assert_eq!(serialized["draft"]["kind"], "sendEmail");
-        // Le proprietaire ne sort jamais : la liste est deja filtree par
-        // session, l'exposer ne servirait qu'a fuiter un identifiant.
+        // Le proprietaire et l'oid ne sortent jamais : la liste est deja filtree
+        // par session, les exposer ne servirait qu'a fuiter des identifiants.
         assert!(serialized.get("ownerId").is_none());
+        assert!(serialized.get("accountOid").is_none());
     }
 
     #[test]
@@ -2436,6 +2930,15 @@ mod tests {
             configured: true,
             connected: true,
             needs_relink: false,
+            accounts: vec![MicrosoftAccountView {
+                oid: "oid-1".into(),
+                email: "jean@example.fr".into(),
+                display_name: None,
+                is_default: true,
+                needs_relink: false,
+                scopes: vec!["Mail.Send".into()],
+                linked_at: 1,
+            }],
             email: Some("jean@example.fr".into()),
             display_name: None,
             scopes: vec!["Mail.Send".into()],
@@ -2448,5 +2951,51 @@ mod tests {
         assert!(!serialized.contains("accessToken"));
         assert!(!serialized.contains("refreshToken"));
         assert!(!serialized.to_lowercase().contains("secret"));
+    }
+
+    #[test]
+    fn defaults_are_normalized_to_exactly_one_per_owner() {
+        let mut links = vec![
+            sample_link("user-1", "a", 10, false),
+            sample_link("user-1", "b", 5, false),
+            sample_link("user-2", "c", 1, true),
+            sample_link("user-2", "d", 2, true),
+        ];
+        normalize_defaults(&mut links);
+        // user-1 n'avait aucun defaut : la boite la plus ancienne (b, linked_at 5)
+        // le devient.
+        let user1 = links
+            .iter()
+            .filter(|l| l.owner_id == "user-1")
+            .filter(|l| l.is_default)
+            .collect::<Vec<_>>();
+        assert_eq!(user1.len(), 1);
+        assert_eq!(user1[0].oid, "b");
+        // user-2 en avait deux : un seul survit.
+        assert_eq!(
+            links
+                .iter()
+                .filter(|l| l.owner_id == "user-2" && l.is_default)
+                .count(),
+            1
+        );
+    }
+
+    fn sample_link(owner: &str, oid: &str, linked_at: i64, is_default: bool) -> StoredLink {
+        StoredLink {
+            owner_id: owner.into(),
+            oid: oid.into(),
+            tenant_id: String::new(),
+            email: format!("{oid}@example.fr"),
+            display_name: None,
+            access_token: "t".into(),
+            refresh_token: "r".into(),
+            expires_at: i64::MAX,
+            scopes: vec![],
+            linked_at,
+            updated_at: linked_at,
+            needs_relink: false,
+            is_default,
+        }
     }
 }

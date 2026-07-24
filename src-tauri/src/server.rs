@@ -3424,11 +3424,11 @@ async fn mcp_chat_tools(
                     match state.microsoft.list_messages(&owner_id, &arguments).await {
                         Ok(data) => {
                             let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
+                            let mailbox =
+                                data.get("mailbox").and_then(Value::as_str).unwrap_or_default();
                             json_response(chat_model_tools::tool_microsoft_data_response(
                                 id,
-                                &format!(
-                                    "{count} e-mail(s) lu(s) dans la boite Microsoft de l'utilisateur."
-                                ),
+                                &format!("{count} e-mail(s) lu(s) dans la boite {mailbox}."),
                                 data,
                             ))
                         }
@@ -3456,10 +3456,12 @@ async fn mcp_chat_tools(
                     match state.microsoft.list_events(&owner_id, &arguments).await {
                         Ok(data) => {
                             let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
+                            let mailbox =
+                                data.get("mailbox").and_then(Value::as_str).unwrap_or_default();
                             json_response(chat_model_tools::tool_microsoft_data_response(
                                 id,
                                 &format!(
-                                    "{count} evenement(s) dans l'agenda Microsoft de l'utilisateur. Les horaires sont en UTC."
+                                    "{count} evenement(s) dans l'agenda de {mailbox}. Les horaires sont en UTC."
                                 ),
                                 data,
                             ))
@@ -3478,6 +3480,9 @@ async fn mcp_chat_tools(
                             MICROSOFT_NO_NOMINAL_USER,
                         ));
                     };
+                    // Chaque outil d'ecriture renvoie (brouillon, boite visee).
+                    // La boite est None quand le modele ne precise rien : la
+                    // boite par defaut de l'utilisateur sera alors employee.
                     let draft = match name {
                         SEND_OUTLOOK_EMAIL_TOOL_NAME => {
                             serde_json::from_value::<SendEmailArguments>(arguments)
@@ -3497,7 +3502,7 @@ async fn mcp_chat_tools(
                             })
                             .and_then(UpdateEventArguments::into_draft),
                     };
-                    let draft = match draft {
+                    let (draft, account) = match draft {
                         Ok(value) => value,
                         Err(error) => {
                             return json_response(chat_model_tools::tool_error_response(id, &error))
@@ -3505,7 +3510,12 @@ async fn mcp_chat_tools(
                     };
                     match state
                         .microsoft
-                        .enqueue(&owner_id, draft, context.source_chat_key.clone())
+                        .enqueue(
+                            &owner_id,
+                            draft,
+                            account.as_deref(),
+                            context.source_chat_key.clone(),
+                        )
                         .await
                     {
                         Ok(action) => json_response(

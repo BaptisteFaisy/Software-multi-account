@@ -44,13 +44,22 @@ La liaison est nominative : elle appartient au compte utilisateur connecté, pas
 
 La liaison vit dans **Mon compte** et non dans **Paramètres** parce qu’elle est nominative : elle suit la personne, pas l’installation ni le serveur. **Paramètres** n’affiche qu’un raccourci vers cette carte, avec l’état courant.
 
-Si Microsoft révoque l’autorisation — mot de passe changé, consentement retiré, longue inactivité —, la carte passe à l’état **À relier** et propose **Relier de nouveau Microsoft 365**. L’adresse liée et le bouton de déliaison restent visibles pendant ce temps.
+### Plusieurs boîtes
+
+Vous pouvez lier plusieurs comptes Microsoft — une boîte personnelle et une boîte professionnelle, par exemple. **Ajouter une autre boîte** relance la connexion ; choisissez un autre compte sur l’écran Microsoft pour l’ajouter à côté du premier. La liste dans **Mon compte** affiche chaque boîte, avec :
+
+- **Par défaut** : la boîte utilisée quand une demande ne précise pas laquelle. **Définir par défaut** la change ; la première boîte liée l’est automatiquement.
+- **Délier** (une boîte) ou **Délier toutes les boîtes** : efface les jetons du serveur.
+
+Depuis un chat, la boîte par défaut sert sauf indication contraire. Dites simplement « depuis ma boîte pro » et le modèle vise cette adresse ; il ne peut choisir qu’entre **vos** boîtes liées, jamais une adresse tierce. Sur la carte de confirmation d’un envoi, la ligne **De** rappelle l’expéditeur et, si vous avez plusieurs boîtes, permet d’en changer avant de valider.
+
+Si Microsoft révoque l’autorisation d’une boîte — mot de passe changé, consentement retiré, longue inactivité —, elle passe à l’état **À relier** et propose **Relier**. Ses jetons sont effacés mais son adresse reste visible ; vos autres boîtes continuent de fonctionner.
 
 Si le serveur est ouvert par `127.0.0.1` derrière un tunnel, le départ de la liaison bascule automatiquement sur l’origine publique déclarée dans Entra : c’est la seule URL que Microsoft acceptera.
 
 ## Utilisation depuis un chat
 
-Cinq outils sont exposés au modèle. Deux lisent immédiatement :
+Cinq outils sont exposés au modèle. Chacun accepte un champ `account` facultatif pour viser l’une de vos boîtes ; sans lui, la boîte par défaut est utilisée. Deux lisent immédiatement :
 
 - `list_outlook_messages` liste jusqu’à 25 messages de `inbox`, `sentitems`, `drafts` ou `archive`, avec une recherche plein texte facultative. Les corps complets ne sont pas retournés : l’objet, l’expéditeur et l’aperçu suffisent à résumer une boîte ;
 - `list_calendar_events` liste jusqu’à 50 événements, occurrences des séries récurrentes comprises.

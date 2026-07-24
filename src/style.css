@@ -7255,7 +7255,98 @@ body.chat-dragging .chat-side-drag-handle {
   font-style: normal;
   font-weight: 600;
 }
+.microsoft-account-list { display: grid; gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; }
+.microsoft-account {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--chat-border);
+  border-radius: 12px;
+  background: rgba(0, 164, 239, .05);
+}
+.microsoft-account.is-stale { border-color: rgba(242, 174, 67, .32); background: rgba(242, 174, 67, .07); }
+.microsoft-account-state { display: grid; place-items: center; width: 26px; height: 26px; flex: none; border-radius: 8px; color: #8ad4ff; background: rgba(0, 164, 239, .12); }
+.microsoft-account.is-stale .microsoft-account-state { color: #f0be76; background: rgba(242, 174, 67, .14); }
+.microsoft-account-state svg { width: 15px; height: 15px; }
+.microsoft-account-identity { display: grid; min-width: 0; gap: 2px; flex: 1; }
+.microsoft-account-identity strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.microsoft-account-identity small { color: var(--muted); font-size: 9px; }
+.microsoft-account-badge {
+  padding: 3px 8px;
+  flex: none;
+  border-radius: 999px;
+  color: #8ad4ff;
+  background: rgba(0, 164, 239, .14);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.microsoft-account-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.microsoft-account-actions button,
+.microsoft-account-actions a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 5px 9px;
+  border: 1px solid var(--chat-border);
+  border-radius: 7px;
+  color: inherit;
+  background: rgba(255, 255, 255, .04);
+  font: 650 9px var(--font-body);
+  text-decoration: none;
+  cursor: pointer;
+}
+.microsoft-account-actions button:hover:not(:disabled),
+.microsoft-account-actions a:hover { border-color: rgba(0, 164, 239, .45); }
+.microsoft-account-actions .microsoft-account-unlink { padding: 5px 7px; color: #ffaaa6; }
+.microsoft-account-actions button.danger { color: #ffaaa6; }
+.microsoft-account-actions svg { width: 12px; height: 12px; }
+.microsoft-account-actions button:disabled { opacity: .55; cursor: default; }
+
+.microsoft-sender {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 11px;
+  padding: 8px 10px;
+  border: 1px dashed var(--chat-border);
+  border-radius: 9px;
+  font-size: 10px;
+}
+.microsoft-sender.is-revoked { border-color: rgba(242, 174, 67, .4); }
+.microsoft-sender-badge {
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #f0be76;
+  background: rgba(242, 174, 67, .16);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.microsoft-sender-label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 9px; font-weight: 650; }
+.microsoft-sender-label svg { width: 12px; height: 12px; }
+.microsoft-sender > strong { font-size: 11px; }
+.microsoft-sender-switch { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-left: auto; }
+.microsoft-sender-switch > span { color: var(--muted); font-size: 9px; }
+.microsoft-sender-switch button {
+  padding: 3px 8px;
+  border: 1px solid var(--chat-border);
+  border-radius: 999px;
+  color: inherit;
+  background: rgba(0, 164, 239, .06);
+  font: 600 9px var(--font-body);
+  cursor: pointer;
+}
+.microsoft-sender-switch button:hover:not(:disabled) { border-color: rgba(0, 164, 239, .45); }
+.microsoft-sender-switch button:disabled { opacity: .55; cursor: default; }
+
 .microsoft-connection-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+.microsoft-connection-actions button.ghost { background: transparent; }
 .microsoft-connection-actions button,
 .microsoft-connect-button {
   display: inline-flex;

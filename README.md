@@ -844,12 +844,14 @@ l'attribut `Secure`.
 
 ### Connexion Microsoft 365 (mail et agenda)
 
-Un utilisateur connecte peut lier son compte Microsoft 365 depuis **Mon compte**
-(la liaison est nominative ; **Parametres** n'affiche qu'un raccourci). Un chat
-normal, comme un agent autonome, lit alors sa boite Outlook et son agenda, et
-prepare e-mails et rendez-vous sous forme de cartes : rien ne part sans un clic
-de confirmation. Un agent autonome ne recoit que ces cinq outils Microsoft, et
-seulement s'il a un proprietaire nominatif.
+Un utilisateur connecte peut lier une ou plusieurs boites Microsoft 365 depuis
+**Mon compte** (la liaison est nominative ; **Parametres** n'affiche qu'un
+raccourci). Un chat normal, comme un agent autonome, lit alors ses boites
+Outlook et ses agendas, et prepare e-mails et rendez-vous sous forme de cartes :
+rien ne part sans un clic de confirmation. Avec plusieurs boites, une boite par
+defaut est utilisee sauf indication contraire, et la carte de confirmation
+permet de choisir l'expediteur. Un agent autonome ne recoit que ces cinq outils
+Microsoft, et seulement s'il a un proprietaire nominatif.
 
 Cote Entra ID, enregistre une application, ajoute une URI de redirection de type
 **Web** identique a celle du serveur, cree un secret client et accorde les
