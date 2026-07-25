@@ -965,6 +965,7 @@ const CLAUDE_MODEL_SUGGESTIONS = [
   "opus",
   "haiku",
   "claude-fable-5",
+  "claude-opus-5",
   "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-opus-4-6",
@@ -972,6 +973,18 @@ const CLAUDE_MODEL_SUGGESTIONS = [
   "claude-sonnet-4-6",
   "claude-haiku-4-5",
 ];
+// Claude Code : niveaux d'intensite (`--effort`). Sous-ensemble valide cote CLI
+// (low/medium/high/xhigh/max) ; `medium` est volontairement omis car c'est le
+// defaut Codex herite ("medium") qui a pu etre persiste sur des comptes Claude
+// avant cette fonctionnalite — l'exclure evite qu'un ancien compte reste bloque
+// sous le defaut natif de Claude (high). Defaut aligne sur Claude Code (high).
+const CLAUDE_REASONING_EFFORTS: CodexReasoningEffort[] = [
+  "low",
+  "high",
+  "xhigh",
+  "max",
+];
+const DEFAULT_CLAUDE_REASONING_EFFORT: CodexReasoningEffort = "high";
 const CODEX_MODEL_SUGGESTIONS = [
   "gpt-5.6-sol",
   "gpt-5.6-terra",
@@ -4095,8 +4108,23 @@ const modelSuggestionsForAccount = (
   return codexCatalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS;
 };
 
-const accountReasoningEffort = (account: AccountProfile | null | undefined) =>
-  normalizeCodexReasoningEffort(account?.reasoningEffort);
+// Codex ET Claude gerent une intensite de raisonnement. Claude Code l'expose
+// via `--effort` (verifie sur le CLI 2.1.x) ; OpenCode ne la gere pas.
+const providerSupportsReasoningEffort = (provider: Provider): boolean =>
+  provider === "codex" || provider === "claude";
+
+const accountReasoningEffort = (account: AccountProfile | null | undefined) => {
+  const raw = account?.reasoningEffort;
+  if (accountProvider(account) === "claude") {
+    // On ne retient une valeur persistee que si elle fait partie des niveaux
+    // Claude proposes (ce qui exclut le defaut Codex herite "medium"), sinon on
+    // retombe sur le defaut natif de Claude (high).
+    return isCodexReasoningEffort(raw) && CLAUDE_REASONING_EFFORTS.includes(raw)
+      ? raw
+      : DEFAULT_CLAUDE_REASONING_EFFORT;
+  }
+  return normalizeCodexReasoningEffort(raw);
+};
 
 const reasoningEffortLabel = (effort: CodexReasoningEffort) =>
   CODEX_REASONING_EFFORTS.find((item) => item.value === effort)?.label ?? effort;
@@ -4124,6 +4152,9 @@ const reasoningEffortsForChatModel = (
   account: AccountProfile | null | undefined,
   model: string,
 ): CodexReasoningEffort[] => {
+  // Claude n'expose pas de catalogue par modele : les niveaux `--effort` sont
+  // fixes (low/high/xhigh/max).
+  if (accountProvider(account) === "claude") return [...CLAUDE_REASONING_EFFORTS];
   const advertised =
     chatCatalogModel(account, model)?.supportedReasoningEfforts
       .map((item) => item.reasoningEffort)
@@ -4142,10 +4173,14 @@ const reasoningEffortForChatModel = (
   if (isCodexReasoningEffort(advertisedDefault) && supported.includes(advertisedDefault)) {
     return advertisedDefault;
   }
-  if (supported.includes(DEFAULT_CODEX_REASONING_EFFORT)) {
-    return DEFAULT_CODEX_REASONING_EFFORT;
+  const providerDefault =
+    accountProvider(account) === "claude"
+      ? DEFAULT_CLAUDE_REASONING_EFFORT
+      : DEFAULT_CODEX_REASONING_EFFORT;
+  if (supported.includes(providerDefault)) {
+    return providerDefault;
   }
-  return supported[0] ?? DEFAULT_CODEX_REASONING_EFFORT;
+  return supported[0] ?? providerDefault;
 };
 
 const chatReasoningEffortOptions = (
@@ -7902,7 +7937,7 @@ const readChatPreferences = (account: AccountProfile, root: ParentNode = documen
   const model =
     root.querySelector<HTMLInputElement>("[data-chat-control='model'], #chatModel")?.value.trim() || previousModel;
   const reasoningEffort =
-    provider === "codex"
+    providerSupportsReasoningEffort(provider)
       ? reasoningEffortForChatModel(
           account,
           model,
@@ -7928,7 +7963,7 @@ const readChatPreferences = (account: AccountProfile, root: ParentNode = documen
     reasoningEffort,
     changed:
       model !== previousModel ||
-      (provider === "codex" && reasoningEffort !== previousReasoningEffort),
+      (providerSupportsReasoningEffort(provider) && reasoningEffort !== previousReasoningEffort),
     error: null,
   };
 };
@@ -8015,7 +8050,7 @@ const chatPanelModel = (): ChatPanelModel => {
       accountReasoningEffort(account),
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
-    supportsReasoningEffort: provider === "codex",
+    supportsReasoningEffort: providerSupportsReasoningEffort(provider),
     composerSelectorsEnabled: chatComposerSelectorsEnabled,
     favoritePrompts: loadFavoritePromptShortcuts(accountScopedStorage),
     supportsGoals: provider === "codex",
@@ -9609,7 +9644,7 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
       accountReasoningEffort(account),
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
-    supportsReasoningEffort: provider === "codex",
+    supportsReasoningEffort: providerSupportsReasoningEffort(provider),
     composerSelectorsEnabled: chatComposerSelectorsEnabled,
     favoritePrompts: loadFavoritePromptShortcuts(accountScopedStorage),
     supportsGoals: provider === "codex",
@@ -23134,10 +23169,15 @@ const renderNewTerminalModal = () => {
                   <span>Modele par defaut</span>
                   <input id="newAccountModel" list="codexModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${escapeAttr(providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider))}" />
                 </label>
-                <label title="Intensite de raisonnement : Codex uniquement (ignoree pour Claude)">
+                ${newTerminalAccountProvider === "codex"
+                  ? `<label title="Intensite de raisonnement (Codex)">
                   <span>Intensite (Codex)</span>
                   <select id="newAccountReasoningEffort">${reasoningEffortOptions(newTerminalAccountReasoningEffort)}</select>
-                </label>
+                </label>`
+                  : `<label title="${newTerminalAccountProvider === "claude" ? "L'intensite Claude se choisit dans chaque chat" : "Ce fournisseur ne gere pas l'intensite"}">
+                  <span>Intensite</span>
+                  <select disabled><option>${newTerminalAccountProvider === "claude" ? "Par chat (defaut Elevee)" : "Non geree"}</option></select>
+                </label>`}
                 <label class="modal-check" title="Sans approbations / sans sandbox (Codex : bypass ; Claude : skip permissions)">
                   <input id="newAccountBypass" type="checkbox" ${newTerminalAccountBypass ? "checked" : ""} />
                   <span>Mode bypass</span>
@@ -23168,10 +23208,15 @@ const renderNewTerminalModal = () => {
               <span>Modele Codex par defaut</span>
               <input id="newTerminalModel" list="codexModelSuggestions" value="${escapeAttr(accountModel(account))}" ${account ? "" : "disabled"} />
             </label>
-            <label>
+            ${accountProvider(account) === "codex"
+              ? `<label>
               <span>Intensite par defaut</span>
               <select id="newTerminalReasoningEffort" ${account ? "" : "disabled"}>${reasoningEffortOptions(accountReasoningEffort(account))}</select>
-            </label>
+            </label>`
+              : `<label title="${accountProvider(account) === "claude" ? "L'intensite Claude se choisit dans chaque chat" : "Ce fournisseur ne gere pas l'intensite"}">
+              <span>Intensite</span>
+              <select disabled><option>${accountProvider(account) === "claude" ? "Par chat (defaut Elevee)" : "Non geree"}</option></select>
+            </label>`}
             <label class="modal-check" title="Sans approbations et sans sandbox Codex">
               <input id="newTerminalBypass" type="checkbox" ${accountBypassEnabled(account) ? "checked" : ""} ${account ? "" : "disabled"} />
               <span>Mode bypass pour ce compte</span>
@@ -25601,10 +25646,14 @@ const readNewTerminalModalForm = () => {
   account.model =
     document.querySelector<HTMLInputElement>("#newTerminalModel")?.value.trim() ||
     accountModel(account);
-  account.reasoningEffort = normalizeCodexReasoningEffort(
-    document.querySelector<HTMLSelectElement>("#newTerminalReasoningEffort")?.value ??
-      account.reasoningEffort,
-  );
+  // L'intensite du compte n'est pertinente que pour Codex. Pour Claude, elle se
+  // choisit dans chaque chat (sans ecraser une eventuelle valeur du compositeur).
+  if (accountProvider(account) === "codex") {
+    account.reasoningEffort = normalizeCodexReasoningEffort(
+      document.querySelector<HTMLSelectElement>("#newTerminalReasoningEffort")?.value ??
+        account.reasoningEffort,
+    );
+  }
   account.bypass =
     document.querySelector<HTMLInputElement>("#newTerminalBypass")?.checked ??
     accountBypassEnabled(account);
@@ -25633,10 +25682,12 @@ const readNewTerminalAccountDraft = () => {
   newTerminalAccountModel = !modelDraft || modelDraft === previousDefault
     ? providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider)
     : modelDraft;
-  newTerminalAccountReasoningEffort = normalizeCodexReasoningEffort(
-    document.querySelector<HTMLSelectElement>("#newAccountReasoningEffort")?.value ??
-      newTerminalAccountReasoningEffort,
-  );
+  if (newTerminalAccountProvider === "codex") {
+    newTerminalAccountReasoningEffort = normalizeCodexReasoningEffort(
+      document.querySelector<HTMLSelectElement>("#newAccountReasoningEffort")?.value ??
+        newTerminalAccountReasoningEffort,
+    );
+  }
 };
 
 const addAccountFromModal = () => {

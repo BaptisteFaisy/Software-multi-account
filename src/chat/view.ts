@@ -1115,7 +1115,7 @@ export const renderChatPanel = (
               <input id="${id("chatModel")}" data-chat-control="model" list="${id("chatModelSuggestions")}" value="${escapeHtml(model.selectedModel)}" ${busy || !model.selectedAccountId || !model.composerSelectorsEnabled ? "disabled" : ""} aria-label="Modele" autocomplete="off" spellcheck="false" maxlength="160" />
               <datalist id="${id("chatModelSuggestions")}">${modelSuggestions(model)}</datalist>
             </label>
-            <label class="chat-effort-select" title="${!model.composerSelectorsEnabled ? "Sélection verrouillée dans les paramètres" : model.supportsReasoningEffort ? "Intensite de raisonnement Codex" : "Ce fournisseur ne gere pas l'intensite de raisonnement"}">
+            <label class="chat-effort-select" title="${!model.composerSelectorsEnabled ? "Sélection verrouillée dans les paramètres" : model.supportsReasoningEffort ? "Intensite de raisonnement" : "Ce fournisseur ne gere pas l'intensite de raisonnement"}">
               <i data-lucide="gauge"></i>
               <select id="${id("chatReasoningEffort")}" data-chat-control="reasoning-effort" ${busy || !model.selectedAccountId || !model.supportsReasoningEffort || !model.composerSelectorsEnabled ? "disabled" : ""} aria-label="Intensite de raisonnement">
                 ${reasoningEffortOptions(model)}

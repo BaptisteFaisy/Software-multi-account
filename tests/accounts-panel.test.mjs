@@ -70,6 +70,7 @@ test("les suggestions de modeles Claude proposent les alias CLI et les modeles a
     '"opus"',
     '"haiku"',
     '"claude-fable-5"',
+    '"claude-opus-5"',
     '"claude-opus-4-8"',
     '"claude-sonnet-5"',
     '"claude-haiku-4-5"',

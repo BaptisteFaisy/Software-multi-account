@@ -2227,6 +2227,12 @@ fn configure_provider_command_with_images_and_scope(
             if let Some(model) = model {
                 command.arg("--model").arg(model);
             }
+            // Intensite de raisonnement Claude Code (low/medium/high/xhigh/max).
+            // Le CLI ignore une valeur inconnue avec un simple avertissement, mais
+            // l'UI ne propose que des niveaux valides.
+            if let Some(effort) = reasoning_effort {
+                command.arg("--effort").arg(effort);
+            }
             if let Some(instructions) = environment_instructions {
                 command.arg("--append-system-prompt").arg(instructions);
             }
@@ -2420,13 +2426,21 @@ fn selected_reasoning_effort(
     requested: Option<&str>,
     fallback: Option<&str>,
 ) -> Result<Option<String>, String> {
-    if provider != Provider::Codex {
-        return Ok(None);
-    }
-    let value = requested
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| fallback.map(str::trim).filter(|value| !value.is_empty()));
+    let request = requested.map(str::trim).filter(|value| !value.is_empty());
+    let value = match provider {
+        // Codex : la requete prime, puis le defaut persiste du compte.
+        Provider::Codex => {
+            request.or_else(|| fallback.map(str::trim).filter(|value| !value.is_empty()))
+        }
+        // Claude : l'intensite (`--effort`) vient UNIQUEMENT de la requete
+        // explicite. Le champ `reasoning_effort` du compte porte un defaut Codex
+        // herite ("medium") qui n'a jamais eu de sens pour Claude ; s'y rabattre
+        // ferait tourner un compte Claude sous son defaut natif (high). Sans
+        // requete explicite, on ne passe pas `--effort` et Claude Code applique
+        // son propre defaut.
+        Provider::Claude => request,
+        Provider::OpenCode => return Ok(None),
+    };
     let Some(value) = value else {
         return Ok(None);
     };
@@ -5009,8 +5023,20 @@ mod tests {
             Some("ultra".to_string())
         );
         assert!(selected_reasoning_effort(Provider::Codex, Some("ultra mode"), None).is_err());
+        // Claude : l'intensite explicite de la requete est appliquee (--effort).
         assert_eq!(
             selected_reasoning_effort(Provider::Claude, Some("high"), Some("medium")).unwrap(),
+            Some("high".to_string())
+        );
+        // Claude : le defaut Codex herite sur le compte est ignore (pas de
+        // fallback), pour ne pas rabaisser un compte Claude sous son defaut natif.
+        assert_eq!(
+            selected_reasoning_effort(Provider::Claude, None, Some("medium")).unwrap(),
+            None
+        );
+        // OpenCode ne gere pas l'intensite.
+        assert_eq!(
+            selected_reasoning_effort(Provider::OpenCode, Some("high"), None).unwrap(),
             None
         );
     }
