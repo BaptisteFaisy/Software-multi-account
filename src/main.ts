@@ -156,7 +156,9 @@ import {
 } from "./chat/quota";
 import {
   MODEL_CAPACITY_RETRY_LIMIT,
+  TRANSIENT_STREAM_RETRY_LIMIT,
   isModelCapacityError,
+  isTransientStreamError,
   modelCapacityRetryDelayMs,
   modelCapacityRetryPrompt,
 } from "./chat/capacity";
@@ -7807,7 +7809,46 @@ const sameModelCapacityRetryTurn = (
   current.sessionId === expected.sessionId &&
   current.startedAt === expected.startedAt &&
   current.status === "failed" &&
-  isModelCapacityError(current.error);
+  (isModelCapacityError(current.error) || isTransientStreamError(current.error));
+
+// Un drop transitoire ne se rejoue automatiquement que si le tour ne peut pas
+// avoir laisse un effet de bord : modes lecture seule (plan/question), ou aucune
+// session encore etablie pour ce tour. Cote Claude, un tool_use / edit ne cree
+// NI part NI activity visibles cote UI, donc `turn.parts` n'est pas un signal
+// fiable de « sortie produite ». En revanche le session_id n'est emis qu'a
+// l'init (avant tout outil), donc son absence prouve que rien n'a pu s'executer.
+// Un tour Construire deja engage (session_id present) n'est donc jamais rejoue
+// automatiquement : l'utilisateur renvoie « continue » lui-meme, ce qui evite de
+// rejouer un edit ou un envoi (email / agenda) deja effectue.
+const transientRetryIsSafe = (turn: ChatTurnSnapshot, mode: ChatMode): boolean =>
+  mode === "plan" || mode === "ask" || !turn.sessionId?.trim();
+
+// Type d'erreur rejouable pour ce tour, ou null. La saturation modele se rejoue
+// toujours ; un drop transitoire seulement s'il est sur (voir ci-dessus).
+const retryableTurnErrorKind = (
+  turn: ChatTurnSnapshot,
+  mode: ChatMode,
+): "capacity" | "transient" | null => {
+  if (isModelCapacityError(turn.error)) return "capacity";
+  if (isTransientStreamError(turn.error) && transientRetryIsSafe(turn, mode)) {
+    return "transient";
+  }
+  return null;
+};
+
+const retryLimitForKind = (kind: "capacity" | "transient"): number =>
+  kind === "capacity" ? MODEL_CAPACITY_RETRY_LIMIT : TRANSIENT_STREAM_RETRY_LIMIT;
+
+// Un tour echoue est-il rejouable automatiquement (saturation ou drop transitoire
+// sur) ? Necessite la soumission active pour connaitre le mode. Utilise par tous
+// les points de decision « planifier une reprise vs vider la file ».
+const failedTurnIsRetryable = (
+  turn: ChatTurnSnapshot | null | undefined,
+  activeSubmission: QueuedChatSubmission | null,
+): boolean =>
+  turn?.status === "failed" &&
+  !!activeSubmission &&
+  retryableTurnErrorKind(turn, activeSubmission.mode) !== null;
 
 const modelCapacityResumeSessionId = (
   turn: ChatTurnSnapshot,
@@ -7844,35 +7885,49 @@ const modelCapacityTurnError = (
 ): string | null => {
   if (turn?.status !== "failed") return null;
   const fallback = turn.error ?? "La reponse a echoue";
-  if (!isModelCapacityError(turn.error) || !activeSubmission) return fallback;
+  if (!activeSubmission) return fallback;
+  const kind = retryableTurnErrorKind(turn, activeSubmission.mode);
+  if (!kind) return fallback;
+  const limit = retryLimitForKind(kind);
   if (retryScheduled) {
-    return `Le modele ${activeSubmission.model} est temporairement sature. Nouvelle tentative automatique avec le meme modele (${retryAttempt}/${MODEL_CAPACITY_RETRY_LIMIT}).`;
+    return kind === "capacity"
+      ? `Le modele ${activeSubmission.model} est temporairement sature. Nouvelle tentative automatique avec le meme modele (${retryAttempt}/${limit}).`
+      : `Connexion coupee en cours de reponse. Nouvelle tentative automatique (${retryAttempt}/${limit}).`;
   }
-  if (retryAttempt >= MODEL_CAPACITY_RETRY_LIMIT) {
-    return `Le modele ${activeSubmission.model} reste sature apres ${MODEL_CAPACITY_RETRY_LIMIT} tentatives automatiques. Vous pouvez renvoyer « continue » plus tard.`;
+  if (retryAttempt >= limit) {
+    return kind === "capacity"
+      ? `Le modele ${activeSubmission.model} reste sature apres ${limit} tentatives automatiques. Vous pouvez renvoyer « continue » plus tard.`
+      : `La connexion a ete coupee malgre ${limit} tentatives automatiques. Renvoyez le message pour reessayer.`;
   }
   return fallback;
 };
 
 const scheduleMainModelCapacityRetry = (turn: ChatTurnSnapshot): boolean => {
-  if (turn.status !== "failed" || !isModelCapacityError(turn.error)) return false;
-  if (chatCapacityRetryTimer !== null) return true;
+  if (turn.status !== "failed") return false;
   const activeSubmission = chatActiveSubmission;
   if (!activeSubmission) return false;
-  if (chatCapacityRetryAttempt >= MODEL_CAPACITY_RETRY_LIMIT) {
-    statusText = `Le modele ${activeSubmission.model} reste sature apres ${MODEL_CAPACITY_RETRY_LIMIT} tentatives automatiques`;
+  const kind = retryableTurnErrorKind(turn, activeSubmission.mode);
+  if (!kind) return false;
+  if (chatCapacityRetryTimer !== null) return true;
+  const limit = retryLimitForKind(kind);
+  if (chatCapacityRetryAttempt >= limit) {
+    statusText = kind === "capacity"
+      ? `Le modele ${activeSubmission.model} reste sature apres ${limit} tentatives automatiques`
+      : `Connexion coupee malgre ${limit} tentatives automatiques`;
     return false;
   }
 
   chatCapacityRetryAttempt += 1;
   const attempt = chatCapacityRetryAttempt;
   const delay = modelCapacityRetryDelayMs(attempt);
-  statusText = `Modele ${activeSubmission.model} sature · nouvelle tentative dans ${Math.ceil(delay / 1_000)} s (${attempt}/${MODEL_CAPACITY_RETRY_LIMIT})`;
+  statusText = kind === "capacity"
+    ? `Modele ${activeSubmission.model} sature · nouvelle tentative dans ${Math.ceil(delay / 1_000)} s (${attempt}/${limit})`
+    : `Connexion coupee · nouvelle tentative dans ${Math.ceil(delay / 1_000)} s (${attempt}/${limit})`;
   chatCapacityRetryTimer = window.setTimeout(() => {
     chatCapacityRetryTimer = null;
     if (!sameModelCapacityRetryTurn(chatTurn, turn)) return;
     const resumeSessionId = modelCapacityResumeSessionId(turn, chatDiscussion);
-    statusText = `Reprise automatique avec ${activeSubmission.model} (${attempt}/${MODEL_CAPACITY_RETRY_LIMIT})`;
+    statusText = `Reprise automatique avec ${activeSubmission.model} (${attempt}/${limit})`;
     void sendChatMessage("message", {
       ...activeSubmission,
       prompt: modelCapacityRetryPrompt(resumeSessionId, activeSubmission.prompt),
@@ -7889,19 +7944,26 @@ const scheduleExpertModelCapacityRetry = (
   pane: ExpertChatPane,
   turn: ChatTurnSnapshot,
 ): boolean => {
-  if (turn.status !== "failed" || !isModelCapacityError(turn.error)) return false;
-  if (pane.capacityRetryTimer !== null) return true;
+  if (turn.status !== "failed") return false;
   const activeSubmission = pane.activeSubmission;
   if (!activeSubmission || !expertChatPanes.includes(pane)) return false;
-  if (pane.capacityRetryAttempt >= MODEL_CAPACITY_RETRY_LIMIT) {
-    statusText = `Le modele ${activeSubmission.model} reste sature apres ${MODEL_CAPACITY_RETRY_LIMIT} tentatives automatiques`;
+  const kind = retryableTurnErrorKind(turn, activeSubmission.mode);
+  if (!kind) return false;
+  if (pane.capacityRetryTimer !== null) return true;
+  const limit = retryLimitForKind(kind);
+  if (pane.capacityRetryAttempt >= limit) {
+    statusText = kind === "capacity"
+      ? `Le modele ${activeSubmission.model} reste sature apres ${limit} tentatives automatiques`
+      : `Connexion coupee malgre ${limit} tentatives automatiques`;
     return false;
   }
 
   pane.capacityRetryAttempt += 1;
   const attempt = pane.capacityRetryAttempt;
   const delay = modelCapacityRetryDelayMs(attempt);
-  statusText = `Modele ${activeSubmission.model} sature · nouvelle tentative dans ${Math.ceil(delay / 1_000)} s (${attempt}/${MODEL_CAPACITY_RETRY_LIMIT})`;
+  statusText = kind === "capacity"
+    ? `Modele ${activeSubmission.model} sature · nouvelle tentative dans ${Math.ceil(delay / 1_000)} s (${attempt}/${limit})`
+    : `Connexion coupee · nouvelle tentative dans ${Math.ceil(delay / 1_000)} s (${attempt}/${limit})`;
   pane.capacityRetryTimer = window.setTimeout(() => {
     pane.capacityRetryTimer = null;
     if (
@@ -7911,7 +7973,7 @@ const scheduleExpertModelCapacityRetry = (
       return;
     }
     const resumeSessionId = modelCapacityResumeSessionId(turn, pane.discussion);
-    statusText = `Reprise automatique avec ${activeSubmission.model} (${attempt}/${MODEL_CAPACITY_RETRY_LIMIT})`;
+    statusText = `Reprise automatique avec ${activeSubmission.model} (${attempt}/${limit})`;
     void sendExpertChatMessage(
       pane,
       expertChatPaneRoot(pane),
@@ -8400,9 +8462,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   const quotaExhausted =
     snapshot.status === "failed" &&
     isQuotaExhaustionError(snapshot.error);
-  const modelCapacityReached =
-    snapshot.status === "failed" &&
-    isModelCapacityError(snapshot.error);
+  const retryableFailure = failedTurnIsRetryable(snapshot, chatActiveSubmission);
   const attached = snapshot.sessionId ? await attachCreatedChat(snapshot.sessionId) : !!chatDiscussion;
 
   if (snapshot.status === "finalizing") {
@@ -8422,7 +8482,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
     statusText = `${chatPanelModel().providerLabel} travaille…`;
   }
 
-  if (modelCapacityReached) {
+  if (retryableFailure) {
     scheduleMainModelCapacityRetry(snapshot);
   } else if (!chatTurnIsBusy(snapshot.status)) {
     resetMainModelCapacityRetry();
@@ -8453,7 +8513,7 @@ const applyChatTurnSnapshot = async (snapshot: ChatTurnSnapshot) => {
   if (quotaExhausted) {
     if (chatDiscussion) automaticallyTransferQuotaExhaustedDiscussion(chatDiscussion, snapshot);
     else void refreshQuotaAlternatives();
-  } else if (modelCapacityReached) {
+  } else if (retryableFailure) {
     // La file utilisateur attend d'abord la reprise automatique de ce tour.
   } else if (!chatTurnIsBusy(snapshot.status)) {
     void drainChatSubmissionQueue();
@@ -8836,6 +8896,9 @@ const sendChatMessage = async (
       pane.turn = failedTurn;
       explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
       statusText = String(error);
+      // Chemin catch (coupure de transport au demarrage du tour) : reprise sur
+      // saturation uniquement. Un drop transitoire ne se rejoue que sur le
+      // chemin snapshot, ou le session_id du backend fait foi (garde de securite).
       const modelCapacityReached = isModelCapacityError(String(error));
       if (modelCapacityReached) {
         scheduleExpertModelCapacityRetry(pane, failedTurn);
@@ -8865,6 +8928,7 @@ const sendChatMessage = async (
     } as ChatTurnSnapshot;
     chatTurn = failedTurn;
     statusText = String(error);
+    // Chemin catch : reprise sur saturation uniquement (voir ci-dessus).
     const modelCapacityReached = isModelCapacityError(String(error));
     if (modelCapacityReached) {
       scheduleMainModelCapacityRetry(failedTurn);
@@ -10266,9 +10330,7 @@ const applyExpertChatTurnSnapshot = async (
   const quotaExhausted =
     snapshot.status === "failed" &&
     isQuotaExhaustionError(snapshot.error);
-  const modelCapacityReached =
-    snapshot.status === "failed" &&
-    isModelCapacityError(snapshot.error);
+  const retryableFailure = failedTurnIsRetryable(snapshot, pane.activeSubmission);
   let attached: boolean;
   try {
     attached = snapshot.sessionId
@@ -10298,7 +10360,7 @@ const applyExpertChatTurnSnapshot = async (
     statusText = `${expertChatPanelModel(pane).providerLabel} travaille…`;
   }
 
-  if (modelCapacityReached) {
+  if (retryableFailure) {
     scheduleExpertModelCapacityRetry(pane, snapshot);
   } else if (!chatTurnIsBusy(snapshot.status)) {
     resetExpertModelCapacityRetry(pane);
@@ -10335,7 +10397,7 @@ const applyExpertChatTurnSnapshot = async (
     } else {
       void refreshQuotaAlternatives();
     }
-  } else if (modelCapacityReached) {
+  } else if (retryableFailure) {
     // Les messages suivants restent en file jusqu'a la reprise du meme modele.
   } else if (
     shouldLaunchAutomaticOrchestration
@@ -10680,6 +10742,7 @@ const sendExpertChatMessage = async (
     automaticQuotaResumeVisibilityPins.delete(pane.key);
     explicitlyOpenedBusyChatVisibilityPins.delete(pane.key);
     statusText = String(error);
+    // Chemin catch : reprise sur saturation uniquement (voir ci-dessus).
     const modelCapacityReached = isModelCapacityError(String(error));
     if (modelCapacityReached) {
       scheduleExpertModelCapacityRetry(pane, failedTurn);

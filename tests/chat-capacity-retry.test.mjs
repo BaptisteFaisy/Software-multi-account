@@ -5,7 +5,9 @@ import test from "node:test";
 import {
   MODEL_CAPACITY_CONTINUE_PROMPT,
   MODEL_CAPACITY_RETRY_LIMIT,
+  TRANSIENT_STREAM_RETRY_LIMIT,
   isModelCapacityError,
+  isTransientStreamError,
   modelCapacityRetryDelayMs,
   modelCapacityRetryPrompt,
 } from "../src/chat/capacity.ts";
@@ -42,4 +44,49 @@ test("les deux interfaces reessaient avec le modele exact du tour", () => {
   assert.match(main, /reasoningEffort: activeSubmission\.reasoningEffort/);
   assert.match(main, /modelCapacityRetryPrompt\(resumeSessionId, activeSubmission\.prompt\)/);
   assert.match(backend, /is_model_capacity_message/);
+});
+
+test("reconnait une coupure de flux transitoire sans la confondre avec autre chose", () => {
+  assert.equal(
+    isTransientStreamError("API Error: Connection closed mid-response. The response above may be incomplete."),
+    true,
+  );
+  assert.equal(isTransientStreamError("read ECONNRESET"), true);
+  assert.equal(isTransientStreamError("socket hang up"), true);
+  // Ne doit PAS matcher une saturation, un quota, ni une erreur applicative.
+  assert.equal(isTransientStreamError("Selected model is at capacity"), false);
+  assert.equal(isTransientStreamError("You've hit your usage limit."), false);
+  assert.equal(isTransientStreamError("Maximum context length exceeded"), false);
+  assert.equal(isTransientStreamError(""), false);
+  assert.equal(isTransientStreamError(null), false);
+});
+
+test("la reprise sur drop transitoire est plus prudente (au plus 2 essais)", () => {
+  assert.equal(TRANSIENT_STREAM_RETRY_LIMIT, 2);
+});
+
+test("un drop transitoire n'est rejoue que dans les cas surs (plan/question ou avant session)", () => {
+  // Porte de securite : lecture seule, OU aucune session encore etablie. Cote
+  // Claude un tool_use/edit ne cree pas de part, donc `parts` n'est PAS un signal
+  // fiable ; le session_id (emis a l'init, avant tout outil) l'est.
+  assert.match(
+    main,
+    /mode === "plan" \|\| mode === "ask" \|\| !turn\.sessionId\?\.trim\(\)/,
+  );
+  // Le classifieur commun distingue saturation vs drop transitoire.
+  assert.match(main, /retryableTurnErrorKind\(turn, activeSubmission\.mode\)/);
+  assert.match(main, /kind === "capacity" \? MODEL_CAPACITY_RETRY_LIMIT : TRANSIENT_STREAM_RETRY_LIMIT/);
+});
+
+test("les points de decision planifient une reprise sur toute erreur rejouable, pas la seule saturation", () => {
+  // Correctif : les callers ne doivent plus gater sur isModelCapacityError seul,
+  // sinon un drop transitoire ne declencherait jamais la reprise.
+  assert.match(main, /const retryableFailure = failedTurnIsRetryable\(/);
+  assert.match(main, /if \(retryableFailure\) \{\s*\n\s*scheduleMainModelCapacityRetry/);
+  assert.match(main, /if \(retryableFailure\) \{\s*\n\s*scheduleExpertModelCapacityRetry/);
+  // Le helper de rejouabilite exige la soumission active (pour le mode).
+  assert.match(
+    main,
+    /retryableTurnErrorKind\(turn, activeSubmission\.mode\) !== null/,
+  );
 });

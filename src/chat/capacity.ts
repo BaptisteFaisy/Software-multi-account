@@ -21,7 +21,30 @@ export const isModelCapacityError = (
   );
 };
 
+/**
+ * Reconnait une coupure de flux transitoire (drop reseau/API en cours de
+ * reponse), distincte d'une saturation modele ou d'un quota de compte. Le CLI
+ * Claude affiche « API Error: Connection closed mid-response » ; on couvre aussi
+ * les variantes reseau frequentes. Volontairement etroit pour ne pas rejouer
+ * une vraie erreur applicative.
+ */
+export const isTransientStreamError = (
+  error: string | null | undefined,
+): boolean => {
+  if (!error?.trim()) return false;
+  const value = normalizeCapacityError(error);
+  return (
+    value.includes("connection closed") ||
+    value.includes("response above may be incomplete") ||
+    value.includes("connection reset") ||
+    value.includes("econnreset") ||
+    value.includes("socket hang up")
+  );
+};
+
 export const MODEL_CAPACITY_RETRY_LIMIT = 3;
+/** Reprise automatique plus prudente que la saturation (au plus 2 essais). */
+export const TRANSIENT_STREAM_RETRY_LIMIT = 2;
 export const MODEL_CAPACITY_CONTINUE_PROMPT = "continue";
 
 /** Delais 3 s, 6 s puis 12 s pour ne pas marteler un modele sature. */
