@@ -4515,7 +4515,9 @@ async fn api_chat_turn_status(
         Err(response) => return response,
     };
     if let Some(identity) = actor.user() {
-        match state.chat.is_owned_by(id, &identity.id) {
+        match state.chat.is_visible_to(id, &identity.id, |project_dir| {
+            chat_workspace_is_visible(&state, identity, project_dir)
+        }) {
             Ok(true) => {}
             Ok(false) => {
                 return api_error(
@@ -4535,6 +4537,21 @@ async fn api_chat_turn_status(
     }
 }
 
+/// Un chat reste visible tant que son environnement l'est. C'est ce qui donne
+/// le meme statut d'execution sur tous les appareils d'un utilisateur, y compris
+/// pour les tours lances au jeton administrateur, par un agent autonome ou par
+/// une orchestration, qui n'ont aucun proprietaire nominatif.
+fn chat_workspace_is_visible(
+    state: &Arc<ServerState>,
+    identity: &AuthIdentity,
+    project_dir: &str,
+) -> bool {
+    state
+        .workspace_access
+        .authorize_existing_environment(identity, project_dir)
+        .is_ok()
+}
+
 async fn api_list_active_chat_turns(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -4545,7 +4562,16 @@ async fn api_list_active_chat_turns(
     };
     let result = match actor {
         RequestActor::Administrator => state.chat.active(),
-        RequestActor::User(identity) => state.chat.active_for_owner(&identity.id),
+        RequestActor::User(identity) => {
+            // Plusieurs tours partagent le meme dossier et l'autorisation touche
+            // le disque : on ne la resout qu'une fois par environnement.
+            let mut authorized = HashMap::<String, bool>::new();
+            state.chat.active_visible_to(&identity.id, |project_dir| {
+                *authorized
+                    .entry(project_dir.to_string())
+                    .or_insert_with(|| chat_workspace_is_visible(&state, &identity, project_dir))
+            })
+        }
     };
     match result {
         Ok(value) => json_response(value),
@@ -4609,7 +4635,9 @@ async fn api_stop_chat_turn(
         Err(response) => return response,
     };
     if let Some(identity) = actor.user() {
-        match state.chat.is_owned_by(id, &identity.id) {
+        match state.chat.is_visible_to(id, &identity.id, |project_dir| {
+            chat_workspace_is_visible(&state, identity, project_dir)
+        }) {
             Ok(true) => {}
             Ok(false) => {
                 return api_error(

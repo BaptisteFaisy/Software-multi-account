@@ -21,6 +21,7 @@ const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const platform = readFileSync(new URL("../src/platform.ts", import.meta.url), "utf8");
 const style = readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 const chatBackend = readFileSync(new URL("../src-tauri/src/chat.rs", import.meta.url), "utf8");
+const server = readFileSync(new URL("../src-tauri/src/server.rs", import.meta.url), "utf8");
 
 test("les contenus sans glyphe visible ne creent plus de bulle vide", () => {
   const invisible = " \n\t\u00a0\u200b\ufeff\u2800";
@@ -377,6 +378,26 @@ test("un envoi d'image dont la reponse s'est perdue ne bascule plus le chat en �
     /pub struct ActiveChatTurnSummary \{[\s\S]*?pub source_chat_key: Option<String>,/,
   );
   assert.match(chatBackend, /source_chat_key: snapshot\.source_chat_key\.clone\(\),/);
+});
+
+test("le statut d'execution d'un chat est le meme sur tous les appareils", () => {
+  // Le catalogue des tours actifs etait filtre sur le seul proprietaire
+  // nominatif. Un tour lance au jeton administrateur (application de bureau),
+  // par un agent autonome ou par une orchestration n'en a aucun : il s'affichait
+  // « En cours » la ou il avait demarre et « Disponible » sur les autres
+  // appareils. La visibilite repose desormais aussi sur l'environnement.
+  assert.match(chatBackend, /workspaces: Arc<Mutex<HashMap<u64, String>>>/);
+  assert.match(chatBackend, /pub\(crate\) fn active_visible_to\(/);
+  assert.match(chatBackend, /pub\(crate\) fn is_visible_to\(/);
+  assert.doesNotMatch(chatBackend, /fn active_for_owner\(/);
+  // Le chemin complet est conserve : `display_path` ne renvoie qu'un libelle.
+  assert.match(chatBackend, /workspaces\.insert\(id, path\.to_string_lossy\(\)\.to_string\(\)\)/);
+  assert.match(server, /active_visible_to\(&identity\.id/);
+  assert.match(server, /fn chat_workspace_is_visible\(/);
+  // `chat_turn_status` et `stop_chat_turn` partagent la meme regle, sinon le
+  // panneau de chat de l'autre appareil ne pourrait pas suivre ni arreter le tour.
+  assert.equal((server.match(/is_visible_to\(id, &identity\.id/g) ?? []).length, 2);
+  assert.doesNotMatch(server, /chat\.is_owned_by\(id, &identity\.id\)/);
 });
 
 test("une mise a jour d'outil dans un transcript declenche le rafraichissement", () => {

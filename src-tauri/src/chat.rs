@@ -512,6 +512,12 @@ pub struct ChatTurnManager {
     /// Proprietaire SaaS de chaque tour. Absent pour les executions desktop ou
     /// administratives internes, qui ne sont jamais exposees a un autre compte.
     owners: Arc<Mutex<HashMap<u64, String>>>,
+    /// Environnement d'execution de chaque tour. C'est la seule identite que
+    /// partagent tous les appareils : un tour lance au jeton administrateur, par
+    /// un agent autonome ou par une orchestration n'a aucun proprietaire
+    /// nominatif, et resterait donc invisible — donc « Disponible » — dans les
+    /// sessions web et mobiles alors qu'il tourne.
+    workspaces: Arc<Mutex<HashMap<u64, String>>>,
     claims: Arc<Mutex<HashSet<String>>>,
     /// Sessions Claude persistantes vivantes, indexees par `account_id\0session_id`.
     /// Un seul process par conversation ; les taches shell en arriere-plan y
@@ -526,6 +532,7 @@ impl Default for ChatTurnManager {
         Self {
             turns: Arc::new(Mutex::new(HashMap::new())),
             owners: Arc::new(Mutex::new(HashMap::new())),
+            workspaces: Arc::new(Mutex::new(HashMap::new())),
             claims: Arc::new(Mutex::new(HashSet::new())),
             live_claude: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(0)),
@@ -573,21 +580,78 @@ impl ChatTurnManager {
             .is_some_and(|owner| owner == owner_id))
     }
 
-    pub(crate) fn active_for_owner(
+    /// Retient l'environnement dans lequel tourne un tour. Il complete le
+    /// proprietaire nominatif, absent des lancements administrateurs, autonomes
+    /// et orchestres.
+    fn remember_turn_workspace(&self, id: u64, project_dir: Option<&Path>) {
+        let Some(path) = project_dir else {
+            return;
+        };
+        // Le chemin complet, pas le libelle de `display_path` : c'est
+        // `authorize_existing_environment` qui le relira, et il canonicalise.
+        if let Ok(mut workspaces) = self.workspaces.lock() {
+            workspaces.insert(id, path.to_string_lossy().to_string());
+        }
+    }
+
+    fn turn_workspace(&self, id: u64) -> Result<Option<String>, String> {
+        Ok(self
+            .workspaces
+            .lock()
+            .map_err(|_| "Environnements des conversations verrouilles".to_string())?
+            .get(&id)
+            .cloned())
+    }
+
+    /// Un tour est visible par un utilisateur nominatif lorsqu'il l'a lance
+    /// lui-meme, ou lorsqu'il tourne dans un environnement auquel il a acces.
+    ///
+    /// Le second critere est ce qui aligne le statut entre tous ses appareils :
+    /// sans lui, un chat lance depuis l'application de bureau (jeton
+    /// administrateur), un agent autonome ou une orchestration s'affiche
+    /// « En cours » la ou il a demarre et « Disponible » partout ailleurs.
+    pub(crate) fn is_visible_to(
+        &self,
+        id: u64,
+        owner_id: &str,
+        workspace_is_authorized: impl FnOnce(&str) -> bool,
+    ) -> Result<bool, String> {
+        if self.is_owned_by(id, owner_id)? {
+            return Ok(true);
+        }
+        Ok(self
+            .turn_workspace(id)?
+            .is_some_and(|path| workspace_is_authorized(&path)))
+    }
+
+    pub(crate) fn active_visible_to(
         &self,
         owner_id: &str,
+        mut workspace_is_authorized: impl FnMut(&str) -> bool,
     ) -> Result<Vec<ActiveChatTurnSummary>, String> {
-        let visible = self
+        // Les deux index sont copies avant le filtrage : l'autorisation touche
+        // le disque et ne doit jamais s'executer sous un verrou du catalogue.
+        let active = self.active()?;
+        let owners = self
             .owners
             .lock()
             .map_err(|_| "Proprietaires des conversations verrouilles".to_string())?
-            .iter()
-            .filter_map(|(id, owner)| (owner == owner_id).then_some(*id))
-            .collect::<HashSet<_>>();
-        Ok(self
-            .active()?
+            .clone();
+        let workspaces = self
+            .workspaces
+            .lock()
+            .map_err(|_| "Environnements des conversations verrouilles".to_string())?
+            .clone();
+        Ok(active
             .into_iter()
-            .filter(|snapshot| visible.contains(&snapshot.id))
+            .filter(|snapshot| {
+                owners
+                    .get(&snapshot.id)
+                    .is_some_and(|owner| owner == owner_id)
+                    || workspaces
+                        .get(&snapshot.id)
+                        .is_some_and(|path| workspace_is_authorized(path))
+            })
             .collect())
     }
 
@@ -833,6 +897,7 @@ impl ChatTurnManager {
                             request.source_chat_key.clone(),
                         ) {
                             Ok(snapshot) => {
+                                self.remember_turn_workspace(id, project_dir.as_deref());
                                 claim.commit();
                                 self.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
                                 return Ok(snapshot);
@@ -897,6 +962,7 @@ impl ChatTurnManager {
             .lock()
             .map_err(|_| "Etat des conversations verrouillé".to_string())?
             .insert(id, turn.clone());
+        self.remember_turn_workspace(id, project_dir.as_deref());
         claim.commit();
         self.runtime_sync.notify(RuntimeSyncTopic::ActiveChatTurns);
 
@@ -1226,6 +1292,9 @@ impl ChatTurnManager {
             turns.remove(&id);
             if let Ok(mut owners) = self.owners.lock() {
                 owners.remove(&id);
+            }
+            if let Ok(mut workspaces) = self.workspaces.lock() {
+                workspaces.remove(&id);
             }
         }
     }
@@ -3943,6 +4012,55 @@ mod tests {
             runtime_sync: RuntimeSync::default(),
             live_session: Weak::new(),
         })
+    }
+
+    #[test]
+    fn active_turns_follow_the_environment_when_no_owner_is_recorded() {
+        let manager = ChatTurnManager::default();
+        let mine = test_turn();
+        let started_elsewhere = test_turn();
+        started_elsewhere
+            .snapshot
+            .lock()
+            .expect("snapshot")
+            .id = 2;
+        {
+            let mut turns = manager.turns.lock().expect("catalogue");
+            turns.insert(1, mine);
+            turns.insert(2, started_elsewhere);
+        }
+        manager.assign_owner(1, "user-a").expect("proprietaire");
+        // Un tour lance au jeton administrateur, par un agent autonome ou par
+        // une orchestration n'a que son environnement pour identite.
+        manager.remember_turn_workspace(1, Some(Path::new("/env")));
+        manager.remember_turn_workspace(2, Some(Path::new("/env")));
+
+        let ids = |turns: Vec<ActiveChatTurnSummary>| {
+            turns.into_iter().map(|turn| turn.id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(manager
+                .active_visible_to("user-a", |path| path == "/env")
+                .expect("catalogue actif")),
+            vec![1, 2],
+            "le meme utilisateur voit le tour partout, quel que soit l'appareil qui l'a lance",
+        );
+        assert_eq!(
+            ids(manager
+                .active_visible_to("user-a", |_| false)
+                .expect("catalogue actif")),
+            vec![1],
+            "sans acces a l'environnement, seul son propre tour reste visible",
+        );
+        assert!(manager
+            .active_visible_to("user-b", |_| false)
+            .expect("catalogue actif")
+            .is_empty());
+
+        // `chat_turn_status` et `stop_chat_turn` suivent la meme regle.
+        assert!(manager.is_visible_to(2, "user-b", |_| true).expect("visibilite"));
+        assert!(!manager.is_visible_to(2, "user-b", |_| false).expect("visibilite"));
+        assert!(manager.is_visible_to(1, "user-a", |_| false).expect("visibilite"));
     }
 
     #[test]
