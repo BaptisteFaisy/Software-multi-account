@@ -13,7 +13,7 @@ const discussions = readFileSync(
   "utf8",
 );
 
-test("OpenCode isole chaque compte dans ses propres repertoires", () => {
+test("OpenCode isole les identifiants de chaque compte et mutualise son runtime", () => {
   for (const variable of [
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
@@ -23,8 +23,17 @@ test("OpenCode isole chaque compte dans ses propres repertoires", () => {
   ]) {
     assert.ok(provider.includes(variable), `variable manquante: ${variable}`);
   }
+  // Identifiants et sessions : sous le home du compte, jamais partages.
+  assert.match(provider, /\("XDG_DATA_HOME", home\.join\("data"\)\)/);
+  assert.match(provider, /\("XDG_STATE_HOME", home\.join\("state"\)\)/);
   assert.match(provider, /data"\)\.join\("opencode"\)\.join\("auth\.json"\)/);
   assert.match(provider, /value\.get\(provider\)/);
+  // Catalogue models.dev et node_modules du plugin : hors du home, sinon chaque
+  // nouveau compte repaye ~8 minutes de bootstrap muet avant l'invite de cle.
+  assert.match(provider, /\("XDG_CACHE_HOME", shared\.join\("cache"\)\)/);
+  assert.match(provider, /\("XDG_CONFIG_HOME", shared\.join\("config"\)\)/);
+  assert.match(provider, /shared\.join\("config"\)\.join\("opencode"\)/);
+  assert.match(provider, /CST_OPENCODE_RUNTIME_DIR/);
 });
 
 test("les chats OpenCode utilisent le protocole JSON officiel", () => {

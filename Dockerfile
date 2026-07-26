@@ -87,6 +87,38 @@ RUN --mount=type=cache,target=/home/cst/.npm,uid=10001,gid=10001 \
     && command -v opencode >/dev/null \
     && opencode --version
 
+# `opencode auth login` bootstrape son environnement AVANT d'afficher son invite :
+# telechargement du catalogue models.dev (3,2 Mo) puis installation de
+# `@opencode-ai/plugin` (~60 Mo de node_modules) dans son dossier de config.
+# Mesure sur le VPS : ~8 minutes de terminal totalement muet, repayees par chaque
+# nouveau compte tant que ces dossiers vivaient sous le home du compte. Le runtime
+# est desormais mutualise (`provider::opencode_shared_runtime_dir`) et pre-chauffe
+# ici une fois pour toutes. Aucun identifiant n'y transite : ils restent dans le
+# `XDG_DATA_HOME` du compte, ici detourne vers un home jetable.
+#
+# Les deux etapes sont reproduites explicitement plutot que lancees via `auth
+# login` : ce dernier attend une cle sur un TTY et n'a donc aucune fin
+# exploitable dans un build (son invite s'affiche AVANT la fin de l'installation
+# du plugin, la couper laisserait l'image a moitie chaude). `opencode models`
+# ecrit le catalogue puis sort ; le plugin est installe a la version exacte de la
+# CLI, dans le format que OpenCode ecrit lui-meme, et il le reutilise tel quel.
+ENV CST_OPENCODE_RUNTIME_DIR=/home/cst/.cst-opencode-runtime
+RUN --mount=type=cache,target=/home/cst/.npm,uid=10001,gid=10001 \
+    set -eu; \
+    export XDG_CACHE_HOME="${CST_OPENCODE_RUNTIME_DIR}/cache" \
+           XDG_CONFIG_HOME="${CST_OPENCODE_RUNTIME_DIR}/config" \
+           OPENCODE_CONFIG_DIR="${CST_OPENCODE_RUNTIME_DIR}/config/opencode" \
+           XDG_DATA_HOME=/tmp/opencode-warmup/data \
+           XDG_STATE_HOME=/tmp/opencode-warmup/state; \
+    mkdir -p "$XDG_CACHE_HOME" "$OPENCODE_CONFIG_DIR" "$XDG_DATA_HOME" "$XDG_STATE_HOME"; \
+    opencode models >/dev/null; \
+    printf '{\n  "dependencies": {\n    "@opencode-ai/plugin": "%s"\n  }\n}\n' \
+      "$(opencode --version | tr -d '\r\n')" > "${OPENCODE_CONFIG_DIR}/package.json"; \
+    npm install --prefix "${OPENCODE_CONFIG_DIR}" --no-audit --no-fund; \
+    test -s "${CST_OPENCODE_RUNTIME_DIR}/cache/opencode/models.json"; \
+    test -d "${CST_OPENCODE_RUNTIME_DIR}/config/opencode/node_modules/@opencode-ai/plugin"; \
+    rm -rf /tmp/opencode-warmup
+
 USER root
 COPY --from=server-build /tmp/cst-server /usr/local/bin/cst-server
 COPY --from=frontend-build /build/dist /opt/codex-switch-terminal/dist

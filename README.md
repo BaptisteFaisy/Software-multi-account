@@ -162,6 +162,15 @@ temporaire se ferme des que la connexion est enregistree. Si OpenCode manque
 dans le `PATH`, le message d'installation s'affiche au lieu d'une attente sans
 fin. La cle API n'est jamais copiee dans `settings.json`.
 
+Avant d'afficher cette invite, `opencode auth login` bootstrape son environnement :
+il telecharge le catalogue models.dev (3,2 Mo) puis installe `@opencode-ai/plugin`
+(~60 Mo de `node_modules`). Ce bootstrap est **mutualise entre tous les comptes**
+et pre-chauffe dans l'image serveur ; sans cela il etait repaye par chaque nouveau
+compte, soit environ 8 minutes de terminal muet sur un VPS 2 vCPU. Seuls les
+identifiants et les sessions restent isoles par compte (`<home>/data/opencode/`).
+`CST_OPENCODE_RUNTIME_DIR` deplace ce runtime partage ; par defaut il est cree a
+cote des homes de comptes.
+
 ## Fonctionnalites principales
 
 - grille paginee de chats independants ;

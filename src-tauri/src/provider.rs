@@ -15,15 +15,44 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Variables qui isolent integralement le store OpenCode d'un compte. OpenCode
-/// ajoute lui-meme le sous-dossier `opencode` dans chacun de ces emplacements.
-const OPENCODE_HOME_ENV: [&str; 5] = [
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_STATE_HOME",
-    "OPENCODE_CONFIG_DIR",
-];
+/// Dossier qui porte le runtime OpenCode mutualise entre les comptes. Le nom est
+/// choisi hors des prefixes reconnus par `is_home_like_dir` pour qu'il ne soit
+/// jamais importe comme le home d'un compte.
+const OPENCODE_SHARED_DIR_NAME: &str = ".cst-opencode-runtime";
+
+/// Variable qui deplace ce runtime mutualise. L'image Docker la pose sur un
+/// dossier deja pre-chauffe au build.
+const OPENCODE_RUNTIME_DIR_ENV: &str = "CST_OPENCODE_RUNTIME_DIR";
+
+/// Racine du runtime OpenCode partage par tous les comptes.
+///
+/// `opencode auth login` bootstrape son environnement **avant** d'afficher son
+/// invite : il telecharge le catalogue models.dev (3,2 Mo) puis installe
+/// `@opencode-ai/plugin` (~60 Mo de `node_modules`) dans son dossier de config.
+/// Tant que ces deux emplacements vivaient sous le home du compte, chaque
+/// nouveau compte repayait ce bootstrap — mesure a ~8 minutes de terminal
+/// totalement muet sur un VPS 2 vCPU, ce que l'utilisateur lit comme une
+/// connexion cassee. Aucun des deux ne contient de secret : les identifiants
+/// restent dans `<XDG_DATA_HOME>/opencode/auth.json`, isole par compte.
+pub fn opencode_shared_runtime_dir(home: &Path) -> PathBuf {
+    opencode_shared_runtime_dir_from(
+        home,
+        std::env::var_os(OPENCODE_RUNTIME_DIR_ENV).map(PathBuf::from),
+    )
+}
+
+/// Coeur testable de `opencode_shared_runtime_dir` : la surcharge est passee en
+/// argument plutot que lue dans l'environnement du process.
+fn opencode_shared_runtime_dir_from(home: &Path, override_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = override_dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        return dir;
+    }
+    // A cote des homes de comptes : un seul bootstrap pour toute l'installation.
+    match home.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(OPENCODE_SHARED_DIR_NAME),
+        _ => home.join(OPENCODE_SHARED_DIR_NAME),
+    }
+}
 
 impl Provider {
     /// Variable d'environnement qui redirige le "home" isole du CLI (le
@@ -45,20 +74,24 @@ impl Provider {
             Provider::Codex | Provider::Claude => {
                 vec![(self.home_env_var(), home.to_path_buf())]
             }
-            Provider::OpenCode => OPENCODE_HOME_ENV
-                .into_iter()
-                .map(|key| {
-                    let suffix = match key {
-                        "XDG_DATA_HOME" => "data",
-                        "XDG_CACHE_HOME" => "cache",
-                        "XDG_CONFIG_HOME" => "config",
-                        "XDG_STATE_HOME" => "state",
-                        "OPENCODE_CONFIG_DIR" => "config/opencode",
-                        _ => unreachable!(),
-                    };
-                    (key, home.join(suffix))
-                })
-                .collect(),
+            // Par compte : identifiants (`data/opencode/auth.json`), sessions et
+            // journaux. Mutualise : catalogue de modeles et `node_modules` du
+            // plugin, qui ne portent aucun secret et coutent ~60 Mo a installer.
+            // OpenCode ajoute lui-meme le sous-dossier `opencode` dans chacun de
+            // ces emplacements.
+            Provider::OpenCode => {
+                let shared = opencode_shared_runtime_dir(home);
+                vec![
+                    ("XDG_DATA_HOME", home.join("data")),
+                    ("XDG_STATE_HOME", home.join("state")),
+                    ("XDG_CACHE_HOME", shared.join("cache")),
+                    ("XDG_CONFIG_HOME", shared.join("config")),
+                    (
+                        "OPENCODE_CONFIG_DIR",
+                        shared.join("config").join("opencode"),
+                    ),
+                ]
+            }
         }
     }
 
@@ -206,10 +239,14 @@ fn opencode_has_auth(home: &Path, inference_provider: Option<&str>) -> bool {
 }
 
 fn ensure_opencode_account_home(home: &Path) -> io::Result<()> {
-    for directory in ["data", "cache", "config/opencode", "state"] {
+    for directory in ["data", "state"] {
         fs::create_dir_all(home.join(directory))?;
     }
-    Ok(())
+    // Le runtime mutualise doit exister avant le premier lancement, sinon
+    // OpenCode le recree sous un chemin qu'il choisit lui-meme.
+    let shared = opencode_shared_runtime_dir(home);
+    fs::create_dir_all(shared.join("cache"))?;
+    fs::create_dir_all(shared.join("config").join("opencode"))
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -406,19 +443,94 @@ mod tests {
     }
 
     #[test]
-    fn opencode_home_is_fully_isolated_with_xdg_directories() {
-        let home = scratch("opencode-home");
+    fn opencode_isolates_credentials_and_shares_the_runtime() {
+        let root = scratch("opencode-home");
+        let home = root.join("opencode-zai");
         Provider::OpenCode
             .write_account_config(&home, true, Some("deepseek/deepseek-chat"), None)
             .unwrap();
+
         let environment = Provider::OpenCode.home_env(&home);
         assert_eq!(environment.len(), 5);
-        for (key, path) in environment {
-            assert!(key.starts_with("XDG_") || key == "OPENCODE_CONFIG_DIR");
-            assert!(path.starts_with(&home));
-            assert!(path.is_dir());
+        let value = |key: &str| {
+            environment
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, path)| path.clone())
+                .unwrap_or_else(|| panic!("{key} absent de home_env"))
+        };
+
+        // Identifiants et sessions : strictement par compte.
+        assert_eq!(value("XDG_DATA_HOME"), home.join("data"));
+        assert_eq!(value("XDG_STATE_HOME"), home.join("state"));
+        assert!(Provider::OpenCode.sessions_root(&home).starts_with(&home));
+
+        // Catalogue de modeles et node_modules du plugin : hors du home.
+        let shared = root.join(OPENCODE_SHARED_DIR_NAME);
+        assert_eq!(value("XDG_CACHE_HOME"), shared.join("cache"));
+        assert_eq!(value("XDG_CONFIG_HOME"), shared.join("config"));
+        assert_eq!(
+            value("OPENCODE_CONFIG_DIR"),
+            shared.join("config").join("opencode")
+        );
+        for key in [
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "OPENCODE_CONFIG_DIR",
+        ] {
+            let path = value(key);
+            assert!(path.is_dir(), "{key} -> {} absent", path.display());
         }
-        let _ = fs::remove_dir_all(&home);
+
+        // Un second compte reutilise le meme runtime : le bootstrap (catalogue
+        // models.dev + ~60 Mo de node_modules) n'est paye qu'une fois.
+        let other = root.join("opencode-minimax");
+        Provider::OpenCode
+            .write_account_config(&other, false, None, None)
+            .unwrap();
+        let other_environment = Provider::OpenCode.home_env(&other);
+        assert_eq!(
+            other_environment
+                .iter()
+                .find(|(name, _)| *name == "OPENCODE_CONFIG_DIR")
+                .map(|(_, path)| path.clone()),
+            Some(shared.join("config").join("opencode"))
+        );
+        // ... sans jamais partager les identifiants.
+        assert_ne!(
+            other_environment
+                .iter()
+                .find(|(name, _)| *name == "XDG_DATA_HOME")
+                .map(|(_, path)| path.clone()),
+            Some(home.join("data"))
+        );
+
+        // Le dossier mutualise ne doit etre importe comme home d'aucun provider.
+        assert!(!Provider::OpenCode.is_home_like_dir(OPENCODE_SHARED_DIR_NAME));
+        assert!(!Provider::Codex.is_home_like_dir(OPENCODE_SHARED_DIR_NAME));
+        assert!(!Provider::Claude.is_home_like_dir(OPENCODE_SHARED_DIR_NAME));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opencode_shared_runtime_follows_the_image_variable() {
+        let home = Path::new("/srv/cst/codex-homes/opencode-zai");
+        assert_eq!(
+            opencode_shared_runtime_dir_from(home, None),
+            Path::new("/srv/cst/codex-homes").join(OPENCODE_SHARED_DIR_NAME)
+        );
+        // L'image Docker pointe sur le runtime pre-chauffe au build.
+        assert_eq!(
+            opencode_shared_runtime_dir_from(home, Some(PathBuf::from("/home/cst/.warm"))),
+            PathBuf::from("/home/cst/.warm")
+        );
+        // Une variable vide ne doit pas produire un chemin relatif fantome.
+        assert_eq!(
+            opencode_shared_runtime_dir_from(home, Some(PathBuf::new())),
+            Path::new("/srv/cst/codex-homes").join(OPENCODE_SHARED_DIR_NAME)
+        );
     }
 
     #[test]

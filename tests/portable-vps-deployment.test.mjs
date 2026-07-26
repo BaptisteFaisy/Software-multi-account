@@ -63,6 +63,33 @@ test("l'image contient le frontend, le serveur et les outils de travail", () => 
   assert.match(dockerfile, /CST_WORKSPACES_ROOT=\/srv\/cst\/workspaces/);
 });
 
+// `opencode auth login` telecharge le catalogue models.dev puis installe ~60 Mo
+// de node_modules avant d'afficher son invite : ~8 minutes de terminal muet sur
+// le VPS. Le runtime est mutualise entre les comptes et pre-chauffe au build,
+// sinon chaque nouveau compte repaye ce silence.
+test("le runtime OpenCode est mutualise et pre-chauffe dans l'image", () => {
+  assert.match(dockerfile, /ENV CST_OPENCODE_RUNTIME_DIR=\/home\/cst\/\.cst-opencode-runtime/);
+  // `auth login` attend une cle sur un TTY et affiche son invite AVANT la fin de
+  // l'installation du plugin : il ne peut pas servir de pre-chauffage. Les deux
+  // etapes sont donc lancees explicitement, avec une fin exploitable.
+  assert.match(dockerfile, /opencode models >\/dev\/null/);
+  assert.match(dockerfile, /@opencode-ai\/plugin.*opencode --version/s);
+  assert.match(dockerfile, /npm install --prefix "\$\{OPENCODE_CONFIG_DIR\}"/);
+  // Le pre-chauffage doit faire echouer le build s'il n'a pas abouti, sinon
+  // l'image partirait froide sans que personne ne le voie.
+  assert.match(
+    dockerfile,
+    /test -s "\$\{CST_OPENCODE_RUNTIME_DIR\}\/cache\/opencode\/models\.json"/,
+  );
+  assert.match(
+    dockerfile,
+    /test -d "\$\{CST_OPENCODE_RUNTIME_DIR\}\/config\/opencode\/node_modules\/@opencode-ai\/plugin"/,
+  );
+  // Le home jetable du pre-chauffage ne doit laisser aucun credential.
+  assert.match(dockerfile, /XDG_DATA_HOME=\/tmp\/opencode-warmup\/data/);
+  assert.match(dockerfile, /rm -rf \/tmp\/opencode-warmup/);
+});
+
 test("Compose garde le runtime prive et les donnees hors de l'image", () => {
   assert.match(compose, /127\.0\.0\.1:\$\{CST_HOST_PORT:-8080\}:8080/);
   assert.match(compose, /:\/srv\/cst/);
