@@ -93,9 +93,12 @@ const quotaDisplayIdentity = (account: QuotaDisplayAccount): string => {
 };
 
 const quotaDisplayQuality = (account: QuotaDisplayAccount): number => {
-  const reliableSource = ["server", "session", "authenticated"].includes(
-    account.source ?? "",
-  );
+  const reliableSource = [
+    "server",
+    "session",
+    "claude-usage",
+    "authenticated",
+  ].includes(account.source ?? "");
   return (
     (account.hasTokens ? 4 : 0)
     + (reliableSource ? 2 : 0)

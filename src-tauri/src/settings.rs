@@ -7,7 +7,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{mpsc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Mutex, OnceLock,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -350,6 +353,19 @@ const RATE_LIMIT_RESET_MATCH_TOLERANCE_SECS: u64 = 60;
 const RATE_LIMIT_READ_TIMEOUT_SECS: u64 = 18;
 const RATE_LIMIT_CACHE_TTL_SECS: u64 = 60;
 const MODEL_CATALOG_TIMEOUT_SECS: u64 = 12;
+
+/// Endpoint OAuth interroge par la commande `/usage` de Claude Code : c'est la
+/// seule source des fenetres de consommation d'un abonnement claude.ai.
+const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
+const CLAUDE_OAUTH_SCOPES: &str =
+    "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const CLAUDE_USAGE_TIMEOUT_SECS: u64 = 10;
+/// Le token d'acces Claude vit environ une journee. On le renouvelle un peu
+/// avant l'echeance pour ne pas payer un aller-retour 401 a chaque lecture.
+const CLAUDE_TOKEN_REFRESH_MARGIN_SECS: i64 = 120;
 
 impl Default for PoolConfig {
     fn default() -> Self {
@@ -1680,8 +1696,33 @@ mod tests {
         assert_eq!(settings.active_agent_id.as_deref(), Some(CODEX_AGENT_ID));
     }
 
+    /// Aucun test ne doit dependre du reseau. Seules les lectures de quotas
+    /// distantes consultent cet interrupteur : l'armer une fois pour tout le
+    /// binaire de test reste donc deterministe quel que soit l'ordre.
+    fn disable_remote_account_limits() {
+        REMOTE_ACCOUNT_LIMITS_DISABLED.store(true, Ordering::Relaxed);
+    }
+
+    /// Reponse reelle de `GET /api/oauth/usage` (compte Max), conservee telle
+    /// quelle : c'est le contrat que le parseur doit respecter.
+    const CLAUDE_USAGE_SAMPLE: &str = r#"{
+      "five_hour": {"utilization": 61.0, "resets_at": "2026-07-26T17:20:00.499219+00:00",
+        "limit_dollars": null, "used_dollars": null, "remaining_dollars": null},
+      "seven_day": {"utilization": 66.0, "resets_at": "2026-07-29T20:00:00.499238+00:00",
+        "limit_dollars": null, "used_dollars": null, "remaining_dollars": null},
+      "seven_day_oauth_apps": null, "seven_day_opus": null, "seven_day_sonnet": null,
+      "extra_usage": {"is_enabled": false, "monthly_limit": null},
+      "limits": [
+        {"kind": "session", "group": "session", "percent": 61, "severity": "normal",
+         "resets_at": "2026-07-26T17:20:00.499219+00:00", "scope": null, "is_active": false},
+        {"kind": "weekly_all", "group": "weekly", "percent": 66, "severity": "normal",
+         "resets_at": "2026-07-29T20:00:00.499238+00:00", "scope": null, "is_active": true}
+      ]
+    }"#;
+
     #[test]
-    fn claude_limit_view_reports_auth_without_calling_codex_rate_limits() {
+    fn claude_limit_view_stays_connected_without_calling_codex_rate_limits() {
+        disable_remote_account_limits();
         let home = fresh_account_home("claude-limit-auth");
         fs::create_dir_all(&home).unwrap();
         fs::write(
@@ -1699,12 +1740,196 @@ mod tests {
 
         assert_eq!(view.provider, Provider::Claude);
         assert!(view.has_tokens);
+        // Lecture distante coupee : le compte reste connecte, sans erreur ni
+        // mesure inventee, et surtout sans `codex app-server`.
         assert_eq!(view.source, "authenticated");
         assert!(!view.refreshing);
         assert!(view.error.is_none());
         assert!(view.buckets.is_empty());
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_limit_placeholder_requests_a_background_refresh() {
+        let home = fresh_account_home("claude-limit-placeholder");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"claude-token"}}"#,
+        )
+        .unwrap();
+        let mut account = account_for_home(&home);
+        account.provider = Provider::Claude;
+
+        let view = account_limit_placeholder(&account);
+
+        assert!(view.has_tokens);
+        assert!(view.refreshing);
+        assert_eq!(view.source, "refreshing");
+        assert!(account_limits_need_remote_refresh(&[view]));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_limit_placeholder_stays_authenticated() {
+        let home = fresh_account_home("opencode-limit-placeholder");
+        fs::create_dir_all(home.join("data").join("opencode")).unwrap();
+        fs::write(
+            home.join("data").join("opencode").join("auth.json"),
+            r#"{"anthropic":{"type":"api","key":"token"}}"#,
+        )
+        .unwrap();
+        let mut account = account_for_home(&home);
+        account.provider = Provider::OpenCode;
+        account.inference_provider = Some("anthropic".to_string());
+
+        let view = account_limit_placeholder(&account);
+
+        assert!(view.has_tokens);
+        assert!(!view.refreshing);
+        assert_eq!(view.source, "authenticated");
+        assert!(!account_limits_need_remote_refresh(&[view]));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_usage_payload_fills_session_and_weekly_windows() {
+        let payload = serde_json::from_str::<Value>(CLAUDE_USAGE_SAMPLE).expect("payload");
+
+        let buckets = claude_usage_buckets(&payload, Some("max"));
+
+        let session = bucket_for_window(&buckets, SESSION_LIMIT_MINS).expect("fenetre 5 h");
+        assert_eq!(session.used_percent, Some(61.0));
+        assert_eq!(session.resets_at, 1_785_086_400);
+        assert_eq!(session.plan_type.as_deref(), Some("max"));
+        assert!(session.rate_limit_reached_type.is_none());
+
+        let weekly = bucket_for_window(&buckets, WEEKLY_LIMIT_MINS).expect("fenetre hebdo");
+        assert_eq!(weekly.used_percent, Some(66.0));
+        assert_eq!(weekly.resets_at, 1_785_355_200);
+
+        // Une seule fenetre par duree : la jauge hebdomadaire ne doit pas etre
+        // disputee par les fenetres par modele.
+        assert_eq!(buckets.len(), 2);
+    }
+
+    #[test]
+    fn claude_usage_falls_back_to_the_limits_array() {
+        let payload = json!({
+            "five_hour": null,
+            "seven_day": null,
+            "limits": [
+                {"kind": "session", "percent": 12, "resets_at": 1_785_086_400_i64},
+                {"kind": "weekly_all", "percent": 34, "resets_at": "2026-07-29T20:00:00+00:00"}
+            ]
+        });
+
+        let buckets = claude_usage_buckets(&payload, None);
+
+        assert_eq!(
+            bucket_for_window(&buckets, SESSION_LIMIT_MINS).and_then(|bucket| bucket.used_percent),
+            Some(12.0)
+        );
+        let weekly = bucket_for_window(&buckets, WEEKLY_LIMIT_MINS).expect("fenetre hebdo");
+        assert_eq!(weekly.used_percent, Some(34.0));
+        assert_eq!(weekly.resets_at, 1_785_355_200);
+    }
+
+    #[test]
+    fn claude_usage_skips_windows_without_measurement() {
+        // Une fenetre absente ne doit pas produire une jauge a 0 %, qui ferait
+        // croire a un quota intact.
+        let payload = json!({ "five_hour": null, "seven_day": null, "limits": [] });
+
+        assert!(claude_usage_buckets(&payload, None).is_empty());
+    }
+
+    #[test]
+    fn claude_usage_marks_an_exhausted_window_as_reached() {
+        let payload = json!({
+            "five_hour": {"utilization": 100.0, "resets_at": "2026-07-26T17:20:00+00:00"}
+        });
+
+        let buckets = claude_usage_buckets(&payload, None);
+        let session = bucket_for_window(&buckets, SESSION_LIMIT_MINS).expect("fenetre 5 h");
+
+        assert_eq!(
+            session.rate_limit_reached_type.as_deref(),
+            Some("rate_limit_reached")
+        );
+    }
+
+    #[test]
+    fn claude_credentials_refresh_preserves_unknown_fields() {
+        let home = fresh_account_home("claude-credentials-refresh");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-refresh",
+                "expiresAt":1,"subscriptionType":"max","rateLimitTier":"default_claude"},
+                "otherProvider":{"token":"keep-me"}}"#,
+        )
+        .unwrap();
+
+        persist_claude_credentials(
+            &home,
+            &ClaudeRefreshedTokens {
+                access_token: "new".to_string(),
+                refresh_token: Some("new-refresh".to_string()),
+                expires_at_ms: Some(42),
+                refresh_token_expires_at_ms: None,
+                scopes: None,
+            },
+        )
+        .expect("ecriture credentials");
+
+        let stored = read_claude_credentials(&home).expect("relecture");
+        assert_eq!(stored.access_token, "new");
+        assert_eq!(stored.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(stored.expires_at_ms, Some(42));
+        // Le plan et les cles etrangeres au renouvellement survivent.
+        assert_eq!(stored.subscription_type.as_deref(), Some("max"));
+        let raw =
+            serde_json::from_slice::<Value>(&fs::read(home.join(".credentials.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw.pointer("/otherProvider/token").and_then(Value::as_str),
+            Some("keep-me")
+        );
+        assert_eq!(
+            raw.pointer("/claudeAiOauth/rateLimitTier")
+                .and_then(Value::as_str),
+            Some("default_claude")
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_credentials_expiry_uses_the_refresh_margin() {
+        let now = 1_785_000_000;
+        let fresh = ClaudeOauthCredentials {
+            access_token: "token".to_string(),
+            refresh_token: None,
+            expires_at_ms: Some((now + 3_600) * 1000),
+            subscription_type: None,
+        };
+        let stale = ClaudeOauthCredentials {
+            expires_at_ms: Some((now + 30) * 1000),
+            ..fresh.clone()
+        };
+        let undated = ClaudeOauthCredentials {
+            expires_at_ms: None,
+            ..fresh.clone()
+        };
+
+        assert!(!fresh.is_expired(now));
+        assert!(stale.is_expired(now));
+        // Sans horodatage, on tente la lecture plutot que de bruler un refresh.
+        assert!(!undated.is_expired(now));
     }
 
     #[test]
@@ -2800,9 +3025,8 @@ fn account_limit_cache_signature(settings: &AppSettings) -> String {
 fn account_limit_placeholder(account: &AccountProfile) -> AccountLimitView {
     let now = now_unix();
     let has_tokens = account_has_auth_tokens(account);
-    let authenticated_without_remote =
-        has_tokens && matches!(account.provider, Provider::Claude | Provider::OpenCode);
-    let refreshing = has_tokens && account.provider == Provider::Codex;
+    let refreshing = has_tokens && provider_reads_remote_limits(account.provider);
+    let authenticated_without_remote = has_tokens && !refreshing;
 
     AccountLimitView {
         id: account.id.clone(),
@@ -2837,13 +3061,13 @@ fn prepare_cached_limit_rows(rows: &mut [AccountLimitView], refreshing: bool) {
     for row in rows {
         row.session_remaining_secs = row.session_reset_at.map(|value| (value - now).max(0));
         row.weekly_remaining_secs = row.weekly_reset_at.map(|value| (value - now).max(0));
-        row.refreshing = refreshing && row.provider == Provider::Codex && row.has_tokens;
+        row.refreshing = refreshing && provider_reads_remote_limits(row.provider) && row.has_tokens;
     }
 }
 
 fn account_limits_need_remote_refresh(rows: &[AccountLimitView]) -> bool {
     rows.iter()
-        .any(|row| row.provider == Provider::Codex && row.has_tokens)
+        .any(|row| provider_reads_remote_limits(row.provider) && row.has_tokens)
 }
 
 fn store_account_limit_cache(signature: String, mut rows: Vec<AccountLimitView>) {
@@ -2963,11 +3187,31 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
     let mut source = "none";
 
     if has_tokens && account.provider == Provider::Claude {
-        // Claude Code ne fournit pas l'equivalent de `account/rateLimits/read`.
-        // La vue Limites doit tout de meme reconnaitre sa session comme valide
-        // sans lancer par erreur le `codex app-server` avec son home Claude.
-        refreshed_at = Some(now);
-        source = "authenticated";
+        // Claude Code ne fournit pas l'equivalent de `account/rateLimits/read` :
+        // ses quotas viennent de l'endpoint OAuth `/api/oauth/usage`, jamais du
+        // `codex app-server`, qui serait lance avec un home Claude.
+        match read_claude_rate_limits(account, settings) {
+            Ok(claude_buckets) if !claude_buckets.is_empty() => {
+                buckets = claude_buckets;
+                refreshed_at = Some(now);
+                source = "claude-usage";
+            }
+            Ok(_) => {
+                // Session valide mais aucune fenetre publiee (cle API, plan sans
+                // quota d'abonnement, lecture reseau desactivee).
+                refreshed_at = Some(now);
+                source = "authenticated";
+            }
+            Err(message) => {
+                // Une panne reseau ne doit pas faire passer un compte connecte
+                // pour un compte deconnecte : seule la mesure manque. L'erreur
+                // reste exposee pour que l'UI propose une reconnexion quand le
+                // token est reellement revoque.
+                refreshed_at = Some(now);
+                source = "authenticated";
+                error = Some(message);
+            }
+        }
     } else if has_tokens && account.provider == Provider::OpenCode {
         // Les fournisseurs pilotes par OpenCode n'exposent pas un format de
         // quotas commun. La presence du credential suffit a marquer le compte
@@ -3508,6 +3752,399 @@ fn merge_rate_limit_buckets(
 
     normalize_rate_limit_buckets(&mut server_buckets);
     (server_buckets, used_local_snapshot)
+}
+
+// ---------------------------------------------------------------------------
+// Quotas Claude Code (abonnement claude.ai)
+// ---------------------------------------------------------------------------
+
+/// Interrupteur global des lectures reseau de quotas. Les tests unitaires et
+/// les environnements volontairement hors ligne l'activent pour retomber sur la
+/// vue « connecte » sans mesure, au lieu de tenter un aller-retour HTTP.
+static REMOTE_ACCOUNT_LIMITS_DISABLED: AtomicBool = AtomicBool::new(false);
+
+fn remote_account_limits_disabled() -> bool {
+    REMOTE_ACCOUNT_LIMITS_DISABLED.load(Ordering::Relaxed)
+        || env::var("CST_DISABLE_REMOTE_ACCOUNT_LIMITS")
+            .is_ok_and(|value| !matches!(value.trim(), "" | "0"))
+}
+
+/// Fournisseurs dont les quotas se lisent a distance, et qui doivent donc
+/// participer au rafraichissement en arriere-plan. OpenCode reste purement
+/// local : la presence du credential suffit a le declarer connecte.
+fn provider_reads_remote_limits(provider: Provider) -> bool {
+    matches!(provider, Provider::Codex | Provider::Claude)
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeOauthCredentials {
+    access_token: String,
+    refresh_token: Option<String>,
+    /// Epoch en millisecondes, tel qu'ecrit par Claude Code.
+    expires_at_ms: Option<i64>,
+    subscription_type: Option<String>,
+}
+
+impl ClaudeOauthCredentials {
+    fn is_expired(&self, now: i64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expires_at| expires_at / 1000 - CLAUDE_TOKEN_REFRESH_MARGIN_SECS <= now)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeRefreshedTokens {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at_ms: Option<i64>,
+    refresh_token_expires_at_ms: Option<i64>,
+    scopes: Option<Vec<String>>,
+}
+
+fn claude_credentials_path(home: &Path) -> PathBuf {
+    home.join(".credentials.json")
+}
+
+fn parse_claude_credentials(value: &Value) -> Option<ClaudeOauthCredentials> {
+    let oauth = value.get("claudeAiOauth")?;
+    let access_token = oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?
+        .to_string();
+
+    Some(ClaudeOauthCredentials {
+        access_token,
+        refresh_token: oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToString::to_string),
+        expires_at_ms: oauth.get("expiresAt").and_then(Value::as_i64),
+        subscription_type: oauth
+            .get("subscriptionType")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|plan| !plan.is_empty())
+            .map(ToString::to_string),
+    })
+}
+
+fn read_claude_credentials(home: &Path) -> Result<ClaudeOauthCredentials, String> {
+    let path = claude_credentials_path(home);
+    let content =
+        fs::read(&path).map_err(|error| format!("credentials Claude illisibles: {error}"))?;
+    let value = serde_json::from_slice::<Value>(&content)
+        .map_err(|error| format!("credentials Claude invalides: {error}"))?;
+    parse_claude_credentials(&value)
+        .ok_or_else(|| "credentials Claude sans accessToken: connexion requise".to_string())
+}
+
+static CLAUDE_CREDENTIALS_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Le refresh token de Claude Code tourne a chaque echange : oublier de
+/// reecrire `.credentials.json` deconnecterait le CLI a l'expiration suivante.
+/// On preserve donc les cles inconnues du fichier et on ecrit atomiquement.
+fn persist_claude_credentials(
+    home: &Path,
+    refreshed: &ClaudeRefreshedTokens,
+) -> Result<(), String> {
+    let path = claude_credentials_path(home);
+    let _guard = CLAUDE_CREDENTIALS_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut root = fs::read(&path)
+        .ok()
+        .and_then(|content| serde_json::from_slice::<Value>(&content).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let Some(entry) = root
+        .as_object_mut()
+        .map(|object| object.entry("claudeAiOauth").or_insert_with(|| json!({})))
+    else {
+        return Err("credentials Claude non modifiables".to_string());
+    };
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    let Some(oauth) = entry.as_object_mut() else {
+        return Err("credentials Claude non modifiables".to_string());
+    };
+
+    oauth.insert("accessToken".to_string(), json!(refreshed.access_token));
+    if let Some(refresh_token) = &refreshed.refresh_token {
+        oauth.insert("refreshToken".to_string(), json!(refresh_token));
+    }
+    if let Some(expires_at) = refreshed.expires_at_ms {
+        oauth.insert("expiresAt".to_string(), json!(expires_at));
+    }
+    if let Some(expires_at) = refreshed.refresh_token_expires_at_ms {
+        oauth.insert("refreshTokenExpiresAt".to_string(), json!(expires_at));
+    }
+    if let Some(scopes) = &refreshed.scopes {
+        oauth.insert("scopes".to_string(), json!(scopes));
+    }
+
+    let serialized = serde_json::to_vec_pretty(&root)
+        .map_err(|error| format!("credentials Claude non serialisables: {error}"))?;
+    crate::fs_util::atomic_write(&path, serialized)
+        .map_err(|error| format!("credentials Claude non enregistrables: {error}"))
+}
+
+fn claude_http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CLAUDE_USAGE_TIMEOUT_SECS))
+        .user_agent(concat!("codex-switch-terminal/", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy_url) = proxy_url {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url).map_err(|error| format!("proxy invalide: {error}"))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|error| format!("client HTTP indisponible: {error}"))
+}
+
+async fn request_claude_usage(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<(u16, Option<Value>), String> {
+    let response = client
+        .get(CLAUDE_USAGE_URL)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Content-Type", "application/json")
+        .header("anthropic-beta", CLAUDE_OAUTH_BETA)
+        .send()
+        .await
+        .map_err(|error| format!("lecture des quotas Claude impossible: {error}"))?;
+    let status = response.status().as_u16();
+    Ok((status, response.json::<Value>().await.ok()))
+}
+
+async fn request_claude_token_refresh(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<ClaudeRefreshedTokens, String> {
+    let response = client
+        .post(CLAUDE_OAUTH_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+            "scope": CLAUDE_OAUTH_SCOPES,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("renouvellement du token Claude impossible: {error}"))?;
+
+    let status = response.status().as_u16();
+    let payload = response.json::<Value>().await.ok();
+    if status != 200 {
+        return Err(format!(
+            "session Claude expiree ({status}) : reconnexion requise"
+        ));
+    }
+
+    let payload = payload.ok_or_else(|| "reponse de renouvellement illisible".to_string())?;
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "renouvellement Claude sans access_token".to_string())?
+        .to_string();
+    let now_ms = now_unix() * 1000;
+
+    Ok(ClaudeRefreshedTokens {
+        access_token,
+        refresh_token: payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToString::to_string),
+        expires_at_ms: payload
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .map(|expires_in| now_ms + expires_in * 1000),
+        refresh_token_expires_at_ms: payload
+            .get("refresh_token_expires_in")
+            .and_then(Value::as_i64)
+            .map(|expires_in| now_ms + expires_in * 1000),
+        scopes: payload
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(|scope| scope.split_whitespace().map(ToString::to_string).collect()),
+    })
+}
+
+/// Claude Code et nos propres chats rafraichissent le meme `.credentials.json`.
+/// On relit donc le disque avant de bruler le refresh token : si un autre
+/// processus vient d'en obtenir un neuf, le notre est deja invalide.
+async fn claude_access_token_after_refresh(
+    client: &reqwest::Client,
+    home: &Path,
+    previous_access_token: &str,
+) -> Result<String, String> {
+    let current = read_claude_credentials(home)?;
+    if current.access_token != previous_access_token && !current.is_expired(now_unix()) {
+        return Ok(current.access_token);
+    }
+
+    let refresh_token = current
+        .refresh_token
+        .ok_or_else(|| "session Claude expiree : reconnexion requise".to_string())?;
+    let tokens = request_claude_token_refresh(client, &refresh_token).await?;
+    persist_claude_credentials(home, &tokens)?;
+    Ok(tokens.access_token)
+}
+
+fn claude_usage_payload(status: u16, payload: Option<Value>) -> Result<Value, String> {
+    match status {
+        200 => payload.ok_or_else(|| "reponse de quotas Claude illisible".to_string()),
+        401 | 403 => Err(format!(
+            "session Claude refusee ({status}) : reconnexion requise"
+        )),
+        429 => Err("quotas Claude temporairement indisponibles (429)".to_string()),
+        _ => Err(format!("lecture des quotas Claude en echec ({status})")),
+    }
+}
+
+/// Lit les fenetres de consommation d'un compte Claude Code.
+///
+/// Claude Code n'expose pas d'equivalent de `account/rateLimits/read` : lancer
+/// `codex app-server` avec un home Claude ne renverrait rien. La mesure vient
+/// de `/api/oauth/usage`, exactement comme la commande `/usage` du CLI.
+fn read_claude_rate_limits(
+    account: &AccountProfile,
+    settings: &AppSettings,
+) -> Result<Vec<AccountRateLimitBucketView>, String> {
+    if remote_account_limits_disabled() {
+        return Ok(Vec::new());
+    }
+
+    let home = expand_home(&account.codex_home)?;
+    let credentials = read_claude_credentials(&home)?;
+    let proxy_url = proxy_url_for_account(account, settings);
+    let client = claude_http_client(proxy_url.as_deref())?;
+    // `account_limit_view` s'execute toujours sur un thread OS dedie (voir
+    // `account_limit_views_uncached`) : y demarrer un runtime est donc sur.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("runtime HTTP indisponible: {error}"))?;
+
+    let payload = runtime.block_on(async {
+        let mut access_token = credentials.access_token.clone();
+        let mut refreshed = false;
+
+        if credentials.is_expired(now_unix()) {
+            access_token = claude_access_token_after_refresh(&client, &home, &access_token).await?;
+            refreshed = true;
+        }
+
+        let (mut status, mut payload) = request_claude_usage(&client, &access_token).await?;
+        if status == 401 && !refreshed {
+            let access_token =
+                claude_access_token_after_refresh(&client, &home, &access_token).await?;
+            let retried = request_claude_usage(&client, &access_token).await?;
+            status = retried.0;
+            payload = retried.1;
+        }
+
+        claude_usage_payload(status, payload)
+    })?;
+
+    Ok(claude_usage_buckets(
+        &payload,
+        credentials.subscription_type.as_deref(),
+    ))
+}
+
+/// Fenetres exposees par `/api/oauth/usage`, alignees sur les deux jauges de la
+/// vue Limites. Le second nom est la cle equivalente du tableau `limits[]`, qui
+/// sert de repli quand la fenetre racine est absente.
+const CLAUDE_USAGE_WINDOWS: [(&str, &str, i64, &str); 2] = [
+    ("five_hour", "session", SESSION_LIMIT_MINS, "primary"),
+    ("seven_day", "weekly_all", WEEKLY_LIMIT_MINS, "secondary"),
+];
+
+fn claude_usage_buckets(
+    payload: &Value,
+    plan_type: Option<&str>,
+) -> Vec<AccountRateLimitBucketView> {
+    let mut buckets = Vec::new();
+
+    for (key, limits_kind, window_duration_mins, bucket) in CLAUDE_USAGE_WINDOWS {
+        let Some((used_percent, resets_at)) = claude_usage_window(payload, key)
+            .or_else(|| claude_usage_limits_entry(payload, limits_kind))
+        else {
+            continue;
+        };
+
+        buckets.push(AccountRateLimitBucketView {
+            limit_id: "claude".to_string(),
+            limit_name: Some(key.to_string()),
+            bucket: bucket.to_string(),
+            window_duration_mins,
+            resets_at,
+            used_percent: Some(used_percent),
+            rate_limit_reached_type: (used_percent >= 100.0)
+                .then(|| "rate_limit_reached".to_string()),
+            plan_type: plan_type.map(ToString::to_string),
+        });
+    }
+
+    normalize_rate_limit_buckets(&mut buckets);
+    buckets
+}
+
+/// `utilization` est un pourcentage 0-100 et `resets_at` un horodatage RFC 3339.
+/// Une fenetre inactive est renvoyee a `null` : elle ne doit pas produire de
+/// jauge a 0 %, qui ferait croire a un quota intact.
+fn claude_usage_window(payload: &Value, key: &str) -> Option<(f64, i64)> {
+    let window = payload.get(key).filter(|value| !value.is_null())?;
+    let used_percent = window.get("utilization").and_then(json_f64)?;
+    let resets_at = claude_reset_timestamp(window.get("resets_at")?)?;
+    Some((used_percent.clamp(0.0, 100.0), resets_at))
+}
+
+fn claude_usage_limits_entry(payload: &Value, kind: &str) -> Option<(f64, i64)> {
+    payload
+        .get("limits")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind))
+        .and_then(|entry| {
+            let used_percent = entry.get("percent").and_then(json_f64)?;
+            let resets_at = claude_reset_timestamp(entry.get("resets_at")?)?;
+            Some((used_percent.clamp(0.0, 100.0), resets_at))
+        })
+}
+
+/// L'API renvoie du RFC 3339, mais le CLI sait aussi lire des epochs : on
+/// accepte les deux plutot que de perdre la fenetre sur un changement de format.
+fn claude_reset_timestamp(value: &Value) -> Option<i64> {
+    if let Some(text) = value.as_str() {
+        return chrono::DateTime::parse_from_rfc3339(text.trim())
+            .ok()
+            .map(|timestamp| timestamp.timestamp());
+    }
+
+    let number = json_f64(value)?;
+    if !number.is_finite() || number <= 0.0 {
+        return None;
+    }
+    Some(if number > 1e12 {
+        (number / 1000.0) as i64
+    } else {
+        number as i64
+    })
 }
 
 fn read_server_rate_limits(

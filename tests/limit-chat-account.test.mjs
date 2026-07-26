@@ -161,19 +161,65 @@ test("la connexion Claude Code utilise son flux auth et pas codex login", () => 
   assert.doesNotMatch(main, /title="Ouvrir un terminal de connexion \(codex login\)/);
 });
 
-test("Limites identifie Claude sans interroger le serveur de quotas Codex", () => {
+test("Limites lit les quotas Claude sans interroger le serveur de quotas Codex", () => {
   assert.match(settingsBackend, /pub provider: Provider,/);
+  // Les quotas Claude viennent de l'endpoint OAuth du CLI, jamais d'un
+  // `codex app-server` lance avec un home Claude.
   assert.match(
     settingsBackend,
-    /if has_tokens && account\.provider == Provider::Claude[\s\S]*?source = "authenticated";/,
+    /const CLAUDE_USAGE_URL: &str = "https:\/\/api\.anthropic\.com\/api\/oauth\/usage";/,
   );
-  assert.match(main, /account\.source === "authenticated"/);
+  assert.match(
+    settingsBackend,
+    /if has_tokens && account\.provider == Provider::Claude \{[\s\S]*?read_claude_rate_limits\(account, settings\)[\s\S]*?source = "claude-usage";/,
+  );
+  const claudeBranch = settingsBackend.slice(
+    settingsBackend.indexOf("if has_tokens && account.provider == Provider::Claude {"),
+    settingsBackend.indexOf("} else if has_tokens && account.provider == Provider::OpenCode {"),
+  );
+  assert.doesNotMatch(claudeBranch, /read_server_rate_limits/);
+  assert.match(main, /account\.source === "claude-usage"/);
   assert.match(
     main,
     /const limitRowProvider = \(account: AccountLimitView\)[\s\S]*?accountById\(account\.id\)[\s\S]*?accountProvider\(configured\)/,
   );
   assert.match(main, /provider === "claude" \? "Claude" : provider === "opencode" \? "OpenCode" : "Codex"/);
-  assert.match(main, /provider !== "codex"[\s\S]*?limit-card-unavailable/);
+});
+
+test("une panne de lecture Claude n'efface pas la session du compte", () => {
+  // Sans reseau la mesure manque, mais le compte reste connecte : seule
+  // l'erreur remonte, pour que l'UI propose une reconnexion si le token est
+  // reellement revoque.
+  assert.match(
+    settingsBackend,
+    /Err\(message\) => \{[\s\S]*?source = "authenticated";\s*error = Some\(message\);/,
+  );
+  assert.match(main, /account\.source === "authenticated"/);
+});
+
+test("les jauges de quota s'affichent pour Codex et Claude, pas pour OpenCode", () => {
+  assert.match(
+    main,
+    /const providerExposesQuotas = \(provider: Provider\): boolean =>\s*provider === "codex" \|\| provider === "claude";/,
+  );
+  assert.match(main, /!providerExposesQuotas\(provider\)[\s\S]*?limit-card-unavailable/);
+  assert.match(
+    main,
+    /if \(!providerExposesQuotas\(limitRowProvider\(account\)\)\) return "connected";/,
+  );
+  // La carte Claude ne doit plus etre court-circuitee par un test de provider.
+  assert.doesNotMatch(main, /provider !== "codex"[\s\S]{0,200}limit-card-unavailable/);
+});
+
+test("Claude participe au rafraichissement de quotas en arriere-plan", () => {
+  assert.match(
+    settingsBackend,
+    /fn provider_reads_remote_limits\(provider: Provider\) -> bool \{\s*matches!\(provider, Provider::Codex \| Provider::Claude\)/,
+  );
+  assert.match(
+    settingsBackend,
+    /fn account_limits_need_remote_refresh[\s\S]*?provider_reads_remote_limits\(row\.provider\) && row\.has_tokens/,
+  );
 });
 
 test("Limites marque aussi OpenCode connecte sans appeler les quotas Codex", () => {

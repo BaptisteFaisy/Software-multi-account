@@ -23897,7 +23897,10 @@ const renderLimitsPanel = () => {
   const nextSession = nextLimitTimestamp("sessionResetAt");
   const nextWeekly = nextLimitTimestamp("weeklyResetAt");
   const availableCount = displayedAccounts.filter(
-    (account) => account.source === "server" || account.source === "session",
+    (account) =>
+      account.source === "server"
+      || account.source === "session"
+      || account.source === "claude-usage",
   ).length;
 
   return `
@@ -23973,6 +23976,12 @@ const limitRowProvider = (account: AccountLimitView): Provider => {
         : "codex";
 };
 
+// Codex publie ses fenêtres via `account/rateLimits/read`, Claude via
+// l'endpoint OAuth `/api/oauth/usage`. Les runtimes OpenCode agrègent des
+// fournisseurs sans format de quota commun : eux seuls restent sans jauge.
+const providerExposesQuotas = (provider: Provider): boolean =>
+  provider === "codex" || provider === "claude";
+
 const renderLimitMeter = (
   label: string,
   windowClass: "session" | "weekly",
@@ -24018,11 +24027,11 @@ const renderLimitCard = (account: AccountLimitView) => {
   );
   const configured = accountById(account.id);
   const providerName = configured ? accountProviderLabel(configured) : providerLabel(provider);
-  const rowTitle = account.error && provider === "codex"
+  const rowTitle = account.error && providerExposesQuotas(provider)
     ? ` title="${escapeAttr(account.error)}"`
     : "";
-  const quotaContent = provider !== "codex"
-    ? `<div class="limit-card-unavailable"><i data-lucide="${provider === "claude" ? "sparkles" : "bot"}"></i><span><strong>Quotas non exposés</strong><small>${escapeHtml(providerName)} ne transmet pas ses fenêtres de consommation à l’application.</small></span></div>`
+  const quotaContent = !providerExposesQuotas(provider)
+    ? `<div class="limit-card-unavailable"><i data-lucide="bot"></i><span><strong>Quotas non exposés</strong><small>${escapeHtml(providerName)} ne transmet pas ses fenêtres de consommation à l’application.</small></span></div>`
     : account.refreshing && !hasFiveHourWindow && !hasWeeklyWindow
       ? `<div class="limit-card-unavailable"><i data-lucide="loader-circle" class="is-spinning"></i><span><strong>Actualisation en cours</strong><small>Le dernier quota serveur arrive en arrière-plan.</small></span></div>`
       : `${hasFiveHourWindow
@@ -24043,7 +24052,7 @@ const renderLimitCard = (account: AccountLimitView) => {
 const limitBadgeClass = (account: AccountLimitView) => {
   if (account.source === "not-received") return "empty";
   if (!account.hasTokens) return "missing";
-  if (limitRowProvider(account) !== "codex") return "connected";
+  if (!providerExposesQuotas(limitRowProvider(account))) return "connected";
   if (account.refreshing) {
     return account.buckets.length > 0 ? "connected" : "empty";
   }
@@ -24051,6 +24060,7 @@ const limitBadgeClass = (account: AccountLimitView) => {
   if (
     account.source === "server" ||
     account.source === "session" ||
+    account.source === "claude-usage" ||
     account.source === "authenticated"
   ) return "connected";
   if (account.source === "server-empty") return "empty";
