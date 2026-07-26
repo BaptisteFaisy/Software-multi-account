@@ -11,6 +11,7 @@ import { escapeHtml, renderMarkdown } from "./markdown";
 import { renderMicrosoftPendingActions } from "../microsoft";
 import type { ChatImageAttachment } from "./image-attachments";
 import { resolveChatTurnWindow } from "./render-window";
+import { CHAT_COMPOSER_MAX_CHARS } from "./message-size";
 import { chatRuntimeShowsStateLabel } from "./status-display";
 import {
   type ChatAgentToolDefinition,
@@ -1078,7 +1079,7 @@ export const renderChatPanel = (
     </footer>` : `<form id="${id("chatComposer")}" data-chat-control="composer" class="chat-composer ${busy ? "is-running" : ""} ${queued ? "has-queued-message" : ""}">
       <div class="chat-composer-box">
         ${renderChatImageAttachments(model.imageAttachments)}
-        <textarea id="${id("chatPrompt")}" data-chat-control="prompt" rows="1" placeholder="${busy ? "Écrivez le prochain message à envoyer…" : `Demandez a ${escapeHtml(model.providerLabel || "l'agent")} de construire quelque chose…`}" aria-label="${busy ? "Prochain message à mettre en attente" : "Message à envoyer"}">${escapeHtml(model.draft)}</textarea>
+        <textarea id="${id("chatPrompt")}" data-chat-control="prompt" rows="1" maxlength="${CHAT_COMPOSER_MAX_CHARS}" placeholder="${busy ? "Écrivez le prochain message à envoyer…" : `Demandez a ${escapeHtml(model.providerLabel || "l'agent")} de construire quelque chose…`}" aria-label="${busy ? "Prochain message à mettre en attente" : "Message à envoyer"}">${escapeHtml(model.draft)}</textarea>
         ${model.favoritePrompts.length ? `<div class="chat-favorite-prompts" data-chat-control="favorite-prompts" role="group" aria-label="Prompts favoris à insérer">
           ${model.favoritePrompts.map((prompt) => {
             const promptId = escapeHtml(prompt.id);

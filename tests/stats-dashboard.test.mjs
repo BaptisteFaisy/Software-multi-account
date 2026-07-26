@@ -201,7 +201,8 @@ test("l'onglet temps de travail charge la mesure locale et exclut explicitement 
   assert.match(main, /invoke<WorkTimeDashboard>\("work_time_dashboard"\)/);
   assert.match(main, /data-work-time-granularity=/);
   assert.match(platform, /case "work_time_dashboard":\s*return api<T>\("GET", "\/api\/work-time"\)/);
-  assert.match(backend, /discussions::is_autonomous_prompt/);
+  // Import simple ou groupe : seule compte la reutilisation du helper partage.
+  assert.match(backend, /discussions::(\{[^}]*)?is_autonomous_prompt/);
   assert.match(backend, /interval\.start_ms <= \*end/);
 });
 

@@ -23,7 +23,7 @@ classique, sans protocole interne supplementaire.
 - Rust et Cargo via rustup
 - Codex CLI ou Claude CLI disponible dans le `PATH`
 - OpenCode dans le `PATH` pour Z.ai, MiniMax, DeepSeek et OpenRouter :
-  `npm install -g opencode-ai`
+  `npm install -g opencode-ai` (l'image serveur l'embarque deja)
 
 ## Demarrage desktop
 
@@ -154,8 +154,13 @@ codex login
 
 Pour un fournisseur annexe, choisis Z.ai, MiniMax, DeepSeek ou OpenRouter dans
 la page **Comptes**. L'application ouvre automatiquement la commande OpenCode
-`auth login --provider <fournisseur>` dans le home isole du nouveau compte ; la
-cle API n'est jamais copiee dans `settings.json`.
+`auth login --provider <fournisseur>` dans le home isole du nouveau compte. Ce
+login n'ouvre aucun navigateur : OpenCode demande la cle API du fournisseur
+directement dans le terminal. Un champ **Cle API** apparait alors sous le
+terminal pour la coller sans passer par le presse-papiers, puis le terminal
+temporaire se ferme des que la connexion est enregistree. Si OpenCode manque
+dans le `PATH`, le message d'installation s'affiche au lieu d'une attente sans
+fin. La cle API n'est jamais copiee dans `settings.json`.
 
 ## Fonctionnalites principales
 

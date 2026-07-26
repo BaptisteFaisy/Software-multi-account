@@ -40,6 +40,9 @@ use tauri::State;
 use uuid::Uuid;
 
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
+/// Seuil de journalisation d'une soumission anormalement grosse. En dessous de
+/// `MAX_PROMPT_BYTES` (qui, lui, rejette) : c'est un signal, pas un refus.
+const OVERSIZED_PROMPT_WARN_BYTES: usize = 32 * 1024;
 const MAX_CHAT_IMAGES: usize = 4;
 const MAX_CHAT_IMAGE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CHAT_IMAGE_TOTAL_BYTES: usize = 100 * 1024 * 1024;
@@ -692,6 +695,19 @@ impl ChatTurnManager {
         };
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err("Le message est trop volumineux".to_string());
+        }
+        // Tout ce que l'application compose elle-meme (amorce de reprise, relais
+        // d'orchestration) est borne en amont bien en dessous de ce seuil. Une
+        // soumission qui l'atteint quand meme est donc anormale : on la trace,
+        // sinon un prochain incident sera aussi difficile a attribuer que
+        // l'injection de competence affichee comme un message utilisateur.
+        if prompt.len() > OVERSIZED_PROMPT_WARN_BYTES {
+            eprintln!(
+                "[chat] prompt volumineux: {} octets (compte {}, chat {})",
+                prompt.len(),
+                request.account_id,
+                request.source_chat_key.as_deref().unwrap_or("-"),
+            );
         }
         let app_settings = settings::load_settings_for_terminal()?;
         let account = app_settings

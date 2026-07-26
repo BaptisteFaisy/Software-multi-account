@@ -48,6 +48,12 @@ import {
   normalizeRemoteClaudeLoginCode,
 } from "./remote-claude-login";
 import {
+  consumeOpenCodeLoginOutput,
+  forgetOpenCodeLoginOutput,
+  normalizeOpenCodeApiKey,
+  openCodeLoginAwaitsApiKey,
+} from "./opencode-login";
+import {
   authenticatedUser,
   bindUserAccountUi,
   closeUserProfileModal,
@@ -163,6 +169,10 @@ import {
   modelCapacityRetryPrompt,
 } from "./chat/capacity";
 import {
+  chatBubbleText,
+  resumeSeedBubbleText,
+} from "./chat/message-size";
+import {
   accountCatalogMatchesLimitRows,
   accountLimitRowsForDisplay,
 } from "./chat/accounts";
@@ -246,9 +256,12 @@ import {
 } from "./chat/runtime";
 import {
   chatIsAtBottom,
+  chatScrollSettleContinues,
+  createChatScrollSettleState,
   pauseChatScrollFollow,
   restoreChatScrollTop,
   updateChatScrollState,
+  type ChatScrollSettleState,
   type ChatScrollState,
   type ChatScrollUserIntent,
 } from "./chat/scroll";
@@ -1668,6 +1681,12 @@ type QueuedChatSubmission = {
   automaticCapacityRetry?: boolean;
   /** Session a reprendre meme si son resume n'est pas encore charge dans l'UI. */
   resumeSessionId?: string | null;
+  /**
+   * Bulle a afficher a la place du prompt. Renseigne uniquement pour les
+   * soumissions engendrees par l'application (amorce de reprise) : le prompt
+   * complet part au modele, mais la conversation n'affiche pas le pave.
+   */
+  displayText?: string;
 };
 
 type ExpertChatPane = {
@@ -8217,23 +8236,77 @@ const captureChatFeedScroll = () => {
   if (feed) rememberChatFeedScroll(feed, chatScrollState);
 };
 
+// Les tours hors ecran portent `content-visibility: auto` : le navigateur ne
+// les met en page qu'a l'approche du viewport. Une reconstruction du fil recree
+// tous les elements et perd leur taille memorisee, donc `scrollHeight` ne vaut
+// plus qu'une fraction de la hauteur reelle. La position restauree est alors
+// ecretee et le fil remonte tout en haut. Cette classe rend la hauteur reelle
+// mesurable, et la mise en page qu'elle declenche amorce au passage la taille
+// memorisee de chaque tour.
+const CHAT_FEED_MEASURING_CLASS = "is-measuring-scroll";
+
+type ChatScrollRestorePass = { frame: number; settle: ChatScrollSettleState };
+
+const chatScrollRestorePasses = new WeakMap<HTMLElement, ChatScrollRestorePass>();
+// Position appliquee par le code : l'evenement `scroll` qu'elle declenche ne
+// doit pas etre pris pour un geste utilisateur.
+const chatProgrammaticScrollTops = new WeakMap<HTMLElement, number>();
+
+const cancelChatFeedScrollRestore = (feed: HTMLElement) => {
+  const pending = chatScrollRestorePasses.get(feed);
+  if (!pending) return;
+  window.cancelAnimationFrame(pending.frame);
+  chatScrollRestorePasses.delete(feed);
+};
+
+const applyChatFeedScrollTop = (feed: HTMLElement, state: ChatScrollState) => {
+  const target = restoreChatScrollTop(state, feed);
+  if (Math.abs(feed.scrollTop - target) > 0.5) {
+    chatProgrammaticScrollTops.set(feed, target);
+    feed.scrollTop = target;
+  }
+  if (state.followLatest) state.scrollTop = feed.scrollTop;
+};
+
 const restoreChatFeedScroll = (
   feed: HTMLElement | null,
   state: ChatScrollState = chatScrollState,
+  rebuilt = false,
 ) => {
   if (!feed) return;
-  const applyPosition = () => {
-    feed.scrollTop = restoreChatScrollTop(state, feed);
-    if (state.followLatest) state.scrollTop = feed.scrollTop;
-  };
-  applyPosition();
+  cancelChatFeedScrollRestore(feed);
+
+  if (rebuilt) {
+    // La lecture de `scrollHeight` force la mise en page tant que la classe est
+    // posee ; elle est retiree avant la peinture, donc rien ne clignote.
+    feed.classList.add(CHAT_FEED_MEASURING_CLASS);
+    applyChatFeedScrollTop(feed, state);
+    feed.classList.remove(CHAT_FEED_MEASURING_CLASS);
+  } else {
+    applyChatFeedScrollTop(feed, state);
+  }
 
   // Le premier calcul peut preceder la mise en page finale (police, icones,
-  // changement de hauteur du composer). Un second passage garde le dernier
-  // message visible sans contrer une remontee effectuee entre-temps.
-  window.requestAnimationFrame(() => {
-    if (feed.isConnected && state.followLatest) applyPosition();
-  });
+  // images, changement de hauteur du composer). On reapplique la position tant
+  // que la hauteur bouge, y compris quand le suivi est en pause : sinon une
+  // remontee de lecture atterrit sur une hauteur intermediaire et y reste.
+  const settle = createChatScrollSettleState(feed);
+  const step = () => {
+    const pending = chatScrollRestorePasses.get(feed);
+    if (!pending) return;
+    if (!feed.isConnected) {
+      chatScrollRestorePasses.delete(feed);
+      return;
+    }
+    const again = chatScrollSettleContinues(pending.settle, state, feed);
+    applyChatFeedScrollTop(feed, state);
+    if (!again) {
+      chatScrollRestorePasses.delete(feed);
+      return;
+    }
+    pending.frame = window.requestAnimationFrame(step);
+  };
+  chatScrollRestorePasses.set(feed, { settle, frame: window.requestAnimationFrame(step) });
 };
 
 const resetChatFeedScroll = () => {
@@ -8252,6 +8325,9 @@ const bindChatFeedScroll = (
   let userScrollIntent: ChatScrollUserIntent = "none";
   let clearUserScrollIntentTimer: number | null = null;
   const markUserScrollIntent = (intent: Exclude<ChatScrollUserIntent, "none">) => {
+    // Un geste explicite reprend la main : le rattrapage de mise en page ne
+    // doit jamais tirer le fil sous les doigts de l'utilisateur.
+    cancelChatFeedScrollRestore(feed);
     userScrollIntent = intent;
     if (clearUserScrollIntentTimer !== null) {
       window.clearTimeout(clearUserScrollIntentTimer);
@@ -8271,17 +8347,25 @@ const bindChatFeedScroll = (
     const previousScrollTop = state.scrollTop;
     const movedAway = feed.scrollTop < previousScrollTop - 0.5;
     const movedTowardLatest = feed.scrollTop > previousScrollTop + 0.5;
-    const userIntent = scrollbarPointerDown
-      ? movedAway
-        ? "away"
-        : movedTowardLatest
-          ? "toward-latest"
-          : "none"
-      : userScrollIntent === "away" && movedAway
-        ? "away"
-        : userScrollIntent === "toward-latest" && movedTowardLatest
-          ? "toward-latest"
-          : "none";
+    // Une position posee par le code arrive ici comme n'importe quel scroll.
+    // Sans cette garde, une restauration ecretee juste apres un geste passerait
+    // pour une remontee volontaire et remplacerait la position memorisee.
+    const appliedByCode = chatProgrammaticScrollTops.get(feed);
+    const programmatic =
+      appliedByCode !== undefined && Math.abs(feed.scrollTop - appliedByCode) <= 0.5;
+    const userIntent: ChatScrollUserIntent = programmatic
+      ? "none"
+      : scrollbarPointerDown
+        ? movedAway
+          ? "away"
+          : movedTowardLatest
+            ? "toward-latest"
+            : "none"
+        : userScrollIntent === "away" && movedAway
+          ? "away"
+          : userScrollIntent === "toward-latest" && movedTowardLatest
+            ? "toward-latest"
+            : "none";
     rememberChatFeedScroll(feed, state, userIntent);
     if (userIntent !== "none") markUserScrollIntent(userIntent);
   }, { passive: true });
@@ -8308,6 +8392,7 @@ const bindChatFeedScroll = (
       event.pointerType === "mouse" &&
       feed.scrollHeight > feed.clientHeight &&
       event.clientX >= bounds.left + feed.clientWidth;
+    if (scrollbarPointerDown) cancelChatFeedScrollRestore(feed);
     if (scrollbarPointerDown && feed.scrollTop > 0) pauseChatScrollFollow(state, feed);
   }, { passive: true });
   feed.addEventListener("pointerup", () => {
@@ -8399,7 +8484,9 @@ const refreshChatFeed = () => {
   refreshChatSyncIndicator();
   if (feedPatchRoot) renderIcons(feedPatchRoot);
   if (runtimeChanged && panel) renderIcons(panel);
-  if (feedChanged) restoreChatFeedScroll(feed);
+  // Le fil entier a ete reconstruit quand le patch retourne le conteneur : les
+  // tailles memorisees des tours sont perdues, la hauteur doit etre remesuree.
+  if (feedChanged) restoreChatFeedScroll(feed, chatScrollState, feedPatchRoot === feed);
 };
 
 const stopChatTurnPoll = () => {
@@ -8791,7 +8878,7 @@ const sendChatMessage = async (
     ...chatMessages,
     {
       role: "user",
-      text: prompt,
+      text: chatBubbleText(prompt, submission.displayText),
       timestamp: Math.floor(Date.now() / 1000),
       deliveryState: "pending",
     },
@@ -9847,10 +9934,14 @@ const captureExpertChatScroll = (pane: ExpertChatPane, root = expertChatPaneRoot
   rememberChatFeedScroll(feed, pane);
 };
 
-const restoreExpertChatScroll = (pane: ExpertChatPane, root = expertChatPaneRoot(pane)) => {
+const restoreExpertChatScroll = (
+  pane: ExpertChatPane,
+  root = expertChatPaneRoot(pane),
+  rebuilt = false,
+) => {
   const feed = root?.querySelector<HTMLElement>("[data-chat-control='feed']");
   if (!feed) return;
-  restoreChatFeedScroll(feed, pane);
+  restoreChatFeedScroll(feed, pane, rebuilt);
 };
 
 const captureAllExpertChatScroll = () => expertChatPanes.forEach((pane) => captureExpertChatScroll(pane));
@@ -9938,7 +10029,7 @@ const refreshExpertChatFeed = (pane: ExpertChatPane) => {
   refreshExpertChatSyncIndicator(pane);
   if (feedPatchRoot) renderIcons(feedPatchRoot);
   if (runtimeChanged) renderIcons(root);
-  if (feedChanged) restoreExpertChatScroll(pane, root);
+  if (feedChanged) restoreExpertChatScroll(pane, root, feedPatchRoot === feed);
 };
 
 const syncExpertChatHistoryUi = (pane: ExpertChatPane, root: HTMLElement): void => {
@@ -9988,7 +10079,8 @@ const refreshExpertChatPane = (pane: ExpertChatPane) => {
       Math.min(selectionEnd, nextPrompt.value.length),
     );
   }
-  restoreExpertChatScroll(pane, nextRoot);
+  // La fenetre a ete re-rendue entierement : les tours sont des elements neufs.
+  restoreExpertChatScroll(pane, nextRoot, true);
 };
 
 const stopExpertChatTurnPoll = (pane: ExpertChatPane) => {
@@ -10627,7 +10719,7 @@ const sendExpertChatMessage = async (
     ...pane.messages,
     {
       role: "user",
-      text: prompt,
+      text: chatBubbleText(prompt, submission.displayText),
       timestamp: Math.floor(Date.now() / 1000),
       deliveryState: "pending",
     },
@@ -11363,6 +11455,9 @@ const resumeDiscussionInChat = async (
   const transferSubmission: QueuedChatSubmission | null = transferSnapshot
     ? {
         prompt,
+        // L'amorce porte tout l'historique de la conversation : elle part en
+        // entier au modele, mais la bulle n'en montre qu'un resume.
+        displayText: resumeSeedBubbleText(prompt),
         imageAttachments: [],
         accountId: targetAccount.id,
         mode: "build",
@@ -11770,7 +11865,7 @@ const bindExpertChatGridUi = () => {
     const root = expertChatPaneRoot(pane);
     if (root) {
       bindExpertChatPaneUi(pane, root);
-      restoreExpertChatScroll(pane, root);
+      restoreExpertChatScroll(pane, root, true);
     }
   });
 };
@@ -20616,6 +20711,15 @@ const renderExpertTerminalGrid = () => {
     loginSession && accountProvider(accountById(loginSession.accountId)) === "claude"
       ? loginSession
       : null;
+  // Le champ n'apparait qu'une fois l'invite `Enter your API key` reellement
+  // affichee par OpenCode : la saisie doit rester possible sans passer par le
+  // presse-papiers de xterm, indisponible sur mobile.
+  const openCodeLoginSession =
+    loginSession
+    && accountProvider(accountById(loginSession.accountId)) === "opencode"
+    && openCodeLoginAwaitsApiKey(loginSession.key)
+      ? loginSession
+      : null;
   const folderPath = userWorkspacePath(terminalFolderFilter);
   if (!folderPath && !loginSession) {
     return `<section class="terminal-environment-gate" data-folder-terminal-view="unselected">
@@ -20694,7 +20798,7 @@ const renderExpertTerminalGrid = () => {
   `).join("");
 
   return `
-    <section class="folder-terminal-panel ${claudeLoginSession ? "has-claude-login-code" : ""}" data-folder-terminal-view="${escapeAttr(loginSession ? "login" : folderPath ?? "")}">
+    <section class="folder-terminal-panel ${claudeLoginSession ? "has-claude-login-code" : ""} ${openCodeLoginSession ? "has-opencode-login-key" : ""}" data-folder-terminal-view="${escapeAttr(loginSession ? "login" : folderPath ?? "")}">
       <header class="folder-terminal-head">
         <span class="folder-terminal-mark"><i data-lucide="${loginSession ? "log-in" : "folder-open"}"></i></span>
         <span class="folder-terminal-copy">
@@ -20723,6 +20827,16 @@ const renderExpertTerminalGrid = () => {
             </label>
             <button type="submit" class="tool-button primary"><i data-lucide="key-round"></i><span>Envoyer le code</span></button>
             <small>Le code est envoyé directement au terminal et n’est pas enregistré.</small>
+          </form>`
+        : ""}
+      ${openCodeLoginSession
+        ? `<form class="opencode-login-key-form" data-opencode-login-key-form="${escapeAttr(openCodeLoginSession.key)}">
+            <label for="openCodeLoginKey-${escapeAttr(openCodeLoginSession.key)}">
+              <span>Clé API ${escapeHtml(accountProviderLabel(accountById(openCodeLoginSession.accountId)))}</span>
+              <input id="openCodeLoginKey-${escapeAttr(openCodeLoginSession.key)}" data-opencode-login-key-input="${escapeAttr(openCodeLoginSession.key)}" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="4096" placeholder="Colle ici la clé API du fournisseur" required />
+            </label>
+            <button type="submit" class="tool-button primary"><i data-lucide="key-round"></i><span>Envoyer la clé</span></button>
+            <small>La clé part directement dans le terminal ; OpenCode l’écrit dans le home isolé du compte, jamais dans les réglages.</small>
           </form>`
         : ""}
       <div class="expert-terminal-wall" style="--expert-columns: ${columns}; --expert-rows: ${rows}" aria-label="Mur de ${sessions.length} terminaux">
@@ -26333,6 +26447,47 @@ const bindUi = () => {
     });
   });
 
+  document.querySelectorAll<HTMLFormElement>("[data-opencode-login-key-form]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const sessionKey = form.dataset.opencodeLoginKeyForm;
+      const session = terminalSessions.find((candidate) => candidate.key === sessionKey);
+      const input = form.querySelector<HTMLInputElement>("[data-opencode-login-key-input]");
+      const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]');
+      if (!input || !session || session.ptyId === null || !session.running) {
+        statusText = "Le terminal OpenCode n’est plus disponible. Relance la connexion.";
+        render();
+        return;
+      }
+
+      const key = normalizeOpenCodeApiKey(input.value);
+      if (!key) {
+        input.setCustomValidity("Colle uniquement la clé API du fournisseur.");
+        input.reportValidity();
+        return;
+      }
+
+      input.setCustomValidity("");
+      input.disabled = true;
+      if (submit) submit.disabled = true;
+      const terminalId = session.ptyId;
+      void invoke("write_terminal", { id: terminalId, data: `${key}\r` })
+        .then(() => {
+          input.value = "";
+          statusText = "Clé API envoyée, enregistrement en cours…";
+          session.terminal.focus();
+        })
+        .catch((error) => {
+          statusText = `Envoi de la clé API impossible : ${String(error)}`;
+          input.focus();
+        })
+        .finally(() => {
+          if (input.isConnected) input.disabled = false;
+          if (submit?.isConnected) submit.disabled = false;
+        });
+    });
+  });
+
   document.querySelectorAll<HTMLElement>("[data-expert-terminal-pane]").forEach((pane) => {
     pane.addEventListener("pointerdown", (event) => {
       if ((event.target as HTMLElement).closest("[data-close-terminal],[data-toggle-chat-sidebar],[data-toggle-terminal-fullscreen]")) return;
@@ -27578,7 +27733,8 @@ const bindUi = () => {
   const mainChatFeed = document.querySelector<HTMLDivElement>("#chatFeed");
   if (mainChatFeed) {
     bindChatFeedScroll(mainChatFeed);
-    restoreChatFeedScroll(mainChatFeed);
+    // `render()` remplace tout le DOM : ce fil vient de naitre.
+    restoreChatFeedScroll(mainChatFeed, chatScrollState, true);
   }
   mainChatFeed?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement | null;
@@ -27918,7 +28074,11 @@ const mountExpertTerminals = () => {
     const claudeCodeInput = Array.from(
       document.querySelectorAll<HTMLInputElement>("[data-claude-login-code-input]"),
     ).find((input) => input.dataset.claudeLoginCodeInput === focusKey);
+    const openCodeKeyInput = Array.from(
+      document.querySelectorAll<HTMLInputElement>("[data-opencode-login-key-input]"),
+    ).find((input) => input.dataset.opencodeLoginKeyInput === focusKey);
     if (claudeCodeInput) claudeCodeInput.focus();
+    else if (openCodeKeyInput) openCodeKeyInput.focus();
     else sessionByKey.get(focusKey)?.terminal.focus();
   }
   requestTerminalFocusKey = null;
@@ -28184,6 +28344,43 @@ const applyRemoteClaudeLoginOutput = (session: TerminalSession, data: string) =>
   return update.type;
 };
 
+// `opencode auth login` ne passe par aucun navigateur : il demande la cle API
+// dans le terminal puis se termine. Sans cette lecture, le terminal de
+// connexion restait ouvert sans fin, meme quand OpenCode n'etait pas installe
+// (le shell affichait juste « command not found » puis rendait la main).
+const applyOpenCodeLoginOutput = (session: TerminalSession, data: string) => {
+  if (
+    !session.loginOnly
+    || accountProvider(accountById(session.accountId)) !== "opencode"
+  ) {
+    return "none" as const;
+  }
+
+  const update = consumeOpenCodeLoginOutput(session.key, data);
+  if (update.type === "prompt") {
+    statusText = `Colle la clé API ${accountProviderLabel(accountById(session.accountId))} puis valide`;
+    requestTerminalFocusKey = session.key;
+    render();
+    return update.type;
+  }
+  if (update.type === "success") {
+    const accountLabel = accountById(session.accountId)?.label ?? session.title;
+    void closeTerminalSession(session.key).finally(() => {
+      statusText = `Connexion réussie pour ${accountLabel}`;
+      render();
+      void refreshLimitStatus(true, true);
+    });
+    return update.type;
+  }
+  if (update.type === "error") {
+    void closeTerminalSession(session.key).finally(() => {
+      statusText = update.message;
+      render();
+    });
+  }
+  return update.type;
+};
+
 // Le WebSocket peut livrer les premiers octets du CLI pendant que l'appel
 // POST /terminals se termine. Le transport conserve donc un court snapshot que
 // l'on rejoue ici jusqu'a retrouver le lien et le code appareil. Cette voie de
@@ -28269,6 +28466,42 @@ const replayRemoteClaudeLoginOutput = async (session: TerminalSession) => {
   }
 };
 
+// Meme fenetre de course que Claude, avec un enjeu supplementaire : l'echec le
+// plus frequent (`opencode` absent du PATH du serveur) est imprime dans les
+// premieres millisecondes. Sans ce rejeu, l'utilisateur restait devant un
+// terminal vide sans jamais savoir que la CLI manquait.
+const replayOpenCodeLoginOutput = async (session: TerminalSession) => {
+  const terminalId = session.ptyId;
+  if (
+    !isRemoteMode()
+    || !session.loginOnly
+    || terminalId === null
+    || accountProvider(accountById(session.accountId)) !== "opencode"
+  ) {
+    return;
+  }
+
+  let previous = "";
+  const deadline = Date.now() + 12_000;
+  while (
+    Date.now() < deadline
+    && terminalSessions.includes(session)
+    && session.ptyId === terminalId
+  ) {
+    const snapshot = await invoke<string>("terminal_output_snapshot", { id: terminalId })
+      .catch(() => "");
+    if (snapshot && snapshot !== previous) {
+      const delta = snapshot.startsWith(previous) ? snapshot.slice(previous.length) : snapshot;
+      previous = snapshot;
+      // Une invite de saisie n'arrete pas le rejeu : le succes ou l'erreur
+      // arrivent ensuite, et le flux live peut ne pas encore etre abonne.
+      const update = applyOpenCodeLoginOutput(session, delta);
+      if (update === "success" || update === "error") return;
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 200));
+  }
+};
+
 const startTerminalSession = async (
   session: TerminalSession,
   commandOverride: string | null = null,
@@ -28341,6 +28574,8 @@ const startTerminalSession = async (
         void replayRemoteCodexLoginOutput(session);
       } else if (accountProvider(startedAccount) === "claude") {
         void replayRemoteClaudeLoginOutput(session);
+      } else if (accountProvider(startedAccount) === "opencode") {
+        void replayOpenCodeLoginOutput(session);
       }
     }
     if (!loginOnly && settings.autoRunCodex && isIde && sessionAgent && !commandOverride) {
@@ -28374,7 +28609,10 @@ const closeTerminalSession = async (key: string) => {
   if (index === -1) return;
 
   const [session] = terminalSessions.splice(index, 1);
-  if (session.loginOnly) forgetRemoteClaudeLoginOutput(session.key);
+  if (session.loginOnly) {
+    forgetRemoteClaudeLoginOutput(session.key);
+    forgetOpenCodeLoginOutput(session.key);
+  }
   if (expertTerminalFullscreenKey === key) expertTerminalFullscreenKey = null;
   const closedWorkspaceKey = terminalWorkspaceDescriptor(session).key;
   const ptyId = session.ptyId;
@@ -28596,6 +28834,7 @@ const setupEvents = async () => {
     if (session?.loginOnly) {
       applyRemoteCodexLoginOutput(session, event.payload.data);
       applyRemoteClaudeLoginOutput(session, event.payload.data);
+      applyOpenCodeLoginOutput(session, event.payload.data);
     }
   });
 
@@ -28610,6 +28849,7 @@ const setupEvents = async () => {
 
     if (session.loginOnly) {
       forgetRemoteClaudeLoginOutput(session.key);
+      forgetOpenCodeLoginOutput(session.key);
       failRemoteCodexLoginWindow(
         session.accountId,
         "La connexion s’est interrompue avant d’être validée.",

@@ -2171,6 +2171,31 @@ fn find_all_rollouts_for(sessions_dir: &Path, id: &str) -> Vec<PathBuf> {
 
 const TRANSCRIPT_MAX_CHARS: usize = 100_000;
 
+/// Plafond PAR TOUR dans l'amorce. L'agregat ne garde que la FIN de la
+/// conversation : sans plafond par tour, un seul tour geant (copier-coller
+/// massif, injection du moteur) mange tout le budget et evince les echanges
+/// reels, c'est-a-dire exactement ce que l'amorce est censee transmettre.
+const TRANSCRIPT_TURN_MAX_CHARS: usize = 8_000;
+
+/// Plafond d'OCTETS de l'amorce. `TRANSCRIPT_MAX_CHARS` borne des CARACTERES :
+/// 100 000 ideogrammes pesent 300 Ko, au-dela de `chat::MAX_PROMPT_BYTES`
+/// (256 Ko). La reprise echouait alors sur « Le message est trop volumineux »
+/// au lieu de partir tronquee. On borne donc aussi en octets.
+const TRANSCRIPT_MAX_BYTES: usize = 128 * 1024;
+
+/// Conserve la FIN de `text` sans depasser `max` octets, en reculant jusqu'a
+/// une frontiere de caractere pour ne jamais couper un UTF-8 au milieu.
+pub(crate) fn keep_last_bytes(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 /// Role d'un tour de conversation extrait d'un fichier de session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -2369,14 +2394,22 @@ fn extract_claude_transcript(path: &Path) -> Vec<TranscriptMessage> {
             Some("assistant") => TranscriptRole::Assistant,
             _ => continue,
         };
-        let Some(text) = claude_message_text(&value) else {
-            continue;
+        let text = if role == TranscriptRole::User {
+            // Une injection du moteur (competence, rappel systeme, hook) ne doit
+            // jamais entrer dans l'amorce de reprise : elle y serait recopiee
+            // comme une demande de l'utilisateur.
+            let Some(text) = claude_user_prompt_text(&value) else {
+                continue;
+            };
+            text
+        } else {
+            let Some(text) = claude_message_text(&value) else {
+                continue;
+            };
+            text
         };
         let msg = text.trim();
         if msg.is_empty() {
-            continue;
-        }
-        if role == TranscriptRole::User && is_synthetic_prompt(msg) {
             continue;
         }
         turns.push(transcript_message(role, msg, &value));
@@ -2456,14 +2489,21 @@ fn format_transcript(turns: &[TranscriptMessage]) -> String {
         };
         body.push_str(speaker);
         body.push_str(": ");
-        body.push_str(&turn.text);
+        body.push_str(&clip_to(&turn.text, TRANSCRIPT_TURN_MAX_CHARS));
         body.push_str("\n\n");
     }
 
-    let body = if body.chars().count() > TRANSCRIPT_MAX_CHARS {
+    let mut truncated = body.chars().count() > TRANSCRIPT_MAX_CHARS;
+    let body = if truncated {
         let skip = body.chars().count() - TRANSCRIPT_MAX_CHARS;
-        let kept: String = body.chars().skip(skip).collect();
-        format!("[... debut de la conversation tronque ...]\n\n{kept}")
+        body.chars().skip(skip).collect::<String>()
+    } else {
+        body
+    };
+    let clamped = keep_last_bytes(&body, TRANSCRIPT_MAX_BYTES);
+    truncated = truncated || clamped.len() < body.len();
+    let body = if truncated {
+        format!("[... debut de la conversation tronque ...]\n\n{clamped}")
     } else {
         body
     };
@@ -2838,16 +2878,16 @@ fn extract_claude_display_transcript(path: &Path) -> Vec<TranscriptMessage> {
                     }
                 }
             }
-            let Some(text) = claude_message_text(&value) else {
+            // Le transcript est relu en boucle pendant qu'un tour tourne : sans
+            // ce filtre, l'injection ecrite par le moteur au moment ou il
+            // charge une competence surgit en direct comme un message de
+            // l'utilisateur, long de tout le SKILL.md.
+            let Some(text) = claude_user_prompt_text(&value) else {
                 continue;
             };
-            let text = text.trim();
-            if text.is_empty() || is_synthetic_prompt(text) {
-                continue;
-            }
             messages.push(TranscriptMessage {
                 role: TranscriptRole::User,
-                text: text.to_string(),
+                text: clip_to(&text, TRANSCRIPT_USER_MAX_CHARS),
                 timestamp,
                 parts: Vec::new(),
             });
@@ -3128,14 +3168,22 @@ fn transcript_json_text(value: &Value) -> Option<String> {
     }
 }
 
-fn transcript_clip(text: &str) -> String {
-    const MAX: usize = 12_000;
-    let clipped = text.chars().take(MAX).collect::<String>();
-    if text.chars().count() > MAX {
-        format!("{clipped}...")
+/// Plafond d'affichage d'une bulle utilisateur. Un vrai copier-coller reste
+/// lisible presque en entier, tandis qu'une injection qui echapperait aux
+/// filtres ne peut plus noyer la conversation. Le modele, lui, a bien recu le
+/// texte complet : ce plafond ne concerne que l'affichage.
+const TRANSCRIPT_USER_MAX_CHARS: usize = 20_000;
+
+fn clip_to(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        format!("{}...", text.chars().take(max).collect::<String>())
     } else {
-        clipped
+        text.to_string()
     }
+}
+
+fn transcript_clip(text: &str) -> String {
+    clip_to(text, 12_000)
 }
 
 fn transcript_short(text: &str) -> String {
@@ -3291,8 +3339,85 @@ fn scan_account_prompts(account: &AccountProfile) -> Vec<PromptEntry> {
 /// jamais des demandes tapees par l'utilisateur. On NE filtre PAS sur un simple
 /// prefixe '<' car de vraies demandes commencent par '<' (HTML/JSX colle,
 /// generiques TS `<T>`, comparaisons `<= 5`, ...).
-fn is_synthetic_prompt(msg: &str) -> bool {
-    msg.starts_with("<environment_context>") || msg.starts_with("<user_instructions>")
+/// Prefixes d'un message de role `user` qui n'est PAS une demande de
+/// l'utilisateur. Codex injecte `<environment_context>` / `<user_instructions>`.
+/// Claude Code ecrit en plus, sous ce meme role, le chargement d'une competence
+/// (« Base directory for this skill: » suivi de tout le corps du SKILL.md), ses
+/// rappels systeme, l'expansion d'une commande slash et la sortie des hooks.
+/// Sans ce filtre, ces injections s'affichent comme des messages ecrits par
+/// l'utilisateur -- un SKILL.md complet pese plusieurs dizaines de milliers de
+/// caracteres et apparait en plein tour, des que le transcript est relu.
+const SYNTHETIC_PROMPT_PREFIXES: &[&str] = &[
+    "<environment_context>",
+    "<user_instructions>",
+    "Base directory for this skill:",
+    "<system-reminder>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<user-prompt-submit-hook>",
+    "Caveat: The messages below were generated by the user while running local commands.",
+    "[Request interrupted by user",
+];
+
+pub(crate) fn is_synthetic_prompt(msg: &str) -> bool {
+    let msg = msg.trim_start();
+    SYNTHETIC_PROMPT_PREFIXES
+        .iter()
+        .any(|prefix| msg.starts_with(prefix))
+}
+
+/// Claude Code marque ses lignes injectees avec `isMeta`. C'est le signal le
+/// plus fiable car il ne depend d'aucun libelle traduisible ni d'un format
+/// d'injection qui peut changer d'une version a l'autre : les prefixes
+/// ci-dessus ne sont que le filet de securite. `work_time.rs` s'en servait
+/// deja ; l'extraction de transcript, elle, l'ignorait.
+fn is_claude_meta_entry(line: &Value) -> bool {
+    line.get("isMeta").and_then(Value::as_bool) == Some(true)
+}
+
+/// Retire les blocs `<system-reminder>...</system-reminder>` que Claude Code
+/// accole a une VRAIE demande utilisateur. Un tel message ne peut pas etre
+/// filtre en entier (il porte le texte de l'utilisateur en tete) : on n'en
+/// enleve que l'injection.
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    if !text.contains(OPEN) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + OPEN.len()..];
+        match after.find(CLOSE) {
+            Some(end) => rest = &after[end + CLOSE.len()..],
+            None => {
+                // Bloc non ferme : tout ce qui suit est de l'injection.
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Texte affichable d'une ligne `user` Claude : `None` des que la ligne est une
+/// injection du moteur plutot qu'une demande de l'utilisateur.
+fn claude_user_prompt_text(line: &Value) -> Option<String> {
+    if is_claude_meta_entry(line) {
+        return None;
+    }
+    let text = strip_system_reminders(&claude_message_text(line)?);
+    let text = text.trim();
+    if text.is_empty() || is_synthetic_prompt(text) {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 pub(crate) fn is_autonomous_prompt(msg: &str) -> bool {
@@ -4885,6 +5010,152 @@ mod tests {
         assert!(turns[1].timestamp > turns[0].timestamp);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Claude Code ecrit ses injections avec le role `user`. Elles ne sont ni
+    /// des demandes de l'utilisateur ni du contexte transferable : elles
+    /// doivent disparaitre de la vue conversation ET de l'amorce de reprise.
+    #[test]
+    fn claude_transcript_drops_engine_injections() {
+        let dir = fresh_dir();
+        let path = dir.join("session.jsonl");
+        let skill_body = "x".repeat(60_000);
+        let lines = [
+            format!(
+                "{{\"timestamp\":\"2026-07-25T10:00:00.000Z\",\"type\":\"user\",\"message\":{{\"content\":\"Base directory for this skill: /tmp/claude-10001/bundled-skills/2.1.220/abc/claude-api\\n\\n{skill_body}\"}}}}"
+            ),
+            "{\"timestamp\":\"2026-07-25T10:00:01.000Z\",\"type\":\"user\",\"isMeta\":true,\"message\":{\"content\":\"injection sans prefixe connu\"}}".to_string(),
+            "{\"timestamp\":\"2026-07-25T10:00:02.000Z\",\"type\":\"user\",\"message\":{\"content\":\"<system-reminder>rappel seul</system-reminder>\"}}".to_string(),
+            "{\"timestamp\":\"2026-07-25T10:00:03.000Z\",\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"corrige le bug\\n\\n<system-reminder>contexte injecte</system-reminder>\"}]}}".to_string(),
+            "{\"timestamp\":\"2026-07-25T10:00:04.000Z\",\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"c'est corrige\"}]}}".to_string(),
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+
+        for turns in [
+            extract_claude_transcript(&path),
+            extract_claude_display_transcript(&path),
+        ] {
+            let user: Vec<_> = turns
+                .iter()
+                .filter(|turn| turn.role == TranscriptRole::User)
+                .collect();
+            assert_eq!(
+                user.len(),
+                1,
+                "seule la vraie demande utilisateur subsiste, or : {:?}",
+                user.iter().map(|turn| &turn.text).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                user[0].text, "corrige le bug",
+                "le rappel systeme accole est retire sans perdre la demande"
+            );
+            assert!(
+                !turns.iter().any(|turn| turn.text.contains("bundled-skills")),
+                "le corps du SKILL.md ne doit jamais apparaitre"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Filet de securite : une injection d'un format encore inconnu reste
+    /// bornee a l'affichage au lieu de noyer la conversation.
+    #[test]
+    fn claude_display_transcript_clips_an_oversized_user_bubble() {
+        let dir = fresh_dir();
+        let path = dir.join("session.jsonl");
+        let huge = "y".repeat(TRANSCRIPT_USER_MAX_CHARS + 5_000);
+        fs::write(
+            &path,
+            format!(
+                "{{\"timestamp\":\"2026-07-25T10:00:00.000Z\",\"type\":\"user\",\"message\":{{\"content\":\"{huge}\"}}}}"
+            ),
+        )
+        .unwrap();
+
+        let turns = extract_claude_display_transcript(&path);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text.chars().count(), TRANSCRIPT_USER_MAX_CHARS + 3);
+        assert!(turns[0].text.ends_with("..."));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L'amorce de reprise ne conserve que la FIN de la conversation : un seul
+    /// tour geant ne doit pas pouvoir evincer les echanges reels.
+    #[test]
+    fn transcript_seed_caps_each_turn() {
+        let turns = vec![
+            TranscriptMessage {
+                role: TranscriptRole::User,
+                text: "z".repeat(TRANSCRIPT_MAX_CHARS * 2),
+                timestamp: 1,
+                parts: Vec::new(),
+            },
+            TranscriptMessage {
+                role: TranscriptRole::Assistant,
+                text: "reponse finale".to_string(),
+                timestamp: 2,
+                parts: Vec::new(),
+            },
+        ];
+
+        let seed = format_transcript(&turns);
+        assert!(
+            seed.contains("reponse finale"),
+            "le dernier echange survit au tour geant"
+        );
+        assert!(
+            seed.chars().count() < TRANSCRIPT_MAX_CHARS,
+            "un tour unique ne consomme plus tout le budget"
+        );
+        assert!(
+            !seed.contains("[... debut de la conversation tronque ...]"),
+            "aucune troncature d'agregat n'est necessaire ici"
+        );
+    }
+
+    /// `TRANSCRIPT_MAX_CHARS` compte des caracteres : en ideogrammes, l'amorce
+    /// depassait `chat::MAX_PROMPT_BYTES` et la reprise etait rejetee au lieu
+    /// de partir tronquee.
+    #[test]
+    fn transcript_seed_stays_under_the_byte_ceiling() {
+        let turns: Vec<_> = (0..40)
+            .map(|index| TranscriptMessage {
+                role: if index % 2 == 0 {
+                    TranscriptRole::User
+                } else {
+                    TranscriptRole::Assistant
+                },
+                // 3 octets par caractere.
+                text: "漢".repeat(TRANSCRIPT_TURN_MAX_CHARS),
+                timestamp: index,
+                parts: Vec::new(),
+            })
+            .collect();
+
+        let seed = format_transcript(&turns);
+        assert!(
+            seed.len() < 256 * 1024,
+            "l'amorce doit rester sous MAX_PROMPT_BYTES, or {} octets",
+            seed.len()
+        );
+        assert!(seed.contains("[... debut de la conversation tronque ...]"));
+        assert!(
+            seed.contains("[Fin de l'historique. Continue.]"),
+            "la fin de la conversation est ce qu'on conserve"
+        );
+    }
+
+    #[test]
+    fn keeping_last_bytes_never_splits_a_character() {
+        let text = "éàü漢字";
+        for max in 0..=text.len() + 2 {
+            let kept = keep_last_bytes(text, max);
+            assert!(kept.len() <= max.max(0) || max >= text.len());
+            assert!(text.ends_with(kept), "on garde bien un suffixe de {text}");
+        }
+        assert_eq!(keep_last_bytes(text, text.len()), text);
     }
 
     #[test]

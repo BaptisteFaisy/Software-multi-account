@@ -42,10 +42,13 @@ test("l'image contient le frontend, le serveur et les outils de travail", () => 
   assert.match(dockerfile, /--profile server/);
   assert.match(
     dockerfile,
-    /npm install --global --prefix \/home\/cst\/\.local @openai\/codex @anthropic-ai\/claude-code/,
+    /npm install --global --prefix \/home\/cst\/\.local @openai\/codex @anthropic-ai\/claude-code opencode-ai/,
   );
   assert.match(dockerfile, /codex --version/);
   assert.match(dockerfile, /claude --version/);
+  // Sans OpenCode, se connecter a un compte Z.ai / MiniMax / DeepSeek /
+  // OpenRouter ouvrait un terminal bloque sur « command not found ».
+  assert.match(dockerfile, /opencode --version/);
   assert.match(entrypoint, /exec \/usr\/sbin\/gosu cst "\$@"/);
   assert.match(entrypoint, /install -d -m 0700 -o cst -g cst \/srv\/cst/);
   assert.match(

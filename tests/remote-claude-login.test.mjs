@@ -107,8 +107,10 @@ test("le login Claude expose un vrai champ de collage et refocalise toujours xte
 
 test("le champ de code Claude reste dans la grille visible sur mobile", () => {
   const lastGenericGrid = style.lastIndexOf(".folder-terminal-panel {");
+  // Le selecteur est groupe avec celui du champ de cle OpenCode : on cible donc
+  // le selecteur seul, sans supposer qu'il ouvre directement le bloc.
   const lastClaudeGrid = style.lastIndexOf(
-    ".folder-terminal-panel.has-claude-login-code {",
+    ".folder-terminal-panel.has-claude-login-code",
   );
 
   assert.ok(lastClaudeGrid > lastGenericGrid);

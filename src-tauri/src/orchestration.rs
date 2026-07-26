@@ -1328,6 +1328,11 @@ fn prepare_account_handoff(
     })
 }
 
+/// Part maximale du relais consacree a l'historique. Laisse une marge
+/// confortable sous `chat::MAX_PROMPT_BYTES` (256 Ko) pour l'instruction qui
+/// lui est concatenee.
+const HANDOFF_TRANSCRIPT_MAX_BYTES: usize = 96 * 1024;
+
 fn prompt_with_pending_handoff(
     run: &OrchestrationSnapshot,
     kind: OrchestrationTurnKind,
@@ -1363,6 +1368,11 @@ fn prompt_with_pending_handoff(
             path.display()
         )
     })?;
+    // `transcript` et `prompt` etaient bornes chacun de leur cote, jamais leur
+    // somme : le relais pouvait donc depasser `chat::MAX_PROMPT_BYTES` et faire
+    // echouer la reprise. On borne la part historique, la seule compressible --
+    // l'instruction de l'utilisateur, elle, part toujours en entier.
+    let transcript = discussions::keep_last_bytes(&transcript, HANDOFF_TRANSCRIPT_MAX_BYTES);
     Ok((
         format!(
             "{transcript}\n\n[Nouvelle instruction du chat orchestre apres changement de compte]\n\n{prompt}"

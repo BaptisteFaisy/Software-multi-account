@@ -10601,7 +10601,8 @@ div.chat-tool-part {
   min-width: 0;
   min-height: 0;
 }
-.folder-terminal-panel.has-claude-login-code {
+.folder-terminal-panel.has-claude-login-code,
+.folder-terminal-panel.has-opencode-login-key {
   grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 .folder-terminal-head {
@@ -10668,7 +10669,8 @@ div.chat-tool-part {
 .folder-agent-summary span svg { width: 10px; height: 10px; }
 .folder-agent-summary span b { color: #d4d4d4; }
 
-.claude-login-code-form {
+.claude-login-code-form,
+.opencode-login-key-form {
   display: grid;
   grid-template-columns: minmax(220px, 1fr) auto;
   align-items: end;
@@ -10679,19 +10681,23 @@ div.chat-tool-part {
   background: #111111;
 }
 
-.claude-login-code-form label {
+.claude-login-code-form label,
+.opencode-login-key-form label {
   display: grid;
   gap: 4px;
   min-width: 0;
 }
 
 .claude-login-code-form label > span,
-.claude-login-code-form > small {
+.claude-login-code-form > small,
+.opencode-login-key-form label > span,
+.opencode-login-key-form > small {
   color: #929292;
   font-size: 9px;
 }
 
-.claude-login-code-form input {
+.claude-login-code-form input,
+.opencode-login-key-form input {
   width: 100%;
   min-width: 0;
   height: 38px;
@@ -10704,12 +10710,14 @@ div.chat-tool-part {
   font-family: var(--font-mono);
 }
 
-.claude-login-code-form input:focus {
+.claude-login-code-form input:focus,
+.opencode-login-key-form input:focus {
   border-color: #d5d5d5;
   box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.08);
 }
 
-.claude-login-code-form > small {
+.claude-login-code-form > small,
+.opencode-login-key-form > small {
   grid-column: 1 / -1;
 }
 
@@ -10990,13 +10998,16 @@ div.chat-tool-part {
   .folder-terminal-panel {
     grid-template-rows: auto auto minmax(0, 1fr);
   }
-  .folder-terminal-panel.has-claude-login-code {
+  .folder-terminal-panel.has-claude-login-code,
+  .folder-terminal-panel.has-opencode-login-key {
     grid-template-rows: auto auto auto minmax(0, 1fr);
   }
-  .claude-login-code-form {
+  .claude-login-code-form,
+  .opencode-login-key-form {
     grid-template-columns: minmax(0, 1fr);
   }
-  .claude-login-code-form > small {
+  .claude-login-code-form > small,
+  .opencode-login-key-form > small {
     grid-column: 1;
   }
   .folder-terminal-head {
@@ -12783,7 +12794,8 @@ div.chat-tool-part {
   grid-template-rows: auto auto minmax(0, 1fr);
 }
 
-.folder-terminal-panel.has-claude-login-code {
+.folder-terminal-panel.has-claude-login-code,
+.folder-terminal-panel.has-opencode-login-key {
   grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 
@@ -13353,6 +13365,16 @@ div.chat-tool-part {
     contain-intrinsic-block-size: auto 180px;
   }
 
+  /* Reconstruire le fil recree les tours : leur taille memorisee est perdue et
+     chacun ne pese plus que sa taille de repli. La hauteur mesuree tombe alors
+     bien sous la hauteur reelle, ce qui ecrete la position restauree et fait
+     remonter la conversation tout en haut. Le temps d'une mesure, on rend donc
+     la hauteur reelle observable — la mise en page ainsi declenchee reamorce au
+     passage la taille memorisee de chaque tour. */
+  .chat-feed.is-measuring-scroll .chat-turn {
+    content-visibility: visible;
+  }
+
   .discussion-row,
   .chat-side-item {
     content-visibility: auto;
@@ -13476,7 +13498,8 @@ div.chat-tool-part {
     grid-template-rows: auto auto minmax(0, 1fr) !important;
   }
 
-  .folder-terminal-panel.has-claude-login-code {
+  .folder-terminal-panel.has-claude-login-code,
+  .folder-terminal-panel.has-opencode-login-key {
     grid-template-rows: auto auto auto minmax(0, 1fr) !important;
   }
 

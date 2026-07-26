@@ -7,7 +7,9 @@
 //! sont fusionnes afin qu'une minute reelle ne soit jamais comptee deux fois.
 
 use crate::{
-    account_usage::collect_rollouts, discussions::is_autonomous_prompt, metrics, settings,
+    account_usage::collect_rollouts,
+    discussions::{is_autonomous_prompt, is_synthetic_prompt},
+    metrics, settings,
 };
 use chrono::{Local, NaiveTime, TimeZone};
 use serde::Serialize;
@@ -536,10 +538,6 @@ fn codex_meta_is_subagent(meta: &Value) -> bool {
             .pointer("/payload/parent_thread_id")
             .and_then(Value::as_str)
             .is_some_and(|parent| !parent.is_empty())
-}
-
-fn is_synthetic_prompt(message: &str) -> bool {
-    message.starts_with("<environment_context>") || message.starts_with("<user_instructions>")
 }
 
 fn claude_message_text(value: &Value) -> Option<String> {

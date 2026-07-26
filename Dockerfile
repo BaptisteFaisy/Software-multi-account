@@ -75,12 +75,17 @@ ENV HOME=/home/cst \
 RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-init.sh \
     && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${RUST_VERSION}" \
     && rm -f /tmp/rustup-init.sh
+# OpenCode porte tous les fournisseurs API annexes (Z.ai, MiniMax, DeepSeek,
+# OpenRouter). Sans lui, `opencode auth login --provider <id>` echouait en
+# « command not found » et le terminal de connexion restait ouvert sans fin.
 RUN --mount=type=cache,target=/home/cst/.npm,uid=10001,gid=10001 \
-    npm install --global --prefix /home/cst/.local @openai/codex @anthropic-ai/claude-code \
+    npm install --global --prefix /home/cst/.local @openai/codex @anthropic-ai/claude-code opencode-ai \
     && command -v codex >/dev/null \
     && codex --version \
     && command -v claude >/dev/null \
-    && claude --version
+    && claude --version \
+    && command -v opencode >/dev/null \
+    && opencode --version
 
 USER root
 COPY --from=server-build /tmp/cst-server /usr/local/bin/cst-server
