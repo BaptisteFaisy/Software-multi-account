@@ -51,7 +51,7 @@ use std::{
     process::Stdio,
     sync::{Mutex, OnceLock},
     thread,
-    time::UNIX_EPOCH,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 const TITLE_MAX_CHARS: usize = 80;
@@ -136,8 +136,29 @@ struct CachedDashboard {
     dashboard: DiscussionsDashboard,
 }
 
+/// Duree pendant laquelle l'index OpenCode d'un compte est reutilise sans
+/// relancer la CLI.
+///
+/// `opencode session list` demarre un runtime complet (~1 seconde de coeur) et,
+/// rien qu'en ouvrant la base, met a jour le mtime de `opencode.db`, `-wal` et
+/// `-shm`. Comme l'empreinte des discussions hache justement ces mtimes, chaque
+/// scan invalidait sa propre entree de cache et en declenchait un autre au tick
+/// suivant : boucle auto-entretenue, mesuree a 169 lancements par minute sur le
+/// VPS, soit plus d'un coeur consomme en permanence des qu'un compte OpenCode
+/// existe. Borner la frequence casse la boucle quel que soit le bruit de
+/// l'empreinte ; les autres providers lisent des fichiers et ne sont pas
+/// concernes.
+const OPENCODE_SCAN_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+struct CachedOpenCodeScan {
+    scanned_at: Instant,
+    discussions: Vec<DiscussionSummary>,
+}
+
 static SUMMARY_CACHE: OnceLock<Mutex<HashMap<SummaryCacheKey, CachedSummary>>> = OnceLock::new();
 static DASHBOARD_CACHE: OnceLock<Mutex<Option<CachedDashboard>>> = OnceLock::new();
+static OPENCODE_SCAN_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedOpenCodeScan>>> = OnceLock::new();
 static CUSTOM_TITLES_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn summary_cache() -> &'static Mutex<HashMap<SummaryCacheKey, CachedSummary>> {
@@ -146,6 +167,10 @@ fn summary_cache() -> &'static Mutex<HashMap<SummaryCacheKey, CachedSummary>> {
 
 fn dashboard_cache() -> &'static Mutex<Option<CachedDashboard>> {
     DASHBOARD_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn opencode_scan_cache() -> &'static Mutex<HashMap<PathBuf, CachedOpenCodeScan>> {
+    OPENCODE_SCAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn custom_titles_write_lock() -> &'static Mutex<()> {
@@ -770,12 +795,38 @@ fn scan_opencode_discussions(
     account: &AccountProfile,
     provider_command: &str,
 ) -> Result<Vec<DiscussionSummary>, String> {
+    // Voir `OPENCODE_SCAN_MIN_INTERVAL` : sans ce garde-fou, l'appel CLI
+    // ci-dessous reveille sa propre invalidation de cache et tourne en boucle.
+    if let Some(cached) = cached_opencode_scan(home) {
+        return Ok(cached);
+    }
+
     let value = run_opencode_json(
         home,
         provider_command,
         &["session", "list", "--format", "json"],
     )?;
-    opencode_summaries_from_value(&value, home, account)
+    let discussions = opencode_summaries_from_value(&value, home, account)?;
+    remember_opencode_scan(home, &discussions);
+    Ok(discussions)
+}
+
+fn cached_opencode_scan(home: &Path) -> Option<Vec<DiscussionSummary>> {
+    let cache = opencode_scan_cache().lock().ok()?;
+    let cached = cache.get(home)?;
+    (cached.scanned_at.elapsed() < OPENCODE_SCAN_MIN_INTERVAL).then(|| cached.discussions.clone())
+}
+
+fn remember_opencode_scan(home: &Path, discussions: &[DiscussionSummary]) {
+    if let Ok(mut cache) = opencode_scan_cache().lock() {
+        cache.insert(
+            home.to_path_buf(),
+            CachedOpenCodeScan {
+                scanned_at: Instant::now(),
+                discussions: discussions.to_vec(),
+            },
+        );
+    }
 }
 
 fn opencode_summaries_from_value(
@@ -5186,5 +5237,38 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // `opencode session list` met a jour le mtime des trois fichiers SQLite du
+    // compte rien qu'en ouvrant la base — or l'empreinte des discussions hache
+    // ces mtimes. Sans intervalle minimal, chaque scan declenchait le suivant :
+    // 169 lancements par minute mesures sur le VPS, chacun un runtime Bun
+    // complet. Ce test verrouille le garde-fou qui casse la boucle.
+    #[test]
+    fn opencode_scan_is_reused_within_its_minimum_interval() {
+        let home = fresh_dir();
+        let other = fresh_dir().join("autre-compte");
+
+        assert!(
+            cached_opencode_scan(&home).is_none(),
+            "aucun scan memorise : la CLI doit etre lancee"
+        );
+
+        remember_opencode_scan(&home, &[]);
+        assert!(
+            cached_opencode_scan(&home).is_some(),
+            "un scan recent doit etre reutilise au lieu de relancer la CLI"
+        );
+        assert!(
+            cached_opencode_scan(&other).is_none(),
+            "le cache est par compte : un autre home doit toujours scanner"
+        );
+
+        // Le garde-fou doit rester court pour que l'index reste vivant, mais
+        // assez long pour borner le cout : quelques lancements par minute.
+        assert!(OPENCODE_SCAN_MIN_INTERVAL >= Duration::from_secs(5));
+        assert!(OPENCODE_SCAN_MIN_INTERVAL <= Duration::from_secs(30));
+
+        let _ = fs::remove_dir_all(&home);
     }
 }
