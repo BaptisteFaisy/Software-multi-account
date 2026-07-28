@@ -146,6 +146,9 @@ export type ChatPanelModel = {
   selectedReasoningEffort: string;
   reasoningEffortOptions: ChatSelectOption[];
   supportsReasoningEffort: boolean;
+  fastModeEnabled: boolean;
+  supportsFastMode: boolean;
+  fastModeHelp: string;
   composerSelectorsEnabled: boolean;
   favoritePrompts: ChatFavoritePrompt[];
   supportsGoals: boolean;
@@ -1122,6 +1125,18 @@ export const renderChatPanel = (
                 ${reasoningEffortOptions(model)}
               </select>
             </label>
+            <button
+              id="${id("chatFastMode")}"
+              data-chat-control="fast-mode"
+              type="button"
+              class="chat-fast-mode ${model.fastModeEnabled ? "active" : ""}"
+              title="${escapeHtml(!model.composerSelectorsEnabled ? "Sélection verrouillée dans les paramètres" : model.fastModeHelp)}"
+              aria-label="${model.fastModeEnabled ? "Désactiver" : "Activer"} Fast mode"
+              aria-pressed="${model.fastModeEnabled}"
+              ${busy || !model.selectedAccountId || !model.supportsFastMode || !model.composerSelectorsEnabled ? "disabled" : ""}
+            >
+              <i data-lucide="zap"></i><span>${model.fastModeEnabled ? "Fast" : "Normal"}</span>
+            </button>
             <span class="chat-workspace-chip" title="${escapeHtml(model.workspaceLabel)}"><i data-lucide="folder-open"></i>${escapeHtml(model.workspaceLabel)}</span>
           </div>
           <div class="chat-agent-tools" role="group" aria-label="Outils de conduite de l'agent">

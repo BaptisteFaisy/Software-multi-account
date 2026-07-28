@@ -12,6 +12,19 @@ services:
       - "127.0.0.1:{{ cst_remote_port }}:8080"
     volumes:
       - /srv/cst:/srv/cst
+    # Sans plafond, une derive du runtime consomme toute la RAM de l'hote PUIS
+    # tout son swap. Le noyau ne declenche alors aucun OOM-kill (le swap absorbe
+    # la demande) et la VM entiere part en thrashing : plus rien n'est ordonnance,
+    # ni sshd ni tailscaled, et la machine devient totalement injoignable jusqu'a
+    # un reset force. C'est exactement la panne du 2026-07-27 (RAM 94 %, swap
+    # 100 %, %idle 0,02 %, 3 h d'indisponibilite).
+    # Avec ce plafond, le depassement tue le processus fautif DANS le conteneur
+    # et l'hote reste administrable.
+    mem_limit: {{ cst_memory_limit_mb | int }}m
+    # Egal a mem_limit => le conteneur n'a acces a AUCUN swap. Le swap de l'hote
+    # reste disponible pour l'hote. C'est deliberé : c'est le swap qui a change
+    # un incident de quelques minutes en indisponibilite de trois heures.
+    memswap_limit: {{ cst_memory_limit_mb | int }}m
 {% if cst_gpu_transcription | default(false) | bool %}
     depends_on:
       speaches:

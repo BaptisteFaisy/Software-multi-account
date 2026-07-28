@@ -776,6 +776,7 @@ impl ChatTurnManager {
                 account.bypass,
                 account.model.as_deref(),
                 account.reasoning_effort.as_deref(),
+                account.fast_mode,
             )
             .map_err(|error| format!("Configuration du compte impossible : {error}"))?;
 
@@ -1357,7 +1358,10 @@ impl ChatTurnManager {
         // annulation) ne doit pas etre ecrase. Si la session est encore occupee,
         // l'appelant repart proprement en one-shot.
         if !session.try_begin_turn(turn.clone()) {
-            return Err("Session Claude persistante occupée (tour précédent en cours de libération)".to_string());
+            return Err(
+                "Session Claude persistante occupée (tour précédent en cours de libération)"
+                    .to_string(),
+            );
         }
         if let Err(error) = session.submit_user_message(prompt) {
             // Le process vient probablement de mourir : on le recycle et on
@@ -1595,7 +1599,8 @@ impl LiveClaudeSession {
     }
 
     fn touch(&self) {
-        self.last_activity.store(metrics::now_ts(), Ordering::Release);
+        self.last_activity
+            .store(metrics::now_ts(), Ordering::Release);
     }
 
     fn last_activity(&self) -> i64 {
@@ -4003,6 +4008,7 @@ mod tests {
             bypass: true,
             model: Some("modele-par-defaut".to_string()),
             reasoning_effort: Some("medium".to_string()),
+            fast_mode: false,
         }
     }
 
@@ -4035,11 +4041,7 @@ mod tests {
         let manager = ChatTurnManager::default();
         let mine = test_turn();
         let started_elsewhere = test_turn();
-        started_elsewhere
-            .snapshot
-            .lock()
-            .expect("snapshot")
-            .id = 2;
+        started_elsewhere.snapshot.lock().expect("snapshot").id = 2;
         {
             let mut turns = manager.turns.lock().expect("catalogue");
             turns.insert(1, mine);
@@ -4074,9 +4076,15 @@ mod tests {
             .is_empty());
 
         // `chat_turn_status` et `stop_chat_turn` suivent la meme regle.
-        assert!(manager.is_visible_to(2, "user-b", |_| true).expect("visibilite"));
-        assert!(!manager.is_visible_to(2, "user-b", |_| false).expect("visibilite"));
-        assert!(manager.is_visible_to(1, "user-a", |_| false).expect("visibilite"));
+        assert!(manager
+            .is_visible_to(2, "user-b", |_| true)
+            .expect("visibilite"));
+        assert!(!manager
+            .is_visible_to(2, "user-b", |_| false)
+            .expect("visibilite"));
+        assert!(manager
+            .is_visible_to(1, "user-a", |_| false)
+            .expect("visibilite"));
     }
 
     #[test]
@@ -4088,8 +4096,14 @@ mod tests {
             live_claude_key("acc", "sess")
         );
         // Des ids reels distincts (jamais de `\0`) ne collisionnent pas.
-        assert_ne!(live_claude_key("acc", "sess-1"), live_claude_key("acc", "sess-2"));
-        assert_ne!(live_claude_key("acc-1", "sess"), live_claude_key("acc-2", "sess"));
+        assert_ne!(
+            live_claude_key("acc", "sess-1"),
+            live_claude_key("acc", "sess-2")
+        );
+        assert_ne!(
+            live_claude_key("acc-1", "sess"),
+            live_claude_key("acc-2", "sess")
+        );
     }
 
     #[test]
@@ -4180,7 +4194,9 @@ mod tests {
         assert!(!claude_line_is_turn_boundary(
             r#"{"type":"assistant","message":{"content":"salut"}}"#
         ));
-        assert!(!claude_line_is_turn_boundary(r#"{"type":"system","session_id":"s"}"#));
+        assert!(!claude_line_is_turn_boundary(
+            r#"{"type":"system","session_id":"s"}"#
+        ));
         assert!(!claude_line_is_turn_boundary("pas du json"));
     }
 
@@ -4896,9 +4912,7 @@ mod tests {
         }
         // Le garde-fou central : le modele ne doit jamais annoncer un envoi que
         // seule la confirmation humaine declenche reellement.
-        assert!(
-            autonomous_agent_tool_instructions().contains("NE FONT PARTIR NI N'ECRIVENT RIEN")
-        );
+        assert!(autonomous_agent_tool_instructions().contains("NE FONT PARTIR NI N'ECRIVENT RIEN"));
     }
 
     #[test]

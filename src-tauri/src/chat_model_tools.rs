@@ -28,6 +28,10 @@ pub const PAUSE_AUTONOMOUS_AGENT_TOOL_NAME: &str = "pause_autonomous_agent";
 pub const APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME: &str = "apply_autonomous_agent_policy";
 pub const ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME: &str = "activate_supervisor_general_report";
 pub const CREATE_CHAT_TOOL_NAME: &str = "create_chat";
+pub const LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME: &str = "list_private_message_users";
+pub const LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME: &str = "list_private_message_campaigns";
+pub const CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME: &str = "create_private_message_campaign";
+pub const CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME: &str = "control_private_message_campaign";
 pub const LIST_OUTLOOK_MESSAGES_TOOL_NAME: &str = "list_outlook_messages";
 pub const LIST_CALENDAR_EVENTS_TOOL_NAME: &str = "list_calendar_events";
 pub const SEND_OUTLOOK_EMAIL_TOOL_NAME: &str = "send_outlook_email";
@@ -72,12 +76,21 @@ pub(crate) const MICROSOFT_TOOL_NAMES: [&str; 5] = [
     CREATE_CALENDAR_EVENT_TOOL_NAME,
     UPDATE_CALENDAR_EVENT_TOOL_NAME,
 ];
+pub(crate) const PRIVATE_MESSAGE_TOOL_NAMES: [&str; 4] = [
+    LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME,
+    LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME,
+    CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
+    CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
+];
 
 impl ChatToolScope {
     pub fn allows(&self, tool_name: &str) -> bool {
         match self {
             Self::Full => true,
-            Self::PersonalDataOnly => MICROSOFT_TOOL_NAMES.contains(&tool_name),
+            Self::PersonalDataOnly => {
+                MICROSOFT_TOOL_NAMES.contains(&tool_name)
+                    || PRIVATE_MESSAGE_TOOL_NAMES.contains(&tool_name)
+            }
         }
     }
 }
@@ -189,10 +202,7 @@ impl ChatToolCapabilityRegistry {
     /// preparent un e-mail ou une ecriture d'agenda : ils ne partent qu'apres
     /// confirmation humaine, mais chaque brouillon coute a l'utilisateur une
     /// carte a relire.
-    pub fn claim_external_action(
-        &self,
-        token: &str,
-    ) -> Result<AutonomousAgentToolContext, String> {
+    pub fn claim_external_action(&self, token: &str) -> Result<AutonomousAgentToolContext, String> {
         let now = metrics::now_ts();
         let mut entries = self
             .inner
@@ -638,7 +648,7 @@ pub(crate) fn initialize_response(
                     "title": "Outils du chat Codex Switch Terminal",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Ces outils donnent acces au compte Microsoft 365 de l'utilisateur qui a cree cet agent : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous, update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux de ce proprietaire : ne demande jamais d'identifiant ni de boite tierce. S'il a plusieurs boites liees, sa boite principale est utilisee par defaut ; le champ account permet d'en viser une autre parmi les siennes. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils deposent une carte que le proprietaire devra confirmer dans l'application. Comme personne ne lit ce cycle en direct, ecris des brouillons complets et autonomes, et indique clairement dans ton compte rendu ce qui attend une validation."
+                "instructions": "Ces outils donnent acces a la messagerie interne et au compte Microsoft 365 du proprietaire. Pour une diffusion interne, commence par list_private_message_users, cree normalement un brouillon avec create_private_message_campaign, puis ne demarre une campagne que si le consentement de cette audience est un fait explicite dans l'objectif ou la memoire. Reutilise uniquement les identifiants retournes ; n'invente jamais de destinataire. La cadence minimale et les limites du produit restent obligatoires. Les outils d'ecriture Microsoft ne font que preparer des cartes a confirmer. Indique clairement dans le compte rendu les campagnes creees, leur statut et ce qui attend une validation."
             }
         });
     }
@@ -653,7 +663,7 @@ pub(crate) fn initialize_response(
                 "title": "Outils du chat Codex Switch Terminal",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Quand l'utilisateur demande explicitement d'ouvrir, creer ou lancer un chat normal separe, appelle create_chat avec son message initial. Le nouveau chat herite du compte, du modele et de l'environnement courants ; un seul peut etre cree par tour. Quand l'utilisateur demande explicitement de creer, lancer ou demarrer un nouvel agent autonome, appelle create_autonomous_agent. Quand il demande explicitement de mettre en pause l'agent autonome lie a ce chat, appelle pause_autonomous_agent sans demander d'identifiant. Quand il demande explicitement de modifier l'agent autonome lie a ce chat, appelle update_autonomous_agent. Quand il demande au superviseur d'activer, produire ou relancer le compte rendu general des rapports non lus, appelle activate_supervisor_general_report ; cet outil fonctionne depuis n'importe quel chat et ne demande aucun identifiant. Quand il demande d'ajouter une meme regle durable a plusieurs agents deja actifs qui utilisent la review humaine, appelle apply_autonomous_agent_policy ; cet outil fonctionne sans cle de chat et reste limite au compte et, par defaut, au projet courants. Deduis une configuration sure, conserve les valeurs existantes et ne demande jamais d'identifiant d'agent. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. N'appelle pas ces outils pour une question theorique. Cinq outils supplementaires donnent acces au compte Microsoft 365 lie a l'utilisateur connecte : list_outlook_messages pour lire ou chercher ses e-mails, list_calendar_events pour consulter son agenda, send_outlook_email pour preparer un e-mail, create_calendar_event pour proposer un rendez-vous et update_calendar_event pour proposer la modification d'un evenement existant. La boite et l'agenda sont ceux du compte connecte : ne demande jamais d'identifiant, de mot de passe ni de boite tierce. L'utilisateur peut avoir lie plusieurs boites Microsoft : par defaut, sa boite principale est utilisee ; s'il precise laquelle (par exemple « depuis ma boite pro »), passe son adresse dans le champ account. N'utilise dans account qu'une de ses propres adresses liees, jamais celle d'un destinataire. Les trois derniers outils N'ENVOIENT ET N'ECRIVENT RIEN : ils preparent une carte que l'utilisateur doit confirmer, ou il voit et peut changer la boite expeditrice. N'affirme donc jamais qu'un e-mail est parti ou qu'un rendez-vous est cree ; dis qu'il attend sa validation."
+            "instructions": "Utilise les outils d'agents et de chats uniquement sur demande explicite. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. La messagerie interne expose list_private_message_users, list_private_message_campaigns, create_private_message_campaign et control_private_message_campaign. Pour une diffusion, liste d'abord les utilisateurs, n'invente aucun identifiant, prepare par defaut un brouillon et ne lance une campagne que si le consentement de l'audience est explicitement etabli. Indique toujours le statut reel renvoye par l'outil. Les outils Microsoft lisent la boite et l'agenda lies au compte ; leurs outils d'ecriture ne font que preparer une carte que l'utilisateur doit confirmer."
         }
     })
 }
@@ -1066,6 +1076,111 @@ fn all_tools_response(id: Value) -> Value {
                     }
                 },
                 {
+                    "name": LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME,
+                    "title": "Lister les destinataires internes",
+                    "description": "Liste les utilisateurs de Codex Switch Terminal auxquels le proprietaire peut ecrire. Reutilise les identifiants retournes tels quels ; n'invente jamais un destinataire.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {}
+                    },
+                    "annotations": {
+                        "title": "Lister les destinataires internes",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME,
+                    "title": "Suivre les campagnes internes",
+                    "description": "Liste les campagnes de messages du proprietaire avec leur statut, progression, cadence et erreurs. Utilise cet outil avant de piloter une campagne existante.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {}
+                    },
+                    "annotations": {
+                        "title": "Suivre les campagnes internes",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
+                    "title": "Creer une campagne de messages internes",
+                    "description": "Cree une campagne persistante. Commence par list_private_message_users. Les variantes tournent entre les destinataires et acceptent {{username}}, {{index}} et {{total}}. Cree un brouillon par defaut. startImmediately et consentConfirmed ne peuvent etre true que si le consentement de toute cette audience est explicitement etabli dans la demande ou la memoire.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "name": { "type": "string", "maxLength": 120 },
+                            "recipientIds": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 100,
+                                "uniqueItems": true,
+                                "items": { "type": "string" }
+                            },
+                            "messageVariants": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 20,
+                                "items": { "type": "string", "minLength": 1, "maxLength": 4000 }
+                            },
+                            "intervalSeconds": {
+                                "type": "integer",
+                                "minimum": 5,
+                                "maximum": 3600
+                            },
+                            "startImmediately": { "type": "boolean" },
+                            "consentConfirmed": { "type": "boolean" },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 160,
+                                "pattern": "^[A-Za-z0-9._:-]+$",
+                                "description": "Cle stable propre a cette campagne pour qu'une relance de l'outil ne cree jamais de doublon."
+                            }
+                        },
+                        "required": ["recipientIds", "messageVariants", "idempotencyKey"]
+                    },
+                    "annotations": {
+                        "title": "Creer une campagne interne",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
+                    "title": "Piloter une campagne interne",
+                    "description": "Demarre, met en pause, reprend ou annule une campagne existante du proprietaire. Recupere d'abord son identifiant et son statut avec list_private_message_campaigns. start exige un consentement confirme ; cancel arrete seulement les livraisons encore en attente.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "campaignId": { "type": "string", "minLength": 1 },
+                            "action": {
+                                "type": "string",
+                                "enum": ["start", "pause", "resume", "cancel"]
+                            }
+                        },
+                        "required": ["campaignId", "action"]
+                    },
+                    "annotations": {
+                        "title": "Piloter une campagne interne",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": false
+                    }
+                },
+                {
                     "name": LIST_OUTLOOK_MESSAGES_TOOL_NAME,
                     "title": "Lire la boite Outlook de l'utilisateur",
                     "description": "Liste les e-mails de la boite Microsoft 365 liee au compte de l'utilisateur connecte. Utilise cet outil quand l'utilisateur demande de consulter, chercher, resumer ou verifier ses e-mails. La boite est deduite du compte connecte : ne demande jamais d'adresse, d'identifiant ni de mot de passe. Les corps complets ne sont pas retournes : appuie-toi sur l'objet, l'expediteur et l'apercu.",
@@ -1321,7 +1436,10 @@ pub(crate) fn tool_pending_action_response(
         // alors qu'une autre boite saine existe (relier celle-ci, ou changer
         // d'expediteur sur la carte).
         let text = if action.has_other_usable_account {
-            let mailbox = action.account_email.as_deref().unwrap_or("la boite choisie");
+            let mailbox = action
+                .account_email
+                .as_deref()
+                .unwrap_or("la boite choisie");
             format!(
                 "Brouillon conserve : {}. La boite {} doit etre reliee avant de pouvoir l'utiliser, mais l'utilisateur a d'autres boites Microsoft actives. Sur la carte affichee, il peut soit relier {}, soit choisir une autre de ses boites comme expediteur, puis confirmer. Ne prepare pas de nouveau brouillon et n'affirme rien tant qu'il n'a pas confirme.",
                 action.summary, mailbox, mailbox
@@ -1734,7 +1852,11 @@ mod tests {
             "objective": "Surveiller les regressions"
         }))
         .unwrap();
-        assert!(arguments.into_request(anonymous).unwrap().owner_id.is_none());
+        assert!(arguments
+            .into_request(anonymous)
+            .unwrap()
+            .owner_id
+            .is_none());
     }
 
     #[test]
@@ -1938,15 +2060,21 @@ mod tests {
     }
 
     #[test]
-    fn an_autonomous_agent_only_sees_the_microsoft_tools() {
+    fn an_autonomous_agent_only_sees_personal_data_and_internal_messaging_tools() {
         let response = tools_list_response(json!(1), ChatToolScope::PersonalDataOnly);
         let tools = response["result"]["tools"].as_array().unwrap();
         let names = tools
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), MICROSOFT_TOOL_NAMES.len());
+        assert_eq!(
+            names.len(),
+            MICROSOFT_TOOL_NAMES.len() + PRIVATE_MESSAGE_TOOL_NAMES.len()
+        );
         for name in MICROSOFT_TOOL_NAMES {
+            assert!(names.contains(&name), "{name} manquant pour un agent");
+        }
+        for name in PRIVATE_MESSAGE_TOOL_NAMES {
             assert!(names.contains(&name), "{name} manquant pour un agent");
         }
         // Un agent autonome qui pourrait se dupliquer ou ouvrir des chats
@@ -1959,12 +2087,16 @@ mod tests {
             ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME,
             CREATE_CHAT_TOOL_NAME,
         ] {
-            assert!(!names.contains(&forbidden), "{forbidden} accessible a un agent");
+            assert!(
+                !names.contains(&forbidden),
+                "{forbidden} accessible a un agent"
+            );
             assert!(!ChatToolScope::PersonalDataOnly.allows(forbidden));
         }
         // La liste et le dispatch doivent refuser exactement les memes outils.
         assert!(ChatToolScope::Full.allows(CREATE_CHAT_TOOL_NAME));
         assert!(ChatToolScope::PersonalDataOnly.allows(SEND_OUTLOOK_EMAIL_TOOL_NAME));
+        assert!(ChatToolScope::PersonalDataOnly.allows(CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME));
     }
 
     #[test]

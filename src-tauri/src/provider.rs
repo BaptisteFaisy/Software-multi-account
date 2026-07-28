@@ -172,12 +172,17 @@ impl Provider {
         bypass: bool,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        fast_mode: bool,
     ) -> io::Result<()> {
         match self {
-            Provider::Codex => {
-                settings::ensure_codex_account_config(home, bypass, model, reasoning_effort)
-            }
-            Provider::Claude => ensure_claude_account_config(home, bypass, model),
+            Provider::Codex => settings::ensure_codex_account_config(
+                home,
+                bypass,
+                model,
+                reasoning_effort,
+                fast_mode,
+            ),
+            Provider::Claude => ensure_claude_account_config(home, bypass, model, fast_mode),
             Provider::OpenCode => ensure_opencode_account_home(home),
         }
     }
@@ -281,6 +286,7 @@ pub fn ensure_claude_account_config(
     home: &Path,
     bypass: bool,
     model: Option<&str>,
+    fast_mode: bool,
 ) -> io::Result<()> {
     let model = model.map(str::trim).filter(|value| !value.is_empty());
 
@@ -309,6 +315,11 @@ pub fn ensure_claude_account_config(
 
         if let Some(model) = model {
             obj.insert("model".to_string(), Value::String(model.to_string()));
+        }
+        if fast_mode {
+            obj.insert("fastMode".to_string(), Value::Bool(true));
+        } else {
+            obj.remove("fastMode");
         }
 
         let mode = if bypass {
@@ -447,7 +458,7 @@ mod tests {
         let root = scratch("opencode-home");
         let home = root.join("opencode-zai");
         Provider::OpenCode
-            .write_account_config(&home, true, Some("deepseek/deepseek-chat"), None)
+            .write_account_config(&home, true, Some("deepseek/deepseek-chat"), None, false)
             .unwrap();
 
         let environment = Provider::OpenCode.home_env(&home);
@@ -487,7 +498,7 @@ mod tests {
         // models.dev + ~60 Mo de node_modules) n'est paye qu'une fois.
         let other = root.join("opencode-minimax");
         Provider::OpenCode
-            .write_account_config(&other, false, None, None)
+            .write_account_config(&other, false, None, None, false)
             .unwrap();
         let other_environment = Provider::OpenCode.home_env(&other);
         assert_eq!(
@@ -537,7 +548,7 @@ mod tests {
     fn claude_config_writes_model_and_bypass_mode_idempotently() {
         let home = scratch("claude-cfg");
 
-        ensure_claude_account_config(&home, true, Some("opus")).unwrap();
+        ensure_claude_account_config(&home, true, Some("opus"), true).unwrap();
         let once = fs::read_to_string(home.join("settings.json")).unwrap();
         let value: Value = serde_json::from_str(&once).unwrap();
         assert_eq!(
@@ -550,9 +561,13 @@ mod tests {
                 .and_then(Value::as_str),
             Some("bypassPermissions")
         );
+        assert_eq!(
+            value.pointer("/fastMode").and_then(Value::as_bool),
+            Some(true)
+        );
 
         // Idempotent au 2e passage.
-        ensure_claude_account_config(&home, true, Some("opus")).unwrap();
+        ensure_claude_account_config(&home, true, Some("opus"), true).unwrap();
         let twice = fs::read_to_string(home.join("settings.json")).unwrap();
         assert_eq!(once, twice);
 
@@ -567,11 +582,11 @@ mod tests {
         // et une permission allow-list qui doivent survivre.
         fs::write(
             home.join("settings.json"),
-            "{\"mcpServers\":{\"foo\":{\"url\":\"http://x\"}},\"permissions\":{\"allow\":[\"Bash\"]}}",
+            "{\"fastMode\":true,\"mcpServers\":{\"foo\":{\"url\":\"http://x\"}},\"permissions\":{\"allow\":[\"Bash\"]}}",
         )
         .unwrap();
 
-        ensure_claude_account_config(&home, false, None).unwrap();
+        ensure_claude_account_config(&home, false, None, false).unwrap();
         let value: Value =
             serde_json::from_str(&fs::read_to_string(home.join("settings.json")).unwrap()).unwrap();
 
@@ -582,6 +597,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("default")
         );
+        assert!(value.pointer("/fastMode").is_none());
         assert_eq!(
             value
                 .pointer("/permissions/allow/0")

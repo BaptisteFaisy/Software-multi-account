@@ -4069,6 +4069,7 @@ mod tests {
             bypass: true,
             model: None,
             reasoning_effort: None,
+            fast_mode: false,
         }
     }
 
@@ -5101,7 +5102,9 @@ mod tests {
                 "le rappel systeme accole est retire sans perdre la demande"
             );
             assert!(
-                !turns.iter().any(|turn| turn.text.contains("bundled-skills")),
+                !turns
+                    .iter()
+                    .any(|turn| turn.text.contains("bundled-skills")),
                 "le corps du SKILL.md ne doit jamais apparaitre"
             );
         }

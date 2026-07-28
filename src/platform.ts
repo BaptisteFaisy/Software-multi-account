@@ -429,8 +429,6 @@ export type RemoteConnectionRepairResult = {
 export const repairRemoteConnection = async (): Promise<RemoteConnectionRepairResult> => {
   const baseUrl = window.location.origin.replace(/\/+$/, "");
   const token = remoteToken();
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 8_000);
 
   // La page courante est la seule origine fiable : sur un telephone, une
   // ancienne valeur 127.0.0.1 viserait le telephone et non le PC serveur.
@@ -442,21 +440,43 @@ export const repairRemoteConnection = async (): Promise<RemoteConnectionRepairRe
     // localStorage suffit pour le navigateur et la PWA.
   }
 
-  let response: Response;
-  try {
-    response = await fetch(`${baseUrl}/api/health`, {
-      cache: "no-store",
-      credentials: "include",
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    const detail = controller.signal.aborted
+  // Tailscale ou le reverse proxy peut demander quelques centaines de ms pour
+  // retablir le tunnel : on tente deux fois la health check avant de declarer
+  // le serveur injoignable. La cause de la premiere tentative est conservee
+  // pour diagnostiquer l'erreur finale.
+  let lastError: unknown = null;
+  let response: Response | null = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8_000);
+    try {
+      response = await fetch(`${baseUrl}/api/health`, {
+        cache: "no-store",
+        credentials: "include",
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        signal: controller.signal,
+      });
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
+      }
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
+  if (!response) {
+    const aborted = lastError instanceof Error
+      && /abort/i.test(lastError.name);
+    const detail = aborted
       ? "Le serveur ne repond pas apres 8 secondes."
       : "Le serveur reste injoignable.";
-    throw new Error(`${detail} Verifiez Tailscale puis reessayez.`, { cause: error });
-  } finally {
-    window.clearTimeout(timeout);
+    throw new Error(`${detail} Verifiez Tailscale puis reessayez.`, {
+      cause: lastError ?? undefined,
+    });
   }
 
   // Supprime uniquement les caches statiques de l'application. Les donnees,
@@ -827,6 +847,7 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         bypass: args.bypass ?? true,
         model: args.model ?? null,
         reasoningEffort: args.reasoningEffort ?? null,
+        fastMode: args.fastMode ?? false,
       });
     case "export_discussion_transcript":
       return remoteSessionApi<T>(args.accountId, args.sessionId, "POST", "/api/discussions/export", {
@@ -993,6 +1014,16 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return api<T>(
         "GET",
         `/api/private-messages/images/${encodeURIComponent(String(args.imageId))}`,
+      );
+    case "list_private_message_campaigns":
+      return api<T>("GET", "/api/private-messages/campaigns");
+    case "create_private_message_campaign":
+      return api<T>("POST", "/api/private-messages/campaigns", args.request);
+    case "control_private_message_campaign":
+      return api<T>(
+        "POST",
+        `/api/private-messages/campaigns/${encodeURIComponent(String(args.campaignId))}/control`,
+        { action: args.action, consentConfirmed: args.consentConfirmed ?? false },
       );
     case "account_model_catalog":
       return api<T>(
@@ -1833,12 +1864,7 @@ async function startRemoteChatTurn<T>(args: Record<string, any>): Promise<T> {
     let lastError: unknown = null;
     for (const route of candidates) {
       try {
-        const snapshot = await apiAt<Record<string, any>>(
-          route,
-          "POST",
-          "/api/chat/turns",
-          payload,
-        );
+        const snapshot = await postChatTurnWithTransportRetry(route, payload);
         rememberRemoteSessionRoute(accountId, sessionId, route, true);
         return decorateRemoteChatSnapshot(snapshot, route) as T;
       } catch (error) {
@@ -1848,6 +1874,72 @@ async function startRemoteChatTurn<T>(args: Record<string, any>): Promise<T> {
     }
     throw lastError ?? new Error("Aucun noeud de chat disponible.");
   });
+}
+
+/**
+ * Detecte une panne de transport (TypeError "Failed to fetch" ou equiv.) en
+ * l'absence de httpStatus : seul cas ou le serveur a PU creer le tour malgre
+ * la reponse perdue, et ou un rejoue de la demande est donc legitime.
+ */
+export const isTransportError = (error: unknown): boolean => {
+  if (typeof (error as { httpStatus?: number } | null | undefined)?.httpStatus === "number") {
+    return false;
+  }
+  const raw = String(error);
+  return error instanceof TypeError
+    || /failed to fetch|networkerror|network request failed|load failed/i.test(raw);
+};
+
+const platformSleep = (ms: number) =>
+  new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+
+/**
+ * POST /api/chat/turns avec un rejoue antichute. Sur panne de transport, le
+ * serveur a pu lancer le tour sans que la reponse nous revienne : on interroge
+ * /api/chat/turns/active (filtrage accountId + sourceChatKey) pour le recuperer
+ * avant de retenter l'envoi, sinon l'on dupliquerait la conversation.
+ *
+ * Une reponse HTTP 4xx/5xx (httpStatus present) est definitive : pas de rejoue.
+ */
+async function postChatTurnWithTransportRetry(
+  route: RemoteTerminalRoute,
+  payload: Record<string, any>,
+): Promise<Record<string, any>> {
+  try {
+    return await apiAt<Record<string, any>>(route, "POST", "/api/chat/turns", payload);
+  } catch (error) {
+    if (!isTransportError(error)) throw error;
+
+    // Laisser au reseau/Tailscale le temps de se retablir avant la verification.
+    await platformSleep(800);
+
+    const accountId = String(payload.accountId ?? "");
+    const sourceChatKey = typeof payload.sourceChatKey === "string"
+      ? payload.sourceChatKey
+      : null;
+    if (sourceChatKey) {
+      try {
+        const active = await apiAt<Record<string, any>[]>(
+          route,
+          "GET",
+          "/api/chat/turns/active",
+          undefined,
+          3_000,
+        );
+        const match = active.find((turn) =>
+          String(turn.accountId ?? "") === accountId
+          && String(turn.sourceChatKey ?? "") === sourceChatKey,
+        );
+        if (match) return match;
+      } catch {
+        // Sondage de dedoublonnement injoignable : on tente quand meme le rejoue.
+      }
+    }
+
+    // Aucun tour actif correspondant : la premiere requete n'est pas arrivee,
+    // retenter l'envoi est sur et evite le message "Non synchronise".
+    return await apiAt<Record<string, any>>(route, "POST", "/api/chat/turns", payload);
+  }
 }
 
 async function remoteChatTurnRequest<T>(

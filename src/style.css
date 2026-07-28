@@ -813,6 +813,20 @@ button {
   min-height: 36px;
 }
 
+.account-fast-mode-toggle {
+  min-width: 88px;
+}
+
+.account-fast-mode-toggle.active {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+}
+
+.account-fast-mode-toggle:disabled {
+  opacity: 0.48;
+}
+
 .simple-accounts-empty {
   display: grid;
   min-height: 150px;
@@ -9675,6 +9689,7 @@ div.chat-tool-part {
 .chat-app-layout .chat-mode-select,
 .chat-app-layout .chat-model-select,
 .chat-app-layout .chat-effort-select,
+.chat-app-layout .chat-fast-mode,
 .chat-app-layout .chat-workspace-chip {
   min-height: 28px;
   padding: 0 7px;
@@ -9687,6 +9702,7 @@ div.chat-tool-part {
 .chat-app-layout .chat-mode-select:hover,
 .chat-app-layout .chat-model-select:hover,
 .chat-app-layout .chat-effort-select:hover,
+.chat-app-layout .chat-fast-mode:hover:not(:disabled),
 .chat-app-layout .chat-workspace-chip:hover {
   background: rgba(255, 255, 255, 0.055);
   color: #c9c9c9;
@@ -10050,6 +10066,7 @@ div.chat-tool-part {
 .chat-mode-select,
 .chat-model-select,
 .chat-effort-select,
+.chat-fast-mode,
 .chat-workspace-chip {
   display: inline-flex;
   align-items: center;
@@ -10062,9 +10079,23 @@ div.chat-tool-part {
   color: var(--chat-muted);
   background: rgba(255, 255, 255, 0.025);
 }
+.chat-fast-mode {
+  cursor: pointer;
+  font: 600 9px var(--font-body);
+}
+.chat-fast-mode.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--chat-border));
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 11%, transparent);
+}
+.chat-fast-mode:disabled {
+  cursor: default;
+  opacity: .48;
+}
 .chat-mode-select svg,
 .chat-model-select svg,
 .chat-effort-select svg,
+.chat-fast-mode svg,
 .chat-workspace-chip svg { width: 12px; height: 12px; flex: none; }
 .chat-mode-select select,
 .chat-effort-select select,
@@ -10484,7 +10515,8 @@ div.chat-tool-part {
   .chat-composer-context { flex-wrap: wrap; gap: 3px; overflow: visible; }
   .chat-mode-select,
   .chat-model-select,
-  .chat-effort-select { padding-inline: 5px; }
+  .chat-effort-select,
+  .chat-fast-mode { padding-inline: 5px; }
   .chat-mode-select select { max-width: 74px; }
   .chat-model-select input { width: 82px; }
   .chat-effort-select select { max-width: 72px; }

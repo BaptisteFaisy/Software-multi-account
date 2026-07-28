@@ -85,6 +85,10 @@ pub struct AccountProfile {
     /// `None` laisse une eventuelle valeur existante du `config.toml` intacte.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Active le palier de service rapide propre a CE compte. Absent des
+    /// anciennes configurations => mode normal, sans surconsommation.
+    #[serde(default)]
+    pub fast_mode: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -147,6 +151,7 @@ pub struct AccountModelView {
     pub display_name: String,
     pub default_reasoning_effort: Option<String>,
     pub supported_reasoning_efforts: Vec<ModelReasoningEffortView>,
+    pub supports_fast_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +579,7 @@ pub fn ensure_account_home(
     bypass: bool,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    fast_mode: Option<bool>,
 ) -> Result<(), String> {
     // La creation/configuration reste propre a l'instance courante. La lecture
     // peut reutiliser un home authentifie d'une instance soeur, mais ne doit
@@ -583,7 +589,13 @@ pub fn ensure_account_home(
     // `provider` absent (anciens appels front) => Codex : comportement inchange.
     provider
         .unwrap_or_default()
-        .write_account_config(&home, bypass, model.as_deref(), reasoning_effort.as_deref())
+        .write_account_config(
+            &home,
+            bypass,
+            model.as_deref(),
+            reasoning_effort.as_deref(),
+            fast_mode.unwrap_or(false),
+        )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -927,6 +939,7 @@ mod tests {
             bypass: true,
             model: None,
             reasoning_effort: None,
+            fast_mode: false,
         }
     }
 
@@ -1113,6 +1126,7 @@ mod tests {
             true,
             Some("gpt-5.6-sol".to_string()),
             Some("medium".to_string()),
+            Some(true),
         )
         .expect("account home should be created and provisioned");
 
@@ -1122,6 +1136,7 @@ mod tests {
         assert!(config.contains("sandbox_mode = \"danger-full-access\""));
         assert!(config.contains("model = \"gpt-5.6-sol\""));
         assert!(config.contains("model_reasoning_effort = \"medium\""));
+        assert!(config.contains("service_tier = \"priority\""));
 
         let _ = fs::remove_dir_all(home);
     }
@@ -1136,6 +1151,7 @@ mod tests {
             false,
             None,
             None,
+            Some(false),
         )
         .expect("non-bypass account should be provisioned");
 
@@ -1151,9 +1167,9 @@ mod tests {
     #[test]
     fn disabling_bypass_replaces_previously_persisted_bypass() {
         let home = fresh_account_home("bypass-transition");
-        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("high"))
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("high"), false)
             .expect("bypass config");
-        ensure_codex_account_config(&home, false, Some("gpt-5.6-sol"), Some("high"))
+        ensure_codex_account_config(&home, false, Some("gpt-5.6-sol"), Some("high"), false)
             .expect("safe config");
 
         let config = fs::read_to_string(home.join("config.toml")).expect("config.toml");
@@ -1168,6 +1184,36 @@ mod tests {
     }
 
     #[test]
+    fn disabling_fast_mode_removes_only_the_root_service_tier() {
+        let home = fresh_account_home("fast-mode-transition");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            concat!(
+                "# service_tier = \"commented\"\n",
+                "[profiles.custom]\n",
+                "service_tier = \"flex\"\n",
+            ),
+        )
+        .unwrap();
+
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("high"), true)
+            .expect("fast config");
+        let enabled = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(enabled.starts_with("service_tier = \"priority\"\n"));
+        assert!(enabled.contains("[profiles.custom]\nservice_tier = \"flex\""));
+
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("high"), false)
+            .expect("normal config");
+        let disabled = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!disabled.contains("service_tier = \"priority\""));
+        assert!(disabled.contains("# service_tier = \"commented\""));
+        assert!(disabled.contains("[profiles.custom]\nservice_tier = \"flex\""));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn account_config_preserves_sections_and_is_idempotent() {
         let home = fresh_account_home("config-idempotent");
         fs::create_dir_all(&home).unwrap();
@@ -1177,16 +1223,17 @@ mod tests {
         )
         .unwrap();
 
-        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"))
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"), true)
             .expect("first provisioning");
         let once = fs::read_to_string(home.join("config.toml")).unwrap();
-        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"))
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("xhigh"), true)
             .expect("second provisioning");
         let twice = fs::read_to_string(home.join("config.toml")).unwrap();
 
         assert_eq!(once, twice);
         assert!(twice.contains("[mcp_servers.example]"));
         assert!(twice.contains("url = \"http://127.0.0.1:8123/mcp\""));
+        assert_eq!(twice.matches("service_tier =").count(), 1);
 
         let _ = fs::remove_dir_all(home);
     }
@@ -1230,7 +1277,7 @@ mod tests {
     #[test]
     fn account_config_rejects_invalid_reasoning_effort() {
         let home = fresh_account_home("invalid-effort");
-        let error = ensure_codex_account_config(&home, true, None, Some("ultra mode"))
+        let error = ensure_codex_account_config(&home, true, None, Some("ultra mode"), false)
             .expect_err("malformed effort must be rejected");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
@@ -1240,9 +1287,9 @@ mod tests {
     #[test]
     fn account_config_accepts_max_and_ultra_reasoning_efforts() {
         let home = fresh_account_home("max-ultra-effort");
-        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("max"))
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("max"), false)
             .expect("max effort");
-        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("ultra"))
+        ensure_codex_account_config(&home, true, Some("gpt-5.6-sol"), Some("ultra"), false)
             .expect("ultra effort");
 
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -1254,11 +1301,11 @@ mod tests {
     fn account_config_escapes_model_before_writing_toml() {
         let home = fresh_account_home("model-escape");
         let injected = "gpt-5.6-sol\"\nsandbox_mode = \"danger-full-access";
-        ensure_codex_account_config(&home, false, Some(injected), Some("low"))
+        ensure_codex_account_config(&home, false, Some(injected), Some("low"), false)
             .expect("escaped model should remain a TOML string");
 
         let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        ensure_codex_account_config(&home, false, Some(injected), Some("low"))
+        ensure_codex_account_config(&home, false, Some(injected), Some("low"), false)
             .expect("escaped model should stay idempotent");
         let second = fs::read_to_string(home.join("config.toml")).unwrap();
         assert_eq!(config, second);
@@ -1285,6 +1332,7 @@ mod tests {
         assert_eq!(account.created_at, None);
         assert_eq!(account.model, None);
         assert_eq!(account.reasoning_effort, None);
+        assert!(!account.fast_mode);
     }
 
     fn assert_session_blob_import(content: &str) {
@@ -2136,22 +2184,33 @@ mod tests {
     }
 
     #[test]
-    fn model_catalog_preserves_model_specific_max_and_ultra_efforts() {
+    fn model_catalog_preserves_efforts_and_fast_mode_capability() {
         let models = parse_account_model_catalog(&json!({
-            "data": [{
-                "id": "gpt-5.6-sol",
-                "displayName": "GPT-5.6-Sol",
-                "defaultReasoningEffort": "medium",
-                "supportedReasoningEfforts": [
-                    { "reasoningEffort": "low", "description": "Fast" },
-                    { "reasoningEffort": "max", "description": "Maximum" },
-                    { "reasoningEffort": "ultra", "description": "Delegation" }
-                ]
-            }]
+            "data": [
+                {
+                    "id": "gpt-5.6-sol",
+                    "displayName": "GPT-5.6-Sol",
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [
+                        { "reasoningEffort": "low", "description": "Fast" },
+                        { "reasoningEffort": "max", "description": "Maximum" },
+                        { "reasoningEffort": "ultra", "description": "Delegation" }
+                    ],
+                    "serviceTiers": [
+                        { "id": "priority", "name": "Fast" }
+                    ]
+                },
+                {
+                    "id": "gpt-5.4-mini",
+                    "additional_speed_tiers": []
+                }
+            ]
         }));
 
-        assert_eq!(models.len(), 1);
+        assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert!(models[0].supports_fast_mode);
+        assert!(!models[1].supports_fast_mode);
         assert_eq!(
             models[0]
                 .supported_reasoning_efforts
@@ -2650,6 +2709,7 @@ fn merge_missing_account_metadata(target: &mut AccountProfile, source: &AccountP
     if target.reasoning_effort.is_none() {
         target.reasoning_effort = source.reasoning_effort.clone();
     }
+    target.fast_mode |= source.fast_mode;
     if target.limits.connected_at.is_none() {
         target.limits.connected_at = source.limits.connected_at;
     }
@@ -2771,6 +2831,7 @@ fn merge_discovered_profiles(settings: &mut AppSettings) -> Result<bool, String>
                 // config.toml. L'utilisateur pourra les choisir dans l'UI.
                 model: None,
                 reasoning_effort: None,
+                fast_mode: false,
             });
             account_paths.insert(normalized);
             changed = true;
@@ -3526,11 +3587,33 @@ fn parse_account_model_catalog(value: &Value) -> Vec<AccountModelView> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let supports_fast_mode = entry
+                .get("serviceTiers")
+                .or_else(|| entry.get("service_tiers"))
+                .and_then(Value::as_array)
+                .is_some_and(|tiers| {
+                    tiers.iter().any(|tier| {
+                        tier.get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id.eq_ignore_ascii_case("priority"))
+                    })
+                })
+                || entry
+                    .get("additionalSpeedTiers")
+                    .or_else(|| entry.get("additional_speed_tiers"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|tiers| {
+                        tiers.iter().any(|tier| {
+                            tier.as_str()
+                                .is_some_and(|id| id.eq_ignore_ascii_case("fast"))
+                        })
+                    });
             Some(AccountModelView {
                 id,
                 display_name,
                 default_reasoning_effort,
                 supported_reasoning_efforts,
+                supports_fast_mode,
             })
         })
         .collect()
@@ -4504,7 +4587,7 @@ fn import_single_account(
     // Compte importe : herite du defaut global "Bypass defaut" (comme la
     // creation via l'UI / newAccountProfile), pas un `true` code en dur.
     let bypass_default = settings.codex_bypass;
-    let (bypass_enabled, model, reasoning_effort) = match settings
+    let (bypass_enabled, model, reasoning_effort, fast_mode) = match settings
         .accounts
         .iter_mut()
         .find(|candidate| candidate.id == id)
@@ -4518,6 +4601,7 @@ fn import_single_account(
                 existing.bypass,
                 existing.model.clone(),
                 existing.reasoning_effort.clone(),
+                existing.fast_mode,
             )
         }
         None => {
@@ -4537,8 +4621,9 @@ fn import_single_account(
                 bypass: bypass_default,
                 model: model.clone(),
                 reasoning_effort: reasoning_effort.clone(),
+                fast_mode: false,
             });
-            (bypass_default, model, reasoning_effort)
+            (bypass_default, model, reasoning_effort, false)
         }
     };
 
@@ -4547,6 +4632,7 @@ fn import_single_account(
         bypass_enabled,
         model.as_deref(),
         reasoning_effort.as_deref(),
+        fast_mode,
     )
     .map_err(|error| error.to_string())?;
 
@@ -4914,6 +5000,7 @@ pub fn ensure_codex_account_config(
     bypass: bool,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    fast_mode: bool,
 ) -> std::io::Result<()> {
     let model = model.map(str::trim).filter(|value| !value.is_empty());
     let reasoning_effort = reasoning_effort
@@ -4947,6 +5034,11 @@ pub fn ensure_codex_account_config(
     if let Some(effort) = reasoning_effort {
         updated = upsert_top_level_string(&updated, "model_reasoning_effort", effort);
     }
+    updated = if fast_mode {
+        upsert_top_level_string(&updated, "service_tier", "priority")
+    } else {
+        remove_top_level_key(&updated, "service_tier")
+    };
     if let Some(windows_sandbox) = codex_windows_sandbox_override()? {
         updated = upsert_table_string(&updated, "windows", "sandbox", &windows_sandbox);
     }
@@ -5054,6 +5146,50 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
         format!("{desired}\n")
     } else {
         format!("{desired}\n{content}")
+    }
+}
+
+/// Retire toutes les occurrences effectives d'une cle scalaire racine sans
+/// toucher aux commentaires, aux tables ni au contenu des valeurs multi-lignes.
+fn remove_top_level_key(content: &str, key: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut removed = false;
+    let mut in_table = false;
+    let mut ml: Option<&'static str> = None;
+    let mut depth: i32 = 0;
+
+    for line in content.lines() {
+        let at_top_level = ml.is_none() && depth == 0;
+        let trimmed = line.trim_start();
+        let is_target = if at_top_level {
+            if trimmed.starts_with('[') {
+                in_table = true;
+                false
+            } else {
+                !in_table
+                    && !trimmed.starts_with('#')
+                    && trimmed
+                        .strip_prefix(key)
+                        .map(|rest| rest.trim_start().starts_with('='))
+                        .unwrap_or(false)
+            }
+        } else {
+            false
+        };
+
+        if is_target {
+            removed = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+        advance_toml_lex(line, &mut ml, &mut depth);
+    }
+
+    if removed {
+        out
+    } else {
+        content.to_string()
     }
 }
 

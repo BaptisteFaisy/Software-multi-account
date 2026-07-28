@@ -4,7 +4,9 @@ import test from "node:test";
 
 import {
   filterPrivateMessageUsers,
+  privateMessageCampaignCounts,
   privateMessagingUnreadCount,
+  renderPrivateMessageCampaignTemplate,
   sortPrivateConversations,
 } from "../src/messaging-model.ts";
 
@@ -53,6 +55,26 @@ test("les conversations sont classees par dernier message et additionnent les no
   assert.equal(privateMessagingUnreadCount(conversations), 3);
 });
 
+test("les campagnes personnalisent les variantes et comptent leur progression", () => {
+  const alice = user("alice", "Alice");
+  assert.equal(
+    renderPrivateMessageCampaignTemplate(
+      "Bonjour {{username}} ({{index}}/{{total}})",
+      alice,
+      2,
+      5,
+    ),
+    "Bonjour Alice (2/5)",
+  );
+  assert.deepEqual(privateMessageCampaignCounts({
+    deliveries: [
+      { status: "sent" },
+      { status: "queued" },
+      { status: "failed" },
+    ],
+  }), { sent: 1, failed: 1, queued: 1, total: 3 });
+});
+
 test("le stockage filtre chaque fil par ses deux participants et persiste les lectures", () => {
   assert.match(backend, /filter\(\|message\| message_involves\(message, viewer_id\)\)/);
   assert.match(backend, /filter\(\|message\| message_between\(message, &viewer_id, &other_id\)\)/);
@@ -97,6 +119,23 @@ test("la vue permet de choisir un utilisateur, lire un fil et envoyer un message
   assert.match(styles, /@media \(max-width: 860px\)/);
   assert.match(styles, /\.messaging-panel\.is-detail-open \.messaging-list \{ display: none;/);
   assert.match(styles, /\.messaging-panel\.is-detail-open \.messaging-detail \{ display: flex;/);
+});
+
+test("les campagnes de messages sont pilotees depuis l'interface et les deux transports", () => {
+  assert.match(messaging, /id="messagingCampaigns"/);
+  assert.match(messaging, /id="messagingCampaignForm"/);
+  assert.match(messaging, /data-campaign-recipient/);
+  assert.match(messaging, /renderPrivateMessageCampaignTemplate/);
+  assert.match(messaging, /invoke<PrivateMessageCampaign>\(\s*"create_private_message_campaign"/);
+  assert.match(messaging, /"control_private_message_campaign"/);
+  assert.match(platform, /case "list_private_message_campaigns"/);
+  assert.match(platform, /case "create_private_message_campaign"/);
+  assert.match(platform, /case "control_private_message_campaign"/);
+  assert.match(desktop, /private_messages::create_private_message_campaign/);
+  assert.match(server, /"\/private-messages\/campaigns"/);
+  assert.match(backend, /pub fn process_due_campaigns/);
+  assert.match(backend, /MIN_CAMPAIGN_INTERVAL_SECONDS: u64 = 5/);
+  assert.match(styles, /\.messaging-campaign-dialog/);
 });
 
 test("la messagerie accepte, valide, affiche et protege les images privees", () => {

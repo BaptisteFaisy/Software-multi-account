@@ -10,6 +10,7 @@ import {
   invoke,
   isRemoteMode,
   isTauriRuntime,
+  isTransportError,
   listen,
   openExternalHttpsUrl,
   openMobileGooglePaySettings,
@@ -966,6 +967,8 @@ type AccountProfile = {
   // compatible avec les settings.json crees avant leur introduction.
   model?: string | null;
   reasoningEffort?: CodexReasoningEffort | null;
+  // Palier rapide par compte. Absent des anciens settings => mode normal.
+  fastMode?: boolean;
 };
 
 const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
@@ -1028,6 +1031,7 @@ type AccountModelView = {
   displayName: string;
   defaultReasoningEffort?: string | null;
   supportedReasoningEfforts: ModelReasoningEffortView[];
+  supportsFastMode: boolean;
 };
 
 type AccountLimitTracking = {
@@ -1973,6 +1977,7 @@ let poolNewAccountProxyId = "";
 let poolNewAccountBypass = true;
 let poolNewAccountModel = DEFAULT_CODEX_MODEL;
 let poolNewAccountReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+let poolNewAccountFastMode = false;
 let pendingDeleteAccountId: string | null = null;
 let limitStatus: AccountLimitView[] = [];
 let limitStatusLoaded = false;
@@ -2046,6 +2051,7 @@ let newTerminalInferenceProvider: OpenCodeInferenceProvider | null = null;
 let newTerminalAccountBypass = true;
 let newTerminalAccountModel = DEFAULT_CODEX_MODEL;
 let newTerminalAccountReasoningEffort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+let newTerminalAccountFastMode = false;
 // Fenetre "nouveau chat" : le routage choisit un compte compatible en arriere-plan.
 // Un choix manuel reste disponible dans les reglages avances, sans devenir une
 // etape obligatoire du parcours principal.
@@ -4115,6 +4121,53 @@ const accountModel = (account: AccountProfile | null | undefined) =>
   account?.model?.trim() ||
   providerDefaultModel(accountProvider(account), accountInferenceProvider(account));
 
+const CODEX_FAST_MODE_FALLBACK_MODELS = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.5",
+  "gpt-5.4",
+]);
+
+const providerModelSupportsFastMode = (
+  provider: Provider,
+  model: string,
+  catalogModel: AccountModelView | null = null,
+): boolean => {
+  if (provider === "claude") return model.toLocaleLowerCase().includes("opus");
+  if (provider !== "codex") return false;
+  if (catalogModel) return catalogModel.supportsFastMode;
+  return CODEX_FAST_MODE_FALLBACK_MODELS.has(model.toLocaleLowerCase());
+};
+
+const accountSupportsFastMode = (
+  account: AccountProfile | null | undefined,
+  model = accountModel(account),
+): boolean =>
+  !!account && providerModelSupportsFastMode(
+    accountProvider(account),
+    model,
+    chatCatalogModel(account, model),
+  );
+
+const accountFastModeEnabled = (account: AccountProfile | null | undefined): boolean =>
+  account?.fastMode === true && accountSupportsFastMode(account);
+
+const fastModeAvailabilityLabel = (
+  provider: Provider,
+  model: string,
+  supported: boolean,
+): string => {
+  if (supported) {
+    return provider === "claude"
+      ? "Plus rapide, avec des limites et crédits séparés"
+      : "Environ 1,5× plus rapide, avec une consommation accrue";
+  }
+  if (provider === "claude") return "Fast mode est disponible avec les modèles Opus";
+  if (provider === "codex") return `Fast mode n'est pas disponible pour ${model}`;
+  return "Fast mode n'est pas pris en charge par OpenCode";
+};
+
 const modelSuggestionsForAccount = (
   account: AccountProfile | null | undefined,
   codexCatalog: AccountModelView[] | undefined = undefined,
@@ -4213,6 +4266,23 @@ const chatReasoningEffortOptions = (
     label: reasoningEffortLabel(value),
   }));
 
+const syncAccountFastModeControl = (accountId: string) => {
+  const account = accountById(accountId);
+  const button = document.querySelector<HTMLButtonElement>(
+    `[data-account-fast-mode="${CSS.escape(accountId)}"]`,
+  );
+  if (!account || !button) return;
+  const model = accountModel(account);
+  const supported = accountSupportsFastMode(account, model);
+  const enabled = accountFastModeEnabled(account);
+  button.disabled = !supported;
+  button.classList.toggle("active", enabled);
+  button.setAttribute("aria-pressed", String(enabled));
+  button.title = fastModeAvailabilityLabel(accountProvider(account), model, supported);
+  const label = button.querySelector("span");
+  if (label) label.textContent = enabled ? "Fast" : "Normal";
+};
+
 const loadChatModelCatalog = async (accountId: string | null | undefined) => {
   if (!accountId || chatModelCatalogs.has(accountId) || chatModelCatalogLoads.has(accountId)) return;
   const account = accountById(accountId);
@@ -4233,6 +4303,8 @@ const loadChatModelCatalog = async (accountId: string | null | undefined) => {
     // mise a jour, ce qui rendait surtout les changements de compte saccades.
     if (activeView === "chat") {
       visiblePanes.forEach((pane) => refreshExpertChatPane(pane));
+    } else if (activeView === "pool") {
+      syncAccountFastModeControl(accountId);
     }
   }
 };
@@ -4260,6 +4332,7 @@ const provisionAccountHome = (account: AccountProfile) =>
     bypass: accountBypassEnabled(account),
     model: accountModel(account),
     reasoningEffort: accountReasoningEffort(account),
+    fastMode: accountFastModeEnabled(account),
   });
 
 // Commande a taper dans le PTY pour lancer un agent. Pour Codex, ajoute le flag
@@ -4779,6 +4852,44 @@ const saveSettings = async () => {
     statusText = "Configuration enregistree";
   } catch (error) {
     statusText = String(error);
+  }
+  render();
+};
+
+const toggleAccountFastMode = async (accountId: string) => {
+  if (!settings) return;
+  const account = accountById(accountId);
+  if (!account) return;
+  const model = accountModel(account);
+  if (!accountSupportsFastMode(account, model)) {
+    statusText = fastModeAvailabilityLabel(accountProvider(account), model, false);
+    render();
+    return;
+  }
+
+  const previous = account.fastMode === true;
+  const next = !previous;
+  account.fastMode = next;
+  selectedAccountId = account.id;
+  try {
+    settings.defaultAccountId = account.id;
+    settings = await invoke<AppSettings>("save_settings", { settings });
+    reconcileAccountSelections();
+  } catch (error) {
+    account.fastMode = previous;
+    statusText = `Fast mode non enregistré : ${String(error)}`;
+    render();
+    return;
+  }
+
+  const persisted = accountById(accountId);
+  try {
+    if (persisted) await provisionAccountHome(persisted);
+    statusText = next
+      ? "Fast mode activé pour ce compte · consommation accrue"
+      : "Mode normal activé pour ce compte";
+  } catch (error) {
+    statusText = `Compte enregistré, mais configuration Fast mode non appliquée : ${String(error)}`;
   }
   render();
 };
@@ -6174,7 +6285,12 @@ const setActiveView = (view: AppView) => {
 
   render();
 
-  if (activeView === "pool") void refreshPoolStatus();
+  if (activeView === "pool") {
+    void refreshPoolStatus();
+    settings?.accounts
+      .filter((account) => accountProvider(account) === "codex")
+      .forEach((account) => void loadChatModelCatalog(account.id));
+  }
   if (activeView === "limits") void refreshLimitStatus();
   if (activeView === "chat" && !limitStatusLoaded) void refreshLimitStatus(true);
   if (activeView === "dashboard") {
@@ -8015,6 +8131,7 @@ const readChatPreferences = (account: AccountProfile, root: ParentNode = documen
   const provider = accountProvider(account);
   const previousModel = accountModel(account);
   const previousReasoningEffort = accountReasoningEffort(account);
+  const previousFastMode = account.fastMode === true;
   const model =
     root.querySelector<HTMLInputElement>("[data-chat-control='model'], #chatModel")?.value.trim() || previousModel;
   const reasoningEffort =
@@ -8038,13 +8155,15 @@ const readChatPreferences = (account: AccountProfile, root: ParentNode = documen
 
   account.model = model;
   if (reasoningEffort) account.reasoningEffort = reasoningEffort;
+  if (!accountSupportsFastMode(account, model)) account.fastMode = false;
 
   return {
     model,
     reasoningEffort,
     changed:
       model !== previousModel ||
-      (providerSupportsReasoningEffort(provider) && reasoningEffort !== previousReasoningEffort),
+      (providerSupportsReasoningEffort(provider) && reasoningEffort !== previousReasoningEffort) ||
+      (account.fastMode === true) !== previousFastMode,
     error: null,
   };
 };
@@ -8064,6 +8183,20 @@ const persistChatPreferences = (accountId: string) => {
     .catch((error) => {
       statusText = `Preferences du chat non enregistrees : ${String(error)}`;
     });
+};
+
+const toggleChatFastMode = (account: AccountProfile): boolean => {
+  const model = accountModel(account);
+  if (!accountSupportsFastMode(account, model)) {
+    statusText = fastModeAvailabilityLabel(accountProvider(account), model, false);
+    return false;
+  }
+  account.fastMode = !accountFastModeEnabled(account);
+  persistChatPreferences(account.id);
+  statusText = account.fastMode
+    ? "Fast mode activé · consommation accrue"
+    : "Mode normal activé";
+  return true;
 };
 
 const chatPanelModel = (): ChatPanelModel => {
@@ -8132,6 +8265,13 @@ const chatPanelModel = (): ChatPanelModel => {
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: providerSupportsReasoningEffort(provider),
+    fastModeEnabled: accountFastModeEnabled(account),
+    supportsFastMode: accountSupportsFastMode(account, selectedModel),
+    fastModeHelp: fastModeAvailabilityLabel(
+      provider,
+      selectedModel,
+      accountSupportsFastMode(account, selectedModel),
+    ),
     composerSelectorsEnabled: chatComposerSelectorsEnabled,
     favoritePrompts: loadFavoritePromptShortcuts(accountScopedStorage),
     supportsGoals: provider === "codex",
@@ -9796,6 +9936,13 @@ const expertChatPanelModel = (pane: ExpertChatPane): ChatPanelModel => {
     ),
     reasoningEffortOptions: chatReasoningEffortOptions(account, selectedModel),
     supportsReasoningEffort: providerSupportsReasoningEffort(provider),
+    fastModeEnabled: accountFastModeEnabled(account),
+    supportsFastMode: accountSupportsFastMode(account, selectedModel),
+    fastModeHelp: fastModeAvailabilityLabel(
+      provider,
+      selectedModel,
+      accountSupportsFastMode(account, selectedModel),
+    ),
     composerSelectorsEnabled: chatComposerSelectorsEnabled,
     favoritePrompts: loadFavoritePromptShortcuts(accountScopedStorage),
     supportsGoals: provider === "codex",
@@ -11832,6 +11979,10 @@ const bindExpertChatPaneUi = (pane: ExpertChatPane, root: HTMLElement) => {
     modelInput.blur();
   });
   root.querySelector<HTMLSelectElement>("[data-chat-control='reasoning-effort']")?.addEventListener("change", commitPreferences);
+  root.querySelector<HTMLButtonElement>("[data-chat-control='fast-mode']")?.addEventListener("click", () => {
+    const account = expertChatSelectedAccount(pane);
+    if (account && toggleChatFastMode(account)) refreshExpertChatPane(pane);
+  });
   root.querySelectorAll<HTMLButtonElement>("[data-chat-starter]").forEach((button) => {
     button.addEventListener("click", () => {
       pane.draft = button.dataset.chatStarter ?? "";
@@ -21704,6 +21855,10 @@ const renderAccountsPanel = () => {
     .map((item) => {
       const provider = accountProvider(item);
       const providerName = accountProviderLabel(item);
+      const model = accountModel(item);
+      const fastSupported = accountSupportsFastMode(item, model);
+      const fastEnabled = accountFastModeEnabled(item);
+      const fastHelp = fastModeAvailabilityLabel(provider, model, fastSupported);
       const codexPanel =
         provider === "codex" && isRemoteMode()
           ? renderCodexLoginCodePanel(item.id)
@@ -21717,10 +21872,21 @@ const renderAccountsPanel = () => {
               </span>
               <span class="simple-account-copy">
                 <strong>${escapeHtml(item.label)}</strong>
-                <small>${escapeHtml(providerName)}</small>
+                <small>${escapeHtml(providerName)} · ${escapeHtml(model)}</small>
               </span>
             </div>
             <div class="simple-account-actions">
+              <button
+                type="button"
+                class="tool-button account-fast-mode-toggle ${fastEnabled ? "active" : ""}"
+                data-account-fast-mode="${escapeAttr(item.id)}"
+                aria-pressed="${fastEnabled}"
+                title="${escapeAttr(fastHelp)}"
+                ${fastSupported ? "" : "disabled"}
+              >
+                <i data-lucide="${fastEnabled ? "zap" : "gauge"}"></i>
+                <span>${fastEnabled ? "Fast" : "Normal"}</span>
+              </button>
               ${accountProvider(item) === "codex" && isRemoteMode()
                 ? `<a class="tool-button" data-login-account="${escapeAttr(item.id)}" href="https://auth.openai.com/codex/device" target="_blank" rel="noopener" title="Se connecter avec OpenAI">
                     <i data-lucide="log-in"></i><span>Se connecter</span>
@@ -23253,6 +23419,11 @@ const renderNewTerminalModal = () => {
     ),
   ].join("");
   const selectedEnvironment = userEnvironmentPath(newTerminalWorkspacePath);
+  const newAccountFastSupported = providerModelSupportsFastMode(
+    newTerminalAccountProvider,
+    newTerminalAccountModel,
+  );
+  const selectedAccountFastSupported = accountSupportsFastMode(account);
   const environmentOptions = terminalEnvironmentGroups()
     .map((group) => {
       const selected =
@@ -23359,6 +23530,10 @@ const renderNewTerminalModal = () => {
                   <input id="newAccountBypass" type="checkbox" ${newTerminalAccountBypass ? "checked" : ""} />
                   <span>Mode bypass</span>
                 </label>
+                <label class="modal-check" title="${escapeAttr(fastModeAvailabilityLabel(newTerminalAccountProvider, newTerminalAccountModel, newAccountFastSupported))}">
+                  <input id="newAccountFastMode" type="checkbox" ${newTerminalAccountFastMode && newAccountFastSupported ? "checked" : ""} ${newAccountFastSupported ? "" : "disabled"} />
+                  <span>Fast mode</span>
+                </label>
               </div>
               <button class="tool-button" id="addAccountFromModal">
                 <i data-lucide="plus"></i><span>Ajouter ce compte</span>
@@ -23398,6 +23573,10 @@ const renderNewTerminalModal = () => {
               <input id="newTerminalBypass" type="checkbox" ${accountBypassEnabled(account) ? "checked" : ""} ${account ? "" : "disabled"} />
               <span>Mode bypass pour ce compte</span>
             </label>
+            <label class="modal-check" title="${escapeAttr(fastModeAvailabilityLabel(accountProvider(account), accountModel(account), selectedAccountFastSupported))}">
+              <input id="newTerminalFastMode" type="checkbox" ${accountFastModeEnabled(account) ? "checked" : ""} ${account && selectedAccountFastSupported ? "" : "disabled"} />
+              <span>Fast mode pour ce compte</span>
+            </label>
             <label class="modal-check">
               <input id="newTerminalAutoRun" type="checkbox" ${settings.autoRunCodex ? "checked" : ""} />
               <span>Lancer l'agent au demarrage${selectedAgent ? ` (${escapeHtml(selectedAgent.label)})` : ""}</span>
@@ -23430,6 +23609,7 @@ const syncNewTerminalAccountUi = (account: AccountProfile) => {
   const model = document.querySelector<HTMLInputElement>("#newTerminalModel");
   const effort = document.querySelector<HTMLSelectElement>("#newTerminalReasoningEffort");
   const bypass = document.querySelector<HTMLInputElement>("#newTerminalBypass");
+  const fastMode = document.querySelector<HTMLInputElement>("#newTerminalFastMode");
 
   if (home) {
     home.value = account.codexHome;
@@ -23454,6 +23634,18 @@ const syncNewTerminalAccountUi = (account: AccountProfile) => {
   if (bypass) {
     bypass.checked = accountBypassEnabled(account);
     bypass.disabled = false;
+  }
+  if (fastMode) {
+    fastMode.checked = accountFastModeEnabled(account);
+    fastMode.disabled = !accountSupportsFastMode(account);
+    fastMode.closest("label")?.setAttribute(
+      "title",
+      fastModeAvailabilityLabel(
+        accountProvider(account),
+        accountModel(account),
+        accountSupportsFastMode(account),
+      ),
+    );
   }
 
   const hasEnvironment = !!userEnvironmentPath(newTerminalWorkspacePath);
@@ -23776,6 +23968,7 @@ const poolRuntimeSummary = (): string =>
 const renderPoolPanel = () => {
   const accounts = poolStatus?.accounts ?? [];
   const proxiesEnabled = proxyControlsEnabled();
+  const poolFastSupported = providerModelSupportsFastMode("codex", poolNewAccountModel);
   const poolProxyOptions =
     settings?.proxies
       .map(
@@ -23823,6 +24016,10 @@ const renderPoolPanel = () => {
           <label class="pool-check" title="Sans approbations et sans sandbox Codex">
             <input id="poolNewAccountBypass" type="checkbox" ${poolNewAccountBypass ? "checked" : ""} />
             <span>Mode bypass</span>
+          </label>
+          <label class="pool-check" title="${escapeAttr(fastModeAvailabilityLabel("codex", poolNewAccountModel, poolFastSupported))}">
+            <input id="poolNewAccountFastMode" type="checkbox" ${poolNewAccountFastMode && poolFastSupported ? "checked" : ""} ${poolFastSupported ? "" : "disabled"} />
+            <span>Fast mode</span>
           </label>
         </div>
         <button class="tool-button" type="submit">
@@ -25262,6 +25459,7 @@ type NewAccountPreferences = {
   bypass?: boolean;
   model?: string | null;
   reasoningEffort?: string | null;
+  fastMode?: boolean;
 };
 
 const newAccountProfile = (
@@ -25290,6 +25488,12 @@ const newAccountProfile = (
     // L'intensite de raisonnement ne concerne que Codex ; on la laisse par
     // defaut pour Claude (le backend l'ignore).
     reasoningEffort: normalizeCodexReasoningEffort(preferences.reasoningEffort),
+    fastMode:
+      preferences.fastMode === true &&
+      providerModelSupportsFastMode(
+        provider,
+        preferences.model?.trim() || providerDefaultModel(provider, inferenceProvider),
+      ),
   };
 };
 
@@ -25320,6 +25524,10 @@ const readPoolNewAccountForm = () => {
     document.querySelector<HTMLSelectElement>("#poolNewAccountReasoningEffort")?.value ??
       poolNewAccountReasoningEffort,
   );
+  poolNewAccountFastMode =
+    (document.querySelector<HTMLInputElement>("#poolNewAccountFastMode")?.checked ??
+      poolNewAccountFastMode) &&
+    providerModelSupportsFastMode("codex", poolNewAccountModel);
 };
 
 const clearPoolNewAccountForm = () => {
@@ -25328,6 +25536,7 @@ const clearPoolNewAccountForm = () => {
   poolNewAccountBypass = settings?.codexBypass ?? true;
   poolNewAccountModel = DEFAULT_CODEX_MODEL;
   poolNewAccountReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+  poolNewAccountFastMode = false;
 };
 
 const addPoolAccount = async () => {
@@ -25344,6 +25553,7 @@ const addPoolAccount = async () => {
       bypass: poolNewAccountBypass,
       model: poolNewAccountModel,
       reasoningEffort: poolNewAccountReasoningEffort,
+      fastMode: poolNewAccountFastMode,
     });
     // Provisionne les permissions des la creation. Sans cela, le compte etait
     // marque bypass dans settings.json mais son config.toml ne l'etait qu'au
@@ -25725,6 +25935,7 @@ const openNewTerminalModal = (folderPath: string | null | undefined = undefined)
   newTerminalAccountBypass = settings.codexBypass ?? true;
   newTerminalAccountModel = DEFAULT_CODEX_MODEL;
   newTerminalAccountReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT;
+  newTerminalAccountFastMode = false;
   rememberDialogTrigger("new-terminal", "folderNewTerminal");
   newTerminalModalOpen = true;
   statusText = "Choisis obligatoirement l'environnement, puis l'agent et le compte";
@@ -25844,6 +26055,10 @@ const readNewTerminalModalForm = () => {
   account.bypass =
     document.querySelector<HTMLInputElement>("#newTerminalBypass")?.checked ??
     accountBypassEnabled(account);
+  account.fastMode =
+    (document.querySelector<HTMLInputElement>("#newTerminalFastMode")?.checked ??
+      (account.fastMode === true)) &&
+    accountSupportsFastMode(account);
   const agentSelect = document.querySelector<HTMLSelectElement>("#newTerminalAgent");
   if (agentSelect) newTerminalAgentId = agentSelect.value || newTerminalAgentId;
   settings.autoRunCodex = document.querySelector<HTMLInputElement>("#newTerminalAutoRun")?.checked ?? settings.autoRunCodex;
@@ -25865,6 +26080,9 @@ const readNewTerminalAccountDraft = () => {
   newTerminalAccountBypass =
     document.querySelector<HTMLInputElement>("#newAccountBypass")?.checked ??
     newTerminalAccountBypass;
+  newTerminalAccountFastMode =
+    document.querySelector<HTMLInputElement>("#newAccountFastMode")?.checked ??
+    newTerminalAccountFastMode;
   const modelDraft = document.querySelector<HTMLInputElement>("#newAccountModel")?.value.trim() ?? "";
   newTerminalAccountModel = !modelDraft || modelDraft === previousDefault
     ? providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider)
@@ -25874,6 +26092,9 @@ const readNewTerminalAccountDraft = () => {
       document.querySelector<HTMLSelectElement>("#newAccountReasoningEffort")?.value ??
         newTerminalAccountReasoningEffort,
     );
+  }
+  if (!providerModelSupportsFastMode(newTerminalAccountProvider, newTerminalAccountModel)) {
+    newTerminalAccountFastMode = false;
   }
 };
 
@@ -25893,6 +26114,7 @@ const addAccountFromModal = () => {
     bypass: newTerminalAccountBypass,
     model: newTerminalAccountModel,
     reasoningEffort: newTerminalAccountReasoningEffort,
+    fastMode: newTerminalAccountFastMode,
   });
   settings.accounts.push(account);
   scheduleUnconnectedAccountCleanup();
@@ -26644,6 +26866,15 @@ const bindUi = () => {
     });
   });
 
+  document.querySelectorAll<HTMLButtonElement>("[data-account-fast-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const accountId = button.dataset.accountFastMode;
+      if (!accountId) return;
+      button.disabled = true;
+      void toggleAccountFastMode(accountId);
+    });
+  });
+
   document.querySelectorAll<HTMLButtonElement>("[data-copy-codex-code]").forEach((button) => {
     button.addEventListener("click", () => {
       const accountId = button.dataset.copyCodexCode;
@@ -26942,6 +27173,57 @@ const bindUi = () => {
     readNewTerminalModalForm();
     newTerminalAgentId = (event.currentTarget as HTMLSelectElement).value || null;
     render();
+  });
+
+  document.querySelector<HTMLSelectElement>("#newAccountProvider")?.addEventListener("change", () => {
+    readNewTerminalAccountDraft();
+    render();
+  });
+
+  document.querySelector<HTMLInputElement>("#newAccountModel")?.addEventListener("input", (event) => {
+    newTerminalAccountModel =
+      (event.currentTarget as HTMLInputElement).value.trim() ||
+      providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider);
+    const supported = providerModelSupportsFastMode(
+      newTerminalAccountProvider,
+      newTerminalAccountModel,
+    );
+    const fastMode = document.querySelector<HTMLInputElement>("#newAccountFastMode");
+    if (fastMode) {
+      fastMode.disabled = !supported;
+      if (!supported) {
+        fastMode.checked = false;
+        newTerminalAccountFastMode = false;
+      }
+      fastMode.closest("label")?.setAttribute(
+        "title",
+        fastModeAvailabilityLabel(
+          newTerminalAccountProvider,
+          newTerminalAccountModel,
+          supported,
+        ),
+      );
+    }
+  });
+
+  document.querySelector<HTMLInputElement>("#newTerminalModel")?.addEventListener("input", (event) => {
+    const account = newTerminalAccount();
+    if (!account) return;
+    const model = (event.currentTarget as HTMLInputElement).value.trim() || accountModel(account);
+    const supported = providerModelSupportsFastMode(
+      accountProvider(account),
+      model,
+      chatCatalogModel(account, model),
+    );
+    const fastMode = document.querySelector<HTMLInputElement>("#newTerminalFastMode");
+    if (fastMode) {
+      fastMode.disabled = !supported;
+      if (!supported) fastMode.checked = false;
+      fastMode.closest("label")?.setAttribute(
+        "title",
+        fastModeAvailabilityLabel(accountProvider(account), model, supported),
+      );
+    }
   });
 
   document.querySelector<HTMLButtonElement>("#addAccountFromModal")?.addEventListener("click", () => {
@@ -27726,6 +28008,10 @@ const bindUi = () => {
   document
     .querySelector<HTMLSelectElement>("#chatReasoningEffort")
     ?.addEventListener("change", commitChatPreferences);
+  document.querySelector<HTMLButtonElement>("#chatFastMode")?.addEventListener("click", () => {
+    const account = chatSelectedAccount();
+    if (account && toggleChatFastMode(account)) render();
+  });
   document.querySelectorAll<HTMLButtonElement>("#chatPanel [data-chat-starter]").forEach((button) => {
     button.addEventListener("click", () => {
       chatDraft = button.dataset.chatStarter ?? "";
@@ -27790,12 +28076,23 @@ const bindUi = () => {
 
   document
     .querySelectorAll<HTMLInputElement | HTMLSelectElement>(
-      "#poolNewAccountLabel, #poolNewAccountProxy, #poolNewAccountBypass, #poolNewAccountModel, #poolNewAccountReasoningEffort",
+      "#poolNewAccountLabel, #poolNewAccountProxy, #poolNewAccountBypass, #poolNewAccountModel, #poolNewAccountReasoningEffort, #poolNewAccountFastMode",
     )
     .forEach((input) => {
       input.addEventListener("input", readPoolNewAccountForm);
       input.addEventListener("change", readPoolNewAccountForm);
     });
+  document.querySelector<HTMLInputElement>("#poolNewAccountModel")?.addEventListener("input", () => {
+    const supported = providerModelSupportsFastMode("codex", poolNewAccountModel);
+    const fastMode = document.querySelector<HTMLInputElement>("#poolNewAccountFastMode");
+    if (!fastMode) return;
+    fastMode.disabled = !supported;
+    if (!supported) fastMode.checked = false;
+    fastMode.closest("label")?.setAttribute(
+      "title",
+      fastModeAvailabilityLabel("codex", poolNewAccountModel, supported),
+    );
+  });
 
   document.querySelector<HTMLTextAreaElement>("#poolImportPaths")?.addEventListener("input", (event) => {
     poolImportPaths = (event.currentTarget as HTMLTextAreaElement).value;
@@ -29150,7 +29447,22 @@ const renderRemoteLogin = (error: string | null = null) => {
     }
     const nodes = document.querySelector<HTMLTextAreaElement>("#remoteNodes")?.value ?? "";
     saveRemoteConfig(baseUrl, token, nodes);
-    await boot();
+    // Un timeout TCP vers le VPS met ~20 s a echouer. On affiche donc un statut
+    // de progression des le clic, puis on catch systematiquement l'erreur pour
+    // la remonter dans le formulaire (au lieu de l'avaler silencieusement).
+    const submitButton = document.querySelector<HTMLButtonElement>("#remoteLoginForm button[type='submit']");
+    if (submitButton) {
+      submitButton.disabled = true;
+      const label = submitButton.querySelector("span");
+      if (label) label.textContent = "Connexion en cours…";
+    }
+    try {
+      await boot();
+    } catch (error) {
+      renderRemoteLogin(isTransportError(error)
+        ? `Le serveur ${baseUrl} n'est pas joignable. Verifie Tailscale puis reessaie.`
+        : String(error));
+    }
   });
 };
 
@@ -29215,6 +29527,7 @@ const boot = async () => {
   chatAccountId = selectedAccountId;
   scheduleUnconnectedAccountCleanup();
   poolNewAccountBypass = settings.codexBypass ?? true;
+  poolNewAccountFastMode = false;
   // Migre le registre de workspaces (localStorage -> settings) et fixe le
   // filtre par defaut, avant le premier rendu de la barre laterale.
   expertGridLayout = loadExpertGridLayout();

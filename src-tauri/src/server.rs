@@ -4,10 +4,9 @@ use crate::{
     autonomous::{
         AddAutonomousMemoryRequest, ApplyAutonomousReviewPolicyRequest, AutonomousAgentAction,
         AutonomousAgentManager, AutonomousAgentSnapshot, AutonomousAgentStatus,
-        ControlAutonomousAgentRequest,
-        CreateAutonomousAgentRequest, ReassignAutonomousAgentAccountRequest,
-        ScheduleAutonomousAgentRequest, SendAutonomousAgentMessageRequest,
-        UpdateAutonomousAgentRequest,
+        ControlAutonomousAgentRequest, CreateAutonomousAgentRequest,
+        ReassignAutonomousAgentAccountRequest, ScheduleAutonomousAgentRequest,
+        SendAutonomousAgentMessageRequest, UpdateAutonomousAgentRequest,
     },
     chat::{ChatTurnManager, StartChatTurnRequest, MAX_CHAT_TURN_REQUEST_BYTES},
     chat_model_tools::{
@@ -16,10 +15,12 @@ use crate::{
         ChatToolScope, CreateAutonomousAgentToolArguments, CreateChatToolArguments,
         UpdateAutonomousAgentToolArguments, ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME,
         APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME,
-        CREATE_CALENDAR_EVENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME, LIST_CALENDAR_EVENTS_TOOL_NAME,
-        LIST_OUTLOOK_MESSAGES_TOOL_NAME, PAUSE_AUTONOMOUS_AGENT_TOOL_NAME,
-        SEND_OUTLOOK_EMAIL_TOOL_NAME, UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
-        UPDATE_CALENDAR_EVENT_TOOL_NAME,
+        CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME, CREATE_CALENDAR_EVENT_TOOL_NAME,
+        CREATE_CHAT_TOOL_NAME, CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
+        LIST_CALENDAR_EVENTS_TOOL_NAME, LIST_OUTLOOK_MESSAGES_TOOL_NAME,
+        LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME, LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME,
+        PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
+        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME, UPDATE_CALENDAR_EVENT_TOOL_NAME,
     },
     creative_accounts::{self, ConnectCreativeAccountRequest, CreativeAccountIdRequest},
     discussions,
@@ -40,7 +41,8 @@ use crate::{
     },
     pool::{self, AccountStatus, PoolManager},
     private_messages::{
-        PrivateMessageError, PrivateMessageImageRequest, PrivateMessageManager, PrivateMessageUser,
+        CreatePrivateMessageCampaignRequest, PrivateMessageCampaignAction, PrivateMessageError,
+        PrivateMessageImageRequest, PrivateMessageManager, PrivateMessageUser,
         MAX_PRIVATE_MESSAGE_REQUEST_BYTES,
     },
     runtime_sync::RuntimeSync,
@@ -298,6 +300,8 @@ struct EnsureAccountHomeRequest {
     model: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    fast_mode: bool,
 }
 
 fn default_true() -> bool {
@@ -651,6 +655,7 @@ impl RemoteTerminalManager {
             account.bypass,
             account.model.as_deref(),
             account.reasoning_effort.as_deref(),
+            account.fast_mode,
         ) {
             eprintln!(
                 "[config] config {} non ecrite pour {}: {error}",
@@ -1091,6 +1096,12 @@ pub async fn run_from_env() -> Result<(), String> {
     });
     telegram_notifications::start_polling(state.autonomous.clone());
     state.microsoft.start_keepalive();
+    tokio::spawn(
+        crate::private_messages::run_private_message_campaign_worker(
+            state.private_messages.clone(),
+            state.chat.runtime_sync(),
+        ),
+    );
 
     spawn_workspace_cleanup(config.data_dir.clone(), state.terminals.clone());
 
@@ -1156,6 +1167,14 @@ pub async fn run_from_env() -> Result<(), String> {
         .route(
             "/private-messages/images/:image_id",
             get(api_get_private_message_image),
+        )
+        .route(
+            "/private-messages/campaigns",
+            get(api_list_private_message_campaigns).post(api_create_private_message_campaign),
+        )
+        .route(
+            "/private-messages/campaigns/:campaign_id/control",
+            post(api_control_private_message_campaign),
         )
         .route("/chat/models", get(api_chat_models))
         .route(
@@ -2040,6 +2059,7 @@ async fn api_ensure_account_home(
             request.bypass,
             request.model,
             request.reasoning_effort,
+            Some(request.fast_mode),
         )
         .map(|_| json_response(json!({ "ok": true })))
     })
@@ -2669,6 +2689,93 @@ async fn api_get_private_message_image(
     }
 }
 
+async fn api_list_private_message_campaigns(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match private_message_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state.private_messages.list_campaigns(&actor.id) {
+        Ok(campaigns) => private_message_no_store(json_response(campaigns)),
+        Err(error) => private_message_api_error(&state, error),
+    }
+}
+
+async fn api_create_private_message_campaign(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<CreatePrivateMessageCampaignRequest>,
+) -> Response {
+    let actor = match private_message_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let mut recipients = Vec::with_capacity(request.recipient_ids.len());
+    for user_id in &request.recipient_ids {
+        match private_message_recipient(&state, &actor, user_id) {
+            Ok(recipient) => recipients.push(recipient),
+            Err(response) => return response,
+        }
+    }
+    match state
+        .private_messages
+        .create_campaign(actor.clone(), recipients, request, "human")
+    {
+        Ok(campaign) => {
+            state
+                .chat
+                .runtime_sync()
+                .notify_private_messages([actor.id]);
+            private_message_no_store((StatusCode::CREATED, Json(campaign)).into_response())
+        }
+        Err(error) => private_message_api_error(&state, error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlPrivateMessageCampaignRequest {
+    action: PrivateMessageCampaignAction,
+    #[serde(default)]
+    consent_confirmed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlPrivateMessageCampaignToolArguments {
+    campaign_id: String,
+    action: PrivateMessageCampaignAction,
+}
+
+async fn api_control_private_message_campaign(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(campaign_id): AxumPath<String>,
+    Json(request): Json<ControlPrivateMessageCampaignRequest>,
+) -> Response {
+    let actor = match private_message_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state.private_messages.control_campaign(
+        &actor.id,
+        &campaign_id,
+        request.action,
+        request.consent_confirmed,
+    ) {
+        Ok(campaign) => {
+            state
+                .chat
+                .runtime_sync()
+                .notify_private_messages([actor.id]);
+            private_message_no_store(json_response(campaign))
+        }
+        Err(error) => private_message_api_error(&state, error),
+    }
+}
+
 fn notify_private_message_participants(
     state: &Arc<ServerState>,
     left: &PrivateMessageUser,
@@ -2698,6 +2805,42 @@ fn private_message_actor(
             &state.config,
         )),
     }
+}
+
+fn private_message_actor_for_tool(
+    state: &Arc<ServerState>,
+    context: &AutonomousAgentToolContext,
+) -> Result<PrivateMessageUser, String> {
+    let Some(user_id) = context.user_id.as_deref() else {
+        return Ok(PrivateMessageUser::administrator());
+    };
+    state
+        .auth
+        .public_identity_by_id(user_id)?
+        .map(private_message_user_from_identity)
+        .ok_or_else(|| "Le proprietaire de cet agent n'existe plus".to_string())
+}
+
+fn private_message_recipient_for_tool(
+    state: &Arc<ServerState>,
+    actor: &PrivateMessageUser,
+    user_id: &str,
+) -> Result<PrivateMessageUser, String> {
+    let user_id = user_id.trim();
+    if user_id.is_empty() || user_id == actor.id {
+        return Err("Destinataire interne invalide".to_string());
+    }
+    if user_id == "server-admin" {
+        return Ok(PrivateMessageUser::administrator());
+    }
+    if let Some(identity) = state.auth.public_identity_by_id(user_id)? {
+        return Ok(private_message_user_from_identity(identity));
+    }
+    state
+        .private_messages
+        .known_conversation_participant(&actor.id, user_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Utilisateur interne introuvable".to_string())
 }
 
 fn private_message_recipient(
@@ -3060,10 +3203,7 @@ async fn mcp_chat_tools(
             "id": id,
             "result": {}
         })),
-        "tools/list" => json_response(chat_model_tools::tools_list_response(
-            id,
-            capability.scope,
-        )),
+        "tools/list" => json_response(chat_model_tools::tools_list_response(id, capability.scope)),
         "tools/call" => {
             let name = payload
                 .pointer("/params/name")
@@ -3080,6 +3220,10 @@ async fn mcp_chat_tools(
                 && name != SEND_OUTLOOK_EMAIL_TOOL_NAME
                 && name != CREATE_CALENDAR_EVENT_TOOL_NAME
                 && name != UPDATE_CALENDAR_EVENT_TOOL_NAME
+                && name != LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME
+                && name != LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME
+                && name != CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
+                && name != CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
             {
                 return json_response(chat_model_tools::protocol_error(
                     id,
@@ -3103,7 +3247,9 @@ async fn mcp_chat_tools(
                 // sous-quota d'actions externes en plus du budget global.
                 SEND_OUTLOOK_EMAIL_TOOL_NAME
                 | CREATE_CALENDAR_EVENT_TOOL_NAME
-                | UPDATE_CALENDAR_EVENT_TOOL_NAME => {
+                | UPDATE_CALENDAR_EVENT_TOOL_NAME
+                | CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
+                | CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME => {
                     state.chat_tool_capabilities.claim_external_action(token)
                 }
                 _ => state.chat_tool_capabilities.claim_call(token),
@@ -3404,6 +3550,182 @@ async fn mcp_chat_tools(
                         )),
                     }
                 }
+                LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME => {
+                    if !arguments
+                        .as_object()
+                        .is_some_and(|arguments| arguments.is_empty())
+                    {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            "La liste des destinataires ne prend aucun argument",
+                        ));
+                    }
+                    let actor = match private_message_actor_for_tool(&state, &context) {
+                        Ok(actor) => actor,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    };
+                    let identities = match state.auth.public_identities() {
+                        Ok(identities) => identities,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    };
+                    let mut users = identities
+                        .into_iter()
+                        .map(private_message_user_from_identity)
+                        .filter(|user| user.id != actor.id)
+                        .collect::<Vec<_>>();
+                    if actor.id != "server-admin" {
+                        users.push(PrivateMessageUser::administrator());
+                    }
+                    users.sort_by(|left, right| {
+                        left.username
+                            .to_lowercase()
+                            .cmp(&right.username.to_lowercase())
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    let count = users.len();
+                    json_response(chat_model_tools::tool_microsoft_data_response(
+                        id,
+                        &format!("{count} destinataire(s) interne(s) disponible(s)."),
+                        json!({ "count": count, "users": users }),
+                    ))
+                }
+                LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME => {
+                    if !arguments
+                        .as_object()
+                        .is_some_and(|arguments| arguments.is_empty())
+                    {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            "La liste des campagnes ne prend aucun argument",
+                        ));
+                    }
+                    let actor = match private_message_actor_for_tool(&state, &context) {
+                        Ok(actor) => actor,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    };
+                    match state.private_messages.list_campaigns(&actor.id) {
+                        Ok(campaigns) => {
+                            let count = campaigns.len();
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!("{count} campagne(s) interne(s) trouvee(s)."),
+                                json!({ "count": count, "campaigns": campaigns }),
+                            ))
+                        }
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
+                CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME => {
+                    let request = match serde_json::from_value::<CreatePrivateMessageCampaignRequest>(
+                        arguments,
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &format!("Arguments invalides pour la campagne interne : {error}"),
+                            ))
+                        }
+                    };
+                    let actor = match private_message_actor_for_tool(&state, &context) {
+                        Ok(actor) => actor,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    };
+                    let recipients = request
+                        .recipient_ids
+                        .iter()
+                        .map(|user_id| private_message_recipient_for_tool(&state, &actor, user_id))
+                        .collect::<Result<Vec<_>, _>>();
+                    let recipients = match recipients {
+                        Ok(recipients) => recipients,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    };
+                    match state.private_messages.create_campaign(
+                        actor.clone(),
+                        recipients,
+                        request,
+                        "autonomous_agent",
+                    ) {
+                        Ok(campaign) => {
+                            state
+                                .chat
+                                .runtime_sync()
+                                .notify_private_messages([actor.id]);
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "Campagne interne « {} » creee avec le statut {:?}.",
+                                    campaign.name, campaign.status
+                                ),
+                                json!({ "campaign": campaign }),
+                            ))
+                        }
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
+                CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME => {
+                    let arguments = match serde_json::from_value::<
+                        ControlPrivateMessageCampaignToolArguments,
+                    >(arguments)
+                    {
+                        Ok(arguments) => arguments,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &format!(
+                                    "Arguments invalides pour le pilotage de campagne : {error}"
+                                ),
+                            ))
+                        }
+                    };
+                    let actor = match private_message_actor_for_tool(&state, &context) {
+                        Ok(actor) => actor,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(id, &error))
+                        }
+                    };
+                    match state.private_messages.control_campaign(
+                        &actor.id,
+                        &arguments.campaign_id,
+                        arguments.action,
+                        false,
+                    ) {
+                        Ok(campaign) => {
+                            state
+                                .chat
+                                .runtime_sync()
+                                .notify_private_messages([actor.id]);
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "Campagne interne « {} » mise a jour : {:?}.",
+                                    campaign.name, campaign.status
+                                ),
+                                json!({ "campaign": campaign }),
+                            ))
+                        }
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
                 LIST_OUTLOOK_MESSAGES_TOOL_NAME => {
                     let Some(owner_id) = context.user_id.clone() else {
                         return json_response(chat_model_tools::tool_error_response(
@@ -3411,21 +3733,25 @@ async fn mcp_chat_tools(
                             MICROSOFT_NO_NOMINAL_USER,
                         ));
                     };
-                    let arguments =
-                        match serde_json::from_value::<ListMessagesArguments>(arguments) {
-                            Ok(value) => value,
-                            Err(error) => {
-                                return json_response(chat_model_tools::tool_error_response(
-                                    id,
-                                    &format!("Arguments invalides pour la lecture des e-mails : {error}"),
-                                ))
-                            }
-                        };
+                    let arguments = match serde_json::from_value::<ListMessagesArguments>(arguments)
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &format!(
+                                    "Arguments invalides pour la lecture des e-mails : {error}"
+                                ),
+                            ))
+                        }
+                    };
                     match state.microsoft.list_messages(&owner_id, &arguments).await {
                         Ok(data) => {
                             let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
-                            let mailbox =
-                                data.get("mailbox").and_then(Value::as_str).unwrap_or_default();
+                            let mailbox = data
+                                .get("mailbox")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
                             json_response(chat_model_tools::tool_microsoft_data_response(
                                 id,
                                 &format!("{count} e-mail(s) lu(s) dans la boite {mailbox}."),
@@ -3449,15 +3775,19 @@ async fn mcp_chat_tools(
                         Err(error) => {
                             return json_response(chat_model_tools::tool_error_response(
                                 id,
-                                &format!("Arguments invalides pour la lecture de l'agenda : {error}"),
+                                &format!(
+                                    "Arguments invalides pour la lecture de l'agenda : {error}"
+                                ),
                             ))
                         }
                     };
                     match state.microsoft.list_events(&owner_id, &arguments).await {
                         Ok(data) => {
                             let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
-                            let mailbox =
-                                data.get("mailbox").and_then(Value::as_str).unwrap_or_default();
+                            let mailbox = data
+                                .get("mailbox")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
                             json_response(chat_model_tools::tool_microsoft_data_response(
                                 id,
                                 &format!(
@@ -3486,16 +3816,16 @@ async fn mcp_chat_tools(
                     let draft = match name {
                         SEND_OUTLOOK_EMAIL_TOOL_NAME => {
                             serde_json::from_value::<SendEmailArguments>(arguments)
-                                .map_err(|error| format!("Arguments invalides pour l'e-mail : {error}"))
+                                .map_err(|error| {
+                                    format!("Arguments invalides pour l'e-mail : {error}")
+                                })
                                 .and_then(SendEmailArguments::into_draft)
                         }
-                        CREATE_CALENDAR_EVENT_TOOL_NAME => {
-                            serde_json::from_value::<CreateEventArguments>(arguments)
-                                .map_err(|error| {
-                                    format!("Arguments invalides pour l'evenement : {error}")
-                                })
-                                .and_then(CreateEventArguments::into_draft)
-                        }
+                        CREATE_CALENDAR_EVENT_TOOL_NAME => serde_json::from_value::<
+                            CreateEventArguments,
+                        >(arguments)
+                        .map_err(|error| format!("Arguments invalides pour l'evenement : {error}"))
+                        .and_then(CreateEventArguments::into_draft),
                         _ => serde_json::from_value::<UpdateEventArguments>(arguments)
                             .map_err(|error| {
                                 format!("Arguments invalides pour la modification : {error}")

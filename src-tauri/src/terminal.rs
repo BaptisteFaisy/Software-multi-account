@@ -182,6 +182,7 @@ pub fn start_terminal(
         account.bypass,
         account.model.as_deref(),
         account.reasoning_effort.as_deref(),
+        account.fast_mode,
     ) {
         eprintln!(
             "[config] config {} non ecrite pour {}: {error}",

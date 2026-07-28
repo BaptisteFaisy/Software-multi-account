@@ -4,11 +4,11 @@
 //! le stockage ne fournit jamais de methode permettant de lire une conversation
 //! sans en etre l'un des deux participants.
 
-use crate::{fs_util, metrics};
+use crate::{fs_util, metrics, runtime_sync::RuntimeSync};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -18,9 +18,14 @@ use uuid::Uuid;
 #[cfg(feature = "desktop")]
 use tauri::State;
 
-const STORE_VERSION: u32 = 2;
+const STORE_VERSION: u32 = 3;
 const MAX_MESSAGE_CHARS: usize = 4_000;
 const MAX_MESSAGES: usize = 200_000;
+const MAX_CAMPAIGNS: usize = 1_000;
+pub const MAX_CAMPAIGN_RECIPIENTS: usize = 100;
+pub const MAX_CAMPAIGN_VARIANTS: usize = 20;
+pub const MIN_CAMPAIGN_INTERVAL_SECONDS: u64 = 5;
+pub const MAX_CAMPAIGN_INTERVAL_SECONDS: u64 = 3_600;
 const MAX_MESSAGE_IMAGES: usize = 4;
 const MAX_MESSAGE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MESSAGE_IMAGE_TOTAL_BYTES: usize = 20 * 1024 * 1024;
@@ -122,6 +127,101 @@ pub struct PrivateConversation {
     pub messages: Vec<PrivateMessage>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateMessageCampaignStatus {
+    Draft,
+    Running,
+    Paused,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateMessageCampaignDeliveryStatus {
+    Queued,
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateMessageCampaignDelivery {
+    pub recipient: PrivateMessageUser,
+    pub body: String,
+    pub status: PrivateMessageCampaignDeliveryStatus,
+    #[serde(default)]
+    pub sent_at: Option<i64>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateMessageCampaign {
+    pub id: String,
+    pub name: String,
+    pub sender: PrivateMessageUser,
+    pub status: PrivateMessageCampaignStatus,
+    pub interval_seconds: u64,
+    pub consent_confirmed: bool,
+    pub created_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub next_delivery_at: Option<i64>,
+    #[serde(default)]
+    pub deliveries: Vec<PrivateMessageCampaignDelivery>,
+}
+
+impl PrivateMessageCampaign {
+    pub fn sent_count(&self) -> usize {
+        self.deliveries
+            .iter()
+            .filter(|delivery| delivery.status == PrivateMessageCampaignDeliveryStatus::Sent)
+            .count()
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.deliveries
+            .iter()
+            .filter(|delivery| delivery.status == PrivateMessageCampaignDeliveryStatus::Failed)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePrivateMessageCampaignRequest {
+    #[serde(default)]
+    pub name: String,
+    pub recipient_ids: Vec<String>,
+    pub message_variants: Vec<String>,
+    #[serde(default = "default_campaign_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default)]
+    pub start_immediately: bool,
+    #[serde(default)]
+    pub consent_confirmed: bool,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivateMessageCampaignAction {
+    Start,
+    Pause,
+    Resume,
+    Cancel,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct PrivateMessageStore {
@@ -130,6 +230,8 @@ struct PrivateMessageStore {
     next_sequence: u64,
     #[serde(default)]
     messages: Vec<PrivateMessage>,
+    #[serde(default)]
+    campaigns: Vec<PrivateMessageCampaign>,
 }
 
 impl Default for PrivateMessageStore {
@@ -138,6 +240,7 @@ impl Default for PrivateMessageStore {
             version: STORE_VERSION,
             next_sequence: 0,
             messages: Vec::new(),
+            campaigns: Vec::new(),
         }
     }
 }
@@ -361,6 +464,304 @@ impl PrivateMessageManager {
         Ok(message)
     }
 
+    pub fn create_campaign(
+        &self,
+        sender: PrivateMessageUser,
+        recipients: Vec<PrivateMessageUser>,
+        request: CreatePrivateMessageCampaignRequest,
+        created_by: &str,
+    ) -> Result<PrivateMessageCampaign, PrivateMessageError> {
+        let CreatePrivateMessageCampaignRequest {
+            name,
+            recipient_ids: _,
+            message_variants,
+            interval_seconds,
+            start_immediately,
+            consent_confirmed,
+            idempotency_key,
+        } = request;
+        if message_variants.is_empty() || message_variants.len() > MAX_CAMPAIGN_VARIANTS {
+            return Err(PrivateMessageError::Validation(format!(
+                "Ajoutez entre 1 et {MAX_CAMPAIGN_VARIANTS} variantes de message"
+            )));
+        }
+        if interval_seconds < MIN_CAMPAIGN_INTERVAL_SECONDS
+            || interval_seconds > MAX_CAMPAIGN_INTERVAL_SECONDS
+        {
+            return Err(PrivateMessageError::Validation(format!(
+                "La cadence doit etre comprise entre {MIN_CAMPAIGN_INTERVAL_SECONDS} et {MAX_CAMPAIGN_INTERVAL_SECONDS} secondes"
+            )));
+        }
+        if start_immediately && !consent_confirmed {
+            return Err(PrivateMessageError::Validation(
+                "Confirmez le consentement des destinataires avant de demarrer".to_string(),
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        let recipients = recipients
+            .into_iter()
+            .filter(|recipient| recipient.id != sender.id)
+            .filter(|recipient| seen.insert(recipient.id.clone()))
+            .collect::<Vec<_>>();
+        if recipients.is_empty() {
+            return Err(PrivateMessageError::Validation(
+                "Selectionnez au moins un destinataire different de l'expediteur".to_string(),
+            ));
+        }
+        if recipients.len() > MAX_CAMPAIGN_RECIPIENTS {
+            return Err(PrivateMessageError::Validation(format!(
+                "Une campagne peut contenir au maximum {MAX_CAMPAIGN_RECIPIENTS} destinataires"
+            )));
+        }
+        let variants = message_variants
+            .into_iter()
+            .map(|variant| validate_body(variant, false))
+            .collect::<Result<Vec<_>, _>>()?;
+        let now = metrics::now_ts();
+        let total = recipients.len();
+        let deliveries = recipients
+            .into_iter()
+            .enumerate()
+            .map(|(index, recipient)| {
+                let template = &variants[index % variants.len()];
+                let body = validate_body(
+                    render_campaign_message(template, &recipient, index + 1, total),
+                    false,
+                )?;
+                Ok(PrivateMessageCampaignDelivery {
+                    body,
+                    recipient,
+                    status: PrivateMessageCampaignDeliveryStatus::Queued,
+                    sent_at: None,
+                    message_id: None,
+                    error: None,
+                })
+            })
+            .collect::<Result<Vec<_>, PrivateMessageError>>()?;
+        let supplied_name = name.trim();
+        if supplied_name.chars().count() > 120 || supplied_name.chars().any(char::is_control) {
+            return Err(PrivateMessageError::Validation(
+                "Le nom de campagne est invalide".to_string(),
+            ));
+        }
+        let idempotency_key = idempotency_key
+            .as_deref()
+            .map(validate_campaign_idempotency_key)
+            .transpose()?;
+        let campaign = PrivateMessageCampaign {
+            id: Uuid::new_v4().to_string(),
+            name: if supplied_name.is_empty() {
+                format!("Campagne du {}", format_campaign_date(now))
+            } else {
+                supplied_name.to_string()
+            },
+            sender,
+            status: if start_immediately {
+                PrivateMessageCampaignStatus::Running
+            } else {
+                PrivateMessageCampaignStatus::Draft
+            },
+            interval_seconds,
+            consent_confirmed,
+            created_by: normalize_campaign_creator(created_by),
+            idempotency_key: idempotency_key.clone(),
+            created_at: now,
+            updated_at: now,
+            next_delivery_at: start_immediately.then_some(now),
+            deliveries,
+        };
+
+        let mut current = self.lock_store()?;
+        if let Some(existing) = idempotency_key.as_deref().and_then(|key| {
+            current.campaigns.iter().find(|candidate| {
+                candidate.sender.id == campaign.sender.id
+                    && candidate.idempotency_key.as_deref() == Some(key)
+            })
+        }) {
+            return Ok(existing.clone());
+        }
+        if current.campaigns.len() >= MAX_CAMPAIGNS {
+            return Err(PrivateMessageError::Validation(
+                "La limite de campagnes archivees est atteinte".to_string(),
+            ));
+        }
+        let mut next = current.clone();
+        next.campaigns.push(campaign.clone());
+        persist_store(&self.inner.storage_path, &next)?;
+        *current = next;
+        Ok(campaign)
+    }
+
+    pub fn list_campaigns(
+        &self,
+        sender_id: &str,
+    ) -> Result<Vec<PrivateMessageCampaign>, PrivateMessageError> {
+        let store = self.lock_store()?;
+        let mut campaigns = store
+            .campaigns
+            .iter()
+            .filter(|campaign| campaign.sender.id == sender_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        campaigns.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(campaigns)
+    }
+
+    pub fn control_campaign(
+        &self,
+        sender_id: &str,
+        campaign_id: &str,
+        action: PrivateMessageCampaignAction,
+        consent_confirmed: bool,
+    ) -> Result<PrivateMessageCampaign, PrivateMessageError> {
+        let mut current = self.lock_store()?;
+        let mut next = current.clone();
+        let now = metrics::now_ts();
+        let campaign = next
+            .campaigns
+            .iter_mut()
+            .find(|campaign| campaign.id == campaign_id && campaign.sender.id == sender_id)
+            .ok_or(PrivateMessageError::NotFound)?;
+        match action {
+            PrivateMessageCampaignAction::Start => {
+                if campaign.status != PrivateMessageCampaignStatus::Draft {
+                    return Err(PrivateMessageError::Validation(
+                        "Seul un brouillon peut etre demarre".to_string(),
+                    ));
+                }
+                if consent_confirmed {
+                    campaign.consent_confirmed = true;
+                }
+                if !campaign.consent_confirmed {
+                    return Err(PrivateMessageError::Validation(
+                        "Le consentement des destinataires doit etre confirme".to_string(),
+                    ));
+                }
+                campaign.status = PrivateMessageCampaignStatus::Running;
+                campaign.next_delivery_at = Some(now);
+            }
+            PrivateMessageCampaignAction::Pause => {
+                if campaign.status != PrivateMessageCampaignStatus::Running {
+                    return Err(PrivateMessageError::Validation(
+                        "Seule une campagne active peut etre mise en pause".to_string(),
+                    ));
+                }
+                campaign.status = PrivateMessageCampaignStatus::Paused;
+                campaign.next_delivery_at = None;
+            }
+            PrivateMessageCampaignAction::Resume => {
+                if campaign.status != PrivateMessageCampaignStatus::Paused {
+                    return Err(PrivateMessageError::Validation(
+                        "Seule une campagne en pause peut etre reprise".to_string(),
+                    ));
+                }
+                campaign.status = PrivateMessageCampaignStatus::Running;
+                campaign.next_delivery_at = Some(now);
+            }
+            PrivateMessageCampaignAction::Cancel => {
+                if matches!(
+                    campaign.status,
+                    PrivateMessageCampaignStatus::Completed
+                        | PrivateMessageCampaignStatus::Cancelled
+                        | PrivateMessageCampaignStatus::Failed
+                ) {
+                    return Err(PrivateMessageError::Validation(
+                        "Cette campagne est deja terminee".to_string(),
+                    ));
+                }
+                campaign.status = PrivateMessageCampaignStatus::Cancelled;
+                campaign.next_delivery_at = None;
+            }
+        }
+        campaign.updated_at = now;
+        let result = campaign.clone();
+        persist_store(&self.inner.storage_path, &next)?;
+        *current = next;
+        Ok(result)
+    }
+
+    /// Livre au plus un message par campagne due. L'ecriture du message et de
+    /// l'avancement de campagne est atomique, ce qui empeche un doublon apres
+    /// un redemarrage entre les deux operations.
+    pub fn process_due_campaigns(
+        &self,
+        now: i64,
+    ) -> Result<Vec<PrivateMessage>, PrivateMessageError> {
+        let mut current = self.lock_store()?;
+        let mut next = current.clone();
+        let mut sent = Vec::new();
+        let PrivateMessageStore {
+            next_sequence,
+            messages,
+            campaigns,
+            ..
+        } = &mut next;
+
+        for campaign in campaigns.iter_mut().filter(|campaign| {
+            campaign.status == PrivateMessageCampaignStatus::Running
+                && campaign.next_delivery_at.is_some_and(|due| due <= now)
+        }) {
+            let Some(delivery) = campaign
+                .deliveries
+                .iter_mut()
+                .find(|delivery| delivery.status == PrivateMessageCampaignDeliveryStatus::Queued)
+            else {
+                campaign.status = PrivateMessageCampaignStatus::Completed;
+                campaign.next_delivery_at = None;
+                campaign.updated_at = now;
+                continue;
+            };
+            if messages.len() >= MAX_MESSAGES {
+                delivery.status = PrivateMessageCampaignDeliveryStatus::Failed;
+                delivery.error = Some("Limite de stockage de la messagerie atteinte".to_string());
+                campaign.status = PrivateMessageCampaignStatus::Failed;
+                campaign.next_delivery_at = None;
+                campaign.updated_at = now;
+                continue;
+            }
+            *next_sequence = next_sequence.saturating_add(1).max(1);
+            let message = PrivateMessage {
+                id: Uuid::new_v4().to_string(),
+                sender: campaign.sender.clone(),
+                recipient: delivery.recipient.clone(),
+                body: delivery.body.clone(),
+                images: Vec::new(),
+                created_at: now,
+                sequence: *next_sequence,
+                read_at: None,
+            };
+            delivery.status = PrivateMessageCampaignDeliveryStatus::Sent;
+            delivery.sent_at = Some(now);
+            delivery.message_id = Some(message.id.clone());
+            messages.push(message.clone());
+            sent.push(message);
+            campaign.updated_at = now;
+            if campaign
+                .deliveries
+                .iter()
+                .all(|delivery| delivery.status != PrivateMessageCampaignDeliveryStatus::Queued)
+            {
+                campaign.status = PrivateMessageCampaignStatus::Completed;
+                campaign.next_delivery_at = None;
+            } else {
+                campaign.next_delivery_at =
+                    Some(now.saturating_add(campaign.interval_seconds as i64));
+            }
+        }
+
+        if next != *current {
+            persist_store(&self.inner.storage_path, &next)?;
+            *current = next;
+        }
+        Ok(sent)
+    }
+
     pub fn image_content(
         &self,
         viewer_id: &str,
@@ -443,6 +844,30 @@ impl PrivateMessageManager {
     }
 }
 
+pub(crate) async fn run_private_message_campaign_worker(
+    manager: PrivateMessageManager,
+    runtime_sync: RuntimeSync,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let worker = manager.clone();
+        let delivered =
+            tokio::task::spawn_blocking(move || worker.process_due_campaigns(metrics::now_ts()))
+                .await;
+        match delivered {
+            Ok(Ok(messages)) => {
+                for message in messages {
+                    runtime_sync.notify_private_messages([message.sender.id, message.recipient.id]);
+                }
+            }
+            Ok(Err(error)) => eprintln!("[messaging] campagne non traitee : {error}"),
+            Err(error) => eprintln!("[messaging] worker de campagne interrompu : {error}"),
+        }
+    }
+}
+
 fn message_involves(message: &PrivateMessage, user_id: &str) -> bool {
     message.sender.id == user_id || message.recipient.id == user_id
 }
@@ -478,6 +903,51 @@ fn validate_body(body: String, has_images: bool) -> Result<String, PrivateMessag
         )));
     }
     Ok(body)
+}
+
+fn default_campaign_interval_seconds() -> u64 {
+    30
+}
+
+fn normalize_campaign_creator(value: &str) -> String {
+    match value.trim() {
+        "autonomous_agent" => "autonomous_agent",
+        _ => "human",
+    }
+    .to_string()
+}
+
+fn validate_campaign_idempotency_key(value: &str) -> Result<String, PrivateMessageError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    {
+        return Err(PrivateMessageError::Validation(
+            "La cle d'idempotence de campagne est invalide".to_string(),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn render_campaign_message(
+    template: &str,
+    recipient: &PrivateMessageUser,
+    index: usize,
+    total: usize,
+) -> String {
+    template
+        .replace("{{username}}", &recipient.username)
+        .replace("{{index}}", &index.to_string())
+        .replace("{{total}}", &total.to_string())
+}
+
+fn format_campaign_date(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|date| date.format("%d/%m/%Y %H:%M").to_string())
+        .unwrap_or_else(|| timestamp.to_string())
 }
 
 fn prepare_private_message_images(
@@ -725,6 +1195,55 @@ pub fn get_private_message_image(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn list_private_message_campaigns(
+    state: State<'_, PrivateMessageManager>,
+) -> Result<Vec<PrivateMessageCampaign>, String> {
+    state
+        .list_campaigns(&PrivateMessageUser::local().id)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn create_private_message_campaign(
+    state: State<'_, PrivateMessageManager>,
+    request: CreatePrivateMessageCampaignRequest,
+) -> Result<PrivateMessageCampaign, String> {
+    let recipients = request
+        .recipient_ids
+        .iter()
+        .map(|user_id| {
+            state
+                .known_participant(user_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| PrivateMessageError::NotFound.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    state
+        .create_campaign(PrivateMessageUser::local(), recipients, request, "human")
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn control_private_message_campaign(
+    state: State<'_, PrivateMessageManager>,
+    campaign_id: String,
+    action: PrivateMessageCampaignAction,
+    consent_confirmed: Option<bool>,
+) -> Result<PrivateMessageCampaign, String> {
+    state
+        .control_campaign(
+            &PrivateMessageUser::local().id,
+            &campaign_id,
+            action,
+            consent_confirmed.unwrap_or(false),
+        )
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +1264,21 @@ mod tests {
             name: name.to_string(),
             mime_type: "image/png".to_string(),
             data_base64: BASE64_STANDARD.encode(b"\x89PNG\r\n\x1a\nmessage-image"),
+        }
+    }
+
+    fn campaign_request(recipients: &[&str]) -> CreatePrivateMessageCampaignRequest {
+        CreatePrivateMessageCampaignRequest {
+            name: "Bienvenue".to_string(),
+            recipient_ids: recipients.iter().map(|id| (*id).to_string()).collect(),
+            message_variants: vec![
+                "Bonjour {{username}} ({{index}}/{{total}})".to_string(),
+                "Salut {{username}}".to_string(),
+            ],
+            interval_seconds: MIN_CAMPAIGN_INTERVAL_SECONDS,
+            start_immediately: true,
+            consent_confirmed: true,
+            idempotency_key: None,
         }
     }
 
@@ -862,6 +1396,92 @@ mod tests {
             manager.send(user("a"), user("b"), "  ".to_string()),
             Err(PrivateMessageError::Validation(_))
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn une_campagne_personnalise_et_livre_sans_doublon() {
+        let (root, manager) = test_manager("campaign");
+        let mut request = campaign_request(&["b", "c"]);
+        request.idempotency_key = Some("agent:welcome:2026-07".to_string());
+        let campaign = manager
+            .create_campaign(
+                user("a"),
+                vec![user("b"), user("c")],
+                request,
+                "autonomous_agent",
+            )
+            .unwrap();
+        assert_eq!(campaign.status, PrivateMessageCampaignStatus::Running);
+        assert_eq!(campaign.created_by, "autonomous_agent");
+        assert_eq!(campaign.deliveries[0].body, "Bonjour user-b (1/2)");
+        let mut retry_request = campaign_request(&["b", "c"]);
+        retry_request.idempotency_key = Some("agent:welcome:2026-07".to_string());
+        let retried = manager
+            .create_campaign(
+                user("a"),
+                vec![user("b"), user("c")],
+                retry_request,
+                "autonomous_agent",
+            )
+            .unwrap();
+        assert_eq!(retried.id, campaign.id);
+        assert_eq!(manager.list_campaigns("a").unwrap().len(), 1);
+
+        let first = manager.process_due_campaigns(campaign.created_at).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].recipient.id, "b");
+        assert!(manager
+            .process_due_campaigns(campaign.created_at)
+            .unwrap()
+            .is_empty());
+        let second = manager
+            .process_due_campaigns(campaign.created_at + MIN_CAMPAIGN_INTERVAL_SECONDS as i64)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].recipient.id, "c");
+
+        let saved = manager.list_campaigns("a").unwrap().remove(0);
+        assert_eq!(saved.status, PrivateMessageCampaignStatus::Completed);
+        assert_eq!(saved.sent_count(), 2);
+        assert_eq!(saved.failed_count(), 0);
+        assert_eq!(
+            manager
+                .conversation(&user("a"), &user("b"))
+                .unwrap()
+                .messages
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn une_campagne_ne_demarre_jamais_sans_consentement_confirme() {
+        let (root, manager) = test_manager("campaign-consent");
+        let mut request = campaign_request(&["b"]);
+        request.consent_confirmed = false;
+        assert!(matches!(
+            manager.create_campaign(user("a"), vec![user("b")], request, "human"),
+            Err(PrivateMessageError::Validation(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn une_campagne_dedoublonne_ses_destinataires() {
+        let (root, manager) = test_manager("campaign-dedup");
+        let campaign = manager
+            .create_campaign(
+                user("a"),
+                vec![user("b"), user("b"), user("c")],
+                campaign_request(&["b", "b", "c"]),
+                "human",
+            )
+            .unwrap();
+        assert_eq!(campaign.deliveries.len(), 2);
+        assert_eq!(campaign.deliveries[0].recipient.id, "b");
+        assert_eq!(campaign.deliveries[1].recipient.id, "c");
         let _ = fs::remove_dir_all(root);
     }
 

@@ -40,6 +40,70 @@ export type PrivateConversation = {
   messages: PrivateMessage[];
 };
 
+export type PrivateMessageCampaignStatus =
+  | "draft"
+  | "running"
+  | "paused"
+  | "completed"
+  | "cancelled"
+  | "failed";
+
+export type PrivateMessageCampaignDelivery = {
+  recipient: PrivateMessageUser;
+  body: string;
+  status: "queued" | "sent" | "failed";
+  sentAt?: number | null;
+  messageId?: string | null;
+  error?: string | null;
+};
+
+export type PrivateMessageCampaign = {
+  id: string;
+  name: string;
+  sender: PrivateMessageUser;
+  status: PrivateMessageCampaignStatus;
+  intervalSeconds: number;
+  consentConfirmed: boolean;
+  createdBy: "human" | "autonomous_agent";
+  idempotencyKey?: string | null;
+  createdAt: number;
+  updatedAt: number;
+  nextDeliveryAt?: number | null;
+  deliveries: PrivateMessageCampaignDelivery[];
+};
+
+export type CreatePrivateMessageCampaignRequest = {
+  name: string;
+  recipientIds: string[];
+  messageVariants: string[];
+  intervalSeconds: number;
+  startImmediately: boolean;
+  consentConfirmed: boolean;
+  idempotencyKey?: string;
+};
+
+export const PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS = 100;
+export const PRIVATE_MESSAGE_CAMPAIGN_MAX_VARIANTS = 20;
+export const PRIVATE_MESSAGE_CAMPAIGN_MIN_INTERVAL_SECONDS = 5;
+export const PRIVATE_MESSAGE_CAMPAIGN_MAX_INTERVAL_SECONDS = 3_600;
+
+export const privateMessageCampaignCounts = (campaign: PrivateMessageCampaign) => ({
+  sent: campaign.deliveries.filter((delivery) => delivery.status === "sent").length,
+  failed: campaign.deliveries.filter((delivery) => delivery.status === "failed").length,
+  queued: campaign.deliveries.filter((delivery) => delivery.status === "queued").length,
+  total: campaign.deliveries.length,
+});
+
+export const renderPrivateMessageCampaignTemplate = (
+  template: string,
+  user: PrivateMessageUser,
+  index: number,
+  total: number,
+) => template
+  .replaceAll("{{username}}", user.username)
+  .replaceAll("{{index}}", String(index))
+  .replaceAll("{{total}}", String(total));
+
 const searchable = (value: string) =>
   value
     .normalize("NFD")

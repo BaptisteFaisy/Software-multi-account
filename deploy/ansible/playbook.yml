@@ -4,6 +4,17 @@
   become: true
   gather_facts: true
 
+  vars:
+    # Memoire laissee a l'hote (dockerd, containerd, tailscaled, sshd, systemd) :
+    # 20 % de la RAM, avec un plancher de 1 Go. Sur la VM 8 Go cela reserve
+    # ~1,6 Go alors que ces services consomment ~0,8 Go au repos.
+    cst_host_memory_reserve_mb: >-
+      {{ [1024, (ansible_memtotal_mb | int * 0.2) | round | int] | max }}
+    # Plafond du conteneur applique par compose.yaml.j2. Surchargeable via
+    # --extra-vars si un noeud a un profil different.
+    cst_memory_limit_mb: >-
+      {{ [1024, (ansible_memtotal_mb | int) - (cst_host_memory_reserve_mb | int)] | max }}
+
   pre_tasks:
     - name: Valider la plateforme cible
       ansible.builtin.assert:
@@ -13,6 +24,8 @@
           - cst_remote_port | int >= 1
           - cst_remote_port | int <= 65535
           - cst_capacity | int >= 1
+          - cst_memory_limit_mb | int >= 1024
+          - cst_memory_limit_mb | int < (ansible_memtotal_mb | int)
         fail_msg: >-
           Le deploiement portable cible Ubuntu ou Debian en amd64/arm64 avec
           un port et une capacite valides.

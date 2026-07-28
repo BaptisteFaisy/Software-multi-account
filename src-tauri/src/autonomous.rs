@@ -3764,10 +3764,7 @@ fn start_agent_run(inner: &Arc<AutonomousAgentInner>, agent_id: &str) {
         // il n'a pas besoin d'atteindre la boite mail du proprietaire.
         inner.chat.start_review_planning(request)
     } else {
-        let tool_server = inner
-            .tool_server
-            .get()
-            .and_then(|factory| factory(&agent));
+        let tool_server = inner.tool_server.get().and_then(|factory| factory(&agent));
         inner.chat.start_with_model_tools(request, tool_server)
     };
 
@@ -8755,7 +8752,7 @@ mod tests {
                     agents: vec![initial],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -9200,6 +9197,7 @@ mod tests {
             bypass: true,
             model: Some(model.to_string()),
             reasoning_effort: Some("medium".to_string()),
+            fast_mode: false,
         }
     }
 
@@ -9765,7 +9763,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -9814,7 +9812,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
         let snapshot = |id, text: &str| ChatTurnSnapshot {
@@ -10011,7 +10009,7 @@ mod tests {
                     agents: vec![active, running, paused],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
         let scheduled_at = metrics::now_ts() + 3_600;
@@ -10061,7 +10059,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -10395,7 +10393,7 @@ mod tests {
                     agents: vec![agent, authorization_agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -10511,7 +10509,7 @@ mod tests {
                     agents: vec![agent],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
 
@@ -10565,7 +10563,7 @@ mod tests {
                     agents: vec![approved, rejected],
                 }),
                 validation_runs: Mutex::new(HashMap::new()),
-            tool_server: std::sync::OnceLock::new(),
+                tool_server: std::sync::OnceLock::new(),
             }),
         };
 

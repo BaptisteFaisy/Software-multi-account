@@ -82,6 +82,10 @@ pub fn run() {
             .expect("repertoire de la messagerie introuvable"),
     )
     .expect("etat de la messagerie illisible");
+    tauri::async_runtime::spawn(private_messages::run_private_message_campaign_worker(
+        private_message_manager.clone(),
+        chat_manager.runtime_sync(),
+    ));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -162,6 +166,9 @@ pub fn run() {
             private_messages::get_private_message_conversation,
             private_messages::get_private_message_image,
             private_messages::send_private_message,
+            private_messages::list_private_message_campaigns,
+            private_messages::create_private_message_campaign,
+            private_messages::control_private_message_campaign,
             chat::start_chat_turn,
             chat::list_active_chat_turns,
             chat::chat_turn_status,

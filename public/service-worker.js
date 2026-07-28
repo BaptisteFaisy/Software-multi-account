@@ -67,9 +67,21 @@ const cachedStaticAsset = async (request) => {
   const cached = await cache.match(request);
   if (cached) return cached;
 
-  const response = await fetch(request);
-  if (response.ok) await cache.put(request, response.clone());
-  return response;
+  try {
+    const response = await fetch(request);
+    if (response.ok) await cache.put(request, response.clone());
+    return response;
+  } catch (error) {
+    // Le VPS est injoignable (Tailscale coupe, tunnel en cours de retablissement,
+    // etc.). On ne doit pas laisser la promesse se rejeter en "Uncaught" pour
+    // chaque asset absent du cache : on renvoie une reponse explicite qui evite
+    // le bruit dans la console et permet au front de rester utilisable.
+    return new Response("", {
+      status: 504,
+      statusText: "Gateway Timeout",
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
 };
 
 const networkFirstNavigation = async (request) => {

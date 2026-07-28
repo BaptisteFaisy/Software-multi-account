@@ -9,14 +9,22 @@ import {
   type ChatImageAttachment,
 } from "./chat/image-attachments";
 import {
+  PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS,
+  PRIVATE_MESSAGE_CAMPAIGN_MAX_VARIANTS,
+  PRIVATE_MESSAGE_CAMPAIGN_MIN_INTERVAL_SECONDS,
   PRIVATE_MESSAGE_MAX_CHARS,
   filterPrivateMessageUsers,
+  privateMessageCampaignCounts,
   privateMessagingUnreadCount,
+  renderPrivateMessageCampaignTemplate,
   sortPrivateConversations,
   sortPrivateMessageUsers,
+  type CreatePrivateMessageCampaignRequest,
   type PrivateConversation,
   type PrivateConversationSummary,
   type PrivateMessage,
+  type PrivateMessageCampaign,
+  type PrivateMessageCampaignStatus,
   type PrivateMessageImage,
   type PrivateMessageImageContent,
   type PrivateMessageUser,
@@ -56,6 +64,16 @@ const messagingImageUrls = new Map<string, string>();
 const messagingImageLoads = new Set<string>();
 const messagingImageFailures = new Set<string>();
 let messagingImageObserver: IntersectionObserver | null = null;
+let messagingCampaigns: PrivateMessageCampaign[] = [];
+let messagingCampaignsOpen = false;
+let messagingCampaignSubmitting = false;
+let messagingCampaignError = "";
+let messagingCampaignName = "";
+let messagingCampaignVariants = "Bonjour {{username}},";
+let messagingCampaignIntervalSeconds = 30;
+let messagingCampaignConsent = false;
+let messagingCampaignPreview = false;
+let messagingCampaignRecipientIds = new Set<string>();
 
 const escapeHtml = (value: string) =>
   value
@@ -80,6 +98,7 @@ const messagingSnapshot = () => JSON.stringify({
   messagingSelectedUserId,
   messagingLoaded,
   messagingError,
+  messagingCampaigns,
 });
 
 const safeAvatarUrl = (value: string | null | undefined) => {
@@ -192,6 +211,113 @@ const renderMessagingImageViewer = () => {
       <figcaption>${escapeHtml(image.name)}</figcaption>
     </figure>
     <button type="button" data-messaging-close-image aria-label="Fermer l’image"><i data-lucide="x"></i></button>
+  </div>`;
+};
+
+const campaignStatusLabel = (status: PrivateMessageCampaignStatus) => ({
+  draft: "Brouillon",
+  running: "En cours",
+  paused: "En pause",
+  completed: "Terminée",
+  cancelled: "Annulée",
+  failed: "Échec",
+})[status];
+
+const campaignVariants = () => messagingCampaignVariants
+  .split(/\n\s*---+\s*\n/g)
+  .map((variant) => variant.trim())
+  .filter(Boolean)
+  .slice(0, PRIVATE_MESSAGE_CAMPAIGN_MAX_VARIANTS);
+
+const renderMessagingCampaignCard = (campaign: PrivateMessageCampaign) => {
+  const counts = privateMessageCampaignCounts(campaign);
+  const progress = counts.total ? Math.round((counts.sent / counts.total) * 100) : 0;
+  const action = campaign.status === "running"
+    ? `<button type="button" data-campaign-action="pause" data-campaign-id="${escapeAttr(campaign.id)}"><i data-lucide="pause"></i>Pause</button>`
+    : campaign.status === "paused"
+      ? `<button type="button" data-campaign-action="resume" data-campaign-id="${escapeAttr(campaign.id)}"><i data-lucide="play"></i>Reprendre</button>`
+      : campaign.status === "draft"
+        ? `<button type="button" data-campaign-action="start" data-campaign-id="${escapeAttr(campaign.id)}"><i data-lucide="play"></i>Démarrer</button>`
+        : "";
+  const cancellable = ["draft", "running", "paused"].includes(campaign.status)
+    ? `<button type="button" class="danger" data-campaign-action="cancel" data-campaign-id="${escapeAttr(campaign.id)}"><i data-lucide="circle-x"></i>Annuler</button>`
+    : "";
+  return `<article class="messaging-campaign-card">
+    <header>
+      <span class="messaging-campaign-status is-${escapeAttr(campaign.status)}">${escapeHtml(campaignStatusLabel(campaign.status))}</span>
+      <small>${campaign.createdBy === "autonomous_agent" ? "Agent autonome" : "Créée manuellement"}</small>
+    </header>
+    <h4>${escapeHtml(campaign.name)}</h4>
+    <p>${counts.sent}/${counts.total} envoyés${counts.failed ? ` · ${counts.failed} échec(s)` : ""} · cadence ${campaign.intervalSeconds}s</p>
+    <div class="messaging-campaign-progress"><span style="width:${progress}%"></span></div>
+    <footer>${action}${cancellable}</footer>
+  </article>`;
+};
+
+const renderMessagingCampaignPreview = () => {
+  if (!messagingCampaignPreview) return "";
+  const recipients = messagingUsers.filter((user) => messagingCampaignRecipientIds.has(user.id));
+  const variants = campaignVariants();
+  if (!recipients.length || !variants.length) {
+    return `<div class="messaging-campaign-preview is-empty">Sélectionnez des destinataires et ajoutez au moins un message.</div>`;
+  }
+  return `<section class="messaging-campaign-preview">
+    <header><strong>Aperçu personnalisé</strong><small>${recipients.length} destinataire(s) · ${variants.length} variante(s)</small></header>
+    ${recipients.slice(0, 3).map((user, index) => `<article>
+      ${renderMessagingAvatar(user)}
+      <span><strong>${escapeHtml(user.username)}</strong><p>${escapeHtml(renderPrivateMessageCampaignTemplate(
+        variants[index % variants.length],
+        user,
+        index + 1,
+        recipients.length,
+      ))}</p></span>
+    </article>`).join("")}
+  </section>`;
+};
+
+const renderMessagingCampaigns = () => {
+  if (!messagingCampaignsOpen) return "";
+  const selectedCount = messagingCampaignRecipientIds.size;
+  return `<div class="messaging-campaign-backdrop" data-campaign-close>
+    <section class="messaging-campaign-dialog" role="dialog" aria-modal="true" aria-labelledby="messagingCampaignTitle">
+      <header>
+        <div><span>Diffusion consentie</span><h3 id="messagingCampaignTitle">Campagnes de messages</h3><p>Personnalisez, cadrez et suivez chaque envoi depuis un seul endroit.</p></div>
+        <button type="button" data-campaign-close aria-label="Fermer"><i data-lucide="x"></i></button>
+      </header>
+      ${messagingCampaignError ? `<div class="messaging-error" role="alert"><i data-lucide="circle-alert"></i><span>${escapeHtml(messagingCampaignError)}</span></div>` : ""}
+      <div class="messaging-campaign-dialog-grid">
+        <form id="messagingCampaignForm" class="messaging-campaign-form">
+          <label><span>Nom de campagne</span><input id="campaignName" maxlength="120" value="${escapeAttr(messagingCampaignName)}" placeholder="Ex. Invitation bêta juillet" /></label>
+          <label><span>Messages <small>séparez les variantes par ---</small></span><textarea id="campaignVariants" maxlength="${PRIVATE_MESSAGE_MAX_CHARS * PRIVATE_MESSAGE_CAMPAIGN_MAX_VARIANTS}" rows="6" placeholder="Bonjour {{username}},…">${escapeHtml(messagingCampaignVariants)}</textarea></label>
+          <div class="messaging-campaign-tokens"><span>Variables :</span><code>{{username}}</code><code>{{index}}</code><code>{{total}}</code></div>
+          <fieldset>
+            <legend><span>Destinataires <b>${selectedCount}/${PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS}</b></span><button type="button" data-campaign-select-all>Tout sélectionner</button></legend>
+            <div class="messaging-campaign-recipients">
+              ${messagingUsers.length ? messagingUsers.map((user) => `<label class="${messagingCampaignRecipientIds.has(user.id) ? "is-selected" : ""}">
+                <input type="checkbox" data-campaign-recipient="${escapeAttr(user.id)}" ${messagingCampaignRecipientIds.has(user.id) ? "checked" : ""} />
+                ${renderMessagingAvatar(user)}<span>${escapeHtml(user.username)}</span><i data-lucide="check"></i>
+              </label>`).join("") : `<p>Aucun autre utilisateur disponible.</p>`}
+            </div>
+          </fieldset>
+          <label class="messaging-campaign-interval"><span>Cadence entre deux messages</span><input id="campaignInterval" type="number" min="${PRIVATE_MESSAGE_CAMPAIGN_MIN_INTERVAL_SECONDS}" max="3600" value="${messagingCampaignIntervalSeconds}" /><small>secondes</small></label>
+          <label class="messaging-campaign-consent"><input id="campaignConsent" type="checkbox" ${messagingCampaignConsent ? "checked" : ""} /><span><strong>Audience autorisée</strong><small>Je confirme que ces destinataires ont accepté ces messages et qu’une demande d’arrêt sera respectée.</small></span></label>
+          ${renderMessagingCampaignPreview()}
+          <footer>
+            <button type="button" class="tool-button" data-campaign-preview><i data-lucide="scan-eye"></i><span>Aperçu</span></button>
+            <span>
+              <button type="submit" class="tool-button" data-campaign-submit="draft" ${messagingCampaignSubmitting ? "disabled" : ""}><i data-lucide="save"></i><span>Brouillon</span></button>
+              <button type="submit" class="tool-button primary" data-campaign-submit="start" ${messagingCampaignSubmitting ? "disabled" : ""}><i data-lucide="send"></i><span>${messagingCampaignSubmitting ? "Création…" : "Lancer"}</span></button>
+            </span>
+          </footer>
+        </form>
+        <aside class="messaging-campaign-history">
+          <header><div><strong>Activité</strong><small>${messagingCampaigns.length} campagne(s)</small></div><button type="button" data-campaign-refresh aria-label="Actualiser"><i data-lucide="refresh-ccw"></i></button></header>
+          <div>${messagingCampaigns.length
+            ? messagingCampaigns.map(renderMessagingCampaignCard).join("")
+            : `<div class="messaging-campaign-empty"><i data-lucide="send"></i><strong>Aucune campagne</strong><p>Votre première campagne apparaîtra ici avec sa progression.</p></div>`}</div>
+        </aside>
+      </div>
+    </section>
   </div>`;
 };
 
@@ -345,7 +471,10 @@ export const renderMessagingPanel = (): string => {
         <div class="messaging-hero-mark"><i data-lucide="mail"></i>${unreadCount ? `<b>${unreadCount > 99 ? "99+" : unreadCount}</b>` : ""}</div>
         <div><span>Échanges directs</span><h2 id="messagingPanelTitle">Messagerie</h2><p>Discutez en privé avec les autres utilisateurs.</p></div>
         <span class="messaging-privacy"><i data-lucide="shield-check"></i><span><strong>Privé</strong><small>Deux participants</small></span></span>
-        <button type="button" id="messagingNew" class="tool-button primary"><i data-lucide="message-square-plus"></i><span>Nouveau message</span></button>
+        <div class="messaging-hero-actions">
+          <button type="button" id="messagingCampaigns" class="tool-button"><i data-lucide="send"></i><span>Campagnes</span></button>
+          <button type="button" id="messagingNew" class="tool-button primary"><i data-lucide="message-square-plus"></i><span>Nouveau message</span></button>
+        </div>
       </header>
       ${messagingError ? `<div class="messaging-error" role="alert"><i data-lucide="circle-alert"></i><span>${escapeHtml(messagingError)}</span><button type="button" data-messaging-dismiss-error aria-label="Fermer"><i data-lucide="x"></i></button></div>` : ""}
       <div class="messaging-layout">
@@ -363,6 +492,7 @@ export const renderMessagingPanel = (): string => {
         <main class="messaging-detail">${renderMessagingThread()}</main>
       </div>
       ${renderMessagingImageViewer()}
+      ${renderMessagingCampaigns()}
     </section>`;
 };
 
@@ -578,16 +708,24 @@ export const refreshMessaging = (
         && !!selectedId
         && (window.innerWidth > 860 || messagingMobileDetailOpen);
       const usersPromise = invoke<PrivateMessageUser[]>("list_private_message_users");
+      const campaignsPromise = invoke<PrivateMessageCampaign[]>(
+        "list_private_message_campaigns",
+      );
       const threadPromise = selectedId && threadIsVisible
         ? invoke<PrivateConversation>("get_private_message_conversation", { userId: selectedId })
         : Promise.resolve(messagingConversation);
-      const [users, thread] = await Promise.all([usersPromise, threadPromise]);
+      const [users, thread, campaigns] = await Promise.all([
+        usersPromise,
+        threadPromise,
+        campaignsPromise,
+      ]);
       const conversations = await invoke<PrivateConversationSummary[]>(
         "list_private_message_conversations",
       );
       messagingUsers = sortPrivateMessageUsers(users);
       messagingConversations = sortPrivateConversations(conversations);
       messagingConversation = thread;
+      messagingCampaigns = campaigns;
       retainCurrentMessagingImages();
       messagingLoaded = true;
       messagingError = "";
@@ -720,9 +858,190 @@ const addMessagingImages = async (
   focusMessagingComposer();
 };
 
+const rememberMessagingCampaignForm = () => {
+  messagingCampaignName =
+    document.querySelector<HTMLInputElement>("#campaignName")?.value ?? messagingCampaignName;
+  messagingCampaignVariants =
+    document.querySelector<HTMLTextAreaElement>("#campaignVariants")?.value
+    ?? messagingCampaignVariants;
+  messagingCampaignIntervalSeconds = Number(
+    document.querySelector<HTMLInputElement>("#campaignInterval")?.value
+      ?? messagingCampaignIntervalSeconds,
+  );
+  messagingCampaignConsent =
+    document.querySelector<HTMLInputElement>("#campaignConsent")?.checked
+    ?? messagingCampaignConsent;
+  messagingCampaignRecipientIds = new Set(
+    Array.from(document.querySelectorAll<HTMLInputElement>("[data-campaign-recipient]:checked"))
+      .map((input) => input.dataset.campaignRecipient ?? "")
+      .filter(Boolean),
+  );
+};
+
+const refreshMessagingCampaigns = async (options: MessagingUiOptions) => {
+  try {
+    messagingCampaigns = await invoke<PrivateMessageCampaign[]>(
+      "list_private_message_campaigns",
+    );
+    messagingCampaignError = "";
+  } catch (error) {
+    messagingCampaignError = errorMessage(error);
+  }
+  options.rerender();
+};
+
+const submitMessagingCampaign = async (
+  options: MessagingUiOptions,
+  startImmediately: boolean,
+) => {
+  rememberMessagingCampaignForm();
+  const variants = campaignVariants();
+  if (!messagingCampaignRecipientIds.size) {
+    messagingCampaignError = "Sélectionnez au moins un destinataire.";
+  } else if (messagingCampaignRecipientIds.size > PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS) {
+    messagingCampaignError =
+      `Une campagne accepte au maximum ${PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS} destinataires.`;
+  } else if (!variants.length) {
+    messagingCampaignError = "Ajoutez au moins une variante de message.";
+  } else if (variants.some((variant) => [...variant].length > PRIVATE_MESSAGE_MAX_CHARS)) {
+    messagingCampaignError =
+      `Chaque variante doit contenir au maximum ${PRIVATE_MESSAGE_MAX_CHARS} caractères.`;
+  } else if (!Number.isInteger(messagingCampaignIntervalSeconds)
+    || messagingCampaignIntervalSeconds < PRIVATE_MESSAGE_CAMPAIGN_MIN_INTERVAL_SECONDS
+    || messagingCampaignIntervalSeconds > 3_600) {
+    messagingCampaignError = "La cadence doit être comprise entre 5 et 3 600 secondes.";
+  } else if (startImmediately && !messagingCampaignConsent) {
+    messagingCampaignError = "Confirmez l’autorisation de l’audience avant le lancement.";
+  } else {
+    messagingCampaignError = "";
+  }
+  if (messagingCampaignError) {
+    options.rerender();
+    return;
+  }
+
+  messagingCampaignSubmitting = true;
+  options.rerender();
+  const request: CreatePrivateMessageCampaignRequest = {
+    name: messagingCampaignName,
+    recipientIds: [...messagingCampaignRecipientIds],
+    messageVariants: variants,
+    intervalSeconds: messagingCampaignIntervalSeconds,
+    startImmediately,
+    consentConfirmed: messagingCampaignConsent,
+  };
+  try {
+    const campaign = await invoke<PrivateMessageCampaign>(
+      "create_private_message_campaign",
+      { request },
+    );
+    messagingCampaigns = [campaign, ...messagingCampaigns];
+    messagingCampaignName = "";
+    messagingCampaignPreview = false;
+    messagingCampaignRecipientIds = new Set();
+    options.setStatus?.(
+      startImmediately
+        ? `Campagne « ${campaign.name} » lancée`
+        : `Brouillon « ${campaign.name} » enregistré`,
+    );
+  } catch (error) {
+    messagingCampaignError = errorMessage(error);
+  } finally {
+    messagingCampaignSubmitting = false;
+    options.rerender();
+  }
+};
+
+const controlMessagingCampaign = async (
+  options: MessagingUiOptions,
+  campaignId: string,
+  action: "start" | "pause" | "resume" | "cancel",
+) => {
+  messagingCampaignError = "";
+  const current = messagingCampaigns.find((campaign) => campaign.id === campaignId);
+  const consentConfirmed = action === "start" && !current?.consentConfirmed
+    ? window.confirm(
+      "Confirmez-vous que tous les destinataires de ce brouillon ont accepté ces messages ?",
+    )
+    : false;
+  if (action === "start" && !current?.consentConfirmed && !consentConfirmed) return;
+  try {
+    const campaign = await invoke<PrivateMessageCampaign>(
+      "control_private_message_campaign",
+      { campaignId, action, consentConfirmed },
+    );
+    messagingCampaigns = messagingCampaigns.map((entry) =>
+      entry.id === campaign.id ? campaign : entry);
+    options.setStatus?.(`Campagne « ${campaign.name} » mise à jour`);
+  } catch (error) {
+    messagingCampaignError = errorMessage(error);
+  }
+  options.rerender();
+};
+
 export const bindMessagingUi = (options: MessagingUiOptions) => {
   document.querySelector<HTMLButtonElement>("#messagingNew")?.addEventListener("click", () =>
     openMessagingComposer(options.rerender));
+  document.querySelector<HTMLButtonElement>("#messagingCampaigns")?.addEventListener("click", () => {
+    messagingCampaignsOpen = true;
+    messagingCampaignError = "";
+    options.rerender();
+    void refreshMessagingCampaigns(options);
+  });
+  const closeMessagingCampaigns = (event?: Event) => {
+    if (event?.target instanceof HTMLElement
+      && event.target.closest(".messaging-campaign-dialog")
+      && !event.target.matches("[data-campaign-close]")) return;
+    rememberMessagingCampaignForm();
+    messagingCampaignsOpen = false;
+    messagingCampaignPreview = false;
+    options.rerender();
+  };
+  document.querySelectorAll<HTMLElement>("[data-campaign-close]").forEach((element) => {
+    element.addEventListener("click", closeMessagingCampaigns);
+  });
+  document.querySelector<HTMLButtonElement>("[data-campaign-refresh]")?.addEventListener("click", () => {
+    rememberMessagingCampaignForm();
+    void refreshMessagingCampaigns(options);
+  });
+  document.querySelector<HTMLButtonElement>("[data-campaign-select-all]")?.addEventListener("click", () => {
+    rememberMessagingCampaignForm();
+    const selectable = messagingUsers.slice(0, PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS);
+    messagingCampaignRecipientIds = messagingCampaignRecipientIds.size === selectable.length
+      ? new Set()
+      : new Set(selectable.map((user) => user.id));
+    options.rerender();
+  });
+  document.querySelectorAll<HTMLInputElement>("[data-campaign-recipient]").forEach((input) => {
+    input.addEventListener("change", () => {
+      rememberMessagingCampaignForm();
+      if (messagingCampaignRecipientIds.size > PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS) {
+        messagingCampaignRecipientIds.delete(input.dataset.campaignRecipient ?? "");
+        messagingCampaignError =
+          `Limite de ${PRIVATE_MESSAGE_CAMPAIGN_MAX_RECIPIENTS} destinataires atteinte.`;
+      } else {
+        messagingCampaignError = "";
+      }
+      options.rerender();
+    });
+  });
+  document.querySelector<HTMLButtonElement>("[data-campaign-preview]")?.addEventListener("click", () => {
+    rememberMessagingCampaignForm();
+    messagingCampaignPreview = true;
+    options.rerender();
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-campaign-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const campaignId = button.dataset.campaignId;
+      const action = button.dataset.campaignAction as "start" | "pause" | "resume" | "cancel";
+      if (campaignId && action) void controlMessagingCampaign(options, campaignId, action);
+    });
+  });
+  document.querySelector<HTMLFormElement>("#messagingCampaignForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const submitter = (event as SubmitEvent).submitter as HTMLButtonElement | null;
+    void submitMessagingCampaign(options, submitter?.dataset.campaignSubmit === "start");
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-messaging-browse-users]").forEach((button) => {
     button.addEventListener("click", () => openMessagingComposer(options.rerender));
   });

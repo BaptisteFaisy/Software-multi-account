@@ -16,6 +16,13 @@ services:
       - "127.0.0.1:${CST_HOST_PORT:-8080}:8080"
     volumes:
       - ${CST_DATA_PATH:-./.cst-data}:/srv/cst
+    # 0 = pas de plafond (comportement historique en local, ou la RAM est large).
+    # Sur un hote contraint, fixer CST_MEM_LIMIT (ex: 6144m) evite qu'une derive
+    # du runtime consomme toute la RAM puis tout le swap de la machine : le noyau
+    # ne declenche alors aucun OOM-kill et l'hote entier part en thrashing.
+    # Le deploiement VPS applique ce plafond automatiquement (compose.yaml.j2).
+    mem_limit: ${CST_MEM_LIMIT:-0}
+    memswap_limit: ${CST_MEM_LIMIT:-0}
     stop_grace_period: 45s
     security_opt:
       - no-new-privileges:true
