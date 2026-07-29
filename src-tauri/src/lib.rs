@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod account_usage;
 mod auth;
 mod autonomous;
@@ -29,6 +31,7 @@ mod settings;
 mod telegram_notifications;
 #[cfg(feature = "desktop")]
 mod terminal;
+mod tiktok_messaging;
 mod video_generation;
 mod voice;
 mod vps_deploy;
@@ -86,6 +89,7 @@ pub fn run() {
         private_message_manager.clone(),
         chat_manager.runtime_sync(),
     ));
+    tauri::async_runtime::spawn(tiktok_messaging::run_tiktok_connector());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

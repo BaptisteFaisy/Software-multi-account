@@ -19,8 +19,11 @@ use crate::{
         CREATE_CHAT_TOOL_NAME, CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
         LIST_CALENDAR_EVENTS_TOOL_NAME, LIST_OUTLOOK_MESSAGES_TOOL_NAME,
         LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME, LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME,
-        PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
-        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME, UPDATE_CALENDAR_EVENT_TOOL_NAME,
+        LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME, LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME,
+        PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+        QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
+        SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME, UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
+        UPDATE_CALENDAR_EVENT_TOOL_NAME,
     },
     creative_accounts::{self, ConnectCreativeAccountRequest, CreativeAccountIdRequest},
     discussions,
@@ -50,6 +53,12 @@ use crate::{
     telegram_notifications::{
         self, ConnectTelegramManagerRequest, ConnectTelegramRequest,
         PrepareManagedTelegramBotRequest,
+    },
+    tiktok_messaging::{
+        ConfirmTikTokDmCampaignRequest, PrepareTikTokDmCampaignRequest,
+        QueueTikTokFollowerExtractionRequest, TikTokConnectorClaimRequest,
+        TikTokConnectorHeartbeatRequest, TikTokConnectorReportRequest, TikTokDmError,
+        TikTokDmManager, TikTokFollowerResultReportRequest, TikTokFollowerSubmissionReportRequest,
     },
     video_generation::{self, VideoGenerationRequest, VideoGenerationStatusRequest},
     voice,
@@ -151,6 +160,7 @@ struct ServerState {
     orchestration: OrchestrationManager,
     forum: ForumManager,
     private_messages: PrivateMessageManager,
+    tiktok_messaging: TikTokDmManager,
     workspace_access: WorkspaceAccessManager,
     doctolib_lab: Arc<DoctolibLabManager>,
     kombai: Arc<KombaiManager>,
@@ -1064,6 +1074,7 @@ pub async fn run_from_env() -> Result<(), String> {
     let forum = ForumManager::new(config.data_dir.join("forum.json"))?;
     let private_messages =
         PrivateMessageManager::new(config.data_dir.join("private-messages.json"))?;
+    let tiktok_messaging = TikTokDmManager::new(config.data_dir.join("tiktok-dm-campaigns.json"))?;
     let workspace_access = WorkspaceAccessManager::load(config.data_dir.clone())?;
     // Les jetons Microsoft vivent dans `config.data_dir`, comme `user-auth.json`
     // et contrairement aux autres integrations qui passent par
@@ -1086,6 +1097,7 @@ pub async fn run_from_env() -> Result<(), String> {
         orchestration,
         forum,
         private_messages,
+        tiktok_messaging,
         workspace_access,
         doctolib_lab: Arc::new(DoctolibLabManager::default()),
         kombai: Arc::new(KombaiManager::default()),
@@ -1175,6 +1187,52 @@ pub async fn run_from_env() -> Result<(), String> {
         .route(
             "/private-messages/campaigns/:campaign_id/control",
             post(api_control_private_message_campaign),
+        )
+        .route(
+            "/tiktok/dm-campaigns",
+            get(api_list_tiktok_dm_campaigns)
+                .post(api_prepare_tiktok_dm_campaign)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/tiktok/dm-campaigns/:campaign_id/confirm",
+            post(api_confirm_tiktok_dm_campaign).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/tiktok/follower-extractions",
+            get(api_list_tiktok_follower_extractions)
+                .post(api_queue_tiktok_follower_extraction)
+                .layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/heartbeat",
+            post(api_tiktok_connector_heartbeat).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/jobs/claim",
+            post(api_tiktok_connector_claim).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/jobs/report",
+            post(api_tiktok_connector_report).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/follower-extractions/claim",
+            post(api_tiktok_follower_connector_claim).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/follower-extractions/report",
+            post(api_tiktok_follower_connector_report).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/follower-extractions/pending-results",
+            post(api_tiktok_follower_connector_pending_results)
+                .layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/follower-extractions/report-result",
+            post(api_tiktok_follower_connector_report_result)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route("/chat/models", get(api_chat_models))
         .route(
@@ -2776,6 +2834,239 @@ async fn api_control_private_message_campaign(
     }
 }
 
+async fn api_list_tiktok_dm_campaigns(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let campaigns = match state.tiktok_messaging.list(actor.owner_id()) {
+        Ok(campaigns) => campaigns,
+        Err(error) => return tiktok_dm_api_error(&state, error),
+    };
+    let connector = match state.tiktok_messaging.connector_status() {
+        Ok(connector) => connector,
+        Err(error) => return tiktok_dm_api_error(&state, error),
+    };
+    let connector_online = connector
+        .as_ref()
+        .is_some_and(|status| status.is_online(metrics::now_ts()));
+    private_message_no_store(json_response(json!({
+        "campaigns": campaigns,
+        "connector": connector,
+        "connectorOnline": connector_online
+    })))
+}
+
+async fn api_prepare_tiktok_dm_campaign(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<PrepareTikTokDmCampaignRequest>,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state
+        .tiktok_messaging
+        .prepare(actor.owner_id(), request, "human_chat")
+    {
+        Ok(campaign) => {
+            private_message_no_store((StatusCode::CREATED, Json(campaign)).into_response())
+        }
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmTikTokDmHttpRequest {
+    #[serde(default)]
+    owned_accounts_confirmed: bool,
+    #[serde(default)]
+    send_confirmed: bool,
+}
+
+async fn api_confirm_tiktok_dm_campaign(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(campaign_id): AxumPath<String>,
+    Json(request): Json<ConfirmTikTokDmHttpRequest>,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state.tiktok_messaging.confirm(
+        actor.owner_id(),
+        ConfirmTikTokDmCampaignRequest {
+            campaign_id,
+            owned_accounts_confirmed: request.owned_accounts_confirmed,
+            send_confirmed: request.send_confirmed,
+        },
+    ) {
+        Ok(campaign) => private_message_no_store(json_response(campaign)),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_list_tiktok_follower_extractions(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state
+        .tiktok_messaging
+        .list_follower_extractions(actor.owner_id())
+    {
+        Ok(extractions) => private_message_no_store(json_response(json!({
+            "extractions": extractions
+        }))),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_queue_tiktok_follower_extraction(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<QueueTikTokFollowerExtractionRequest>,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state
+        .tiktok_messaging
+        .queue_follower_extraction(actor.owner_id(), request, "human_chat")
+    {
+        Ok(extraction) => {
+            private_message_no_store((StatusCode::CREATED, Json(extraction)).into_response())
+        }
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_connector_heartbeat(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokConnectorHeartbeatRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state.tiktok_messaging.heartbeat(request) {
+        Ok(status) => private_message_no_store(json_response(status)),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_connector_claim(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokConnectorClaimRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state.tiktok_messaging.claim_next(&request.connector_id) {
+        Ok(job) => private_message_no_store(json_response(json!({ "job": job }))),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_connector_report(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokConnectorReportRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state.tiktok_messaging.report(request) {
+        Ok(campaign) => private_message_no_store(json_response(campaign)),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_follower_connector_claim(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokConnectorClaimRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state
+        .tiktok_messaging
+        .claim_next_follower_extraction(&request.connector_id)
+    {
+        Ok(job) => private_message_no_store(json_response(json!({ "job": job }))),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_follower_connector_report(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokFollowerSubmissionReportRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state.tiktok_messaging.report_follower_submission(request) {
+        Ok(extraction) => private_message_no_store(json_response(extraction)),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_follower_connector_pending_results(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokConnectorClaimRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state
+        .tiktok_messaging
+        .pending_follower_results(&request.connector_id)
+    {
+        Ok(extractions) => private_message_no_store(json_response(json!({
+            "extractions": extractions
+        }))),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_follower_connector_report_result(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokFollowerResultReportRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state.tiktok_messaging.report_follower_result(request) {
+        Ok(extraction) => private_message_no_store(json_response(extraction)),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+fn tiktok_dm_api_error(state: &Arc<ServerState>, error: TikTokDmError) -> Response {
+    let status = match &error {
+        TikTokDmError::Validation(_) => StatusCode::BAD_REQUEST,
+        TikTokDmError::NotFound => StatusCode::NOT_FOUND,
+        TikTokDmError::Conflict(_) => StatusCode::CONFLICT,
+        TikTokDmError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    api_error(status, &error.to_string(), &state.config)
+}
+
 fn notify_private_message_participants(
     state: &Arc<ServerState>,
     left: &PrivateMessageUser,
@@ -3224,6 +3515,11 @@ async fn mcp_chat_tools(
                 && name != LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME
                 && name != CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
                 && name != CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
+                && name != LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME
+                && name != PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME
+                && name != SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME
+                && name != LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME
+                && name != QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME
             {
                 return json_response(chat_model_tools::protocol_error(
                     id,
@@ -3249,7 +3545,10 @@ async fn mcp_chat_tools(
                 | CREATE_CALENDAR_EVENT_TOOL_NAME
                 | UPDATE_CALENDAR_EVENT_TOOL_NAME
                 | CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
-                | CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME => {
+                | CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
+                | PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME
+                | SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME
+                | QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME => {
                     state.chat_tool_capabilities.claim_external_action(token)
                 }
                 _ => state.chat_tool_capabilities.claim_call(token),
@@ -3718,6 +4017,199 @@ async fn mcp_chat_tools(
                                     campaign.name, campaign.status
                                 ),
                                 json!({ "campaign": campaign }),
+                            ))
+                        }
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
+                LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME => {
+                    if !arguments
+                        .as_object()
+                        .is_some_and(|arguments| arguments.is_empty())
+                    {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            "La liste des campagnes TikTok ne prend aucun argument",
+                        ));
+                    }
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    let campaigns = match state.tiktok_messaging.list(owner_id) {
+                        Ok(campaigns) => campaigns,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &error.to_string(),
+                            ))
+                        }
+                    };
+                    let connector = match state.tiktok_messaging.connector_status() {
+                        Ok(connector) => connector,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &error.to_string(),
+                            ))
+                        }
+                    };
+                    let connector_online = connector
+                        .as_ref()
+                        .is_some_and(|status| status.is_online(metrics::now_ts()));
+                    json_response(chat_model_tools::tool_microsoft_data_response(
+                        id,
+                        &format!(
+                            "{} campagne(s) TikTok ; connecteur Windows {}.",
+                            campaigns.len(),
+                            if connector_online {
+                                "en ligne"
+                            } else {
+                                "hors ligne"
+                            }
+                        ),
+                        json!({
+                            "campaigns": campaigns,
+                            "connector": connector,
+                            "connectorOnline": connector_online
+                        }),
+                    ))
+                }
+                PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME => {
+                    let request =
+                        match serde_json::from_value::<PrepareTikTokDmCampaignRequest>(arguments) {
+                            Ok(request) => request,
+                            Err(error) => {
+                                return json_response(chat_model_tools::tool_error_response(
+                                    id,
+                                    &format!("Arguments invalides pour l'apercu TikTok : {error}"),
+                                ))
+                            }
+                        };
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    let created_by = if context.scope == ChatToolScope::PersonalDataOnly {
+                        "autonomous_agent"
+                    } else {
+                        "human_chat"
+                    };
+                    match state
+                        .tiktok_messaging
+                        .prepare(owner_id, request, created_by)
+                    {
+                        Ok(campaign) => json_response(
+                            chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "Apercu TikTok prepare pour {} compte(s). Aucun message n'a ete envoye.",
+                                    campaign.recipients.len()
+                                ),
+                                json!({ "campaign": campaign, "requiresConfirmation": true }),
+                            ),
+                        ),
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
+                SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME => {
+                    let request =
+                        match serde_json::from_value::<ConfirmTikTokDmCampaignRequest>(arguments) {
+                            Ok(request) => request,
+                            Err(error) => {
+                                return json_response(chat_model_tools::tool_error_response(
+                                    id,
+                                    &format!(
+                                        "Arguments invalides pour la confirmation TikTok : {error}"
+                                    ),
+                                ))
+                            }
+                        };
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    match state.tiktok_messaging.confirm(owner_id, request) {
+                        Ok(campaign) => json_response(
+                            chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                "Campagne TikTok confirmee et placee dans la file du connecteur Windows.",
+                                json!({ "campaign": campaign }),
+                            ),
+                        ),
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
+                LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME => {
+                    if !arguments
+                        .as_object()
+                        .is_some_and(|arguments| arguments.is_empty())
+                    {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            "La liste des collectes TikTok ne prend aucun argument",
+                        ));
+                    }
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    match state.tiktok_messaging.list_follower_extractions(owner_id) {
+                        Ok(extractions) => {
+                            let completed = extractions
+                                .iter()
+                                .filter(|extraction| {
+                                    extraction.status
+                                        == crate::tiktok_messaging::TikTokFollowerExtractionStatus::Completed
+                                })
+                                .count();
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "{} collecte(s) TikTok, dont {completed} terminee(s).",
+                                    extractions.len()
+                                ),
+                                json!({ "extractions": extractions }),
+                            ))
+                        }
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
+                QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME => {
+                    let request = match serde_json::from_value::<QueueTikTokFollowerExtractionRequest>(
+                        arguments,
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &format!("Arguments invalides pour la collecte TikTok : {error}"),
+                            ))
+                        }
+                    };
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    let created_by = if context.scope == ChatToolScope::PersonalDataOnly {
+                        "autonomous_agent"
+                    } else {
+                        "human_chat"
+                    };
+                    match state
+                        .tiktok_messaging
+                        .queue_follower_extraction(owner_id, request, created_by)
+                    {
+                        Ok(extraction) => {
+                            let pipeline_note = if extraction.dm_pipeline.is_some() {
+                                " Un brouillon sera prepare uniquement pour l'intersection avec la liste de comptes secondaires controles ; aucun message ne sera envoye sans un nouvel apercu et une confirmation humaine."
+                            } else {
+                                ""
+                            };
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "Collecte TikTok placee dans la file pour {} (maximum {} noms).{}",
+                                    extraction.target_username, extraction.max_count, pipeline_note
+                                ),
+                                json!({ "extraction": extraction }),
                             ))
                         }
                         Err(error) => json_response(chat_model_tools::tool_error_response(

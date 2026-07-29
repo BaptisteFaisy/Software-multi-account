@@ -54,9 +54,10 @@ Exemple de séquence :
 5. Utiliser `control_private_message_campaign` pour mettre en pause, reprendre ou
    annuler.
 
-## Référence TikMatrix
+## Connecteur TikMatrix séparé
 
 Le dépôt TikMatrix est installé séparément dans
-`C:\Users\jeanp\tikmatrix-desktop`. Il sert de référence fonctionnelle et reste
-isolé de l'exécution de Codex Switch Terminal. Aucun code TikMatrix n'est copié
-dans l'application.
+`%USERPROFILE%\tikmatrix-desktop`. Aucun code TikMatrix n'est copié dans
+l'application. Un connecteur local distinct peut cependant soumettre à son agent
+loopback des campagnes TikTok de test préparées sur le VPS. Ce parcours est
+décrit dans [Messages TikTok de test depuis un chat VPS](tiktok-vps-messaging.md).

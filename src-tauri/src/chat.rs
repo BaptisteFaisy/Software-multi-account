@@ -8,9 +8,12 @@ use crate::{
         ChatModelToolServerConfig, ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME,
         APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME,
         CREATE_CALENDAR_EVENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME, LIST_CALENDAR_EVENTS_TOOL_NAME,
-        LIST_OUTLOOK_MESSAGES_TOOL_NAME, MCP_BEARER_ENV, MCP_SERVER_NAME,
-        PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
-        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME, UPDATE_CALENDAR_EVENT_TOOL_NAME,
+        LIST_OUTLOOK_MESSAGES_TOOL_NAME, LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME,
+        LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME, MCP_BEARER_ENV, MCP_SERVER_NAME,
+        PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+        QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
+        SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME, UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
+        UPDATE_CALENDAR_EVENT_TOOL_NAME,
     },
     chat_tools::{chat_skills_document, chat_tool_instructions, ChatAgentSkill, ChatAgentTool},
     discussions::{self, DiscussionContextUsage},
@@ -60,6 +63,12 @@ const MAX_MODEL_CHARS: usize = 160;
 const MAX_RETAINED_TURNS: usize = 500;
 const PROVIDER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const COMPACT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Le serveur MCP vit dans le meme processus HTTP que l'API du chat. Sous forte
+/// charge, son handshake peut depasser les cinq secondes historiques alors que
+/// le serveur est sain. On lui laisse une marge, mais il reste optionnel : une
+/// indisponibilite transitoire des outils ne doit jamais bloquer la reprise
+/// d'une conversation ni faire perdre le message de l'utilisateur.
+const CHAT_MCP_STARTUP_TIMEOUT_SECONDS: u64 = 15;
 const RESPONSE_QUALITY_INSTRUCTIONS: &str = "Avant toute réponse finale destinée à l'utilisateur, effectue une relecture silencieuse. Corrige les fautes de grammaire, de syntaxe, d'orthographe, d'accord et de ponctuation, puis vérifie que les phrases sont naturelles et non ambiguës dans la langue de l'utilisateur, sauf demande contraire. Pour le code, les commandes et les formats structurés, préserve les éléments littéraux et vérifie que la syntaxe ainsi que tous les délimiteurs et blocs sont complets. Ne modifie pas les citations ou les contenus demandés mot pour mot et ne mentionne pas cette relecture.";
 
 /// Filet applique aux tours Claude one-shot : chaque tour est un process
@@ -2332,7 +2341,7 @@ fn configure_provider_command_with_images_and_scope(
                     .arg(path)
                     .arg("--allowedTools")
                     .arg(format!(
-                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CHAT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_OUTLOOK_MESSAGES_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_CALENDAR_EVENTS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_OUTLOOK_EMAIL_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_CALENDAR_EVENT_TOOL_NAME}"
+                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CHAT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_OUTLOOK_MESSAGES_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_CALENDAR_EVENTS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_OUTLOOK_EMAIL_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME}"
                     ));
             }
         }
@@ -2371,11 +2380,11 @@ fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelTo
         format!("{prefix}.url={url}"),
         format!("{prefix}.bearer_token_env_var=\"{MCP_BEARER_ENV}\""),
         format!(
-            "{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\",\"{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}\",\"{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}\",\"{CREATE_CHAT_TOOL_NAME}\",\"{LIST_OUTLOOK_MESSAGES_TOOL_NAME}\",\"{LIST_CALENDAR_EVENTS_TOOL_NAME}\",\"{SEND_OUTLOOK_EMAIL_TOOL_NAME}\",\"{CREATE_CALENDAR_EVENT_TOOL_NAME}\",\"{UPDATE_CALENDAR_EVENT_TOOL_NAME}\"]"
+            "{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\",\"{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}\",\"{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}\",\"{CREATE_CHAT_TOOL_NAME}\",\"{LIST_OUTLOOK_MESSAGES_TOOL_NAME}\",\"{LIST_CALENDAR_EVENTS_TOOL_NAME}\",\"{SEND_OUTLOOK_EMAIL_TOOL_NAME}\",\"{CREATE_CALENDAR_EVENT_TOOL_NAME}\",\"{UPDATE_CALENDAR_EVENT_TOOL_NAME}\",\"{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME}\",\"{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME}\",\"{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME}\",\"{LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME}\",\"{QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME}\"]"
         ),
         format!("{prefix}.enabled=true"),
-        format!("{prefix}.required=true"),
-        format!("{prefix}.startup_timeout_sec=5"),
+        format!("{prefix}.required=false"),
+        format!("{prefix}.startup_timeout_sec={CHAT_MCP_STARTUP_TIMEOUT_SECONDS}"),
         format!("{prefix}.tool_timeout_sec=30"),
         format!("{prefix}.default_tools_approval_mode=\"approve\""),
         format!("{prefix}.tools.{AUTONOMOUS_AGENT_TOOL_NAME}.approval_mode=\"approve\""),
@@ -2397,6 +2406,15 @@ fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelTo
         format!("{prefix}.tools.{SEND_OUTLOOK_EMAIL_TOOL_NAME}.approval_mode=\"approve\""),
         format!("{prefix}.tools.{CREATE_CALENDAR_EVENT_TOOL_NAME}.approval_mode=\"approve\""),
         format!("{prefix}.tools.{UPDATE_CALENDAR_EVENT_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME}.approval_mode=\"approve\""),
+        format!(
+            "{prefix}.tools.{LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME}.approval_mode=\"approve\""
+        ),
+        format!(
+            "{prefix}.tools.{QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME}.approval_mode=\"approve\""
+        ),
     ] {
         command.arg("-c").arg(value);
     }
@@ -4859,8 +4877,9 @@ mod tests {
         for expected in [
             "mcp_servers.cst_chat.url=\"http://127.0.0.1:8080/mcp/chat-tools\"",
             "mcp_servers.cst_chat.bearer_token_env_var=\"CST_CHAT_AUTONOMOUS_TOOL_TOKEN\"",
-            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\",\"update_autonomous_agent\",\"pause_autonomous_agent\",\"activate_supervisor_general_report\",\"apply_autonomous_agent_policy\",\"create_chat\",\"list_outlook_messages\",\"list_calendar_events\",\"send_outlook_email\",\"create_calendar_event\",\"update_calendar_event\"]",
-            "mcp_servers.cst_chat.required=true",
+            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\",\"update_autonomous_agent\",\"pause_autonomous_agent\",\"activate_supervisor_general_report\",\"apply_autonomous_agent_policy\",\"create_chat\",\"list_outlook_messages\",\"list_calendar_events\",\"send_outlook_email\",\"create_calendar_event\",\"update_calendar_event\",\"list_tiktok_dm_campaigns\",\"prepare_tiktok_dm_campaign\",\"send_tiktok_dm_campaign\",\"list_tiktok_follower_extractions\",\"extract_tiktok_followers\"]",
+            "mcp_servers.cst_chat.required=false",
+            "mcp_servers.cst_chat.startup_timeout_sec=15",
             "mcp_servers.cst_chat.default_tools_approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.create_autonomous_agent.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.update_autonomous_agent.approval_mode=\"approve\"",
@@ -4873,6 +4892,11 @@ mod tests {
             "mcp_servers.cst_chat.tools.send_outlook_email.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.create_calendar_event.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.update_calendar_event.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.list_tiktok_dm_campaigns.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.prepare_tiktok_dm_campaign.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.send_tiktok_dm_campaign.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.list_tiktok_follower_extractions.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.extract_tiktok_followers.approval_mode=\"approve\"",
         ] {
             assert!(args
                 .windows(2)

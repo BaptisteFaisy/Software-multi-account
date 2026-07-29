@@ -856,6 +856,30 @@ utilise le flux serveur avec `state`, PKCE et les scopes
 Avec une URL publique HTTPS, les cookies de session recoivent automatiquement
 l'attribut `Secure`.
 
+### Messages TikTok de test via TikMatrix
+
+Un chat ou un agent du VPS peut préparer un message pour cinq comptes TikTok
+secondaires contrôlés, afficher l'aperçu exact puis placer la campagne confirmée
+dans une file persistante. Le client desktop Cloud récupère cette file par sa
+connexion authentifiée existante et appelle TikMatrix uniquement sur le
+loopback Windows. Aucun port TikMatrix ni identifiant TikTok n'est exposé au
+VPS. Le guide [Messages TikTok depuis un chat VPS](docs/tiktok-vps-messaging.md)
+décrit les prérequis, les outils et la protection anti-doublon.
+
+Le même connecteur peut demander en une seule opération jusqu'à 1 000
+`@username` disponibles dans les followers d'un compte appartenant à
+l'utilisateur ou explicitement autorisé. TikTok peut toutefois ne rendre
+qu'environ 50 profils visibles : l'application déduplique et retourne le
+nombre réellement obtenu, sans présenter le résultat comme exhaustif. Cette
+liste n'est jamais transformée automatiquement en campagne de messages.
+
+Pour relier les deux fonctions sans contacter les autres profils collectés, le
+chat peut recevoir une liste séparée d'au plus cinq comptes secondaires
+contrôlés et un message exact. Après la collecte, il intersecte uniquement
+cette liste autorisée avec les résultats et crée un brouillon TikTok. Le chat
+affiche alors les destinataires retenus et le message ; une nouvelle
+confirmation humaine reste obligatoire avant l'envoi.
+
 ### Connexion Microsoft 365 (mail et agenda)
 
 Un utilisateur connecte peut lier une ou plusieurs boites Microsoft 365 depuis

@@ -32,6 +32,11 @@ pub const LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME: &str = "list_private_message_use
 pub const LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME: &str = "list_private_message_campaigns";
 pub const CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME: &str = "create_private_message_campaign";
 pub const CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME: &str = "control_private_message_campaign";
+pub const LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME: &str = "list_tiktok_dm_campaigns";
+pub const PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME: &str = "prepare_tiktok_dm_campaign";
+pub const SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME: &str = "send_tiktok_dm_campaign";
+pub const LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME: &str = "list_tiktok_follower_extractions";
+pub const QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME: &str = "extract_tiktok_followers";
 pub const LIST_OUTLOOK_MESSAGES_TOOL_NAME: &str = "list_outlook_messages";
 pub const LIST_CALENDAR_EVENTS_TOOL_NAME: &str = "list_calendar_events";
 pub const SEND_OUTLOOK_EMAIL_TOOL_NAME: &str = "send_outlook_email";
@@ -42,7 +47,7 @@ pub const MCP_BEARER_ENV: &str = "CST_CHAT_AUTONOMOUS_TOOL_TOKEN";
 const CAPABILITY_TTL_SECONDS: i64 = 2 * 60 * 60;
 const MAX_TOOL_CALLS_PER_TURN: u8 = 8;
 const MAX_CHAT_CREATIONS_PER_TURN: u8 = 1;
-/// Sous-quota des actions qui sortent de l'application (e-mail, agenda). Le
+/// Sous-quota des actions qui sortent de l'application (e-mail, agenda, TikTok). Le
 /// budget global de 8 appels est partage avec les outils d'agents : sans ce
 /// plafond, une boucle de redaction epuiserait le tour a elle seule.
 const MAX_EXTERNAL_ACTIONS_PER_TURN: u8 = 3;
@@ -82,6 +87,13 @@ pub(crate) const PRIVATE_MESSAGE_TOOL_NAMES: [&str; 4] = [
     CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
     CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
 ];
+pub(crate) const TIKTOK_DM_TOOL_NAMES: [&str; 5] = [
+    LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME,
+    PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+    SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+    LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME,
+    QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME,
+];
 
 impl ChatToolScope {
     pub fn allows(&self, tool_name: &str) -> bool {
@@ -90,6 +102,7 @@ impl ChatToolScope {
             Self::PersonalDataOnly => {
                 MICROSOFT_TOOL_NAMES.contains(&tool_name)
                     || PRIVATE_MESSAGE_TOOL_NAMES.contains(&tool_name)
+                    || TIKTOK_DM_TOOL_NAMES.contains(&tool_name)
             }
         }
     }
@@ -199,9 +212,9 @@ impl ChatToolCapabilityRegistry {
     }
 
     /// Consomme un appel ET une action externe. Utilise par les outils qui
-    /// preparent un e-mail ou une ecriture d'agenda : ils ne partent qu'apres
-    /// confirmation humaine, mais chaque brouillon coute a l'utilisateur une
-    /// carte a relire.
+    /// preparent un e-mail, une ecriture d'agenda ou une campagne TikTok. Ces
+    /// actions suivent leur propre confirmation, mais chaque brouillon coute a
+    /// l'utilisateur une carte a relire.
     pub fn claim_external_action(&self, token: &str) -> Result<AutonomousAgentToolContext, String> {
         let now = metrics::now_ts();
         let mut entries = self
@@ -217,7 +230,7 @@ impl ChatToolCapabilityRegistry {
         }
         if entry.external_actions >= MAX_EXTERNAL_ACTIONS_PER_TURN {
             return Err(
-                "Limite d'actions Microsoft atteinte pour ce tour ; traite les brouillons en attente avant d'en preparer d'autres"
+                "Limite d'actions externes atteinte pour ce tour ; traite les brouillons en attente avant d'en preparer d'autres"
                     .to_string(),
             );
         }
@@ -648,7 +661,7 @@ pub(crate) fn initialize_response(
                     "title": "Outils du chat Codex Switch Terminal",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Ces outils donnent acces a la messagerie interne et au compte Microsoft 365 du proprietaire. Pour une diffusion interne, commence par list_private_message_users, cree normalement un brouillon avec create_private_message_campaign, puis ne demarre une campagne que si le consentement de cette audience est un fait explicite dans l'objectif ou la memoire. Reutilise uniquement les identifiants retournes ; n'invente jamais de destinataire. La cadence minimale et les limites du produit restent obligatoires. Les outils d'ecriture Microsoft ne font que preparer des cartes a confirmer. Indique clairement dans le compte rendu les campagnes creees, leur statut et ce qui attend une validation."
+                "instructions": "Ces outils donnent acces a la messagerie interne, au connecteur TikMatrix local et au compte Microsoft 365 du proprietaire. Les campagnes TikTok sont strictement limitees a cinq comptes de test controles par l'utilisateur : prepare_tiktok_dm_campaign cree toujours un apercu, et send_tiktok_dm_campaign n'est autorise que si la demande ou la memoire confirme explicitement la propriete des destinataires ainsi que l'envoi du message exact. extract_tiktok_followers accepte une demande unique allant jusqu'a 1000 resultats pour un compte appartenant a l'utilisateur ou explicitement autorise. TikTok peut toutefois ne rendre qu'environ 50 profils visibles : presente toujours le nombre effectivement retourne et ne promets jamais une liste exhaustive. Son option dmPipeline ne conserve que l'intersection avec une liste explicite d'au plus cinq comptes secondaires confirmes comme controles et cree uniquement un brouillon. Apres la collecte, affiche les destinataires et le message exact, puis attends une nouvelle confirmation humaine avant send_tiktok_dm_campaign. N'envoie jamais aux autres noms extraits et ne transforme jamais cette capacite en prospection non sollicitee. Pour une diffusion interne, commence par list_private_message_users et cree normalement un brouillon. Les outils d'ecriture Microsoft ne font que preparer des cartes a confirmer. Indique clairement le statut reel de chaque action."
             }
         });
     }
@@ -663,7 +676,7 @@ pub(crate) fn initialize_response(
                 "title": "Outils du chat Codex Switch Terminal",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Utilise les outils d'agents et de chats uniquement sur demande explicite. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. La messagerie interne expose list_private_message_users, list_private_message_campaigns, create_private_message_campaign et control_private_message_campaign. Pour une diffusion, liste d'abord les utilisateurs, n'invente aucun identifiant, prepare par defaut un brouillon et ne lance une campagne que si le consentement de l'audience est explicitement etabli. Indique toujours le statut reel renvoye par l'outil. Les outils Microsoft lisent la boite et l'agenda lies au compte ; leurs outils d'ecriture ne font que preparer une carte que l'utilisateur doit confirmer."
+            "instructions": "Utilise les outils d'agents et de chats uniquement sur demande explicite. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. La messagerie TikTok via TikMatrix est limitee a cinq comptes secondaires controles par l'utilisateur : prepare_tiktok_dm_campaign cree l'apercu, puis send_tiktok_dm_campaign exige une autorisation explicite portant sur les destinataires et le message exact. La collecte de followers accepte une demande unique jusqu'a 1000 noms pour un compte appartenant a l'utilisateur ou explicitement autorise. TikTok peut cependant limiter la liste visible a environ 50 profils : annonce le nombre reellement retourne et ne qualifie jamais le resultat d'exhaustif sans preuve. L'option dmPipeline de la collecte peut preparer un brouillon uniquement pour l'intersection avec une liste explicite d'au plus cinq comptes secondaires confirmes comme controles. N'utilise jamais les autres noms extraits. Affiche le brouillon termine puis attends une nouvelle confirmation humaine avant send_tiktok_dm_campaign. Refuse toute prospection non sollicitee et indique si le connecteur Windows est hors ligne. La messagerie interne conserve son propre flux de brouillon et de consentement. Les outils Microsoft lisent la boite et l'agenda lies au compte ; leurs outils d'ecriture ne font que preparer une carte que l'utilisateur doit confirmer."
         }
     })
 }
@@ -1178,6 +1191,218 @@ fn all_tools_response(id: Value) -> Value {
                         "destructiveHint": false,
                         "idempotentHint": false,
                         "openWorldHint": false
+                    }
+                },
+                {
+                    "name": LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME,
+                    "title": "Suivre les campagnes TikTok de test",
+                    "description": "Liste les brouillons et soumissions TikTok du proprietaire, ainsi que l'etat recent du connecteur Windows TikMatrix. Un statut submitted signifie que TikMatrix a accepte la tache, pas que TikTok a garanti chaque livraison.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {}
+                    },
+                    "annotations": {
+                        "title": "Suivre les campagnes TikTok",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+                    "title": "Preparer des messages TikTok de test",
+                    "description": "Cree un brouillon persistant, sans envoyer. Accepte au maximum cinq @username appartenant explicitement a l'utilisateur et un message unique sur une ligne. Montre toujours l'apercu exact avant de demander ou d'utiliser la confirmation d'envoi. N'utilise jamais cet outil pour de la prospection non sollicitee.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "recipients": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 5,
+                                "uniqueItems": true,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 2,
+                                    "maxLength": 25,
+                                    "pattern": "^@?[A-Za-z0-9._]{2,24}$"
+                                }
+                            },
+                            "message": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500,
+                                "description": "Message exact, sur une seule ligne."
+                            },
+                            "minIntervalMinutes": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                                "default": 1
+                            },
+                            "maxIntervalMinutes": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                                "default": 2
+                            },
+                            "deviceSerial": {
+                                "type": "string",
+                                "maxLength": 96,
+                                "description": "Facultatif lorsqu'un seul appareil TikMatrix est connecte."
+                            },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 160,
+                                "pattern": "^[A-Za-z0-9._:-]+$",
+                                "description": "Cle stable propre a cet apercu pour eviter tout doublon."
+                            }
+                        },
+                        "required": ["recipients", "message", "idempotencyKey"]
+                    },
+                    "annotations": {
+                        "title": "Preparer une campagne TikTok",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+                    "title": "Confirmer l'envoi TikTok de test",
+                    "description": "Place un brouillon TikTok dans la file du connecteur Windows. Appelle cet outil uniquement apres une autorisation explicite portant sur le message et les @username affiches, et seulement si l'utilisateur confirme qu'il controle tous les comptes destinataires. Les deux booleens doivent refleter des faits explicites, jamais une supposition.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "campaignId": { "type": "string", "minLength": 36, "maxLength": 36 },
+                            "ownedAccountsConfirmed": {
+                                "type": "boolean",
+                                "description": "Vrai uniquement si l'utilisateur a explicitement confirme controler chaque destinataire."
+                            },
+                            "sendConfirmed": {
+                                "type": "boolean",
+                                "description": "Vrai uniquement si l'utilisateur a explicitement autorise l'envoi du message exact de l'apercu."
+                            }
+                        },
+                        "required": ["campaignId", "ownedAccountsConfirmed", "sendConfirmed"]
+                    },
+                    "annotations": {
+                        "title": "Envoyer la campagne TikTok",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME,
+                    "title": "Lire les collectes de followers TikTok",
+                    "description": "Liste les collectes de followers du proprietaire. Quand le statut est completed, le champ usernames contient les @username effectivement lus dans le fichier produit par TikMatrix.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {}
+                    },
+                    "annotations": {
+                        "title": "Lire les collectes TikTok",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME,
+                    "title": "Extraire des followers TikTok",
+                    "description": "Demarre en une seule operation TikMatrix la collecte de jusqu'a 1000 @username disponibles dans les followers d'un compte, puis dedoublonne le resultat. Utilise cet outil seulement si l'utilisateur affirme que le compte source lui appartient ou qu'il est autorise a l'utiliser. TikTok peut ne rendre qu'environ 50 profils visibles : rapporte toujours le nombre reellement obtenu et ne promets pas une liste exhaustive. L'option dmPipeline relie la collecte a la messagerie sans prospection : elle intersecte le resultat avec au plus cinq comptes secondaires explicitement fournis et confirmes comme controles, puis cree seulement un brouillon. Affiche ensuite son apercu et attends une nouvelle confirmation humaine avant tout envoi.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "targetUsername": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 25,
+                                "pattern": "^@?[A-Za-z0-9._]{2,24}$"
+                            },
+                            "maxCount": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 1000,
+                                "default": 1000,
+                                "description": "Maximum demande a TikMatrix en un passage. Utilise 1000 lorsque l'utilisateur demande tous les followers disponibles."
+                            },
+                            "deviceSerial": {
+                                "type": "string",
+                                "maxLength": 96,
+                                "description": "Facultatif lorsqu'un seul appareil TikMatrix est connecte."
+                            },
+                            "authorizedAccountConfirmed": {
+                                "type": "boolean",
+                                "description": "Vrai uniquement si l'utilisateur a explicitement confirme etre proprietaire du compte source ou autorise a l'utiliser."
+                            },
+                            "dmPipeline": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "description": "Facultatif. Prepare apres la collecte un brouillon de DM uniquement pour les comptes controles de cette liste qui apparaissent dans le resultat. Ne jamais remplir cette liste avec les autres followers extraits.",
+                                "properties": {
+                                    "ownedRecipientAllowlist": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 5,
+                                        "uniqueItems": true,
+                                        "items": {
+                                            "type": "string",
+                                            "minLength": 2,
+                                            "maxLength": 25,
+                                            "pattern": "^@?[A-Za-z0-9._]{2,24}$"
+                                        },
+                                        "description": "Liste explicite de comptes secondaires controles par l'utilisateur, jamais la liste scrapee complete."
+                                    },
+                                    "message": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 500,
+                                        "pattern": "^[^\\r\\n]+$",
+                                        "description": "Message exact du futur brouillon."
+                                    },
+                                    "ownedAccountsConfirmed": {
+                                        "type": "boolean",
+                                        "description": "Vrai uniquement si l'utilisateur confirme explicitement controler tous les comptes de ownedRecipientAllowlist."
+                                    }
+                                },
+                                "required": [
+                                    "ownedRecipientAllowlist",
+                                    "message",
+                                    "ownedAccountsConfirmed"
+                                ]
+                            },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 160,
+                                "pattern": "^[A-Za-z0-9._:-]+$",
+                                "description": "Cle stable pour eviter de lancer deux fois la meme collecte."
+                            }
+                        },
+                        "required": [
+                            "targetUsername",
+                            "maxCount",
+                            "authorizedAccountConfirmed",
+                            "idempotencyKey"
+                        ]
+                    },
+                    "annotations": {
+                        "title": "Extraire des followers TikTok",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
                     }
                 },
                 {
@@ -1789,7 +2014,7 @@ mod tests {
         assert!(registry
             .claim_external_action(&token)
             .unwrap_err()
-            .contains("Limite d'actions Microsoft"));
+            .contains("Limite d'actions externes"));
         // Le budget global reste disponible pour les autres outils.
         assert!(registry.claim_call(&token).is_ok());
     }
@@ -2060,7 +2285,7 @@ mod tests {
     }
 
     #[test]
-    fn an_autonomous_agent_only_sees_personal_data_and_internal_messaging_tools() {
+    fn an_autonomous_agent_only_sees_personal_data_and_messaging_tools() {
         let response = tools_list_response(json!(1), ChatToolScope::PersonalDataOnly);
         let tools = response["result"]["tools"].as_array().unwrap();
         let names = tools
@@ -2069,12 +2294,17 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names.len(),
-            MICROSOFT_TOOL_NAMES.len() + PRIVATE_MESSAGE_TOOL_NAMES.len()
+            MICROSOFT_TOOL_NAMES.len()
+                + PRIVATE_MESSAGE_TOOL_NAMES.len()
+                + TIKTOK_DM_TOOL_NAMES.len()
         );
         for name in MICROSOFT_TOOL_NAMES {
             assert!(names.contains(&name), "{name} manquant pour un agent");
         }
         for name in PRIVATE_MESSAGE_TOOL_NAMES {
+            assert!(names.contains(&name), "{name} manquant pour un agent");
+        }
+        for name in TIKTOK_DM_TOOL_NAMES {
             assert!(names.contains(&name), "{name} manquant pour un agent");
         }
         // Un agent autonome qui pourrait se dupliquer ou ouvrir des chats
@@ -2097,6 +2327,7 @@ mod tests {
         assert!(ChatToolScope::Full.allows(CREATE_CHAT_TOOL_NAME));
         assert!(ChatToolScope::PersonalDataOnly.allows(SEND_OUTLOOK_EMAIL_TOOL_NAME));
         assert!(ChatToolScope::PersonalDataOnly.allows(CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME));
+        assert!(ChatToolScope::PersonalDataOnly.allows(SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME));
     }
 
     #[test]

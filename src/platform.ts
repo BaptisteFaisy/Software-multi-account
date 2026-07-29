@@ -1025,6 +1025,23 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
         `/api/private-messages/campaigns/${encodeURIComponent(String(args.campaignId))}/control`,
         { action: args.action, consentConfirmed: args.consentConfirmed ?? false },
       );
+    case "list_tiktok_dm_campaigns":
+      return api<T>("GET", "/api/tiktok/dm-campaigns");
+    case "prepare_tiktok_dm_campaign":
+      return api<T>("POST", "/api/tiktok/dm-campaigns", args.request);
+    case "confirm_tiktok_dm_campaign":
+      return api<T>(
+        "POST",
+        `/api/tiktok/dm-campaigns/${encodeURIComponent(String(args.campaignId))}/confirm`,
+        {
+          ownedAccountsConfirmed: args.ownedAccountsConfirmed ?? false,
+          sendConfirmed: args.sendConfirmed ?? false,
+        },
+      );
+    case "list_tiktok_follower_extractions":
+      return api<T>("GET", "/api/tiktok/follower-extractions");
+    case "queue_tiktok_follower_extraction":
+      return api<T>("POST", "/api/tiktok/follower-extractions", args.request);
     case "account_model_catalog":
       return api<T>(
         "GET",
