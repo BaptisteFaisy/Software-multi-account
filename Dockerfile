@@ -3,8 +3,10 @@
 FROM node:22-bookworm-slim AS frontend-build
 WORKDIR /build
 
+ARG TARGETARCH
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci
+RUN --mount=type=cache,id=cst-frontend-npm-${TARGETARCH},target=/root/.npm,sharing=locked \
+    npm ci
 
 COPY index.html tsconfig.json vite.config.ts ./
 COPY scripts ./scripts
@@ -15,6 +17,9 @@ RUN npm run build:frontend
 FROM rust:1.88.0-bookworm AS server-build
 WORKDIR /build
 
+# Les plateformes Buildx compilent en parallele : chaque architecture doit
+# disposer de ses propres caches pour eviter les courses d'extraction Cargo.
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -22,9 +27,9 @@ RUN apt-get update \
 COPY src-tauri ./src-tauri
 ARG CST_GIT_COMMIT=container
 ENV CST_GIT_COMMIT=${CST_GIT_COMMIT}
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/src-tauri/target \
+RUN --mount=type=cache,id=cst-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cst-cargo-git-${TARGETARCH},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=cst-cargo-target-${TARGETARCH},target=/build/src-tauri/target,sharing=locked \
     cargo build \
       --locked \
       --manifest-path src-tauri/Cargo.toml \
@@ -34,6 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM node:22-bookworm-slim AS runtime
 
+ARG TARGETARCH
 ARG RUST_VERSION=1.88.0
 ARG CST_GIT_COMMIT=container
 LABEL org.opencontainers.image.title="Codex Switch Terminal" \
@@ -78,7 +84,7 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
 # OpenCode porte tous les fournisseurs API annexes (Z.ai, MiniMax, DeepSeek,
 # OpenRouter). Sans lui, `opencode auth login --provider <id>` echouait en
 # « command not found » et le terminal de connexion restait ouvert sans fin.
-RUN --mount=type=cache,target=/home/cst/.npm,uid=10001,gid=10001 \
+RUN --mount=type=cache,id=cst-runtime-npm-${TARGETARCH},target=/home/cst/.npm,uid=10001,gid=10001,sharing=locked \
     npm install --global --prefix /home/cst/.local @openai/codex @anthropic-ai/claude-code opencode-ai \
     && command -v codex >/dev/null \
     && codex --version \
@@ -103,7 +109,7 @@ RUN --mount=type=cache,target=/home/cst/.npm,uid=10001,gid=10001 \
 # ecrit le catalogue puis sort ; le plugin est installe a la version exacte de la
 # CLI, dans le format que OpenCode ecrit lui-meme, et il le reutilise tel quel.
 ENV CST_OPENCODE_RUNTIME_DIR=/home/cst/.cst-opencode-runtime
-RUN --mount=type=cache,target=/home/cst/.npm,uid=10001,gid=10001 \
+RUN --mount=type=cache,id=cst-runtime-npm-${TARGETARCH},target=/home/cst/.npm,uid=10001,gid=10001,sharing=locked \
     set -eu; \
     export XDG_CACHE_HOME="${CST_OPENCODE_RUNTIME_DIR}/cache" \
            XDG_CONFIG_HOME="${CST_OPENCODE_RUNTIME_DIR}/config" \
