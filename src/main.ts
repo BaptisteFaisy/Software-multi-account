@@ -4938,9 +4938,17 @@ const fitAndResizeExpertTerminals = () => {
 const fitAndResizeVisibleTerminals = () => {
   if (activeView === "terminal") {
     fitAndResizeExpertTerminals();
-  } else {
-    fitAndResizeActiveTerminal();
+    return;
   }
+  // Le mur de chats affiche ses propres tuiles de terminal : elles doivent etre
+  // ajustees comme celles du mur de terminaux, sinon xterm conserve la taille
+  // heritee de son montage et le contenu deborde ou reste minuscule.
+  const wallTerminals = activeView === "chat" ? expertChatWallTerminals() : [];
+  if (wallTerminals.length > 0) {
+    wallTerminals.forEach(fitAndResizeTerminal);
+    return;
+  }
+  fitAndResizeActiveTerminal();
 };
 
 const projectFieldLabel = () => (isRemoteMode() ? "Repo Git optionnel" : "Environnement projet");
@@ -9808,6 +9816,16 @@ const responsiveExpertChatGridDimensions = (
   );
 };
 
+// Terminaux poses dans le mur de chats. Ils occupent des tuiles de la meme
+// grille que les chats de l'environnement courant, et restent visibles quelle
+// que soit la page de chats affichee : un terminal ne doit pas disparaitre
+// parce qu'on tourne les pages de conversations.
+const expertChatWallTerminals = (): TerminalSession[] => {
+  const environmentPath = userEnvironmentPath(currentWorkspace());
+  if (!environmentPath) return [];
+  return terminalSessionsForFolder(environmentPath).slice(0, EXPERT_MAX_TERMINALS);
+};
+
 const expertChatLayoutSignature = (visibleChatCount: number): string => {
   const viewport = expertChatResponsiveViewport();
   const pageSize = resolveExpertChatPageSize(effectiveExpertChatPageSizeMode());
@@ -9824,7 +9842,7 @@ const scheduleExpertChatResponsiveRender = () => {
     if (!settings || activeView !== "chat") return;
 
     reconcileExpertChatPage();
-    const visibleCount = visibleExpertChatPanes().length;
+    const visibleCount = visibleExpertChatPanes().length + expertChatWallTerminals().length;
     if (expertChatLayoutSignature(visibleCount) === renderedExpertChatLayoutSignature) {
       return;
     }
@@ -12536,7 +12554,13 @@ const bindDiscussionRowUi = () => {
       if (!session) return;
       closeMobileOverlays();
       activateTerminalSession(session);
-      activeView = "terminal";
+      // Le mur de chats affiche desormais les terminaux de l'environnement.
+      // Quand la tuile est deja sous les yeux, basculer de vue ferait
+      // disparaitre les chats pour rien : on se contente d'y donner le focus.
+      const shownInChatWall =
+        activeView === "chat" &&
+        expertChatWallTerminals().some((item) => item.key === session.key);
+      if (!shownInChatWall) activeView = "terminal";
       requestTerminalFocusKey = session.key;
       render();
     });
@@ -12674,7 +12698,10 @@ const restoreTerminals = async () => {
     restored[0].key;
   const restoredActive = activeTerminal();
   if (restoredActive && activeView === "terminal") activateTerminalSession(restoredActive);
-  if (activeView === "terminal") render();
+  // La vue chat liste elle aussi les terminaux (colonne de gauche et tuiles du
+  // mur) : sans ce rendu, les sessions restaurees restaient invisibles jusqu'a
+  // la prochaine action de l'utilisateur, qui les faisait apparaitre d'un coup.
+  if (activeView === "terminal" || activeView === "chat") render();
 
   for (let index = 0; index < restored.length; index += TERMINAL_RESTORE_CONCURRENCY) {
     const batch = restored.slice(index, index + TERMINAL_RESTORE_CONCURRENCY);
@@ -12684,7 +12711,7 @@ const restoreTerminals = async () => {
         : null;
       return startTerminalSession(session, command, false, false);
     }));
-    if (activeView === "terminal") render();
+    if (activeView === "terminal" || activeView === "chat") render();
   }
 
   if (eligibleRecords.length > records.length) {
@@ -21096,6 +21123,43 @@ const renderTerminalEnvironmentMenu = (): string => {
   </div>`;
 };
 
+// Tuile de terminal du mur expert. Extraite de la grille de terminaux pour
+// pouvoir etre posee telle quelle dans le mur de chats : une tuile de chat et
+// une tuile de terminal partagent alors la meme grille, cote a cote.
+const renderExpertTerminalPane = (session: TerminalSession, index: number): string => {
+  const chatSidebarHidden = displayedChatSidebarWidth() === 0;
+  const sessionAgentLabel = agentById(session.agentId)?.label ?? session.agentId;
+  const workspaceDetail = session.loginOnly
+    ? "Authentification isolee du compte"
+    : session.workspacePath ?? session.folderPath ?? "Dossier en preparation";
+  const workspaceLabel = workspaceBaseName(workspaceDetail);
+  return `
+    <article class="expert-terminal-pane ${session.key === activeTerminalKey ? "active" : ""} ${session.running ? "running" : ""} ${session.key === expertTerminalFullscreenKey ? "is-fullscreen" : ""}" data-expert-terminal-pane="${escapeAttr(session.key)}">
+      <header class="expert-terminal-pane-head">
+        <button type="button" class="expert-pane-identity" data-focus-terminal="${escapeAttr(session.key)}" title="${escapeAttr(`${workspaceDetail} · Survolez puis appuyez sur la barre d'espace pour agrandir`)}">
+          <span class="expert-pane-index">${index + 1}</span>
+          <span class="live-dot ${session.running ? "on" : ""}"></span>
+          <span class="expert-pane-copy">
+            <strong>${escapeHtml(terminalTitle(session))}</strong>
+            <small>${escapeHtml(`${sessionAgentLabel} · ${workspaceLabel}`)}</small>
+          </span>
+        </button>
+        <span class="expert-pane-status">${escapeHtml(session.ptyId ? `PTY ${session.ptyId}` : session.status)}</span>
+        <button type="button" class="expert-pane-toggle-chat" data-toggle-chat-sidebar title="${chatSidebarHidden ? "Afficher la fenêtre de chat" : "Masquer la fenêtre de chat"}" aria-label="${chatSidebarHidden ? "Afficher la fenêtre de chat" : "Masquer la fenêtre de chat"}" aria-pressed="${!chatSidebarHidden}">
+          <i data-lucide="${chatSidebarHidden ? "panel-left-open" : "panel-left-close"}"></i>
+        </button>
+        <button type="button" class="expert-pane-fullscreen" data-toggle-terminal-fullscreen="${escapeAttr(session.key)}" title="${session.key === expertTerminalFullscreenKey ? "Quitter le plein ecran" : "Afficher ce terminal en plein ecran"}" aria-label="${session.key === expertTerminalFullscreenKey ? "Quitter le plein ecran" : "Afficher ce terminal en plein ecran"}" aria-pressed="${session.key === expertTerminalFullscreenKey}">
+          <i data-lucide="${session.key === expertTerminalFullscreenKey ? "minimize-2" : "maximize-2"}"></i>
+        </button>
+        <button type="button" class="expert-pane-close" data-close-terminal="${escapeAttr(session.key)}" title="Fermer ce terminal" aria-label="Fermer ${escapeAttr(terminalTitle(session))}">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <div class="expert-terminal-host" data-terminal-host="${escapeAttr(session.key)}"></div>
+    </article>
+  `;
+};
+
 const renderExpertTerminalGrid = () => {
   const loginSession = activeLoginTerminal();
   const claudeLoginSession =
@@ -21145,41 +21209,7 @@ const renderExpertTerminalGrid = () => {
   const slotCount = loginSession ? 1 : Math.max(2, sessions.length);
   const columns = loginSession ? 1 : expertGridColumnCount(slotCount);
   const rows = Math.ceil(slotCount / columns);
-  const chatSidebarHidden = displayedChatSidebarWidth() === 0;
-  const panes = sessions
-    .map((session, index) => {
-      const sessionAgentLabel = agentById(session.agentId)?.label ?? session.agentId;
-      const workspaceDetail = session.loginOnly
-        ? "Authentification isolee du compte"
-        : session.workspacePath ?? session.folderPath ?? "Dossier en preparation";
-      const workspaceLabel = workspaceBaseName(workspaceDetail);
-      return `
-        <article class="expert-terminal-pane ${session.key === activeTerminalKey ? "active" : ""} ${session.running ? "running" : ""} ${session.key === expertTerminalFullscreenKey ? "is-fullscreen" : ""}" data-expert-terminal-pane="${escapeAttr(session.key)}">
-          <header class="expert-terminal-pane-head">
-            <button type="button" class="expert-pane-identity" data-focus-terminal="${escapeAttr(session.key)}" title="${escapeAttr(`${workspaceDetail} · Survolez puis appuyez sur la barre d'espace pour agrandir`)}">
-              <span class="expert-pane-index">${index + 1}</span>
-              <span class="live-dot ${session.running ? "on" : ""}"></span>
-              <span class="expert-pane-copy">
-                <strong>${escapeHtml(terminalTitle(session))}</strong>
-                <small>${escapeHtml(`${sessionAgentLabel} · ${workspaceLabel}`)}</small>
-              </span>
-            </button>
-            <span class="expert-pane-status">${escapeHtml(session.ptyId ? `PTY ${session.ptyId}` : session.status)}</span>
-            <button type="button" class="expert-pane-toggle-chat" data-toggle-chat-sidebar title="${chatSidebarHidden ? "Afficher la fenêtre de chat" : "Masquer la fenêtre de chat"}" aria-label="${chatSidebarHidden ? "Afficher la fenêtre de chat" : "Masquer la fenêtre de chat"}" aria-pressed="${!chatSidebarHidden}">
-              <i data-lucide="${chatSidebarHidden ? "panel-left-open" : "panel-left-close"}"></i>
-            </button>
-            <button type="button" class="expert-pane-fullscreen" data-toggle-terminal-fullscreen="${escapeAttr(session.key)}" title="${session.key === expertTerminalFullscreenKey ? "Quitter le plein ecran" : "Afficher ce terminal en plein ecran"}" aria-label="${session.key === expertTerminalFullscreenKey ? "Quitter le plein ecran" : "Afficher ce terminal en plein ecran"}" aria-pressed="${session.key === expertTerminalFullscreenKey}">
-              <i data-lucide="${session.key === expertTerminalFullscreenKey ? "minimize-2" : "maximize-2"}"></i>
-            </button>
-            <button type="button" class="expert-pane-close" data-close-terminal="${escapeAttr(session.key)}" title="Fermer ce terminal" aria-label="Fermer ${escapeAttr(terminalTitle(session))}">
-              <i data-lucide="x"></i>
-            </button>
-          </header>
-          <div class="expert-terminal-host" data-terminal-host="${escapeAttr(session.key)}"></div>
-        </article>
-      `;
-    })
-    .join("");
+  const panes = sessions.map(renderExpertTerminalPane).join("");
   const emptySlots = loginSession ? "" : Array.from({ length: Math.max(0, columns * rows - sessions.length) }, (_, index) => `
     <button type="button" class="expert-terminal-empty" data-add-expert-terminal ${terminalSessions.length >= EXPERT_MAX_TERMINALS ? "disabled" : ""}>
       <span class="expert-empty-icon"><i data-lucide="plus"></i></span>
@@ -21335,9 +21365,10 @@ const renderExpertChatGrid = () => {
   expertChatPage = clampExpertChatPage(expertChatPage, count, effectivePageSizeMode);
   const totalPages = expertChatPageTotal();
   const pagePanes = visibleExpertChatPanes();
+  const wallTerminals = expertChatWallTerminals();
   const pageSize = resolveExpertChatPageSize(effectivePageSizeMode);
-  const { columns, rows } = responsiveExpertChatGridDimensions(pagePanes.length);
-  renderedExpertChatLayoutSignature = expertChatLayoutSignature(pagePanes.length);
+  const { columns, rows } = responsiveExpertChatGridDimensions(pagePanes.length + wallTerminals.length);
+  renderedExpertChatLayoutSignature = expertChatLayoutSignature(pagePanes.length + wallTerminals.length);
   const firstVisible = count ? expertChatPage * pageSize + 1 : 0;
   const lastVisible = expertChatPage * pageSize + pagePanes.length;
   const environment = knownWorkspaces().find(
@@ -21441,7 +21472,10 @@ const renderExpertChatGrid = () => {
         <i data-lucide="chevron-down"></i>
       </button>
       <div class="expert-chat-wall" style="--expert-chat-columns: ${columns}; --expert-chat-rows: ${rows}" data-responsive-page-size="${pageSize}" aria-label="Chats ${firstVisible} a ${lastVisible}">
-        ${pagePanes.map(renderExpertChatPane).join("") || wallEmptyState}
+        ${[
+          ...pagePanes.map(renderExpertChatPane),
+          ...wallTerminals.map(renderExpertTerminalPane),
+        ].join("") || wallEmptyState}
       </div>
     </section>`;
 };
@@ -21711,7 +21745,7 @@ const renderChatFirstShell = () => {
   bindUserAccountUi(() => render());
   bindUi();
   bindExpertChatGridUi();
-  if (activeView === "terminal") mountExpertTerminals();
+  if (activeView === "terminal" || activeView === "chat") mountExpertTerminals();
   ensureMobileChrome();
   syncActiveDialogAccessibility();
   revealSelectedStatsPoint();
@@ -22057,7 +22091,7 @@ const renderLegacyTerminalShell = () => {
 
   renderIcons(app);
   bindUi();
-  if (activeView === "terminal") mountExpertTerminals();
+  if (activeView === "terminal" || activeView === "chat") mountExpertTerminals();
   ensureMobileChrome();
   syncActiveDialogAccessibility();
   revealSelectedStatsPoint();
@@ -28688,11 +28722,14 @@ const createTerminalSession = async (
 };
 
 const mountExpertTerminals = () => {
-  const sessions = expertTerminalSessions();
-  const sessionByKey = new Map(sessions.map((session) => [session.key, session]));
-  const fontSize = sessions.length > 9 ? 10 : sessions.length > 4 ? 11 : 12;
+  // Le mur de chats peut afficher des tuiles de terminal : la table couvre donc
+  // tous les terminaux ouverts, et la taille de police suit le nombre de tuiles
+  // reellement presentes dans le DOM plutot que le seul mur de terminaux.
+  const sessionByKey = new Map(terminalSessions.map((session) => [session.key, session]));
+  const hosts = document.querySelectorAll<HTMLDivElement>("[data-terminal-host]");
+  const fontSize = hosts.length > 9 ? 10 : hosts.length > 4 ? 11 : 12;
 
-  document.querySelectorAll<HTMLDivElement>("[data-terminal-host]").forEach((host) => {
+  hosts.forEach((host) => {
     const session = sessionByKey.get(host.dataset.terminalHost ?? "");
     if (!session) return;
     session.terminal.options.fontSize = session.key === expertTerminalFullscreenKey ? 13 : fontSize;
@@ -29338,6 +29375,20 @@ const closeHoveredExpertChat = (action: ChatHoverShortcutAction): boolean => {
 };
 
 const toggleHoveredExpertFullscreen = (): boolean => {
+  // Une tuile de terminal peut desormais etre survolee dans le mur de chats.
+  const hoveredTerminalPane =
+    activeView === "chat"
+      ? document.querySelector<HTMLElement>("[data-expert-terminal-pane]:hover")
+      : null;
+  if (hoveredTerminalPane) {
+    const hoveredSession = terminalSessions.find(
+      (candidate) => candidate.key === hoveredTerminalPane.dataset.expertTerminalPane,
+    );
+    if (hoveredSession) {
+      toggleExpertTerminalFullscreen(hoveredSession);
+      return true;
+    }
+  }
   if (activeView === "terminal") {
     const hoveredPane = document.querySelector<HTMLElement>("[data-expert-terminal-pane]:hover");
     const key = expertTerminalFullscreenKey ?? hoveredPane?.dataset.expertTerminalPane;

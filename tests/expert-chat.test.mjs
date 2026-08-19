@@ -297,7 +297,7 @@ test("l'interface permet un nombre libre et persiste le mode choisi", () => {
   );
   assert.match(
     main,
-    /responsiveExpertChatGridDimensions\(pagePanes\.length\)/,
+    /responsiveExpertChatGridDimensions\(pagePanes\.length \+ wallTerminals\.length\)/,
   );
   assert.match(
     main,
