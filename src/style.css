@@ -21165,3 +21165,18 @@ body.chat-context-sidebar-resizing {
     animation: none !important;
   }
 }
+
+/* Pastilles d'activite des terminaux.
+   Meme langage visuel que les chats : vert au repos, orange pendant le travail.
+   Ces regles closent la feuille pour passer apres `.live-dot.on`, de meme
+   specificite, dont elles doivent l'emporter sur la couleur. */
+.chat-side-status--off {
+  border-color: #4a4a4a;
+  background: #2f2f2f;
+  box-shadow: none;
+}
+
+.live-dot.thinking {
+  background: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}

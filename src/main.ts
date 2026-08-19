@@ -1878,6 +1878,58 @@ let ptyIdSeed = Date.now();
 let terminalSessions: TerminalSession[] = [];
 const terminalSessionsByPtyId = new Map<number, TerminalSession>();
 
+// Un terminal n'expose aucun etat de tour, contrairement a un chat dont le
+// serveur connait le statut. Le seul signal disponible est son flux de sortie :
+// les CLI d'agent animent un indicateur tant qu'elles travaillent, puis se
+// taisent en rendant la main. Une sortie recente vaut donc « reflechit ».
+// C'est une heuristique et non une mesure : un agent qui reste muet plus d'une
+// seconde en pleine reflexion passera au vert.
+const terminalLastOutputAt = new Map<string, number>();
+const TERMINAL_THINKING_IDLE_MS = 900;
+type TerminalActivityStatus = "off" | "running" | "idle";
+const terminalActivityStatus = (session: TerminalSession): TerminalActivityStatus => {
+  if (!session.running) return "off";
+  const last = terminalLastOutputAt.get(session.key) ?? 0;
+  return Date.now() - last < TERMINAL_THINKING_IDLE_MS ? "running" : "idle";
+};
+const terminalActivityLabel = (status: TerminalActivityStatus) =>
+  status === "running" ? "Reflechit" : status === "idle" ? "Pret" : "Ferme";
+// Meme pastille que les chats : vert au repos, orange pendant le travail.
+const renderTerminalActivityDot = (session: TerminalSession): string => {
+  const status = terminalActivityStatus(session);
+  const label = terminalActivityLabel(status);
+  return `<span class="chat-side-status chat-side-status--${status}" data-terminal-status="${escapeAttr(session.key)}" role="img" title="${escapeAttr(label)}" aria-label="Statut : ${escapeAttr(label)}"></span>`;
+};
+// La pastille doit repasser au vert des que la sortie se tait : sans ce
+// rafraichissement periodique elle resterait orange jusqu'au prochain rendu.
+let terminalActivityTimer = 0;
+const refreshTerminalActivityDots = () => {
+  document.querySelectorAll<HTMLElement>("[data-terminal-status]").forEach((node) => {
+    const session = terminalSessions.find((item) => item.key === node.dataset.terminalStatus);
+    if (!session) return;
+    const status = terminalActivityStatus(session);
+    node.classList.toggle("chat-side-status--running", status === "running");
+    node.classList.toggle("chat-side-status--idle", status === "idle");
+    node.classList.toggle("chat-side-status--off", status === "off");
+    const label = terminalActivityLabel(status);
+    node.title = label;
+    node.setAttribute("aria-label", `Statut : ${label}`);
+  });
+  document.querySelectorAll<HTMLElement>("[data-terminal-dot]").forEach((node) => {
+    const session = terminalSessions.find((item) => item.key === node.dataset.terminalDot);
+    if (!session) return;
+    node.classList.toggle("on", session.running);
+    node.classList.toggle("thinking", terminalActivityStatus(session) === "running");
+  });
+};
+const startTerminalActivityTicker = () => {
+  if (terminalActivityTimer) return;
+  terminalActivityTimer = window.setInterval(() => {
+    if (terminalSessions.length === 0) return;
+    refreshTerminalActivityDots();
+  }, 400);
+};
+
 const syncThemeControls = (): void => {
   document.querySelectorAll<HTMLButtonElement>("[data-theme-choice]").forEach((button) => {
     const selected = button.dataset.themeChoice === activeTheme;
@@ -14285,6 +14337,7 @@ const renderChatSidebarOpenTerminals = (): string => {
           : session.status || "ouvert";
       return `<div class="chat-side-item ${current ? "current" : ""}">
         <button type="button" class="chat-side-open" data-open-terminal="${escapeAttr(session.key)}" title="${escapeAttr(label)}">
+          ${renderTerminalActivityDot(session)}
           <i class="chat-side-terminal-icon" data-lucide="${providerIcon(provider)}"></i>
           <span class="chat-side-copy">
             <strong>${escapeHtml(label)}</strong>
@@ -21138,7 +21191,7 @@ const renderExpertTerminalPane = (session: TerminalSession, index: number): stri
       <header class="expert-terminal-pane-head">
         <button type="button" class="expert-pane-identity" data-focus-terminal="${escapeAttr(session.key)}" title="${escapeAttr(`${workspaceDetail} · Survolez puis appuyez sur la barre d'espace pour agrandir`)}">
           <span class="expert-pane-index">${index + 1}</span>
-          <span class="live-dot ${session.running ? "on" : ""}"></span>
+          <span class="live-dot ${session.running ? "on" : ""} ${terminalActivityStatus(session) === "running" ? "thinking" : ""}" data-terminal-dot="${escapeAttr(session.key)}"></span>
           <span class="expert-pane-copy">
             <strong>${escapeHtml(terminalTitle(session))}</strong>
             <small>${escapeHtml(`${sessionAgentLabel} · ${workspaceLabel}`)}</small>
@@ -29518,9 +29571,11 @@ const setupEvents = async () => {
     lastPointerClientY = null;
   });
 
+  startTerminalActivityTicker();
   unlistenData = await listen<PtyDataEvent>("pty-data", (event) => {
     const session = terminalSessionsByPtyId.get(event.payload.id);
     session?.terminal.write(event.payload.data);
+    if (session) terminalLastOutputAt.set(session.key, Date.now());
     if (session?.loginOnly) {
       applyRemoteCodexLoginOutput(session, event.payload.data);
       applyRemoteClaudeLoginOutput(session, event.payload.data);
