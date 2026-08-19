@@ -12,6 +12,10 @@ const composeTemplate = readFileSync(
   new URL("../deploy/ansible/templates/compose.yaml.j2", import.meta.url),
   "utf8",
 );
+const duelloCompose = readFileSync(
+  new URL("../deploy/duello/compose.yaml", import.meta.url),
+  "utf8",
+);
 const envTemplate = readFileSync(
   new URL("../deploy/ansible/templates/cst.env.j2", import.meta.url),
   "utf8",
@@ -95,7 +99,10 @@ test("Compose garde le runtime prive et les donnees hors de l'image", () => {
   assert.match(compose, /:\/srv\/cst/);
   assert.match(compose, /no-new-privileges:true/);
   assert.match(composeTemplate, /127\.0\.0\.1:\{\{ cst_remote_port \}\}:8080/);
-  assert.match(composeTemplate, /\/srv\/cst:\/srv\/cst/);
+  assert.match(
+    composeTemplate,
+    /volumes:[\s\S]*?- type: bind[\s\S]*?source: \/srv\/cst[\s\S]*?target: \/srv\/cst[\s\S]*?propagation: rslave/,
+  );
   assert.match(envTemplate, /CST_BIND="0\.0\.0\.0:8080"/);
 });
 
@@ -111,6 +118,28 @@ test("Ansible installe Docker officiellement puis valide la sante", () => {
     playbook,
     /path: "\/srv\/cst\/workspaces\/\{\{ cst_workspace_name \}\}"[\s\S]*?owner: "10001"[\s\S]*?group: "10001"[\s\S]*?mode: "0700"/,
   );
+});
+
+test("les rebuilds CST laissent les services externes comme Duello intacts", () => {
+  assert.match(
+    playbook,
+    /label=com\.codex-switch-terminal\.rebuild-policy=exclude/,
+  );
+  assert.match(playbook, /cst_protected_containers_before/);
+  assert.match(playbook, /cst_protected_containers_after/);
+  assert.match(playbook, /com\.docker\.compose\.project=codex-switch-terminal/);
+  assert.doesNotMatch(playbook, /--remove-orphans/);
+
+  assert.match(duelloCompose, /^name: duello$/m);
+  assert.match(duelloCompose, /container_name: duello-server/);
+  assert.match(
+    duelloCompose,
+    /com\.codex-switch-terminal\.rebuild-policy: exclude/,
+  );
+  assert.match(duelloCompose, /restart: unless-stopped/);
+  assert.match(duelloCompose, /OPENAI_ACCOUNTS_DIR: \/srv\/cst\/codex-homes/);
+  assert.match(duelloCompose, /http:\/\/127\.0\.0\.1:8787\/health\)" = 401/);
+  assert.doesNotMatch(duelloCompose, /^\s+ports:/m);
 });
 
 test("le wrapper protege les secrets et cree un profil reutilisable", () => {

@@ -1,7 +1,7 @@
 export type ChatAccountReference = {
   id: string;
   label: string;
-  provider?: "codex" | "claude" | "opencode";
+  provider?: "codex" | "claude" | "opencode" | "freebuff";
   codexHome: string;
 };
 

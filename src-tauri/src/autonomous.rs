@@ -9220,6 +9220,7 @@ mod tests {
             source: "test".to_string(),
             refreshing: false,
             error: None,
+            session_busy: false,
         }
     }
 

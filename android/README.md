@@ -7,8 +7,9 @@ les integrations et la recuperation propres a Android.
 
 ## Ce que fait l'app
 
-- Charge par défaut le VPS `https://cst-google-trial.tail3a8bdf.ts.net` (modifiable :
-  `res/values/strings.xml` → `server_url`).
+- Charge par défaut le serveur du PC fixe à l'URL exacte
+  `https://pc-fixe-cst.tail3a8bdf.ts.net/?cst-chunk-build=ms65eccm-mcl3yt41`
+  (`res/values/strings.xml` → `server_url` et `server_start_url`).
 - Active JavaScript + DOM storage, cookies first-party et WebSocket `wss://`.
 - Clavier virtuel : `adjustResize` + `interactive-widget` → le terminal reste
   visible pendant la frappe.

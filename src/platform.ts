@@ -521,17 +521,26 @@ export const initializePlatform = async () => {
       return;
     }
 
+    const startupNodes = config.nodes?.trim() ?? "";
+    const startupPrimaryNode = startupNodes
+      .split(/\r?\n/)
+      .map((line, index) => parseRemoteNodeLine(line, index))
+      .filter((node): node is RemoteNodeConfig => node !== null)
+      .sort((left, right) => left.priority - right.priority)[0];
+    const startupBaseUrl = config.baseUrl?.trim() || startupPrimaryNode?.baseUrl || "";
+    const startupToken = config.token?.trim() || startupPrimaryNode?.token || "";
+
     localStorage.setItem(REMOTE_ENABLED_KEY, "1");
-    if (config.baseUrl?.trim()) {
-      localStorage.setItem(REMOTE_BASE_URL_KEY, config.baseUrl.trim().replace(/\/+$/, ""));
+    if (startupBaseUrl) {
+      localStorage.setItem(REMOTE_BASE_URL_KEY, startupBaseUrl.replace(/\/+$/, ""));
     }
-    if (config.token?.trim()) {
-      localStorage.setItem(REMOTE_TOKEN_KEY, config.token.trim());
+    if (startupToken) {
+      localStorage.setItem(REMOTE_TOKEN_KEY, startupToken);
     }
     // La liste peut contenir un token propre a chaque noeud. Lorsqu'elle vient
     // du lanceur, elle reste en memoire pour ne pas etre persistee dans le
     // profil WebView.
-    startupRemoteNodes = config.nodes?.trim() ?? "";
+    startupRemoteNodes = startupNodes;
   } catch {
     // Older desktop builds do not have the command; keep local behavior.
   }
@@ -1027,6 +1036,17 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       );
     case "list_tiktok_dm_campaigns":
       return api<T>("GET", "/api/tiktok/dm-campaigns");
+    case "list_tiktok_sender_accounts":
+      return api<T>("GET", "/api/tiktok/sender-accounts");
+    case "manage_tiktok_sender_login":
+      return api<T>("POST", "/api/tiktok/sender-login", {
+        action: args.action,
+        deviceSerial: args.deviceSerial,
+      });
+    case "select_tiktok_sender_account":
+      return api<T>("POST", "/api/tiktok/sender-accounts/select", {
+        username: args.username,
+      });
     case "prepare_tiktok_dm_campaign":
       return api<T>("POST", "/api/tiktok/dm-campaigns", args.request);
     case "confirm_tiktok_dm_campaign":

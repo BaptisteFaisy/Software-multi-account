@@ -29,6 +29,7 @@ pub enum Provider {
     Codex,
     Claude,
     OpenCode,
+    Freebuff,
 }
 
 impl Provider {
@@ -38,6 +39,7 @@ impl Provider {
             Provider::Codex => "codex",
             Provider::Claude => "claude",
             Provider::OpenCode => "opencode",
+            Provider::Freebuff => "freebuff",
         }
     }
 }
@@ -119,6 +121,11 @@ pub struct AccountLimitView {
     pub source: String,
     pub refreshing: bool,
     pub error: Option<String>,
+    /// freebuff uniquement : une session occupe deja le home de ce compte.
+    /// freebuff refusant toute seconde instance sur un meme home, l'interface
+    /// s'appuie dessus pour diriger un nouveau terminal vers un compte libre
+    /// plutot que d'y ouvrir une session condamnee a son ecran de blocage.
+    pub session_busy: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,6 +327,19 @@ fn default_auto_install_extension() -> bool {
 const CODEX_AGENT_ID: &str = "codex";
 const CLAUDE_AGENT_ID: &str = "claude";
 const OPENCODE_AGENT_ID: &str = "opencode";
+/// Agent CLI freebuff. TUI interactif : il vit dans un onglet terminal et ne
+/// peut pas alimenter le flux de chat, son CLI n'acceptant ni prompt en
+/// argument ni sortie structuree (seulement `login` et `--continue`).
+const FREEBUFF_AGENT_ID: &str = "freebuff";
+/// Freebuff Desktop, lance comme app externe (`kind = "ide"`) sur le dossier
+/// projet. C'est le seul canal ou le mode agent MAX est joignable : le CLI
+/// freebuff est fige sur LITE par un flag compile dans son binaire.
+const FREEBUFF_DESKTOP_AGENT_ID: &str = "freebuff-desktop";
+/// Emplacement d'installation standard de Freebuff Desktop (electron-builder
+/// par utilisateur). La variable est laissee litterale : cmd.exe la resout au
+/// lancement, ce qui garde le reglage valable pour n'importe quel profil.
+const FREEBUFF_DESKTOP_COMMAND: &str =
+    "%LOCALAPPDATA%\\Programs\\@codebufffreebuff-desktop\\Freebuff.exe";
 const KOMBAI_AGENT_ID: &str = "kombai";
 
 fn default_agent_kind() -> String {
@@ -1634,6 +1654,75 @@ mod tests {
     }
 
     #[test]
+    fn ensure_agents_seeds_both_freebuff_agents() {
+        let mut settings = empty_settings("codex", Vec::new(), None);
+
+        let changed = ensure_agents(&mut settings);
+
+        assert!(changed);
+        // Le CLI freebuff n'expose que `login` : ni status ni doctor n'existent,
+        // les seeder produirait des commandes qui echouent a l'usage.
+        let cli = settings
+            .agents
+            .iter()
+            .find(|agent| agent.id == FREEBUFF_AGENT_ID)
+            .expect("freebuff agent seeded");
+        assert!(cli.builtin);
+        assert_eq!(cli.command, "freebuff");
+        assert_eq!(cli.kind, "cli");
+        assert_eq!(cli.provider, Provider::Freebuff);
+        assert_eq!(cli.login_command.as_deref(), Some("login"));
+        assert_eq!(cli.status_command, None);
+        assert_eq!(cli.doctor_command, None);
+
+        // Freebuff Desktop est un lanceur d'application, pas un agent terminal.
+        let desktop = settings
+            .agents
+            .iter()
+            .find(|agent| agent.id == FREEBUFF_DESKTOP_AGENT_ID)
+            .expect("freebuff desktop agent seeded");
+        assert_eq!(desktop.kind, "ide");
+        assert!(desktop.command.contains("%LOCALAPPDATA%"));
+    }
+
+    /// `command_for_provider` retient le premier agent integre du provider. Les
+    /// deux agents freebuff le partagent : c'est le CLI qui doit gagner, sans
+    /// quoi piloter le provider lancerait l'application de bureau.
+    #[test]
+    fn freebuff_provider_command_resolves_to_the_cli_not_the_desktop_app() {
+        let mut settings = empty_settings("codex", Vec::new(), None);
+        ensure_agents(&mut settings);
+
+        assert_eq!(
+            command_for_provider(&settings, Provider::Freebuff),
+            "freebuff"
+        );
+    }
+
+    /// L'intensite est exposee en lecture seule : le CLI freebuff ne persiste
+    /// aucun reglage d'intensite, il applique la valeur propre au modele.
+    #[test]
+    fn freebuff_catalog_exposes_efforts_as_read_only() {
+        let catalog = freebuff_model_catalog();
+
+        assert!(catalog
+            .iter()
+            .any(|model| model.id == "deepseek/deepseek-v4-pro"));
+        // Le seul modele illimite doit rester identifiable et arriver en
+        // tete : c'est celui applique par defaut aux nouveaux comptes.
+        assert_eq!(catalog[0].id, "deepseek/deepseek-v4-flash");
+        assert!(catalog[0].display_name.contains("illimite"));
+        assert!(catalog
+            .iter()
+            .filter(|model| model.id != "deepseek/deepseek-v4-flash")
+            .all(|model| model.display_name.contains("premium")));
+        assert!(catalog
+            .iter()
+            .all(|model| model.supported_reasoning_efforts.is_empty()));
+        assert!(catalog.iter().all(|model| !model.supports_fast_mode));
+    }
+
+    #[test]
     fn ensure_agents_repairs_missing_builtin_claude_commands() {
         let claude = AgentProfile {
             id: CLAUDE_AGENT_ID.to_string(),
@@ -2361,6 +2450,52 @@ fn ensure_agents(settings: &mut AppSettings) -> bool {
         changed = true;
     }
 
+    // Agent CLI freebuff. Son binaire n'expose que deux entrees : `login` pour
+    // s'authentifier et `--continue` pour reprendre une conversation. Ni
+    // `status` ni `doctor` n'existent, d'ou les champs laisses vides.
+    if !settings
+        .agents
+        .iter()
+        .any(|agent| agent.id == FREEBUFF_AGENT_ID)
+    {
+        settings.agents.push(AgentProfile {
+            id: FREEBUFF_AGENT_ID.to_string(),
+            label: "Freebuff".to_string(),
+            command: "freebuff".to_string(),
+            provider: Provider::Freebuff,
+            kind: "cli".to_string(),
+            builtin: true,
+            login_command: Some("login".to_string()),
+            status_command: None,
+            doctor_command: None,
+        });
+        changed = true;
+    }
+
+    // Freebuff Desktop : application externe ouverte sur le dossier projet
+    // (`kind = "ide"`, comme Kombai). C'est le seul canal ou le mode agent MAX
+    // est disponible, le CLI etant fige sur LITE par un flag compile dans son
+    // binaire. `%LOCALAPPDATA%` est resolu au lancement par cmd.exe, que
+    // `terminal::ide_command` utilise deja : le chemin reste donc portable.
+    if !settings
+        .agents
+        .iter()
+        .any(|agent| agent.id == FREEBUFF_DESKTOP_AGENT_ID)
+    {
+        settings.agents.push(AgentProfile {
+            id: FREEBUFF_DESKTOP_AGENT_ID.to_string(),
+            label: "Freebuff Desktop".to_string(),
+            command: FREEBUFF_DESKTOP_COMMAND.to_string(),
+            provider: Provider::Freebuff,
+            kind: "ide".to_string(),
+            builtin: true,
+            login_command: None,
+            status_command: None,
+            doctor_command: None,
+        });
+        changed = true;
+    }
+
     // Agent Claude Code integre. Comme l'agent Codex, il est (re)cree s'il
     // manque : Claude Code est un fournisseur pris en charge de premier rang.
     // Les versions recentes du CLI exposent l'authentification via
@@ -2913,6 +3048,7 @@ pub fn command_for_provider(settings: &AppSettings, provider: Provider) -> Strin
             Provider::Codex => "codex".to_string(),
             Provider::Claude => "claude".to_string(),
             Provider::OpenCode => "opencode".to_string(),
+            Provider::Freebuff => "freebuff".to_string(),
         })
 }
 
@@ -3083,6 +3219,18 @@ fn account_limit_cache_signature(settings: &AppSettings) -> String {
     signature
 }
 
+/// Vrai si le CLI du compte occupe deja son home. Seul freebuff impose cette
+/// exclusivite ; les autres providers acceptent plusieurs sessions par compte,
+/// donc la reponse est constante pour eux.
+fn account_session_busy(account: &AccountProfile) -> bool {
+    if account.provider != Provider::Freebuff {
+        return false;
+    }
+    expand_home(&account.codex_home)
+        .map(|home| crate::provider::freebuff_instance_busy(&home))
+        .unwrap_or(false)
+}
+
 fn account_limit_placeholder(account: &AccountProfile) -> AccountLimitView {
     let now = now_unix();
     let has_tokens = account_has_auth_tokens(account);
@@ -3114,6 +3262,7 @@ fn account_limit_placeholder(account: &AccountProfile) -> AccountLimitView {
         .to_string(),
         refreshing,
         error: None,
+        session_busy: account_session_busy(account),
     }
 }
 
@@ -3279,6 +3428,18 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
         // connecte, sans appeler le serveur de quotas Codex.
         refreshed_at = Some(now);
         source = "authenticated";
+    } else if has_tokens && account.provider == Provider::Freebuff {
+        // freebuff n'annonce ses limites (sessions par jour ou par semaine,
+        // plafond de depense) que dans son propre TUI, au demarrage d'une
+        // session : son CLI n'expose aucune sous-commande de statut, donc
+        // rien n'est interrogeable depuis Switch.
+        //
+        // Sans ce bras, un compte freebuff authentifie tombait dans le
+        // chemin Codex ci-dessous, qui lance le `codex app-server` sur un
+        // home etranger et faisait echouer la lecture d'un compte pourtant
+        // valide.
+        refreshed_at = Some(now);
+        source = "authenticated";
     } else if has_tokens {
         let local_snapshot = read_local_rate_limit_snapshot(account).ok().flatten();
         match read_server_rate_limits(account, settings) {
@@ -3350,6 +3511,7 @@ fn account_limit_view(account: &AccountProfile, settings: &AppSettings) -> Accou
         source: source.to_string(),
         refreshing: false,
         error,
+        session_busy: account_session_busy(account),
     }
 }
 
@@ -3375,6 +3537,9 @@ pub fn load_account_model_catalog(account_id: &str) -> Result<Vec<AccountModelVi
         .find(|candidate| candidate.id == account_id)
         .cloned()
         .ok_or_else(|| "Compte introuvable".to_string())?;
+    if account.provider == Provider::Freebuff {
+        return Ok(freebuff_model_catalog());
+    }
     if account.provider != Provider::Codex {
         return Ok(Vec::new());
     }
@@ -3401,6 +3566,57 @@ pub fn load_account_model_catalog(account_id: &str) -> Result<Vec<AccountModelVi
     Err(app_server_result
         .err()
         .unwrap_or_else(|| "Catalogue de modeles Codex indisponible".to_string()))
+}
+
+/// Catalogue des modeles proposes par freebuff.
+///
+/// Il est fige ici plutot qu'interroge : freebuff n'expose aucun point
+/// d'acces au catalogue, la liste est compilee dans son binaire et son
+/// validateur n'accepte que ces identifiants exacts. Un identifiant absent
+/// de cette liste est silencieusement ignore a la lecture de sa config.
+///
+/// L'intensite de raisonnement est donnee en lecture seule : le CLI freebuff
+/// ne persiste aucun reglage d'intensite et applique la valeur propre au
+/// modele. Choisir le modele est le seul levier de profondeur disponible.
+fn freebuff_model_catalog() -> Vec<AccountModelView> {
+    // Le statut premium est porte par le libelle : c'est la seule
+    // information qui distingue un modele facture en credits d'un modele
+    // illimite, et elle n'apparait nulle part ailleurs cote Switch. Le
+    // modele illimite vient en tete, c'est celui applique par defaut.
+    const MODELS: [(&str, &str, Option<&str>); 4] = [
+        (
+            "deepseek/deepseek-v4-flash",
+            "DeepSeek V4 Flash (illimite)",
+            Some("high"),
+        ),
+        (
+            "deepseek/deepseek-v4-pro",
+            "DeepSeek V4 Pro (premium, le plus capable)",
+            Some("high"),
+        ),
+        (
+            "openai/gpt-5.6-luna",
+            "GPT-5.6 Luna (premium, images)",
+            Some("high"),
+        ),
+        (
+            "minimax/minimax-m3",
+            "MiniMax M3 (premium, le plus rapide)",
+            None,
+        ),
+    ];
+
+    MODELS
+        .into_iter()
+        .map(|(id, display_name, effort)| AccountModelView {
+            id: id.to_string(),
+            display_name: display_name.to_string(),
+            default_reasoning_effort: effort.map(str::to_string),
+            // Vide a dessein : aucune intensite n'est selectionnable.
+            supported_reasoning_efforts: Vec::new(),
+            supports_fast_mode: false,
+        })
+        .collect()
 }
 
 fn read_model_catalog_from_app_server(
@@ -3643,6 +3859,9 @@ fn local_snapshot_matches_current_credentials(
         Provider::Codex => home.join("auth.json"),
         Provider::Claude => home.join(".credentials.json"),
         Provider::OpenCode => home.join("data").join("opencode").join("auth.json"),
+        Provider::Freebuff => {
+            crate::provider::freebuff_config_dir(&home).join("credentials.json")
+        }
     };
     let Some(modified_at) = fs::metadata(credentials)
         .ok()

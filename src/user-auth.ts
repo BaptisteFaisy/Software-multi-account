@@ -135,7 +135,12 @@ export const initializeUserAuth = async (): Promise<AuthBootstrapState> => {
     if (error instanceof AuthApiError && error.status === 404) return "unsupported";
     throw error;
   }
-  if (!authConfig.enabled) return "unsupported";
+  // Une origine Tauri locale ou un ancien proxy peut repondre 200 avec un
+  // corps JSON `null`. Ce n'est pas une configuration d'authentification et
+  // cela ne doit jamais faire planter l'ecran de connexion sur `.enabled`.
+  if (!authConfig || typeof authConfig.enabled !== "boolean" || !authConfig.enabled) {
+    return "unsupported";
+  }
 
   try {
     const session = await authApi<SessionResponse>("/me");

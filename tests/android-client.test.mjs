@@ -22,9 +22,12 @@ test("la cible Android reste actuelle, installable et adaptable", async () => {
   assert.match(manifest, /android:configChanges="[^"]*orientation[^"]*screenSize/);
   assert.match(html, /interactive-widget=resizes-content/);
   assert.match(html, /viewport-fit=cover/);
-  assert.match(strings, /https:\/\/cst-google-trial\.tail3a8bdf\.ts\.net/);
-  assert.match(activity, /LEGACY_PC_BASE_URL = "https:\/\/pc-fixe-cst\.tail3a8bdf\.ts\.net"/);
+  assert.match(strings, /<string name="server_url">https:\/\/pc-fixe-cst\.tail3a8bdf\.ts\.net<\/string>/);
+  assert.match(strings, /<string name="server_start_url">https:\/\/pc-fixe-cst\.tail3a8bdf\.ts\.net\/\?cst-chunk-build=ms65eccm-mcl3yt41<\/string>/);
+  assert.match(activity, /LEGACY_VPS_BASE_URL = "https:\/\/cst-google-trial\.tail3a8bdf\.ts\.net"/);
   assert.match(activity, /migrateLegacyServerRoute\(\)/);
+  assert.match(activity, /webView\.loadUrl\(currentStartupUrl\(\)\)/);
+  assert.match(activity, /buildUpon\(\)\.clearQuery\(\)\.fragment\(null\)/);
 });
 
 test("la coque Android durcit la WebView et protege la configuration", async () => {

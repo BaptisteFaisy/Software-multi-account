@@ -21,11 +21,47 @@ $SuccessFile = Join-Path $StateDir "provision-success.json"
 
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 
-$capacityWslPath = @(& wsl.exe -d $WslDistribution -e wslpath -a -u $CapacityScript 2>&1)
-if ($LASTEXITCODE -ne 0) {
+function Invoke-HiddenWsl {
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Arguments,
+    [int]$TimeoutSeconds = 900
+  )
+
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = Join-Path $env:WINDIR "System32\wsl.exe"
+  $psi.Arguments = ($Arguments | ForEach-Object {
+    if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+  }) -join " "
+  # La tache planifiee n'a pas de console a heriter : sans CreateNoWindow,
+  # Windows ouvre une nouvelle fenetre console visible pour wsl.exe.
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+
+  $process = [Diagnostics.Process]::Start($psi)
+  $stdout = $process.StandardOutput.ReadToEndAsync()
+  $stderr = $process.StandardError.ReadToEndAsync()
+
+  if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    try { $process.Kill() } catch { }
+    return [pscustomobject]@{ ExitCode = -1; Output = ""; TimedOut = $true }
+  }
+
+  return [pscustomobject]@{
+    ExitCode = $process.ExitCode
+    Output = ($stdout.Result + $stderr.Result)
+    TimedOut = $false
+  }
+}
+
+$capacityPathResult = Invoke-HiddenWsl -Arguments @(
+  "-d", $WslDistribution, "-e", "wslpath", "-a", "-u", $CapacityScript
+) -TimeoutSeconds 60
+if ($capacityPathResult.ExitCode -ne 0) {
   throw "Impossible de convertir le chemin du controle de capacite pour WSL."
 }
-$capacityWslPath = (($capacityWslPath | ForEach-Object { [string]$_ }) -join "`n").Trim()
+$capacityWslPath = $capacityPathResult.Output.Trim()
 
 $mutex = New-Object Threading.Mutex($false, "Local\CSTOracleAlwaysFreeProvision")
 $hasMutex = $false
@@ -94,18 +130,15 @@ try {
       $launchForced = $false
       foreach ($capacityProfile in $capacityProfiles) {
         Write-RetryLog "Test du profil A1 $($capacityProfile.Label)."
-        $previousErrorAction = $ErrorActionPreference
-        try {
-          $ErrorActionPreference = "Continue"
-          $capacityOutput = @(
-            & wsl.exe -d $WslDistribution -e bash $capacityWslPath `
-              --ocpus ([string]$capacityProfile.Ocpus) `
-              --memory-gb ([string]$capacityProfile.MemoryGB) 2>&1
-          )
-          $capacityExit = $LASTEXITCODE
-        }
-        finally {
-          $ErrorActionPreference = $previousErrorAction
+        $capacityResult = Invoke-HiddenWsl -Arguments @(
+          "-d", $WslDistribution, "-e", "bash", $capacityWslPath,
+          "--ocpus", [string]$capacityProfile.Ocpus,
+          "--memory-gb", [string]$capacityProfile.MemoryGB
+        ) -TimeoutSeconds 900
+        $capacityOutput = @($capacityResult.Output -split "`r?`n" | Where-Object { $_.Trim() })
+        $capacityExit = $capacityResult.ExitCode
+        if ($capacityResult.TimedOut) {
+          throw "Le rapport de capacite OCI n'a pas repondu en 900 secondes."
         }
         foreach ($line in $capacityOutput) {
           Add-Content -LiteralPath $LogFile -Value ([string]$line) -Encoding UTF8

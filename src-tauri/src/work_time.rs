@@ -111,6 +111,8 @@ fn build_dashboard(settings: &settings::AppSettings) -> WorkTimeDashboard {
             // Le store OpenCode est gere par sa propre base ; les executions
             // restent tout de meme comptees par les metriques de lancement.
             settings::Provider::OpenCode => {}
+            // freebuff tient son propre historique, non expose par Switch.
+            settings::Provider::Freebuff => {}
         }
     }
 

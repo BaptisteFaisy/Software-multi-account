@@ -1,4 +1,4 @@
-//! Abstraction multi-fournisseur (Codex / Claude Code / OpenCode).
+//! Abstraction multi-fournisseur (Codex / Claude Code / OpenCode / Freebuff).
 //!
 //! Centralise tout ce qui differe entre les CLI geres par l'app : variable
 //! d'environnement du "home" isole, presence de credentials, ecriture de la
@@ -23,6 +23,23 @@ const OPENCODE_SHARED_DIR_NAME: &str = ".cst-opencode-runtime";
 /// Variable qui deplace ce runtime mutualise. L'image Docker la pose sur un
 /// dossier deja pre-chauffe au build.
 const OPENCODE_RUNTIME_DIR_ENV: &str = "CST_OPENCODE_RUNTIME_DIR";
+
+/// Dossier de config de freebuff, relatif au home du compte. Le lanceur npm
+/// le calcule en dur comme `path.join(os.homedir(), ".config", "manicode")`
+/// (manicode est l'ancien nom de Codebuff, dont freebuff est un rebrand) et
+/// n'expose aucune variable d'environnement pour le deplacer : deplacer
+/// deplacer le home de l'OS est donc le seul levier d'isolation par compte.
+const FREEBUFF_CONFIG_DIR: [&str; 2] = [".config", "manicode"];
+
+/// Fichiers que le lanceur telecharge dans ce dossier au premier demarrage :
+/// le binaire Bun (126 Mo) et ses ressources. Sans pre-amorcage, **chaque**
+/// compte repaierait ce telechargement, exactement le probleme deja resolu
+/// pour OpenCode par un runtime mutualise.
+const FREEBUFF_RUNTIME_FILES: [&str; 3] = [
+    "freebuff.exe",
+    "freebuff-metadata.json",
+    "tree-sitter.wasm",
+];
 
 /// Racine du runtime OpenCode partage par tous les comptes.
 ///
@@ -65,6 +82,17 @@ impl Provider {
             // Variable principale affichee dans les bannieres. Le lancement
             // applique aussi toutes les autres variables avec `home_env`.
             Provider::OpenCode => "XDG_DATA_HOME",
+            // freebuff n'a pas de variable dediee : son dossier de config est
+            // derive du home de l'OS, donc c'est le home entier qu'on deplace.
+            // Le nom depend de la plateforme, `os.homedir()` lisant USERPROFILE
+            // sous Windows et HOME ailleurs. `home_env` pose les deux.
+            Provider::Freebuff => {
+                if cfg!(windows) {
+                    "USERPROFILE"
+                } else {
+                    "HOME"
+                }
+            }
         }
     }
 
@@ -92,6 +120,15 @@ impl Provider {
                     ),
                 ]
             }
+            // Deplacer le home suffit : credentials, reglages, projets et
+            // binaire vivent tous sous <home>/.config/manicode. Les deux
+            // variables sont posees plutot qu'une seule : le deploiement reel
+            // est un conteneur Linux, qui ne regarde que HOME, tandis que
+            // l'application de bureau ne regarde que USERPROFILE.
+            Provider::Freebuff => vec![
+                ("HOME", home.to_path_buf()),
+                ("USERPROFILE", home.to_path_buf()),
+            ],
         }
     }
 
@@ -101,6 +138,10 @@ impl Provider {
             Provider::Codex => "--dangerously-bypass-approvals-and-sandbox",
             Provider::Claude => "--dangerously-skip-permissions",
             Provider::OpenCode => "--auto",
+            // freebuff n'expose aucun flag de ce type. Jamais atteint en
+            // pratique : le bypass n'est applique que par le runtime de chat,
+            // que freebuff ne peut pas alimenter.
+            Provider::Freebuff => "",
         }
     }
 
@@ -110,6 +151,11 @@ impl Provider {
             Provider::Codex => "gpt-5.6-sol",
             Provider::Claude => "sonnet",
             Provider::OpenCode => "",
+            // Seul modele freebuff a cumuler l'illimite et une intensite de
+            // raisonnement `high` : un nouveau compte ne consomme donc aucun
+            // credit sans rien perdre en profondeur. V4 Pro, plus capable,
+            // reste selectionnable mais il est premium.
+            Provider::Freebuff => "deepseek/deepseek-v4-flash",
         }
     }
 
@@ -121,6 +167,8 @@ impl Provider {
             Provider::Codex => home.join("sessions"),
             Provider::Claude => home.join("projects"),
             Provider::OpenCode => home.join("data").join("opencode"),
+            // freebuff: <home>/.config/manicode/projects, comme Claude Code.
+            Provider::Freebuff => freebuff_config_dir(home).join("projects"),
         }
     }
 
@@ -131,6 +179,7 @@ impl Provider {
             Provider::Codex => format!("{cli} resume {session_id}"),
             Provider::Claude => format!("{cli} --resume {session_id}"),
             Provider::OpenCode => format!("{cli} --session {session_id}"),
+            Provider::Freebuff => format!("{cli} --continue {session_id}"),
         }
     }
 
@@ -152,6 +201,16 @@ impl Provider {
                     || name.starts_with("opencode-")
                     || name.starts_with("opencode_")
             }
+            // Meme prudence que pour OpenCode : ne jamais ramasser un dossier
+            // utilisateur au hasard pendant la decouverte automatique.
+            Provider::Freebuff => {
+                // Sans point : forme produite par les homes distants, ou le
+                // compte vit dans un sous-dossier du home partage.
+                name.starts_with(".freebuff-")
+                    || name.starts_with(".freebuff_")
+                    || name.starts_with("freebuff-")
+                    || name.starts_with("freebuff_")
+            }
         }
     }
 
@@ -161,6 +220,7 @@ impl Provider {
             Provider::Codex => codex_has_auth(home),
             Provider::Claude => claude_has_auth(home),
             Provider::OpenCode => opencode_has_auth(home, inference_provider),
+            Provider::Freebuff => freebuff_has_auth(home),
         }
     }
 
@@ -184,6 +244,7 @@ impl Provider {
             ),
             Provider::Claude => ensure_claude_account_config(home, bypass, model, fast_mode),
             Provider::OpenCode => ensure_opencode_account_home(home),
+            Provider::Freebuff => ensure_freebuff_account_config(home, model),
         }
     }
 }
@@ -252,6 +313,158 @@ fn ensure_opencode_account_home(home: &Path) -> io::Result<()> {
     let shared = opencode_shared_runtime_dir(home);
     fs::create_dir_all(shared.join("cache"))?;
     fs::create_dir_all(shared.join("config").join("opencode"))
+}
+
+// ---------------------------------------------------------------------------
+// Freebuff : dossier de config, credentials, pre-amorcage du runtime
+// ---------------------------------------------------------------------------
+
+/// `<home>/.config/manicode` : tout l'etat freebuff d'un compte.
+/// Marqueur d'instance ecrit par freebuff dans le home du compte, sous la
+/// forme `{"instanceId": "...", "pid": 1234}`.
+const FREEBUFF_INSTANCE_OWNER: &str = "freebuff-instance-owner.json";
+
+/// Vrai si une session freebuff occupe deja ce home.
+///
+/// freebuff n'autorise qu'une instance a la fois PAR HOME : au demarrage il y
+/// inscrit son pid, et toute instance suivante qui l'y relit encore vivant
+/// affiche "Only one freebuff instance is allowed at a time" au lieu du chat.
+/// Le verrou etant porte par le home, deux comptes freebuff distincts tournent
+/// simultanement sans jamais se voir : c'est l'isolation par compte de Switch
+/// qui rend les sessions paralleles possibles.
+///
+/// Un pid mort marque un verrou perime (session tuee sans nettoyage) que
+/// freebuff reprend de lui-meme : le compte est alors bien libre.
+pub fn freebuff_instance_busy(home: &Path) -> bool {
+    let Some(value) = read_json(&freebuff_config_dir(home).join(FREEBUFF_INSTANCE_OWNER))
+    else {
+        return false;
+    };
+    let Some(pid) = value.get("pid").and_then(Value::as_u64) else {
+        return false;
+    };
+    u32::try_from(pid).map_or(false, pid_is_alive)
+}
+
+/// Existence d'un processus, sans lui envoyer de signal ni demander un droit
+/// d'ecriture. Le critere reste volontairement celui de freebuff, zombie
+/// compris : Switch doit annoncer libre exactement ce que freebuff acceptera
+/// de lancer.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(windows)]
+fn pid_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: OpenProcess ne lit que `pid` et rend un handle possede par
+    // l'appelant, referme immediatement ci-dessous.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let _ = CloseHandle(handle);
+        true
+    }
+}
+
+pub fn freebuff_config_dir(home: &Path) -> PathBuf {
+    FREEBUFF_CONFIG_DIR
+        .iter()
+        .fold(home.to_path_buf(), |path, segment| path.join(segment))
+}
+
+/// freebuff : `credentials.json` est un objet indexe par profil (`default` hors
+/// configuration explicite). Comme pour OpenCode, on ne lit jamais la valeur
+/// au-dela du test de presence et rien n'est recopie dans les reglages.
+fn freebuff_has_auth(home: &Path) -> bool {
+    let Some(value) = read_json(&freebuff_config_dir(home).join("credentials.json")) else {
+        return false;
+    };
+    let Value::Object(profiles) = value else {
+        return false;
+    };
+    profiles.values().any(|profile| match profile {
+        Value::Object(fields) => fields
+            .values()
+            .filter_map(Value::as_str)
+            .any(|field| !field.trim().is_empty()),
+        _ => false,
+    })
+}
+
+/// Copie le runtime deja telechargé par l'installation principale vers le home
+/// du compte. Lien physique d'abord (0 octet sur le meme volume NTFS), copie
+/// en repli. Best-effort : si la source manque, le lanceur retelechargera.
+fn seed_freebuff_runtime(config_dir: &Path) {
+    // Meme resolution que `settings::home_dir` : sans le repli sur HOME, le
+    // pre-amorcage ne se ferait jamais sous Linux et chaque compte
+    // retelechargerait les 140 Mo du binaire.
+    let Some(source_home) = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let source_dir = freebuff_config_dir(&source_home);
+    if source_dir == config_dir {
+        return;
+    }
+    for name in FREEBUFF_RUNTIME_FILES {
+        let (source, target) = (source_dir.join(name), config_dir.join(name));
+        if target.exists() || !source.exists() {
+            continue;
+        }
+        if fs::hard_link(&source, &target).is_err() {
+            let _ = fs::copy(&source, &target);
+        }
+    }
+}
+
+/// Prepare le home d'un compte freebuff et y fixe le modele choisi dans Switch.
+///
+/// `freebuffModel` est la cle que le binaire relit au demarrage (validee puis
+/// normalisee contre son propre catalogue) : l'ecrire avant le lancement est le
+/// seul moyen d'ouvrir freebuff sur un modele precis, son CLI n'ayant pas
+/// d'option `--model`. Les cles inconnues sont preservees, et le mode agent est
+/// volontairement laisse tel quel : la build freebuff le force a LITE.
+fn ensure_freebuff_account_config(home: &Path, model: Option<&str>) -> io::Result<()> {
+    let config_dir = freebuff_config_dir(home);
+    fs::create_dir_all(&config_dir)?;
+    seed_freebuff_runtime(&config_dir);
+
+    let model = model.map(str::trim).filter(|value| !value.is_empty());
+    let path = config_dir.join("settings.json");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+
+    let mut root: Value = if existing.trim().is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(&existing).unwrap_or_else(|_| Value::Object(Map::new()))
+    };
+    if !root.is_object() {
+        root = Value::Object(Map::new());
+    }
+    if let Some(model) = model {
+        root.as_object_mut()
+            .expect("root is object")
+            .insert(
+                "freebuffModel".to_string(),
+                Value::String(model.to_string()),
+            );
+    }
+
+    let mut serialized = serde_json::to_string_pretty(&root)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    serialized.push('\n');
+    if serialized == existing {
+        return Ok(());
+    }
+    crate::fs_util::atomic_write(&path, serialized)
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -377,6 +590,123 @@ mod tests {
         assert!(Provider::OpenCode.is_home_like_dir(".opencode-deepseek"));
         assert!(Provider::OpenCode.is_home_like_dir("opencode-deepseek"));
     }
+
+    /// freebuff derive son dossier de config du home de l'OS et n'expose
+    /// aucune variable pour le deplacer : deplacer le home est le seul levier.
+    #[test]
+    fn freebuff_isolation_relies_on_the_os_home() {
+        assert_eq!(
+            Provider::Freebuff.home_env_var(),
+            if cfg!(windows) { "USERPROFILE" } else { "HOME" }
+        );
+        let home = Path::new("C:/homes/.freebuff-perso");
+        // Les deux variables sont posees quelle que soit la plateforme : le
+        // conteneur Linux lit HOME, l'application de bureau USERPROFILE.
+        assert_eq!(
+            Provider::Freebuff.home_env(home),
+            vec![
+                ("HOME", home.to_path_buf()),
+                ("USERPROFILE", home.to_path_buf())
+            ]
+        );
+        assert_eq!(
+            freebuff_config_dir(home),
+            home.join(".config").join("manicode")
+        );
+        assert!(Provider::Freebuff.is_home_like_dir(".freebuff-perso"));
+        assert!(Provider::Freebuff.is_home_like_dir("freebuff-perso"));
+        // Jamais ramasser un dossier utilisateur pendant la decouverte.
+        assert!(!Provider::Freebuff.is_home_like_dir(".config"));
+    }
+
+    #[test]
+    fn freebuff_resume_uses_the_continue_flag() {
+        assert_eq!(
+            Provider::Freebuff.resume_command("freebuff", "abc123"),
+            "freebuff --continue abc123"
+        );
+    }
+
+    /// Le modele choisi dans Switch est fixe via `freebuffModel` avant le
+    /// lancement : le CLI n'ayant pas d'option `--model`, c'est le seul moyen
+    /// d'ouvrir freebuff sur un modele precis. Les cles que Switch ne gere pas
+    /// doivent survivre a l'ecriture.
+    #[test]
+    fn freebuff_account_config_pins_the_model_and_keeps_unknown_keys() {
+        let home = scratch("freebuff");
+        let config = freebuff_config_dir(&home);
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("settings.json"),
+            r#"{"adsEnabled": true, "mode": "DEFAULT"}"#,
+        )
+        .unwrap();
+
+        Provider::Freebuff
+            .write_account_config(
+                &home,
+                false,
+                Some("deepseek/deepseek-v4-pro"),
+                None,
+                false,
+            )
+            .unwrap();
+
+        let written: Value = serde_json::from_str(
+            &fs::read_to_string(config.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["freebuffModel"], "deepseek/deepseek-v4-pro");
+        assert_eq!(written["adsEnabled"], true);
+        assert_eq!(written["mode"], "DEFAULT");
+    }
+
+    /// Genere un pid garanti mort : un processus enfant court termine puis
+    /// moissonne. Il sert a simuler le verrou perime laisse par une session
+    /// freebuff tuee sans nettoyage.
+    fn spawn_then_reap_dead_pid() -> u32 {
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "exit", "0"]);
+            command
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut child = command.spawn().expect("spawn a short-lived process");
+        let pid = child.id();
+        child.wait().expect("reap the short-lived process");
+        pid
+    }
+
+    /// Le verrou d'instance freebuff est lu depuis le home du compte : absent,
+    /// mal forme ou perime le compte est libre ; vivant il est occupe. C'est ce
+    /// signal que Switch expose pour diriger un nouveau terminal vers un compte
+    /// libre plutot que d'y ouvrir une session condamnee a son ecran de blocage.
+    #[test]
+    fn freebuff_instance_busy_reads_the_owner_lock() {
+        let home = scratch("freebuff-busy");
+        let config = freebuff_config_dir(&home);
+        fs::create_dir_all(&config).unwrap();
+        let owner = config.join(FREEBUFF_INSTANCE_OWNER);
+
+        // Pas de marqueur : freebuff n'a jamais demarre, le compte est libre.
+        assert!(!freebuff_instance_busy(&home));
+
+        // Marqueur sans pid (fichier corrompu) : libre, sans paniquer.
+        fs::write(&owner, r#"{"instanceId":"abc"}"#).unwrap();
+        assert!(!freebuff_instance_busy(&home));
+
+        // Pid mort : verrou perime que freebuff reprend de lui-meme, libre.
+        let dead = spawn_then_reap_dead_pid();
+        fs::write(&owner, format!(r#"{{"instanceId":"abc","pid":{dead}}}"#)).unwrap();
+        assert!(!freebuff_instance_busy(&home));
+
+        // Pid vivant (le processus de test lui-meme) : le home est occupe.
+        let alive = std::process::id();
+        fs::write(&owner, format!(r#"{{"instanceId":"abc","pid":{alive}}}"#)).unwrap();
+        assert!(freebuff_instance_busy(&home));
+    }
+
 
     #[test]
     fn resume_command_matches_each_cli_syntax() {

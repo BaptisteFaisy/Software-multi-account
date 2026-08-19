@@ -61,10 +61,10 @@ while ($true) {
   $exitCode = $LASTEXITCODE
 
   if ($exitCode -eq 0) {
-    Write-SupervisorLog "Arret normal du noeud."
-    exit 0
+    Write-SupervisorLog "Arret normal du noeud; redemarrage dans 5 secondes pour maintenir le service."
   }
-
-  Write-SupervisorLog "Arret inattendu du noeud (code $exitCode); redemarrage dans 5 secondes."
+  else {
+    Write-SupervisorLog "Arret inattendu du noeud (code $exitCode); redemarrage dans 5 secondes."
+  }
   Start-Sleep -Seconds 5
 }

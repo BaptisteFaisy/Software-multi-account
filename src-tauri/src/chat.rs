@@ -9,11 +9,12 @@ use crate::{
         APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME, AUTONOMOUS_AGENT_TOOL_NAME,
         CREATE_CALENDAR_EVENT_TOOL_NAME, CREATE_CHAT_TOOL_NAME, LIST_CALENDAR_EVENTS_TOOL_NAME,
         LIST_OUTLOOK_MESSAGES_TOOL_NAME, LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME,
-        LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME, MCP_BEARER_ENV, MCP_SERVER_NAME,
+        LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME, LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME,
+        MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME, MCP_BEARER_ENV, MCP_SERVER_NAME,
         PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
-        QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
-        SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME, UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
-        UPDATE_CALENDAR_EVENT_TOOL_NAME,
+        QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME, SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME,
+        SEND_OUTLOOK_EMAIL_TOOL_NAME, SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME, UPDATE_CALENDAR_EVENT_TOOL_NAME,
     },
     chat_tools::{chat_skills_document, chat_tool_instructions, ChatAgentSkill, ChatAgentTool},
     discussions::{self, DiscussionContextUsage},
@@ -61,6 +62,8 @@ const MAX_THOUGHT_CHARS: usize = 4_000;
 const MAX_PART_DETAIL_CHARS: usize = 12_000;
 const MAX_MODEL_CHARS: usize = 160;
 const MAX_RETAINED_TURNS: usize = 500;
+const DEFAULT_MIN_CONTAINER_HEADROOM_MIB: u64 = 1536;
+const DEFAULT_MIN_HOST_AVAILABLE_MIB: u64 = 1536;
 const PROVIDER_EXIT_GRACE: Duration = Duration::from_secs(2);
 const COMPACT_TIMEOUT: Duration = Duration::from_secs(180);
 /// Le serveur MCP vit dans le meme processus HTTP que l'API du chat. Sous forte
@@ -70,6 +73,13 @@ const COMPACT_TIMEOUT: Duration = Duration::from_secs(180);
 /// d'une conversation ni faire perdre le message de l'utilisateur.
 const CHAT_MCP_STARTUP_TIMEOUT_SECONDS: u64 = 15;
 const RESPONSE_QUALITY_INSTRUCTIONS: &str = "Avant toute réponse finale destinée à l'utilisateur, effectue une relecture silencieuse. Corrige les fautes de grammaire, de syntaxe, d'orthographe, d'accord et de ponctuation, puis vérifie que les phrases sont naturelles et non ambiguës dans la langue de l'utilisateur, sauf demande contraire. Pour le code, les commandes et les formats structurés, préserve les éléments littéraux et vérifie que la syntaxe ainsi que tous les délimiteurs et blocs sont complets. Ne modifie pas les citations ou les contenus demandés mot pour mot et ne mentionne pas cette relecture.";
+
+/// Les identifiants de processus renvoyes par les outils d'execution sont lies
+/// au runtime du tour. Apres une reprise ou un redemarrage, l'ancien identifiant
+/// peut etre inconnu alors que la conversation elle-meme reste parfaitement
+/// reprenable. Le modele doit alors relancer l'operation utile au lieu de boucler
+/// sur le handle perime ou d'abandonner le chat.
+const CODEX_PROCESS_CONTINUITY_INSTRUCTIONS: &str = "Les identifiants de processus ou de cellule retournés par `exec`, `write_stdin` et `wait` sont temporaires. Si `write_stdin` ou `wait` répond `Unknown process id`, ne réutilise plus cet identifiant : vérifie l'état du résultat attendu, puis relance seulement l'opération encore nécessaire de façon idempotente et continue la tâche. Une erreur isolée d'outil n'est pas une raison de terminer la conversation.";
 
 /// Filet applique aux tours Claude one-shot : chaque tour est un process
 /// `claude --print` distinct qui meurt a la fin du tour. Toute commande lancee
@@ -94,6 +104,65 @@ const LIVE_CLAUDE_MAX_SESSIONS: usize = 8;
 /// complet du process. En pratique l'avortement emet un `result` en une fraction
 /// de seconde ; la marge couvre un noeud charge. Au-dela, interruption echouee.
 const LIVE_CLAUDE_INTERRUPT_DRAIN: Duration = Duration::from_secs(3);
+
+fn positive_env_mib(name: &str, fallback_mib: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback_mib)
+}
+
+fn cgroup_container_headroom_bytes() -> Option<u64> {
+    let maximum = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    if maximum.trim() == "max" {
+        return None;
+    }
+    let maximum = maximum.trim().parse::<u64>().ok()?;
+    let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(maximum.saturating_sub(current))
+}
+
+fn host_available_memory_bytes() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("MemAvailable:")?;
+            value
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+                .map(|kib| kib.saturating_mul(1024))
+        })
+}
+
+fn enforce_chat_resource_admission() -> Result<(), String> {
+    let container_required = positive_env_mib(
+        "CST_CHAT_MIN_CONTAINER_HEADROOM_MIB",
+        DEFAULT_MIN_CONTAINER_HEADROOM_MIB,
+    )
+    .saturating_mul(1024 * 1024);
+    if cgroup_container_headroom_bytes().is_some_and(|value| value < container_required) {
+        return Err("memoire insuffisante: le nouveau chat est temporairement refuse pour proteger Switch et Duello".to_string());
+    }
+
+    let host_required = positive_env_mib(
+        "CST_CHAT_MIN_HOST_AVAILABLE_MIB",
+        DEFAULT_MIN_HOST_AVAILABLE_MIB,
+    )
+    .saturating_mul(1024 * 1024);
+    if host_available_memory_bytes().is_some_and(|value| value < host_required) {
+        return Err("memoire insuffisante sur l'hote: le nouveau chat est temporairement refuse pour proteger Switch et Duello".to_string());
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -531,6 +600,9 @@ pub struct ChatTurnManager {
     /// sessions web et mobiles alors qu'il tourne.
     workspaces: Arc<Mutex<HashMap<u64, String>>>,
     claims: Arc<Mutex<HashSet<String>>>,
+    /// Serialise la mesure de marge et le lancement du fournisseur. Il n'y a
+    /// aucun plafond de chats : seule la memoire disponible ferme l'admission.
+    start_gate: Arc<Mutex<()>>,
     /// Sessions Claude persistantes vivantes, indexees par `account_id\0session_id`.
     /// Un seul process par conversation ; les taches shell en arriere-plan y
     /// survivent d'un tour a l'autre.
@@ -546,6 +618,7 @@ impl Default for ChatTurnManager {
             owners: Arc::new(Mutex::new(HashMap::new())),
             workspaces: Arc::new(Mutex::new(HashMap::new())),
             claims: Arc::new(Mutex::new(HashSet::new())),
+            start_gate: Arc::new(Mutex::new(())),
             live_claude: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(0)),
             runtime_sync: RuntimeSync::default(),
@@ -693,6 +766,11 @@ impl ChatTurnManager {
         filesystem_scope: ChatFilesystemScope,
     ) -> Result<ChatTurnSnapshot, String> {
         self.prune_finished_turns();
+        let _start_guard = self
+            .start_gate
+            .lock()
+            .map_err(|_| "Admission des chats verrouillee".to_string())?;
+        enforce_chat_resource_admission()?;
         let prompt = request.prompt.trim().to_string();
         if prompt.is_empty() && request.image_attachments.is_empty() {
             return Err("Le message est vide".to_string());
@@ -725,6 +803,12 @@ impl ChatTurnManager {
             .find(|candidate| candidate.id == request.account_id)
             .cloned()
             .ok_or_else(|| "Compte introuvable".to_string())?;
+        if account.provider == Provider::Freebuff {
+            return Err(format!(
+                "Le chat ne prend pas en charge freebuff ({}) : son CLI est un TUI interactif, sans prompt en argument ni sortie structuree. Ouvre-le dans un onglet terminal.",
+                account.label
+            ));
+        }
         if let Some(session_id) = request.session_id.as_deref() {
             validate_session_id(account.provider, session_id)?;
         }
@@ -788,6 +872,17 @@ impl ChatTurnManager {
                 account.fast_mode,
             )
             .map_err(|error| format!("Configuration du compte impossible : {error}"))?;
+        if account.provider == Provider::Codex {
+            if let Some(session_id) = request.session_id.as_deref() {
+                let repaired =
+                    discussions::repair_interrupted_codex_tool_calls(&canonical_home, session_id)?;
+                if repaired > 0 {
+                    eprintln!(
+                        "[chat] session Codex {session_id} reparee avant reprise: {repaired} sortie(s) d'outil interrompue(s) completee(s)"
+                    );
+                }
+            }
+        }
 
         let environment_instructions = project_dir
             .as_deref()
@@ -828,6 +923,10 @@ impl ChatTurnManager {
         );
         let base_instructions = merge_turn_instructions(
             Some(RESPONSE_QUALITY_INSTRUCTIONS),
+            (account.provider == Provider::Codex).then_some(CODEX_PROCESS_CONTINUITY_INSTRUCTIONS),
+        );
+        let base_instructions = merge_turn_instructions(
+            base_instructions.as_deref(),
             apply_foreground_net.then_some(CLAUDE_FOREGROUND_SHELL_INSTRUCTIONS),
         );
         let turn_instructions = merge_turn_instructions(
@@ -2239,6 +2338,8 @@ fn configure_provider_command_with_images_and_scope(
     filesystem_scope: ChatFilesystemScope,
 ) {
     match account.provider {
+        // Inatteignable : `ChatTurnManager::start` refuse freebuff en amont.
+        Provider::Freebuff => {}
         Provider::Codex => {
             command.arg("exec");
             if session_id.is_some() {
@@ -2341,7 +2442,7 @@ fn configure_provider_command_with_images_and_scope(
                     .arg(path)
                     .arg("--allowedTools")
                     .arg(format!(
-                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CHAT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_OUTLOOK_MESSAGES_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_CALENDAR_EVENTS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_OUTLOOK_EMAIL_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME}"
+                        "mcp__{MCP_SERVER_NAME}__{AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CHAT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_OUTLOOK_MESSAGES_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_CALENDAR_EVENTS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_OUTLOOK_EMAIL_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{CREATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{UPDATE_CALENDAR_EVENT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME},mcp__{MCP_SERVER_NAME}__{QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME}"
                     ));
             }
         }
@@ -2380,7 +2481,7 @@ fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelTo
         format!("{prefix}.url={url}"),
         format!("{prefix}.bearer_token_env_var=\"{MCP_BEARER_ENV}\""),
         format!(
-            "{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\",\"{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}\",\"{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}\",\"{CREATE_CHAT_TOOL_NAME}\",\"{LIST_OUTLOOK_MESSAGES_TOOL_NAME}\",\"{LIST_CALENDAR_EVENTS_TOOL_NAME}\",\"{SEND_OUTLOOK_EMAIL_TOOL_NAME}\",\"{CREATE_CALENDAR_EVENT_TOOL_NAME}\",\"{UPDATE_CALENDAR_EVENT_TOOL_NAME}\",\"{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME}\",\"{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME}\",\"{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME}\",\"{LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME}\",\"{QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME}\"]"
+            "{prefix}.enabled_tools=[\"{AUTONOMOUS_AGENT_TOOL_NAME}\",\"{UPDATE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{PAUSE_AUTONOMOUS_AGENT_TOOL_NAME}\",\"{ACTIVATE_SUPERVISOR_GENERAL_REPORT_TOOL_NAME}\",\"{APPLY_AUTONOMOUS_AGENT_POLICY_TOOL_NAME}\",\"{CREATE_CHAT_TOOL_NAME}\",\"{LIST_OUTLOOK_MESSAGES_TOOL_NAME}\",\"{LIST_CALENDAR_EVENTS_TOOL_NAME}\",\"{SEND_OUTLOOK_EMAIL_TOOL_NAME}\",\"{CREATE_CALENDAR_EVENT_TOOL_NAME}\",\"{UPDATE_CALENDAR_EVENT_TOOL_NAME}\",\"{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME}\",\"{LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME}\",\"{MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME}\",\"{SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME}\",\"{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME}\",\"{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME}\",\"{LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME}\",\"{QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME}\"]"
         ),
         format!("{prefix}.enabled=true"),
         format!("{prefix}.required=false"),
@@ -2407,6 +2508,9 @@ fn configure_codex_model_tool(command: &mut Command, config: Option<&ChatModelTo
         format!("{prefix}.tools.{CREATE_CALENDAR_EVENT_TOOL_NAME}.approval_mode=\"approve\""),
         format!("{prefix}.tools.{UPDATE_CALENDAR_EVENT_TOOL_NAME}.approval_mode=\"approve\""),
         format!("{prefix}.tools.{LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME}.approval_mode=\"approve\""),
+        format!("{prefix}.tools.{SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME}.approval_mode=\"approve\""),
         format!("{prefix}.tools.{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME}.approval_mode=\"approve\""),
         format!("{prefix}.tools.{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME}.approval_mode=\"approve\""),
         format!(
@@ -2547,7 +2651,7 @@ fn selected_reasoning_effort(
         // requete explicite, on ne passe pas `--effort` et Claude Code applique
         // son propre defaut.
         Provider::Claude => request,
-        Provider::OpenCode => return Ok(None),
+        Provider::OpenCode | Provider::Freebuff => return Ok(None),
     };
     let Some(value) = value else {
         return Ok(None);
@@ -2561,7 +2665,7 @@ fn selected_reasoning_effort(
 fn validate_session_id(provider: Provider, session_id: &str) -> Result<(), String> {
     let valid = match provider {
         Provider::Codex | Provider::Claude => Uuid::parse_str(session_id).is_ok(),
-        Provider::OpenCode => {
+        Provider::OpenCode | Provider::Freebuff => {
             let len = session_id.chars().count();
             (1..=160).contains(&len)
                 && session_id.chars().all(|character| {
@@ -2792,8 +2896,67 @@ fn resolve_native_npm_codex(wrapper: &Path) -> Option<(PathBuf, PathBuf)> {
 }
 
 #[cfg(not(windows))]
-fn resolve_native_npm_codex(_wrapper: &Path) -> Option<(PathBuf, PathBuf)> {
-    None
+fn resolve_native_npm_codex(wrapper: &Path) -> Option<(PathBuf, PathBuf)> {
+    // Le paquet npm Unix expose normalement `bin/codex` comme lien vers
+    // `@openai/codex/bin/codex.js`. Ce lanceur Node ne fait ensuite que
+    // resoudre le binaire Rust de la plateforme et attendre sa fin. Dans un
+    // serveur multi-chat, conserver ce parent Node coute environ 50 Mio RSS
+    // par tour sans apporter de fonctionnalite supplementaire : le serveur
+    // gere deja les flux, les signaux et l'arret du processus.
+    let is_official_entry = wrapper
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "codex" | "codex.js"));
+    if !is_official_entry {
+        return None;
+    }
+
+    let entrypoint = std::fs::canonicalize(wrapper).ok()?;
+    if entrypoint.file_name().and_then(|name| name.to_str()) != Some("codex.js") {
+        return None;
+    }
+    let bin_directory = entrypoint.parent()?;
+    if bin_directory.file_name().and_then(|name| name.to_str()) != Some("bin") {
+        return None;
+    }
+    let package_root = bin_directory.parent()?.to_path_buf();
+    if package_root.file_name().and_then(|name| name.to_str()) != Some("codex")
+        || package_root
+            .parent()?
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("@openai")
+    {
+        return None;
+    }
+
+    let (platform_package, target_triple) = match (env::consts::OS, env::consts::ARCH) {
+        ("linux" | "android", "x86_64") => ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+        ("linux" | "android", "aarch64") => ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => ("codex-darwin-x64", "x86_64-apple-darwin"),
+        ("macos", "aarch64") => ("codex-darwin-arm64", "aarch64-apple-darwin"),
+        _ => return None,
+    };
+    let relative_binary = Path::new("vendor")
+        .join(target_triple)
+        .join("bin")
+        .join("codex");
+    let openai_directory = package_root.parent()?;
+    let candidates = [
+        package_root
+            .join("node_modules")
+            .join("@openai")
+            .join(platform_package)
+            .join(&relative_binary),
+        openai_directory
+            .join(platform_package)
+            .join(&relative_binary),
+        package_root.join(relative_binary),
+    ];
+    let executable = candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())?;
+    Some((executable, package_root))
 }
 
 /// Le paquet npm officiel expose un shim `opencode.cmd` vers son binaire natif.
@@ -2865,7 +3028,14 @@ fn hide_process_window(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn hide_process_window(_command: &mut Command) {}
+fn hide_process_window(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // Isole chaque tour dans son propre groupe. Les outils lances par Codex
+    // (code-mode, shells, serveurs de test) peuvent autrement survivre a la
+    // fin du processus principal et conserver leur memoire dans WSL.
+    command.process_group(0);
+}
 
 #[cfg(windows)]
 fn terminate_chat_process_tree(child: &mut Child) -> std::io::Result<()> {
@@ -2895,8 +3065,33 @@ fn terminate_chat_process_tree(child: &mut Child) -> std::io::Result<()> {
     if child.try_wait()?.is_some() {
         Ok(())
     } else {
+        let pid = child.id();
+        if unix_process_group_is_isolated(pid) {
+            let process_group = format!("-{pid}");
+            if Command::new("kill")
+                .args(["-KILL", "--", process_group.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+        }
         child.kill()
     }
+}
+
+#[cfg(not(windows))]
+fn unix_process_group_is_isolated(pid: u32) -> bool {
+    Command::new("ps")
+        .args(["-o", "pgid=", "-p", pid.to_string().as_str()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        == Some(pid)
 }
 
 fn wait_for_child(turn: &Arc<ChatTurn>) -> Result<ExitStatus, String> {
@@ -3996,6 +4191,7 @@ fn provider_label(provider: Provider) -> &'static str {
         Provider::Codex => "Codex",
         Provider::Claude => "Claude",
         Provider::OpenCode => "OpenCode",
+        Provider::Freebuff => "Freebuff",
     }
 }
 
@@ -4877,7 +5073,7 @@ mod tests {
         for expected in [
             "mcp_servers.cst_chat.url=\"http://127.0.0.1:8080/mcp/chat-tools\"",
             "mcp_servers.cst_chat.bearer_token_env_var=\"CST_CHAT_AUTONOMOUS_TOOL_TOKEN\"",
-            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\",\"update_autonomous_agent\",\"pause_autonomous_agent\",\"activate_supervisor_general_report\",\"apply_autonomous_agent_policy\",\"create_chat\",\"list_outlook_messages\",\"list_calendar_events\",\"send_outlook_email\",\"create_calendar_event\",\"update_calendar_event\",\"list_tiktok_dm_campaigns\",\"prepare_tiktok_dm_campaign\",\"send_tiktok_dm_campaign\",\"list_tiktok_follower_extractions\",\"extract_tiktok_followers\"]",
+            "mcp_servers.cst_chat.enabled_tools=[\"create_autonomous_agent\",\"update_autonomous_agent\",\"pause_autonomous_agent\",\"activate_supervisor_general_report\",\"apply_autonomous_agent_policy\",\"create_chat\",\"list_outlook_messages\",\"list_calendar_events\",\"send_outlook_email\",\"create_calendar_event\",\"update_calendar_event\",\"list_tiktok_dm_campaigns\",\"list_tiktok_sender_accounts\",\"manage_tiktok_sender_login\",\"select_tiktok_sender_account\",\"prepare_tiktok_dm_campaign\",\"send_tiktok_dm_campaign\",\"list_tiktok_follower_extractions\",\"extract_tiktok_followers\"]",
             "mcp_servers.cst_chat.required=false",
             "mcp_servers.cst_chat.startup_timeout_sec=15",
             "mcp_servers.cst_chat.default_tools_approval_mode=\"approve\"",
@@ -4893,6 +5089,9 @@ mod tests {
             "mcp_servers.cst_chat.tools.create_calendar_event.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.update_calendar_event.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.list_tiktok_dm_campaigns.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.list_tiktok_sender_accounts.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.manage_tiktok_sender_login.approval_mode=\"approve\"",
+            "mcp_servers.cst_chat.tools.select_tiktok_sender_account.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.prepare_tiktok_dm_campaign.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.send_tiktok_dm_campaign.approval_mode=\"approve\"",
             "mcp_servers.cst_chat.tools.list_tiktok_follower_extractions.approval_mode=\"approve\"",
@@ -5422,6 +5621,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(all(not(windows), any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[test]
+    fn official_unix_npm_codex_uses_its_native_binary_with_safe_fallbacks() {
+        let root = env::temp_dir().join(format!("cst-native-codex-unix-{}", Uuid::new_v4()));
+        let shim = root.join("bin").join("codex");
+        let package_root = root
+            .join("lib")
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
+        let entrypoint = package_root.join("bin").join("codex.js");
+        let (platform_package, target_triple) = match (env::consts::OS, env::consts::ARCH) {
+            ("linux" | "android", "aarch64") => ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+            ("linux" | "android", _) => ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+            ("macos", "aarch64") => ("codex-darwin-arm64", "aarch64-apple-darwin"),
+            ("macos", _) => ("codex-darwin-x64", "x86_64-apple-darwin"),
+            _ => unreachable!("plateforme Unix de test non prise en charge"),
+        };
+        let native = package_root
+            .join("node_modules")
+            .join("@openai")
+            .join(platform_package)
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join("codex");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&entrypoint, "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(&native, b"").unwrap();
+        std::os::unix::fs::symlink(&entrypoint, &shim).unwrap();
+
+        let resolved = resolve_provider_program(shim.to_str().unwrap(), Provider::Codex).unwrap();
+        assert_eq!(resolved.executable, native);
+        assert_eq!(
+            resolved.managed_codex_package_root,
+            Some(std::fs::canonicalize(&package_root).unwrap())
+        );
+
+        let direct_entrypoint =
+            resolve_provider_program(entrypoint.to_str().unwrap(), Provider::Codex).unwrap();
+        assert_eq!(direct_entrypoint.executable, native);
+        assert_eq!(
+            direct_entrypoint.managed_codex_package_root,
+            Some(std::fs::canonicalize(&package_root).unwrap())
+        );
+
+        std::fs::remove_file(&native).unwrap();
+        let fallback = resolve_provider_program(shim.to_str().unwrap(), Provider::Codex).unwrap();
+        assert_eq!(fallback.executable, shim);
+        assert!(fallback.managed_codex_package_root.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(windows)]
     #[test]
     fn official_npm_opencode_uses_its_native_binary() {
@@ -5469,6 +5723,36 @@ mod tests {
         assert!(
             !marker.exists(),
             "la commande descendante a survecu a l'arret du tour"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn stopping_a_unix_chat_turn_kills_its_process_group() {
+        let marker = env::temp_dir().join(format!("cst-chat-tree-stop-{}.txt", Uuid::new_v4()));
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 1; printf survived > \"$1\"",
+                "cst-chat-test",
+                marker.to_string_lossy().as_ref(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_process_window(&mut command);
+        let mut child = command.spawn().expect("wrapper Unix de test");
+
+        thread::sleep(Duration::from_millis(200));
+        terminate_chat_process_tree(&mut child).expect("arret du groupe du tour");
+        let _ = child.wait();
+        thread::sleep(Duration::from_millis(1_000));
+
+        assert!(
+            !marker.exists(),
+            "un descendant Unix a survecu a l'arret du tour"
         );
         let _ = std::fs::remove_file(marker);
     }

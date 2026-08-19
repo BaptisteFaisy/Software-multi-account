@@ -45,14 +45,36 @@ foreach ($command in @("wsl.exe", "ssh")) {
 $resolvedPublicKey = (Resolve-Path -LiteralPath $SshPublicKey).Path
 $resolvedIdentity = (Resolve-Path -LiteralPath $IdentityFile).Path
 
+function Start-HiddenWsl {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = Join-Path $env:WINDIR "System32\wsl.exe"
+  $psi.Arguments = ($Arguments | ForEach-Object {
+    if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+  }) -join " "
+  # Lance depuis une tache planifiee, wsl.exe n'a aucune console a heriter et
+  # Windows lui en ouvre une nouvelle, visible a l'ecran. CreateNoWindow est le
+  # seul reglage qui l'empeche.
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  return [Diagnostics.Process]::Start($psi)
+}
+
 function Invoke-WslText {
   param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
-  $output = @(& wsl.exe -d $WslDistribution -e @Arguments 2>&1)
-  if ($LASTEXITCODE -ne 0) {
-    throw "Commande WSL en echec: $($output -join [Environment]::NewLine)"
+  $process = Start-HiddenWsl -Arguments (@("-d", $WslDistribution, "-e") + $Arguments)
+  $stdout = $process.StandardOutput.ReadToEndAsync()
+  $stderr = $process.StandardError.ReadToEndAsync()
+  $process.WaitForExit()
+  $output = $stdout.Result + $stderr.Result
+  if ($process.ExitCode -ne 0) {
+    throw "Commande WSL en echec: $($output.Trim())"
   }
-  return (($output | ForEach-Object { [string]$_ }) -join "`n").Trim()
+  return $output.Trim()
 }
 
 function Convert-ToWslPath {
@@ -160,19 +182,26 @@ $arguments = @(
 )
 if ($Apply) { $arguments += "--apply" }
 
+# Le processus est pilote directement plutot que via l'operateur d'appel: cela
+# evite la fenetre console que Windows accorderait a wsl.exe sous la tache
+# planifiee, et contourne les NativeCommandError que Windows PowerShell leve sur
+# chaque ligne stderr d'un executable natif. stdout est diffuse au fil de l'eau,
+# stderr draine en parallele pour qu'aucun des deux tampons ne bloque l'autre.
 $runOutput = @()
-$previousErrorAction = $ErrorActionPreference
-try {
-  # Windows PowerShell transforme chaque ligne stderr d'un executable natif en
-  # NativeCommandError. On doit conserver la suite du diagnostic et utiliser le
-  # vrai code de sortie WSL pour decider du succes.
-  $ErrorActionPreference = "Continue"
-  & wsl.exe @arguments 2>&1 | Tee-Object -Variable runOutput | ForEach-Object { Write-Host ([string]$_) }
-  $provisionExit = $LASTEXITCODE
+$process = Start-HiddenWsl -Arguments $arguments
+$errorTask = $process.StandardError.ReadToEndAsync()
+while ($null -ne ($line = $process.StandardOutput.ReadLine())) {
+  $runOutput += $line
+  Write-Host $line
 }
-finally {
-  $ErrorActionPreference = $previousErrorAction
+$process.WaitForExit()
+foreach ($line in ($errorTask.Result -split "`r?`n")) {
+  if ($line.Trim()) {
+    $runOutput += $line
+    Write-Host $line
+  }
 }
+$provisionExit = $process.ExitCode
 if ($provisionExit -ne 0) {
   throw "Le preflight/provisionnement OCI a echoue (code $provisionExit)."
 }

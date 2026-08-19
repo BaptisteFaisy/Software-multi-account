@@ -6,27 +6,46 @@ const source = (path) =>
   readFileSync(new URL(path, import.meta.url), "utf8");
 
 const backend = source("../src-tauri/src/tiktok_messaging.rs");
+const policy = source("../src-tauri/src/tiktok_messaging_policy.rs");
 const server = source("../src-tauri/src/server.rs");
 const tools = source("../src-tauri/src/chat_model_tools.rs");
 const chat = source("../src-tauri/src/chat.rs");
 const desktop = source("../src-tauri/src/lib.rs");
 const platform = source("../src/platform.ts");
 
-test("le chat VPS expose le flux TikTok prepare, confirme et suivi", () => {
+test("le chat VPS expose l'envoi TikTok direct, le brouillon compatible et le suivi", () => {
   assert.match(tools, /LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME/);
+  assert.match(tools, /LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME/);
+  assert.match(tools, /MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME/);
+  assert.match(tools, /SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME/);
   assert.match(tools, /PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME/);
   assert.match(tools, /SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME/);
+  assert.match(tools, /"required": \["recipient", "message"\]/);
+  assert.match(tools, /"senderAccount"/);
+  assert.match(tools, /ne demande et ne transmets jamais de mot de passe/);
+  assert.match(tools, /sans demander une seconde confirmation/);
   assert.match(tools, /"maxItems": 5/);
   assert.match(tools, /"ownedAccountsConfirmed"/);
   assert.match(tools, /"sendConfirmed"/);
   assert.match(server, /"\/tiktok\/dm-campaigns"/);
   assert.match(server, /api_prepare_tiktok_dm_campaign/);
   assert.match(server, /api_confirm_tiktok_dm_campaign/);
+  assert.match(server, /api_list_tiktok_sender_accounts/);
+  assert.match(server, /api_queue_tiktok_sender_setup/);
+  assert.match(server, /api_select_tiktok_sender_account/);
+  assert.match(server, /resolve_sender_account/);
+  assert.match(server, /SendTikTokDmDirectToolArguments/);
+  assert.match(server, /request\.into_prepare_request\(token\)/);
+  assert.match(server, /wait_for_tiktok_submission/);
+  assert.match(server, /status\.is_online\(metrics::now_ts\(\)\) && status\.agent_healthy/);
   assert.match(chat, /enabled_tools=\[[^\n]*\{PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME\}/);
   assert.match(chat, /tools\.\{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME\}\.approval_mode/);
   assert.match(chat, /mcp__\{MCP_SERVER_NAME\}__\{SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME\}/);
   assert.match(platform, /case "prepare_tiktok_dm_campaign"/);
   assert.match(platform, /case "confirm_tiktok_dm_campaign"/);
+  assert.match(platform, /case "list_tiktok_sender_accounts"/);
+  assert.match(platform, /case "manage_tiktok_sender_login"/);
+  assert.match(platform, /case "select_tiktok_sender_account"/);
   assert.match(tools, /"extract_tiktok_followers"/);
   assert.match(tools, /"maximum": 1000/);
   assert.match(tools, /"default": 1000/);
@@ -45,7 +64,16 @@ test("le connecteur reste sortant et TikMatrix demeure sur le loopback Windows",
   assert.match(backend, /CST_CLIENT_BASE_URL|client_startup_config/);
   assert.match(backend, /http:\/\/127\.0\.0\.1:\{port\}/);
   assert.match(backend, /\/api\/tiktok\/connector\/jobs\/claim/);
+  assert.match(backend, /\/api\/tiktok\/connector\/sender-setup\/claim/);
+  assert.match(backend, /OpenScrcpy/);
+  assert.match(backend, /parse_adb_devices/);
+  assert.match(backend, /CST_SCRCPY_PATH/);
+  assert.match(backend, /\/api\/open_tiktok/);
+  assert.match(backend, /match_accounts/);
   assert.match(backend, /\/api\/message_now/);
+  assert.match(backend, /\/api\/account/);
+  assert.match(backend, /TikTokSenderAccount/);
+  assert.match(backend, /select_tikmatrix_sender_serial/);
   assert.match(backend, /\/api\/scrape_now/);
   assert.match(backend, /scrape_users_settings\.json/);
   assert.match(backend, /exported_users_/);
@@ -55,8 +83,15 @@ test("le connecteur reste sortant et TikMatrix demeure sur le loopback Windows",
 });
 
 test("les confirmations, leases et recus locaux empechent les envois implicites ou doubles", () => {
-  assert.match(backend, /MAX_TIKTOK_DM_RECIPIENTS: usize = 5/);
-  assert.match(backend, /MAX_TIKTOK_FOLLOWER_RESULTS: usize = 1_000/);
+  assert.match(policy, /MAX_TIKTOK_DM_RECIPIENTS: usize = 5/);
+  assert.match(policy, /MAX_TIKTOK_FOLLOWER_RESULTS: usize = 1_000/);
+  assert.match(policy, /owner_id: validate_owner_id\(owner_id\)\?/);
+  assert.match(policy, /recipients: validate_recipients\(request\.recipients\)\?/);
+  assert.match(policy, /owned_recipient_allowlist: validate_recipients/);
+  assert.match(backend, /tiktok_messaging_policy as policy/);
+  assert.match(backend, /policy::validate_campaign_request/);
+  assert.match(backend, /policy::validate_follower_extraction_request/);
+  assert.match(backend, /pipeline\s*\.owned_recipient_allowlist\s*\.iter\(\)/);
   assert.match(backend, /scrape_to_dm_pipeline/);
   assert.match(backend, /prepared_campaign_id/);
   assert.match(backend, /CLAIM_LEASE_SECONDS: i64 = 120/);

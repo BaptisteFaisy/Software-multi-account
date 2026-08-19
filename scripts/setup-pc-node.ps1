@@ -95,15 +95,27 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$powershell = Join-Path $PSHOME "powershell.exe"
+# Le setup peut etre lance depuis pwsh.exe (runtime Codex), dont PSHOME ne
+# contient pas powershell.exe. La tache persistante utilise Windows PowerShell.
+$powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) {
+  throw "PowerShell Windows introuvable: $powershell"
+}
 $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$StartScript`""
 $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+# Le declencheur periodique joue le role de watchdog : MultipleInstances=IgnoreNew
+# laisse le noeud actif tranquille et le relance sous cinq minutes s'il s'arrete.
+$watchdogTrigger = New-ScheduledTaskTrigger `
+  -Once `
+  -At (Get-Date).AddMinutes(5) `
+  -RepetitionInterval (New-TimeSpan -Minutes 5)
+$trigger = @($logonTrigger, $watchdogTrigger)
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
   -StartWhenAvailable `
-  -RestartCount 10 `
+  -RestartCount 999 `
   -RestartInterval (New-TimeSpan -Minutes 1) `
   -ExecutionTimeLimit ([TimeSpan]::Zero)
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited

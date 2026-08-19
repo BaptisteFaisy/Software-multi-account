@@ -171,13 +171,24 @@ function Remove-ObsoleteLocalReleases {
 
 function Register-NodeTask {
   $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-  $powershell = Join-Path $PSHOME "powershell.exe"
+  # Le script peut etre lance depuis pwsh.exe (runtime Codex), dont PSHOME ne
+  # contient pas powershell.exe. La tache persistante utilise Windows PowerShell.
+  $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  if (-not (Test-Path -LiteralPath $powershell -PathType Leaf)) {
+    throw "PowerShell Windows introuvable: $powershell"
+  }
   $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$StartNode`" -Port $Port"
   $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments
-  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+  $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+  $watchdogTrigger = New-ScheduledTaskTrigger `
+    -Once `
+    -At (Get-Date).AddMinutes(5) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5)
+  $trigger = @($logonTrigger, $watchdogTrigger)
   $settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-    -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -DontStopOnIdleEnd `
+    -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
   $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `

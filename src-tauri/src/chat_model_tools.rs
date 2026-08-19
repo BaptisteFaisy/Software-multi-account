@@ -33,6 +33,9 @@ pub const LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME: &str = "list_private_message
 pub const CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME: &str = "create_private_message_campaign";
 pub const CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME: &str = "control_private_message_campaign";
 pub const LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME: &str = "list_tiktok_dm_campaigns";
+pub const LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME: &str = "list_tiktok_sender_accounts";
+pub const MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME: &str = "manage_tiktok_sender_login";
+pub const SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME: &str = "select_tiktok_sender_account";
 pub const PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME: &str = "prepare_tiktok_dm_campaign";
 pub const SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME: &str = "send_tiktok_dm_campaign";
 pub const LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME: &str = "list_tiktok_follower_extractions";
@@ -87,8 +90,11 @@ pub(crate) const PRIVATE_MESSAGE_TOOL_NAMES: [&str; 4] = [
     CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
     CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME,
 ];
-pub(crate) const TIKTOK_DM_TOOL_NAMES: [&str; 5] = [
+pub(crate) const TIKTOK_DM_TOOL_NAMES: [&str; 8] = [
     LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME,
+    LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME,
+    MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME,
+    SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME,
     PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
     SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
     LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME,
@@ -661,7 +667,7 @@ pub(crate) fn initialize_response(
                     "title": "Outils du chat Codex Switch Terminal",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Ces outils donnent acces a la messagerie interne, au connecteur TikMatrix local et au compte Microsoft 365 du proprietaire. Les campagnes TikTok sont strictement limitees a cinq comptes de test controles par l'utilisateur : prepare_tiktok_dm_campaign cree toujours un apercu, et send_tiktok_dm_campaign n'est autorise que si la demande ou la memoire confirme explicitement la propriete des destinataires ainsi que l'envoi du message exact. extract_tiktok_followers accepte une demande unique allant jusqu'a 1000 resultats pour un compte appartenant a l'utilisateur ou explicitement autorise. TikTok peut toutefois ne rendre qu'environ 50 profils visibles : presente toujours le nombre effectivement retourne et ne promets jamais une liste exhaustive. Son option dmPipeline ne conserve que l'intersection avec une liste explicite d'au plus cinq comptes secondaires confirmes comme controles et cree uniquement un brouillon. Apres la collecte, affiche les destinataires et le message exact, puis attends une nouvelle confirmation humaine avant send_tiktok_dm_campaign. N'envoie jamais aux autres noms extraits et ne transforme jamais cette capacite en prospection non sollicitee. Pour une diffusion interne, commence par list_private_message_users et cree normalement un brouillon. Les outils d'ecriture Microsoft ne font que preparer des cartes a confirmer. Indique clairement le statut reel de chaque action."
+                "instructions": "Ces outils donnent acces a la messagerie interne, au connecteur TikMatrix local et au compte Microsoft 365 du proprietaire. L'authentification TikTok reste exclusivement dans l'application TikTok de l'appareil Android : ne demande et ne transmets jamais de mot de passe, cookie, code 2FA ou captcha au VPS. Quand l'utilisateur veut connecter un emetteur, appelle manage_tiktok_sender_login avec open_login : la fenetre TikTok locale s'ouvre et l'utilisateur y saisit lui-meme ses secrets et validations. Dis-lui ensuite de revenir confirmer que la connexion est terminee ; seulement alors appelle le meme outil avec match_accounts, puis list_tiktok_sender_accounts et select_tiktok_sender_account. La session persistante est celle de l'application TikTok/TikMatrix locale, aucun token TikTok n'est extrait par le chat. Utilise list_tiktok_sender_accounts pour verifier les comptes reconnus. Utilise select_tiktok_sender_account pour choisir l'emetteur ; un seul compte actif par appareil est exige pour garantir son identite. Quand l'utilisateur donne dans une meme demande un @username destinataire, le message exact et un ordre explicite d'envoi, appelle directement send_tiktok_dm_campaign avec recipient et message : cet outil utilise l'emetteur selectionne, prepare et met en file l'envoi en une seule operation, sans demander une seconde confirmation. Utilise prepare_tiktok_dm_campaign seulement si l'utilisateur demande un brouillon ou si le destinataire, le texte exact ou l'intention d'envoyer manque. L'envoi direct est limite a un destinataire et ne doit jamais servir a de la prospection non sollicitee. extract_tiktok_followers accepte une demande unique allant jusqu'a 1000 resultats pour un compte appartenant a l'utilisateur ou explicitement autorise. TikTok peut toutefois ne rendre qu'environ 50 profils visibles : presente toujours le nombre effectivement retourne et ne promets jamais une liste exhaustive. Son option dmPipeline ne conserve que l'intersection avec une liste explicite d'au plus cinq comptes secondaires confirmes comme controles et cree uniquement un brouillon. Apres la collecte, affiche les destinataires et le message exact, puis attends une nouvelle confirmation humaine avant send_tiktok_dm_campaign. N'envoie jamais aux autres noms extraits. Pour une diffusion interne, commence par list_private_message_users et cree normalement un brouillon. Les outils d'ecriture Microsoft ne font que preparer des cartes a confirmer. Indique clairement le statut reel de chaque action et distingue l'acceptation de la tache par TikMatrix d'une livraison confirmee par TikTok."
             }
         });
     }
@@ -676,7 +682,7 @@ pub(crate) fn initialize_response(
                 "title": "Outils du chat Codex Switch Terminal",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Utilise les outils d'agents et de chats uniquement sur demande explicite. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. La messagerie TikTok via TikMatrix est limitee a cinq comptes secondaires controles par l'utilisateur : prepare_tiktok_dm_campaign cree l'apercu, puis send_tiktok_dm_campaign exige une autorisation explicite portant sur les destinataires et le message exact. La collecte de followers accepte une demande unique jusqu'a 1000 noms pour un compte appartenant a l'utilisateur ou explicitement autorise. TikTok peut cependant limiter la liste visible a environ 50 profils : annonce le nombre reellement retourne et ne qualifie jamais le resultat d'exhaustif sans preuve. L'option dmPipeline de la collecte peut preparer un brouillon uniquement pour l'intersection avec une liste explicite d'au plus cinq comptes secondaires confirmes comme controles. N'utilise jamais les autres noms extraits. Affiche le brouillon termine puis attends une nouvelle confirmation humaine avant send_tiktok_dm_campaign. Refuse toute prospection non sollicitee et indique si le connecteur Windows est hors ligne. La messagerie interne conserve son propre flux de brouillon et de consentement. Les outils Microsoft lisent la boite et l'agenda lies au compte ; leurs outils d'ecriture ne font que preparer une carte que l'utilisateur doit confirmer."
+            "instructions": "Utilise les outils d'agents et de chats uniquement sur demande explicite. N'affirme jamais qu'une creation, une modification ou une mise en pause a reussi avant le succes de l'outil. L'authentification TikTok reste sur Windows et l'appareil Android ; ne demande jamais de secret TikTok dans le chat. Pour connecter un emetteur, utilise manage_tiktok_sender_login avec open_login, demande a l'utilisateur d'effectuer localement le login/captcha/2FA et d'indiquer quand il a termine, puis utilise match_accounts. Verifie ensuite les emetteurs avec list_tiktok_sender_accounts et choisis-en un avec select_tiktok_sender_account. Aucun token TikTok n'est extrait : la session est conservee par l'application locale. Quand une demande explicite contient un @username destinataire et le message exact, send_tiktok_dm_campaign peut utiliser l'emetteur selectionne, preparer et mettre en file cet envoi unique directement avec recipient et message, sans seconde confirmation. Utilise prepare_tiktok_dm_campaign pour un brouillon ou une demande incomplete. Refuse toute prospection non sollicitee et indique si le connecteur Windows est hors ligne. La collecte de followers accepte une demande unique jusqu'a 1000 noms pour un compte appartenant a l'utilisateur ou explicitement autorise. TikTok peut cependant limiter la liste visible a environ 50 profils : annonce le nombre reellement retourne et ne qualifie jamais le resultat d'exhaustif sans preuve. L'option dmPipeline de la collecte peut preparer un brouillon uniquement pour l'intersection avec une liste explicite d'au plus cinq comptes secondaires confirmes comme controles. N'utilise jamais les autres noms extraits. Affiche le brouillon termine puis attends une nouvelle confirmation humaine avant send_tiktok_dm_campaign. La messagerie interne conserve son propre flux de brouillon et de consentement. Les outils Microsoft lisent la boite et l'agenda lies au compte ; leurs outils d'ecriture ne font que preparer une carte que l'utilisateur doit confirmer. Distingue toujours l'acceptation par TikMatrix d'une livraison confirmee par TikTok."
         }
     })
 }
@@ -1211,6 +1217,77 @@ fn all_tools_response(id: Value) -> Value {
                     }
                 },
                 {
+                    "name": LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME,
+                    "title": "Verifier les comptes emetteurs TikTok",
+                    "description": "Liste les comptes TikTok reconnus par le TikMatrix Windows, leur appareil, leur etat de connexion et le compte emetteur selectionne. Aucun mot de passe, cookie ou code 2FA n'est lu ni stocke sur le VPS. Si la liste est vide, demande a l'utilisateur de se connecter dans l'application TikTok de l'appareil Android puis de lancer Match Accounts dans TikMatrix.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {}
+                    },
+                    "annotations": {
+                        "title": "Verifier les emetteurs TikTok",
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME,
+                    "title": "Connecter un compte emetteur TikTok",
+                    "description": "Pilote l'appareil Android local sans transmettre de secret au VPS. Utilise open_scrcpy pour afficher l'appareil USB, l'emulateur ou l'appareil ADB reseau choisi dans une fenetre scrcpy locale. Utilise open_login pour ouvrir TikTok sur cet appareil. L'utilisateur saisit ensuite ses informations et resout les verifications uniquement dans cette fenetre locale. Quand il confirme avoir termine, utilise match_accounts pour demander a TikMatrix de detecter la session persistante.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["open_scrcpy", "open_login", "match_accounts"]
+                            },
+                            "deviceSerial": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 96,
+                                "description": "Facultatif lorsqu'un seul appareil Android autorise est connecte par ADB."
+                            }
+                        },
+                        "required": ["action"]
+                    },
+                    "annotations": {
+                        "title": "Gerer la connexion TikTok locale",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME,
+                    "title": "Selectionner le compte emetteur TikTok",
+                    "description": "Associe au proprietaire un compte TikTok deja connecte et reconnu par TikMatrix. Le compte doit etre actif sur un appareil connecte. Un seul compte actif est accepte par appareil afin de garantir l'identite de l'emetteur.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "username": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 25,
+                                "pattern": "^@?[A-Za-z0-9._]{2,24}$"
+                            }
+                        },
+                        "required": ["username"]
+                    },
+                    "annotations": {
+                        "title": "Selectionner l'emetteur TikTok",
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                },
+                {
                     "name": PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
                     "title": "Preparer des messages TikTok de test",
                     "description": "Cree un brouillon persistant, sans envoyer. Accepte au maximum cinq @username appartenant explicitement a l'utilisateur et un message unique sur une ligne. Montre toujours l'apercu exact avant de demander ou d'utiliser la confirmation d'envoi. N'utilise jamais cet outil pour de la prospection non sollicitee.",
@@ -1253,6 +1330,13 @@ fn all_tools_response(id: Value) -> Value {
                                 "maxLength": 96,
                                 "description": "Facultatif lorsqu'un seul appareil TikMatrix est connecte."
                             },
+                            "senderAccount": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 25,
+                                "pattern": "^@?[A-Za-z0-9._]{2,24}$",
+                                "description": "Compte emetteur TikTok reconnu par TikMatrix. Facultatif si un emetteur par defaut est selectionne."
+                            },
                             "idempotencyKey": {
                                 "type": "string",
                                 "minLength": 1,
@@ -1273,28 +1357,81 @@ fn all_tools_response(id: Value) -> Value {
                 },
                 {
                     "name": SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
-                    "title": "Confirmer l'envoi TikTok de test",
-                    "description": "Place un brouillon TikTok dans la file du connecteur Windows. Appelle cet outil uniquement apres une autorisation explicite portant sur le message et les @username affiches, et seulement si l'utilisateur confirme qu'il controle tous les comptes destinataires. Les deux booleens doivent refleter des faits explicites, jamais une supposition.",
+                    "title": "Envoyer un message TikTok",
+                    "description": "Pour un ordre explicite contenant un destinataire et le message exact, utilise directement recipient et message : le VPS prepare puis met l'envoi dans la file TikMatrix en une operation. L'ancien format campaignId reste accepte pour envoyer un brouillon deja prepare. N'utilise jamais cet outil pour une demande ambigue ou de la prospection non sollicitee.",
                     "inputSchema": {
                         "type": "object",
                         "additionalProperties": false,
                         "properties": {
-                            "campaignId": { "type": "string", "minLength": 36, "maxLength": 36 },
-                            "ownedAccountsConfirmed": {
-                                "type": "boolean",
-                                "description": "Vrai uniquement si l'utilisateur a explicitement confirme controler chaque destinataire."
+                            "recipient": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 25,
+                                "pattern": "^@?[A-Za-z0-9._]{2,24}$",
+                                "description": "Compte TikTok explicitement nomme par l'utilisateur."
                             },
-                            "sendConfirmed": {
-                                "type": "boolean",
-                                "description": "Vrai uniquement si l'utilisateur a explicitement autorise l'envoi du message exact de l'apercu."
-                            }
+                            "message": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 500,
+                                "description": "Message exact demande par l'utilisateur, sur une seule ligne."
+                            },
+                            "minIntervalMinutes": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                                "default": 1
+                            },
+                            "maxIntervalMinutes": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                                "default": 2
+                            },
+                            "deviceSerial": {
+                                "type": "string",
+                                "maxLength": 96,
+                                "description": "Facultatif lorsqu'un seul appareil TikMatrix est connecte."
+                            },
+                            "senderAccount": {
+                                "type": "string",
+                                "minLength": 2,
+                                "maxLength": 25,
+                                "pattern": "^@?[A-Za-z0-9._]{2,24}$",
+                                "description": "Compte emetteur TikTok reconnu par TikMatrix. Facultatif si un emetteur par defaut est selectionne."
+                            },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 160,
+                                "pattern": "^[A-Za-z0-9._:-]+$",
+                                "description": "Facultatif ; le VPS en genere une pour ce tour si elle manque."
+                            },
+                            "campaignId": {
+                                "type": "string",
+                                "minLength": 36,
+                                "maxLength": 36
+                            },
+                            "ownedAccountsConfirmed": { "type": "boolean" },
+                            "sendConfirmed": { "type": "boolean" }
                         },
-                        "required": ["campaignId", "ownedAccountsConfirmed", "sendConfirmed"]
+                        "oneOf": [
+                            {
+                                "required": ["recipient", "message"]
+                            },
+                            {
+                                "required": [
+                                    "campaignId",
+                                    "ownedAccountsConfirmed",
+                                    "sendConfirmed"
+                                ]
+                            }
+                        ]
                     },
                     "annotations": {
-                        "title": "Envoyer la campagne TikTok",
+                        "title": "Envoyer un message TikTok",
                         "readOnlyHint": false,
-                        "destructiveHint": false,
+                        "destructiveHint": true,
                         "idempotentHint": true,
                         "openWorldHint": true
                     }

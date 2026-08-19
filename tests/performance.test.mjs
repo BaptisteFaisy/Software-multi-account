@@ -12,6 +12,10 @@ test("xterm et l'updater restent hors du chemin de demarrage", async () => {
 
   assert.match(main, /import\("\.\/terminal-runtime"\)/);
   assert.match(main, /import\("\.\/updater"\)/);
+  assert.match(
+    main,
+    /const initDesktopUpdaterDeferred[\s\S]*?if \(isRemoteMode\(\)\) return;[\s\S]*?import\("\.\/updater"\)/,
+  );
   assert.match(main, /import type \{ Terminal \} from "@xterm\/xterm"/);
   assert.match(terminalRuntime, /new Terminal\(/);
   assert.match(terminalRuntime, /@xterm\/xterm\/css\/xterm\.css/);

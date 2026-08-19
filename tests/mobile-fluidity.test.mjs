@@ -80,3 +80,21 @@ test("le profil Android retire les effets couteux des surfaces fixes", async () 
   assert.match(main, /latest\.outerHTML = latestHtml/);
   assert.match(main, /scheduleIdleTask\(\(\) => \{\s*void refreshSkills\(\);\s*void refreshAutonomousAgents\(\);\s*void refreshLimitStatus\(true\);/);
 });
+
+test("le compositeur Android masque les outils et montre l'intensite du modele", async () => {
+  const [css, view] = await Promise.all([
+    read("src/style.css"),
+    read("src/chat/view.ts"),
+  ]);
+
+  assert.match(
+    css,
+    /:root\.native-android \.chat-agent-tools\s*\{[^}]*display:\s*none\s*!important;/,
+  );
+  assert.match(
+    css,
+    /:root\.native-android \.chat-app-layout \.chat-effort-select\s*\{[^}]*display:\s*inline-flex;/,
+  );
+  assert.match(view, /data-chat-control="reasoning-effort"/);
+  assert.match(view, /option\.value === model\.selectedReasoningEffort/);
+});

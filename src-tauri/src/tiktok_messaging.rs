@@ -5,7 +5,7 @@
 //! VPS, reclame une campagne, prepare les fichiers locaux attendus par
 //! TikMatrix, puis soumet la tache a son agent loopback.
 
-use crate::{fs_util, metrics};
+use crate::{fs_util, metrics, tiktok_messaging_policy as policy};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -18,20 +18,13 @@ use uuid::Uuid;
 #[cfg(feature = "desktop")]
 use serde_json::{json, Map, Value};
 #[cfg(feature = "desktop")]
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 const STORE_VERSION: u32 = 1;
-pub const MAX_TIKTOK_DM_RECIPIENTS: usize = 5;
-pub const MAX_TIKTOK_DM_MESSAGE_CHARS: usize = 500;
-// TikMatrix exposes a 1..=1000 input in Scrape Users. TikTok may still expose
-// only about 50 visible followers, so this is a requested maximum rather than
-// a promise that every follower will be returned.
-pub const MAX_TIKTOK_FOLLOWER_RESULTS: usize = 1_000;
-const MAX_TIKTOK_DM_CAMPAIGNS: usize = 500;
-const MAX_TIKTOK_FOLLOWER_EXTRACTIONS: usize = 500;
-const MAX_IDEMPOTENCY_KEY_CHARS: usize = 160;
-const MIN_INTERVAL_MINUTES: u8 = 1;
-const MAX_INTERVAL_MINUTES: u8 = 10;
 const CLAIM_LEASE_SECONDS: i64 = 120;
 const CONNECTOR_STALE_SECONDS: i64 = 30;
 
@@ -58,6 +51,8 @@ pub struct TikTokDmCampaign {
     pub max_interval_minutes: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_account: Option<String>,
     pub owned_accounts_confirmed: bool,
     pub send_confirmed: bool,
     pub created_by: String,
@@ -91,6 +86,8 @@ pub struct PrepareTikTokDmCampaignRequest {
     pub max_interval_minutes: u8,
     #[serde(default)]
     pub device_serial: Option<String>,
+    #[serde(default)]
+    pub sender_account: Option<String>,
     pub idempotency_key: String,
 }
 
@@ -111,7 +108,15 @@ pub struct TikTokConnectorStatus {
     pub last_seen_at: i64,
     pub agent_healthy: bool,
     pub device_serials: Vec<String>,
+    #[serde(default)]
+    pub devices: Vec<TikTokAndroidDevice>,
+    #[serde(default)]
+    pub scrcpy_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adb_error: Option<String>,
     pub account_count: usize,
+    #[serde(default)]
+    pub accounts: Vec<TikTokSenderAccount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_campaign_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,11 +139,55 @@ pub struct TikTokConnectorHeartbeatRequest {
     #[serde(default)]
     pub device_serials: Vec<String>,
     #[serde(default)]
+    pub devices: Vec<TikTokAndroidDevice>,
+    #[serde(default)]
+    pub scrcpy_available: bool,
+    #[serde(default)]
+    pub adb_error: Option<String>,
+    #[serde(default)]
     pub account_count: usize,
+    #[serde(default)]
+    pub accounts: Vec<TikTokSenderAccount>,
     #[serde(default)]
     pub current_campaign_id: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TikTokAndroidDeviceState {
+    Device,
+    Unauthorized,
+    Offline,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TikTokAndroidDeviceTransport {
+    Usb,
+    Emulator,
+    Network,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TikTokAndroidDevice {
+    pub serial: String,
+    #[serde(default)]
+    pub state: TikTokAndroidDeviceState,
+    #[serde(default)]
+    pub transport: TikTokAndroidDeviceTransport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<String>,
+    #[serde(default)]
+    pub tikmatrix_managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +201,97 @@ pub struct TikTokConnectorJob {
     pub max_interval_minutes: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_account: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TikTokSenderAccount {
+    pub username: String,
+    pub device_serial: String,
+    pub logged_in: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TikTokSenderAccountView {
+    pub username: String,
+    pub device_serial: String,
+    pub logged_in: bool,
+    pub enabled: bool,
+    pub connected: bool,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TikTokSenderSetupActionKind {
+    OpenLogin,
+    MatchAccounts,
+    OpenScrcpy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TikTokSenderSetupActionStatus {
+    Queued,
+    Claimed,
+    Submitted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TikTokSenderSetupAction {
+    pub id: String,
+    pub owner_id: String,
+    pub action: TikTokSenderSetupActionKind,
+    pub status: TikTokSenderSetupActionStatus,
+    pub device_serial: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueueTikTokSenderSetupRequest {
+    pub action: TikTokSenderSetupActionKind,
+    #[serde(default)]
+    pub device_serial: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TikTokSenderSetupJob {
+    pub action_id: String,
+    pub claim_token: String,
+    pub action: TikTokSenderSetupActionKind,
+    pub device_serial: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TikTokSenderSetupReportRequest {
+    pub connector_id: String,
+    pub action_id: String,
+    pub claim_token: String,
+    pub success: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +452,19 @@ struct TikTokDmStore {
     campaigns: Vec<TikTokDmCampaign>,
     #[serde(default)]
     follower_extractions: Vec<TikTokFollowerExtraction>,
+    #[serde(default)]
+    sender_bindings: Vec<TikTokSenderBinding>,
+    #[serde(default)]
+    sender_setup_actions: Vec<TikTokSenderSetupAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct TikTokSenderBinding {
+    owner_id: String,
+    username: String,
+    device_serial: String,
+    updated_at: i64,
 }
 
 impl Default for TikTokDmStore {
@@ -320,6 +473,8 @@ impl Default for TikTokDmStore {
             version: STORE_VERSION,
             campaigns: Vec::new(),
             follower_extractions: Vec::new(),
+            sender_bindings: Vec::new(),
+            sender_setup_actions: Vec::new(),
         }
     }
 }
@@ -374,16 +529,16 @@ impl TikTokDmManager {
         request: PrepareTikTokDmCampaignRequest,
         created_by: &str,
     ) -> Result<TikTokDmCampaign, TikTokDmError> {
-        let owner_id = validate_owner_id(owner_id)?;
-        let recipients = validate_recipients(request.recipients)?;
-        let message = validate_message(request.message)?;
-        let idempotency_key = validate_idempotency_key(&request.idempotency_key)?;
-        validate_intervals(request.min_interval_minutes, request.max_interval_minutes)?;
-        let device_serial = request
-            .device_serial
-            .as_deref()
-            .map(validate_device_serial)
-            .transpose()?;
+        let policy::ValidatedCampaignRequest {
+            owner_id,
+            recipients,
+            message,
+            min_interval_minutes,
+            max_interval_minutes,
+            device_serial,
+            sender_account,
+            idempotency_key,
+        } = policy::validate_campaign_request(owner_id, request)?;
 
         let mut current = self.lock_store()?;
         if let Some(existing) = current.campaigns.iter().find(|campaign| {
@@ -391,11 +546,7 @@ impl TikTokDmManager {
         }) {
             return Ok(existing.clone());
         }
-        if current.campaigns.len() >= MAX_TIKTOK_DM_CAMPAIGNS {
-            return Err(TikTokDmError::Validation(
-                "La limite de campagnes TikTok archivees est atteinte".to_string(),
-            ));
-        }
+        policy::ensure_campaign_capacity(current.campaigns.len())?;
         let now = metrics::now_ts();
         let campaign = TikTokDmCampaign {
             id: Uuid::new_v4().to_string(),
@@ -403,9 +554,10 @@ impl TikTokDmManager {
             recipients,
             message,
             status: TikTokDmCampaignStatus::Draft,
-            min_interval_minutes: request.min_interval_minutes,
-            max_interval_minutes: request.max_interval_minutes,
+            min_interval_minutes,
+            max_interval_minutes,
             device_serial,
+            sender_account,
             owned_accounts_confirmed: false,
             send_confirmed: false,
             created_by: normalize_creator(created_by),
@@ -431,11 +583,8 @@ impl TikTokDmManager {
         owner_id: &str,
         request: ConfirmTikTokDmCampaignRequest,
     ) -> Result<TikTokDmCampaign, TikTokDmError> {
-        if !request.owned_accounts_confirmed || !request.send_confirmed {
-            return Err(TikTokDmError::Validation(
-                "Confirmez que tous les destinataires sont vos comptes de test et que l'envoi est autorise"
-                    .to_string(),
-            ));
+        if !policy::campaign_confirmation_guard(&request) {
+            return Err(policy::campaign_confirmation_rejection());
         }
         let mut current = self.lock_store()?;
         let mut next = current.clone();
@@ -492,27 +641,396 @@ impl TikTokDmManager {
         Ok(connector.clone())
     }
 
+    pub fn sender_accounts(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<TikTokSenderAccountView>, TikTokDmError> {
+        let owner_id = policy::validate_owner_id(owner_id)?;
+        let connector = self.connector_status()?;
+        let store = self.lock_store()?;
+        let selected = store
+            .sender_bindings
+            .iter()
+            .find(|binding| binding.owner_id == owner_id);
+        let Some(connector) = connector else {
+            return Ok(Vec::new());
+        };
+        let online = connector.is_online(metrics::now_ts()) && connector.agent_healthy;
+        let mut accounts = connector
+            .accounts
+            .iter()
+            .map(|account| TikTokSenderAccountView {
+                username: account.username.clone(),
+                device_serial: account.device_serial.clone(),
+                logged_in: account.logged_in,
+                enabled: account.enabled,
+                connected: online
+                    && connector
+                        .device_serials
+                        .iter()
+                        .any(|serial| serial == &account.device_serial),
+                selected: selected.is_some_and(|binding| {
+                    binding.username == account.username
+                        && binding.device_serial == account.device_serial
+                }),
+            })
+            .collect::<Vec<_>>();
+        accounts.sort_by(|left, right| {
+            right
+                .selected
+                .cmp(&left.selected)
+                .then_with(|| left.username.cmp(&right.username))
+                .then_with(|| left.device_serial.cmp(&right.device_serial))
+        });
+        Ok(accounts)
+    }
+
+    pub fn select_sender_account(
+        &self,
+        owner_id: &str,
+        username: &str,
+    ) -> Result<TikTokSenderAccountView, TikTokDmError> {
+        let owner_id = policy::validate_owner_id(owner_id)?;
+        let username = policy::normalize_tiktok_username(username)?;
+        let accounts = self.sender_accounts(&owner_id)?;
+        let account = accounts
+            .iter()
+            .find(|account| account.username.eq_ignore_ascii_case(&username))
+            .cloned()
+            .ok_or_else(|| {
+                TikTokDmError::Validation(format!(
+                    "Le compte emetteur {username} n'est pas reconnu par TikMatrix. Connectez-le sur l'appareil puis lancez Match Accounts."
+                ))
+            })?;
+        ensure_sender_account_ready(&account, &accounts)?;
+
+        let mut current = self.lock_store()?;
+        let mut next = current.clone();
+        next.sender_bindings
+            .retain(|binding| binding.owner_id != owner_id);
+        next.sender_bindings.push(TikTokSenderBinding {
+            owner_id,
+            username: account.username.clone(),
+            device_serial: account.device_serial.clone(),
+            updated_at: metrics::now_ts(),
+        });
+        self.persist_and_replace(&mut current, next)?;
+        Ok(TikTokSenderAccountView {
+            selected: true,
+            ..account
+        })
+    }
+
+    pub fn resolve_sender_account(
+        &self,
+        owner_id: &str,
+        requested_username: Option<&str>,
+        requested_device_serial: Option<&str>,
+    ) -> Result<TikTokSenderAccountView, TikTokDmError> {
+        let accounts = self.sender_accounts(owner_id)?;
+        let requested_username = requested_username
+            .map(policy::normalize_tiktok_username)
+            .transpose()?;
+        let requested_device_serial = requested_device_serial
+            .map(policy::validate_device_serial)
+            .transpose()?;
+        let mut candidates = accounts
+            .iter()
+            .filter(|account| {
+                requested_username
+                    .as_ref()
+                    .is_none_or(|username| account.username.eq_ignore_ascii_case(username))
+                    && requested_device_serial
+                        .as_ref()
+                        .is_none_or(|serial| account.device_serial == *serial)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if requested_username.is_none() && requested_device_serial.is_none() {
+            if let Some(selected) = candidates.iter().find(|account| account.selected).cloned() {
+                ensure_sender_account_ready(&selected, &accounts)?;
+                return Ok(selected);
+            }
+            candidates.retain(|account| account.logged_in && account.enabled && account.connected);
+            if candidates.len() == 1 {
+                return Ok(candidates.remove(0));
+            }
+        }
+
+        let account = match candidates.as_slice() {
+            [account] => account.clone(),
+            [] => {
+                return Err(TikTokDmError::Validation(
+                    "Aucun compte emetteur TikTok correspondant n'est disponible. Connectez le compte sur Windows, lancez Match Accounts, puis selectionnez-le depuis le chat."
+                        .to_string(),
+                ))
+            }
+            _ => {
+                return Err(TikTokDmError::Validation(
+                    "Plusieurs comptes emetteurs TikTok correspondent. Indiquez senderAccount ou selectionnez un compte emetteur par defaut."
+                        .to_string(),
+                ))
+            }
+        };
+        ensure_sender_account_ready(&account, &accounts)?;
+        Ok(account)
+    }
+
+    pub fn queue_sender_setup(
+        &self,
+        owner_id: &str,
+        request: QueueTikTokSenderSetupRequest,
+    ) -> Result<TikTokSenderSetupAction, TikTokDmError> {
+        let owner_id = policy::validate_owner_id(owner_id)?;
+        let requested_device = request
+            .device_serial
+            .as_deref()
+            .map(policy::validate_device_serial)
+            .transpose()?;
+        let connector = self.connector_status()?.ok_or_else(|| {
+            TikTokDmError::Conflict(
+                "Le pont Android Windows est hors ligne. Demarrez l'application desktop."
+                    .to_string(),
+            )
+        })?;
+        if !connector.is_online(metrics::now_ts()) {
+            return Err(TikTokDmError::Conflict(
+                "Le pont Android Windows est hors ligne. Demarrez l'application desktop."
+                    .to_string(),
+            ));
+        }
+        if request.action != TikTokSenderSetupActionKind::OpenScrcpy && !connector.agent_healthy {
+            return Err(TikTokDmError::Conflict(
+                "TikMatrix est hors ligne ou son agent local ne repond pas.".to_string(),
+            ));
+        }
+        if request.action == TikTokSenderSetupActionKind::OpenScrcpy && !connector.scrcpy_available
+        {
+            return Err(TikTokDmError::Conflict(
+                "scrcpy est introuvable sur le poste Windows. Installez-le ou configurez CST_SCRCPY_PATH."
+                    .to_string(),
+            ));
+        }
+        let device_serial = match requested_device {
+            Some(serial) => {
+                if !connector
+                    .device_serials
+                    .iter()
+                    .any(|connected| connected == &serial)
+                {
+                    return Err(TikTokDmError::Validation(format!(
+                        "L'appareil Android {serial} n'est pas connecte ou n'est pas autorise par ADB"
+                    )));
+                }
+                serial
+            }
+            None => match connector.device_serials.as_slice() {
+                [serial] => serial.clone(),
+                [] => {
+                    return Err(TikTokDmError::Conflict(
+                        "Aucun appareil Android autorise n'est connecte par ADB.".to_string(),
+                    ))
+                }
+                _ => {
+                    return Err(TikTokDmError::Validation(
+                        "Plusieurs appareils Android sont connectes. Indiquez deviceSerial pour choisir la fenetre de connexion."
+                            .to_string(),
+                    ))
+                }
+            },
+        };
+
+        let mut current = self.lock_store()?;
+        if let Some(existing) = current.sender_setup_actions.iter().find(|action| {
+            action.owner_id == owner_id
+                && action.action == request.action
+                && action.device_serial == device_serial
+                && matches!(
+                    action.status,
+                    TikTokSenderSetupActionStatus::Queued | TikTokSenderSetupActionStatus::Claimed
+                )
+        }) {
+            let mut public_action = existing.clone();
+            public_action.claim_token = None;
+            return Ok(public_action);
+        }
+        let now = metrics::now_ts();
+        let mut next = current.clone();
+        next.sender_setup_actions.retain(|action| {
+            matches!(
+                action.status,
+                TikTokSenderSetupActionStatus::Queued | TikTokSenderSetupActionStatus::Claimed
+            ) || action.updated_at.saturating_add(7 * 24 * 60 * 60) > now
+        });
+        if next.sender_setup_actions.len() >= 100 {
+            return Err(TikTokDmError::Conflict(
+                "Trop d'actions de connexion TikTok sont conservees".to_string(),
+            ));
+        }
+        let action = TikTokSenderSetupAction {
+            id: Uuid::new_v4().to_string(),
+            owner_id,
+            action: request.action,
+            status: TikTokSenderSetupActionStatus::Queued,
+            device_serial,
+            created_at: now,
+            updated_at: now,
+            claimed_at: None,
+            submitted_at: None,
+            connector_id: None,
+            claim_token: None,
+            detail: None,
+        };
+        next.sender_setup_actions.push(action.clone());
+        self.persist_and_replace(&mut current, next)?;
+        Ok(action)
+    }
+
+    pub fn claim_next_sender_setup(
+        &self,
+        connector_id: &str,
+    ) -> Result<Option<TikTokSenderSetupJob>, TikTokDmError> {
+        let connector_id = policy::validate_connector_id(connector_id)?;
+        let mut current = self.lock_store()?;
+        let mut next = current.clone();
+        let now = metrics::now_ts();
+        for action in &mut next.sender_setup_actions {
+            if action.status == TikTokSenderSetupActionStatus::Claimed
+                && action
+                    .claimed_at
+                    .is_some_and(|claimed| claimed.saturating_add(CLAIM_LEASE_SECONDS) <= now)
+            {
+                action.status = TikTokSenderSetupActionStatus::Queued;
+                action.claimed_at = None;
+                action.connector_id = None;
+                action.claim_token = None;
+                action.updated_at = now;
+                action.detail =
+                    Some("Le connecteur precedent n'a pas confirme cette action".to_string());
+            }
+        }
+        let job = next
+            .sender_setup_actions
+            .iter_mut()
+            .find(|action| action.status == TikTokSenderSetupActionStatus::Queued)
+            .map(|action| {
+                let claim_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+                action.status = TikTokSenderSetupActionStatus::Claimed;
+                action.claimed_at = Some(now);
+                action.updated_at = now;
+                action.connector_id = Some(connector_id);
+                action.claim_token = Some(claim_token.clone());
+                action.detail = None;
+                TikTokSenderSetupJob {
+                    action_id: action.id.clone(),
+                    claim_token,
+                    action: action.action,
+                    device_serial: action.device_serial.clone(),
+                }
+            });
+        if next != *current {
+            self.persist_and_replace(&mut current, next)?;
+        }
+        Ok(job)
+    }
+
+    pub fn report_sender_setup(
+        &self,
+        request: TikTokSenderSetupReportRequest,
+    ) -> Result<TikTokSenderSetupAction, TikTokDmError> {
+        let connector_id = policy::validate_connector_id(&request.connector_id)?;
+        let action_id = policy::validate_campaign_id(&request.action_id)?;
+        let mut current = self.lock_store()?;
+        let mut next = current.clone();
+        let action = next
+            .sender_setup_actions
+            .iter_mut()
+            .find(|action| action.id == action_id)
+            .ok_or(TikTokDmError::NotFound)?;
+        if action.status == TikTokSenderSetupActionStatus::Submitted && request.success {
+            return Ok(action.clone());
+        }
+        if action.status != TikTokSenderSetupActionStatus::Claimed
+            || action.connector_id.as_deref() != Some(connector_id.as_str())
+            || action.claim_token.as_deref() != Some(request.claim_token.trim())
+        {
+            return Err(TikTokDmError::Conflict(
+                "Lease de connexion TikTok absente ou expiree".to_string(),
+            ));
+        }
+        let now = metrics::now_ts();
+        action.updated_at = now;
+        action.claim_token = None;
+        action.detail = sanitize_detail(request.detail);
+        if request.success {
+            action.status = TikTokSenderSetupActionStatus::Submitted;
+            action.submitted_at = Some(now);
+        } else {
+            action.status = TikTokSenderSetupActionStatus::Failed;
+            if action.detail.is_none() {
+                action.detail = Some("Action de connexion TikMatrix impossible".to_string());
+            }
+        }
+        let result = action.clone();
+        self.persist_and_replace(&mut current, next)?;
+        Ok(result)
+    }
+
     pub fn heartbeat(
         &self,
         request: TikTokConnectorHeartbeatRequest,
     ) -> Result<TikTokConnectorStatus, TikTokDmError> {
-        let connector_id = validate_connector_id(&request.connector_id)?;
+        let connector_id = policy::validate_connector_id(&request.connector_id)?;
         let mut device_serials = request
             .device_serials
             .into_iter()
-            .map(|serial| validate_device_serial(&serial))
+            .map(|serial| policy::validate_device_serial(&serial))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut devices = request
+            .devices
+            .into_iter()
+            .map(validate_android_device)
+            .collect::<Result<Vec<_>, _>>()?;
+        devices.sort_by(|left, right| left.serial.cmp(&right.serial));
+        devices.dedup_by(|left, right| left.serial == right.serial);
+        devices.truncate(50);
+        device_serials.extend(
+            devices
+                .iter()
+                .filter(|device| device.state == TikTokAndroidDeviceState::Device)
+                .map(|device| device.serial.clone()),
+        );
         device_serials.sort();
         device_serials.dedup();
+        device_serials.truncate(50);
+        let mut accounts = request
+            .accounts
+            .into_iter()
+            .map(validate_sender_account)
+            .collect::<Result<Vec<_>, _>>()?;
+        accounts.sort_by(|left, right| {
+            left.username
+                .cmp(&right.username)
+                .then_with(|| left.device_serial.cmp(&right.device_serial))
+        });
+        accounts.dedup_by(|left, right| {
+            left.username == right.username && left.device_serial == right.device_serial
+        });
+        let account_count = request.account_count.max(accounts.len()).min(100);
         let status = TikTokConnectorStatus {
             connector_id,
             last_seen_at: metrics::now_ts(),
             agent_healthy: request.agent_healthy,
             device_serials,
-            account_count: request.account_count.min(100),
+            devices,
+            scrcpy_available: request.scrcpy_available,
+            adb_error: sanitize_detail(request.adb_error),
+            account_count,
+            accounts,
             current_campaign_id: request
                 .current_campaign_id
-                .map(|value| validate_campaign_id(&value))
+                .map(|value| policy::validate_campaign_id(&value))
                 .transpose()?,
             error: sanitize_detail(request.error),
         };
@@ -528,7 +1046,7 @@ impl TikTokDmManager {
         &self,
         connector_id: &str,
     ) -> Result<Option<TikTokConnectorJob>, TikTokDmError> {
-        let connector_id = validate_connector_id(connector_id)?;
+        let connector_id = policy::validate_connector_id(connector_id)?;
         let mut current = self.lock_store()?;
         let mut next = current.clone();
         let now = metrics::now_ts();
@@ -569,6 +1087,7 @@ impl TikTokDmManager {
                     min_interval_minutes: campaign.min_interval_minutes,
                     max_interval_minutes: campaign.max_interval_minutes,
                     device_serial: campaign.device_serial.clone(),
+                    sender_account: campaign.sender_account.clone(),
                 }
             });
         if next != *current {
@@ -581,8 +1100,8 @@ impl TikTokDmManager {
         &self,
         request: TikTokConnectorReportRequest,
     ) -> Result<TikTokDmCampaign, TikTokDmError> {
-        let connector_id = validate_connector_id(&request.connector_id)?;
-        let campaign_id = validate_campaign_id(&request.campaign_id)?;
+        let connector_id = policy::validate_connector_id(&request.connector_id)?;
+        let campaign_id = policy::validate_campaign_id(&request.campaign_id)?;
         let mut current = self.lock_store()?;
         let mut next = current.clone();
         let campaign = next
@@ -632,45 +1151,18 @@ impl TikTokDmManager {
         request: QueueTikTokFollowerExtractionRequest,
         created_by: &str,
     ) -> Result<TikTokFollowerExtraction, TikTokDmError> {
-        if !request.authorized_account_confirmed {
-            return Err(TikTokDmError::Validation(
-                "Confirmez que le compte source vous appartient ou que vous etes autorise a en extraire les followers"
-                    .to_string(),
-            ));
+        if !policy::follower_extraction_guard(&request) {
+            return Err(policy::follower_extraction_rejection(&request));
         }
-        let owner_id = validate_owner_id(owner_id)?;
-        let target_username = normalize_tiktok_username(&request.target_username)?;
-        if request.max_count == 0 || usize::from(request.max_count) > MAX_TIKTOK_FOLLOWER_RESULTS {
-            return Err(TikTokDmError::Validation(format!(
-                "La collecte TikTok doit demander entre 1 et {MAX_TIKTOK_FOLLOWER_RESULTS} followers"
-            )));
-        }
-        let idempotency_key = validate_idempotency_key(&request.idempotency_key)?;
-        let device_serial = request
-            .device_serial
-            .as_deref()
-            .map(validate_device_serial)
-            .transpose()?;
-        let dm_pipeline = request
-            .dm_pipeline
-            .map(|pipeline| {
-                if !pipeline.owned_accounts_confirmed {
-                    return Err(TikTokDmError::Validation(
-                        "Confirmez que chaque destinataire de test de la liste vous appartient"
-                            .to_string(),
-                    ));
-                }
-                Ok(TikTokFollowerDmPipeline {
-                    owned_recipient_allowlist: validate_recipients(
-                        pipeline.owned_recipient_allowlist,
-                    )?,
-                    message: validate_message(pipeline.message)?,
-                    owned_accounts_confirmed: true,
-                    prepared_campaign_id: None,
-                    note: None,
-                })
-            })
-            .transpose()?;
+        let policy::ValidatedFollowerExtractionRequest {
+            owner_id,
+            target_username,
+            max_count,
+            device_serial,
+            authorized_account_confirmed,
+            dm_pipeline,
+            idempotency_key,
+        } = policy::validate_follower_extraction_request(owner_id, request)?;
 
         let mut current = self.lock_store()?;
         if let Some(existing) = current.follower_extractions.iter().find(|extraction| {
@@ -678,20 +1170,16 @@ impl TikTokDmManager {
         }) {
             return Ok(existing.clone());
         }
-        if current.follower_extractions.len() >= MAX_TIKTOK_FOLLOWER_EXTRACTIONS {
-            return Err(TikTokDmError::Validation(
-                "La limite de collectes TikTok archivees est atteinte".to_string(),
-            ));
-        }
+        policy::ensure_follower_extraction_capacity(current.follower_extractions.len())?;
         let now = metrics::now_ts();
         let extraction = TikTokFollowerExtraction {
             id: Uuid::new_v4().to_string(),
             owner_id,
             target_username,
-            max_count: request.max_count,
+            max_count,
             status: TikTokFollowerExtractionStatus::Queued,
             device_serial,
-            authorized_account_confirmed: true,
+            authorized_account_confirmed,
             created_by: normalize_creator(created_by),
             idempotency_key,
             created_at: now,
@@ -737,7 +1225,7 @@ impl TikTokDmManager {
         &self,
         connector_id: &str,
     ) -> Result<Option<TikTokFollowerConnectorJob>, TikTokDmError> {
-        let connector_id = validate_connector_id(connector_id)?;
+        let connector_id = policy::validate_connector_id(connector_id)?;
         let mut current = self.lock_store()?;
         let mut next = current.clone();
         let now = metrics::now_ts();
@@ -788,8 +1276,8 @@ impl TikTokDmManager {
         &self,
         request: TikTokFollowerSubmissionReportRequest,
     ) -> Result<TikTokFollowerExtraction, TikTokDmError> {
-        let connector_id = validate_connector_id(&request.connector_id)?;
-        let extraction_id = validate_campaign_id(&request.extraction_id)?;
+        let connector_id = policy::validate_connector_id(&request.connector_id)?;
+        let extraction_id = policy::validate_campaign_id(&request.extraction_id)?;
         let mut current = self.lock_store()?;
         let mut next = current.clone();
         let extraction = next
@@ -836,7 +1324,7 @@ impl TikTokDmManager {
         &self,
         connector_id: &str,
     ) -> Result<Vec<TikTokFollowerPendingResult>, TikTokDmError> {
-        let connector_id = validate_connector_id(connector_id)?;
+        let connector_id = policy::validate_connector_id(connector_id)?;
         let store = self.lock_store()?;
         Ok(store
             .follower_extractions
@@ -861,11 +1349,11 @@ impl TikTokDmManager {
         &self,
         request: TikTokFollowerResultReportRequest,
     ) -> Result<TikTokFollowerExtraction, TikTokDmError> {
-        let connector_id = validate_connector_id(&request.connector_id)?;
-        let extraction_id = validate_campaign_id(&request.extraction_id)?;
+        let connector_id = policy::validate_connector_id(&request.connector_id)?;
+        let extraction_id = policy::validate_campaign_id(&request.extraction_id)?;
         let mut current = self.lock_store()?;
         let mut next = current.clone();
-        let can_prepare_campaign = next.campaigns.len() < MAX_TIKTOK_DM_CAMPAIGNS;
+        let can_prepare_campaign = policy::campaign_capacity_available(next.campaigns.len());
         let mut prepared_campaign = None;
         let extraction = next
             .follower_extractions
@@ -888,7 +1376,7 @@ impl TikTokDmManager {
             let mut seen = HashSet::new();
             let mut usernames = Vec::new();
             for value in request.usernames {
-                let username = normalize_tiktok_username(&value)?;
+                let username = policy::normalize_tiktok_username(&value)?;
                 if seen.insert(username.to_ascii_lowercase()) {
                     usernames.push(username);
                 }
@@ -922,10 +1410,7 @@ impl TikTokDmManager {
                             .to_string(),
                     );
                 } else if !can_prepare_campaign {
-                    pipeline.note = Some(
-                        "La collecte est terminee, mais la limite de campagnes TikTok archivees empeche de creer le brouillon."
-                            .to_string(),
-                    );
+                    pipeline.note = Some(policy::campaign_capacity_note());
                 } else {
                     let campaign_id = Uuid::new_v4().to_string();
                     pipeline.prepared_campaign_id = Some(campaign_id.clone());
@@ -942,7 +1427,8 @@ impl TikTokDmManager {
                         min_interval_minutes: default_min_interval_minutes(),
                         max_interval_minutes: default_max_interval_minutes(),
                         device_serial,
-                        owned_accounts_confirmed: true,
+                        sender_account: None,
+                        owned_accounts_confirmed: pipeline.owned_accounts_confirmed,
                         send_confirmed: false,
                         created_by: "scrape_to_dm_pipeline".to_string(),
                         idempotency_key: format!("scrape-dm:{extraction_id}"),
@@ -999,138 +1485,86 @@ fn default_max_interval_minutes() -> u8 {
 }
 
 fn default_follower_max_count() -> u16 {
-    MAX_TIKTOK_FOLLOWER_RESULTS as u16
+    policy::MAX_TIKTOK_FOLLOWER_RESULTS as u16
 }
 
-fn validate_owner_id(value: &str) -> Result<String, TikTokDmError> {
-    let value = value.trim();
-    if value.is_empty() || value.chars().count() > 160 || value.chars().any(char::is_control) {
-        return Err(TikTokDmError::Validation(
-            "Proprietaire de campagne invalide".to_string(),
+fn validate_sender_account(
+    account: TikTokSenderAccount,
+) -> Result<TikTokSenderAccount, TikTokDmError> {
+    Ok(TikTokSenderAccount {
+        username: policy::normalize_tiktok_username(&account.username)?,
+        device_serial: policy::validate_device_serial(&account.device_serial)?,
+        logged_in: account.logged_in,
+        enabled: account.enabled,
+        package_name: account.package_name.and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()
+                && value.chars().count() <= 160
+                && !value.chars().any(char::is_control))
+            .then(|| value.to_string())
+        }),
+    })
+}
+
+fn validate_android_device(
+    device: TikTokAndroidDevice,
+) -> Result<TikTokAndroidDevice, TikTokDmError> {
+    let metadata = |value: Option<String>| {
+        value.and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()
+                && value.chars().count() <= 160
+                && !value.chars().any(char::is_control))
+            .then(|| value.to_string())
+        })
+    };
+    Ok(TikTokAndroidDevice {
+        serial: policy::validate_device_serial(&device.serial)?,
+        state: device.state,
+        transport: device.transport,
+        model: metadata(device.model),
+        product: metadata(device.product),
+        tikmatrix_managed: device.tikmatrix_managed,
+    })
+}
+
+fn ensure_sender_account_ready(
+    account: &TikTokSenderAccountView,
+    accounts: &[TikTokSenderAccountView],
+) -> Result<(), TikTokDmError> {
+    if !account.connected {
+        return Err(TikTokDmError::Conflict(
+            "L'appareil du compte emetteur TikTok est hors ligne".to_string(),
         ));
     }
-    Ok(value.to_string())
-}
-
-fn validate_recipients(values: Vec<String>) -> Result<Vec<String>, TikTokDmError> {
-    if values.is_empty() || values.len() > MAX_TIKTOK_DM_RECIPIENTS {
-        return Err(TikTokDmError::Validation(format!(
-            "Ajoutez entre 1 et {MAX_TIKTOK_DM_RECIPIENTS} comptes TikTok de test"
+    if !account.logged_in {
+        return Err(TikTokDmError::Conflict(format!(
+            "Le compte emetteur {} n'est pas marque comme connecte dans TikMatrix",
+            account.username
         )));
     }
-    let mut seen = HashSet::new();
-    let mut recipients = Vec::with_capacity(values.len());
-    for value in values {
-        let username = normalize_tiktok_username(&value)?;
-        if seen.insert(username.to_ascii_lowercase()) {
-            recipients.push(username);
-        }
+    if !account.enabled {
+        return Err(TikTokDmError::Conflict(format!(
+            "Le compte emetteur {} est desactive dans TikMatrix",
+            account.username
+        )));
     }
-    if recipients.is_empty() {
-        return Err(TikTokDmError::Validation(
-            "Ajoutez au moins un compte TikTok de test".to_string(),
+    let active_on_device = accounts
+        .iter()
+        .filter(|candidate| {
+            candidate.device_serial == account.device_serial
+                && candidate.logged_in
+                && candidate.enabled
+                && candidate.connected
+        })
+        .count();
+    if active_on_device > 1 {
+        return Err(TikTokDmError::Conflict(
+            "Plusieurs comptes TikTok actifs partagent cet appareil. Desactivez les autres comptes dans TikMatrix ou utilisez un appareil dedie afin de garantir l'identite de l'emetteur."
+                .to_string(),
         ));
-    }
-    Ok(recipients)
-}
-
-fn normalize_tiktok_username(value: &str) -> Result<String, TikTokDmError> {
-    let bare = value.trim().trim_start_matches('@');
-    if bare.len() < 2
-        || bare.len() > 24
-        || !bare
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
-    {
-        return Err(TikTokDmError::Validation(format!(
-            "Nom de compte TikTok invalide : {value}"
-        )));
-    }
-    Ok(format!("@{bare}"))
-}
-
-fn validate_message(value: String) -> Result<String, TikTokDmError> {
-    let value = value.trim();
-    let count = value.chars().count();
-    if count == 0 || count > MAX_TIKTOK_DM_MESSAGE_CHARS {
-        return Err(TikTokDmError::Validation(format!(
-            "Le message TikTok doit contenir entre 1 et {MAX_TIKTOK_DM_MESSAGE_CHARS} caracteres"
-        )));
-    }
-    if value
-        .chars()
-        .any(|character| matches!(character, '\r' | '\n'))
-    {
-        return Err(TikTokDmError::Validation(
-            "Le premier connecteur TikTok accepte un message sur une seule ligne".to_string(),
-        ));
-    }
-    if value.chars().any(|character| character.is_control()) {
-        return Err(TikTokDmError::Validation(
-            "Le message TikTok contient un caractere de controle".to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn validate_intervals(minimum: u8, maximum: u8) -> Result<(), TikTokDmError> {
-    if minimum < MIN_INTERVAL_MINUTES || maximum > MAX_INTERVAL_MINUTES || minimum > maximum {
-        return Err(TikTokDmError::Validation(format!(
-            "La cadence TikTok doit etre comprise entre {MIN_INTERVAL_MINUTES} et {MAX_INTERVAL_MINUTES} minutes"
-        )));
     }
     Ok(())
-}
-
-fn validate_idempotency_key(value: &str) -> Result<String, TikTokDmError> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.chars().count() > MAX_IDEMPOTENCY_KEY_CHARS
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character))
-    {
-        return Err(TikTokDmError::Validation(
-            "Cle d'idempotence TikTok invalide".to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn validate_device_serial(value: &str) -> Result<String, TikTokDmError> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > 96
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character))
-    {
-        return Err(TikTokDmError::Validation(
-            "Identifiant d'appareil TikMatrix invalide".to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn validate_connector_id(value: &str) -> Result<String, TikTokDmError> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > 160
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character))
-    {
-        return Err(TikTokDmError::Validation(
-            "Identifiant de connecteur TikMatrix invalide".to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn validate_campaign_id(value: &str) -> Result<String, TikTokDmError> {
-    Uuid::parse_str(value.trim())
-        .map(|uuid| uuid.to_string())
-        .map_err(|_| TikTokDmError::Validation("Identifiant de campagne invalide".to_string()))
 }
 
 fn normalize_creator(value: &str) -> String {
@@ -1187,6 +1621,8 @@ struct LocalReceiptStore {
     receipts: HashMap<String, LocalReceipt>,
     #[serde(default)]
     follower_extractions: HashMap<String, LocalFollowerExtractionReceipt>,
+    #[serde(default)]
+    sender_setup_actions: HashMap<String, LocalSenderSetupReceipt>,
 }
 
 #[cfg(feature = "desktop")]
@@ -1212,11 +1648,29 @@ struct LocalFollowerExtractionReceipt {
 }
 
 #[cfg(feature = "desktop")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSenderSetupReceipt {
+    detail: String,
+    submitted_at: i64,
+}
+
+#[cfg(feature = "desktop")]
 #[derive(Debug, Clone, Default)]
 struct TikMatrixSnapshot {
     agent_healthy: bool,
     device_serials: Vec<String>,
+    devices: Vec<TikTokAndroidDevice>,
     account_count: usize,
+    accounts: Vec<TikTokSenderAccount>,
+    error: Option<String>,
+}
+
+#[cfg(feature = "desktop")]
+#[derive(Debug, Clone, Default)]
+struct LocalAndroidSnapshot {
+    devices: Vec<TikTokAndroidDevice>,
+    scrcpy_available: bool,
     error: Option<String>,
 }
 
@@ -1267,12 +1721,29 @@ pub async fn run_tiktok_connector() {
 
     loop {
         let mut submitted_work = false;
-        let snapshot = inspect_tikmatrix(&client).await;
+        let mut snapshot = inspect_tikmatrix(&client).await;
+        let local_android = tokio::task::spawn_blocking(inspect_local_android)
+            .await
+            .unwrap_or_else(|error| LocalAndroidSnapshot {
+                error: Some(format!("Inventaire ADB interrompu : {error}")),
+                ..LocalAndroidSnapshot::default()
+            });
+        snapshot.devices = merge_android_devices(snapshot.devices, local_android.devices.clone());
+        snapshot.device_serials = snapshot
+            .devices
+            .iter()
+            .filter(|device| device.state == TikTokAndroidDeviceState::Device)
+            .map(|device| device.serial.clone())
+            .collect();
         let heartbeat = TikTokConnectorHeartbeatRequest {
             connector_id: connector_id.clone(),
             agent_healthy: snapshot.agent_healthy,
             device_serials: snapshot.device_serials.clone(),
+            devices: snapshot.devices.clone(),
+            scrcpy_available: local_android.scrcpy_available,
+            adb_error: local_android.error.clone(),
             account_count: snapshot.account_count,
+            accounts: snapshot.accounts.clone(),
             current_campaign_id: current_campaign_id.clone(),
             error: snapshot.error.clone(),
         };
@@ -1285,16 +1756,58 @@ pub async fn run_tiktok_connector() {
         )
         .await;
 
-        let claim = post_server_json::<Value>(
+        let setup_claim = post_server_json::<Value>(
             &client,
             &base_url,
             &token,
-            "/api/tiktok/connector/jobs/claim",
+            "/api/tiktok/connector/sender-setup/claim",
             &TikTokConnectorClaimRequest {
                 connector_id: connector_id.clone(),
             },
         )
         .await;
+        if let Ok(value) = setup_claim {
+            if let Some(job_value) = value.get("job").filter(|value| !value.is_null()) {
+                match serde_json::from_value::<TikTokSenderSetupJob>(job_value.clone()) {
+                    Ok(job) => {
+                        let report = process_tiktok_sender_setup(
+                            &client,
+                            &receipts_path,
+                            &connector_id,
+                            &job,
+                        )
+                        .await;
+                        let _ = post_server_json::<Value>(
+                            &client,
+                            &base_url,
+                            &token,
+                            "/api/tiktok/connector/sender-setup/report",
+                            &report,
+                        )
+                        .await;
+                        submitted_work = true;
+                    }
+                    Err(error) => {
+                        eprintln!("Action de connexion TikTok invalide recue du VPS : {error}");
+                    }
+                }
+            }
+        }
+
+        let claim = if submitted_work {
+            Ok(json!({ "job": null }))
+        } else {
+            post_server_json::<Value>(
+                &client,
+                &base_url,
+                &token,
+                "/api/tiktok/connector/jobs/claim",
+                &TikTokConnectorClaimRequest {
+                    connector_id: connector_id.clone(),
+                },
+            )
+            .await
+        };
         if let Ok(value) = claim {
             if let Some(job_value) = value.get("job").filter(|value| !value.is_null()) {
                 match serde_json::from_value::<TikTokConnectorJob>(job_value.clone()) {
@@ -1309,7 +1822,11 @@ pub async fn run_tiktok_connector() {
                                 connector_id: connector_id.clone(),
                                 agent_healthy: snapshot.agent_healthy,
                                 device_serials: snapshot.device_serials.clone(),
+                                devices: snapshot.devices.clone(),
+                                scrcpy_available: local_android.scrcpy_available,
+                                adb_error: local_android.error.clone(),
                                 account_count: snapshot.account_count,
+                                accounts: snapshot.accounts.clone(),
                                 current_campaign_id: current_campaign_id.clone(),
                                 error: snapshot.error.clone(),
                             },
@@ -1359,7 +1876,11 @@ pub async fn run_tiktok_connector() {
                                     connector_id: connector_id.clone(),
                                     agent_healthy: snapshot.agent_healthy,
                                     device_serials: snapshot.device_serials.clone(),
+                                    devices: snapshot.devices.clone(),
+                                    scrcpy_available: local_android.scrcpy_available,
+                                    adb_error: local_android.error.clone(),
                                     account_count: snapshot.account_count,
+                                    accounts: snapshot.accounts.clone(),
                                     current_campaign_id: current_campaign_id.clone(),
                                     error: snapshot.error.clone(),
                                 },
@@ -1425,6 +1946,185 @@ async fn post_server_json<T: serde::de::DeserializeOwned>(
 }
 
 #[cfg(feature = "desktop")]
+async fn process_tiktok_sender_setup(
+    client: &reqwest::Client,
+    receipts_path: &Path,
+    connector_id: &str,
+    job: &TikTokSenderSetupJob,
+) -> TikTokSenderSetupReportRequest {
+    if let Some(receipt) = load_local_receipts(receipts_path)
+        .sender_setup_actions
+        .get(&job.action_id)
+        .cloned()
+    {
+        let (success, detail) = if receipt.submitted_at > 0 {
+            (
+                true,
+                format!(
+                    "{} (recu local rejoue apres une coupure de connexion)",
+                    receipt.detail
+                ),
+            )
+        } else {
+            (
+                false,
+                "Etat de l'action de connexion TikTok incertain apres une interruption ; elle n'a pas ete relancee automatiquement."
+                    .to_string(),
+            )
+        };
+        return TikTokSenderSetupReportRequest {
+            connector_id: connector_id.to_string(),
+            action_id: job.action_id.clone(),
+            claim_token: job.claim_token.clone(),
+            success,
+            detail: Some(detail),
+        };
+    }
+
+    let mut receipts = load_local_receipts(receipts_path);
+    receipts.version = 1;
+    receipts.sender_setup_actions.insert(
+        job.action_id.clone(),
+        LocalSenderSetupReceipt {
+            detail: "Action de connexion TikTok demarree".to_string(),
+            submitted_at: 0,
+        },
+    );
+    if let Err(error) = persist_local_receipts(receipts_path, &receipts) {
+        return TikTokSenderSetupReportRequest {
+            connector_id: connector_id.to_string(),
+            action_id: job.action_id.clone(),
+            claim_token: job.claim_token.clone(),
+            success: false,
+            detail: Some(format!(
+                "Impossible d'enregistrer la protection anti-doublon de la connexion : {error}"
+            )),
+        };
+    }
+
+    match submit_tiktok_sender_setup(client, job).await {
+        Ok(detail) => {
+            if let Some(receipt) = receipts.sender_setup_actions.get_mut(&job.action_id) {
+                receipt.detail = detail.clone();
+                receipt.submitted_at = metrics::now_ts();
+            }
+            let persisted = persist_local_receipts(receipts_path, &receipts);
+            TikTokSenderSetupReportRequest {
+                connector_id: connector_id.to_string(),
+                action_id: job.action_id.clone(),
+                claim_token: job.claim_token.clone(),
+                success: persisted.is_ok(),
+                detail: Some(match persisted {
+                    Ok(()) => detail,
+                    Err(error) => format!(
+                        "TikMatrix a accepte l'action, mais son recu local n'a pas pu etre enregistre : {error}"
+                    ),
+                }),
+            }
+        }
+        Err(error) => {
+            receipts.sender_setup_actions.remove(&job.action_id);
+            let detail = match persist_local_receipts(receipts_path, &receipts) {
+                Ok(()) => error,
+                Err(cleanup_error) => {
+                    format!("{error} Le recu local n'a pas pu etre nettoye : {cleanup_error}")
+                }
+            };
+            TikTokSenderSetupReportRequest {
+                connector_id: connector_id.to_string(),
+                action_id: job.action_id.clone(),
+                claim_token: job.claim_token.clone(),
+                success: false,
+                detail: Some(detail),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "desktop")]
+async fn submit_tiktok_sender_setup(
+    client: &reqwest::Client,
+    job: &TikTokSenderSetupJob,
+) -> Result<String, String> {
+    if job.action == TikTokSenderSetupActionKind::OpenScrcpy {
+        let local = tokio::task::spawn_blocking(inspect_local_android)
+            .await
+            .map_err(|error| format!("Inventaire ADB interrompu : {error}"))?;
+        let device = local
+            .devices
+            .iter()
+            .find(|device| device.serial == job.device_serial)
+            .ok_or_else(|| format!("L'appareil ADB {} n'est plus connecte", job.device_serial))?;
+        if device.state != TikTokAndroidDeviceState::Device {
+            return Err(format!(
+                "L'appareil ADB {} n'est pas autorise ou est hors ligne",
+                job.device_serial
+            ));
+        }
+        let serial = job.device_serial.clone();
+        tokio::task::spawn_blocking(move || launch_scrcpy(&serial))
+            .await
+            .map_err(|error| format!("Lancement de scrcpy interrompu : {error}"))??;
+        return Ok(format!(
+            "scrcpy est ouvert sur l'appareil {}.",
+            job.device_serial
+        ));
+    }
+
+    let snapshot = inspect_tikmatrix(client).await;
+    if !snapshot.agent_healthy {
+        return Err(snapshot
+            .error
+            .unwrap_or_else(|| "L'agent TikMatrix ne repond pas".to_string()));
+    }
+    let serial = select_tikmatrix_serial(&snapshot, Some(&job.device_serial))?;
+    let port = tikmatrix_port()?;
+    let base = format!("http://127.0.0.1:{port}");
+    match job.action {
+        TikTokSenderSetupActionKind::OpenLogin => {
+            post_tikmatrix_json(
+                client,
+                &base,
+                "/api/open_tiktok",
+                &json!({
+                    "serials": [serial]
+                }),
+            )
+            .await?;
+            Ok(format!(
+                "TikTok est ouvert sur l'appareil {}. Saisissez les identifiants et resolvez le captcha ou la verification directement dans cette fenetre.",
+                job.device_serial
+            ))
+        }
+        TikTokSenderSetupActionKind::MatchAccounts => {
+            let running = get_tikmatrix_json(client, &base, "/api/running_task").await?;
+            if !data_array(&running).is_empty() {
+                return Err(
+                    "Une tache TikMatrix est deja active ; attendez sa fin avant Match Accounts"
+                        .to_string(),
+                );
+            }
+            post_tikmatrix_json(
+                client,
+                &base,
+                "/api/task/run_now_by_account",
+                &json!({
+                    "script_name": "match_accounts",
+                    "serials": [serial],
+                    "script_args": "{\"enable_multi_account\":false,\"rotate_proxy\":false}"
+                }),
+            )
+            .await?;
+            Ok(format!(
+                "La synchronisation Match Accounts a ete lancee sur l'appareil {}. Le compte apparaitra dans le chat apres sa detection par TikMatrix.",
+                job.device_serial
+            ))
+        }
+        TikTokSenderSetupActionKind::OpenScrcpy => unreachable!("traite avant TikMatrix"),
+    }
+}
+
+#[cfg(feature = "desktop")]
 async fn inspect_tikmatrix(client: &reqwest::Client) -> TikMatrixSnapshot {
     let port = match tikmatrix_port() {
         Ok(port) => port,
@@ -1455,17 +2155,361 @@ async fn inspect_tikmatrix(client: &reqwest::Client) -> TikMatrixSnapshot {
             }
         }
     };
+    let android_devices = data_array(&devices)
+        .iter()
+        .filter_map(tikmatrix_android_device)
+        .collect::<Vec<_>>();
+    let device_serials = android_devices
+        .iter()
+        .filter(|device| device.state == TikTokAndroidDeviceState::Device)
+        .map(|device| device.serial.clone())
+        .collect::<Vec<_>>();
+    let sender_accounts = data_array(&accounts)
+        .iter()
+        .filter_map(tikmatrix_sender_account)
+        .collect::<Vec<_>>();
     TikMatrixSnapshot {
         agent_healthy: true,
-        device_serials: data_array(&devices)
-            .iter()
-            .filter(|device| device.get("status").and_then(Value::as_str) == Some("device"))
-            .filter_map(|device| device.get("serial").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect(),
+        device_serials,
+        devices: android_devices,
         account_count: data_array(&accounts).len(),
+        accounts: sender_accounts,
         error: None,
     }
+}
+
+#[cfg(feature = "desktop")]
+fn tikmatrix_android_device(value: &Value) -> Option<TikTokAndroidDevice> {
+    let serial = value
+        .get("serial")
+        .or_else(|| value.get("real_serial"))?
+        .as_str()?
+        .trim();
+    if serial.is_empty() {
+        return None;
+    }
+    let state = android_device_state(
+        value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    Some(TikTokAndroidDevice {
+        serial: serial.to_string(),
+        state,
+        transport: android_device_transport(serial),
+        model: value
+            .get("model")
+            .or_else(|| value.get("mode"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        product: value
+            .get("product")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        tikmatrix_managed: true,
+    })
+}
+
+#[cfg(feature = "desktop")]
+fn inspect_local_android() -> LocalAndroidSnapshot {
+    let scrcpy_available = resolve_scrcpy_path().is_some();
+    let candidates = adb_candidates();
+    if candidates.is_empty() {
+        return LocalAndroidSnapshot {
+            scrcpy_available,
+            error: Some(
+                "ADB est introuvable. Installez Android Platform Tools ou configurez CST_ADB_PATH."
+                    .to_string(),
+            ),
+            ..LocalAndroidSnapshot::default()
+        };
+    }
+    let mut last_error = None;
+    for adb in candidates {
+        let output = quiet_command(&adb).args(["devices", "-l"]).output();
+        match output {
+            Ok(output) if output.status.success() => {
+                return LocalAndroidSnapshot {
+                    devices: parse_adb_devices(&String::from_utf8_lossy(&output.stdout)),
+                    scrcpy_available,
+                    error: None,
+                };
+            }
+            Ok(output) => {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                last_error = Some(if detail.is_empty() {
+                    format!("ADB a quitte avec le statut {}", output.status)
+                } else {
+                    format!("ADB : {detail}")
+                });
+            }
+            Err(error) => last_error = Some(format!("ADB impossible : {error}")),
+        }
+    }
+    LocalAndroidSnapshot {
+        scrcpy_available,
+        error: last_error,
+        ..LocalAndroidSnapshot::default()
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn parse_adb_devices(output: &str) -> Vec<TikTokAndroidDevice> {
+    let mut devices = Vec::new();
+    for line in output
+        .lines()
+        .skip_while(|line| !line.starts_with("List of devices"))
+    {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("List of devices") || line.starts_with('*') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(serial) = fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let state = android_device_state(fields.next().unwrap_or("unknown"));
+        let mut model = None;
+        let mut product = None;
+        for field in fields {
+            if let Some(value) = field.strip_prefix("model:") {
+                model = Some(value.replace('_', " "));
+            } else if let Some(value) = field.strip_prefix("product:") {
+                product = Some(value.replace('_', " "));
+            }
+        }
+        devices.push(TikTokAndroidDevice {
+            serial: serial.to_string(),
+            state,
+            transport: android_device_transport(serial),
+            model,
+            product,
+            tikmatrix_managed: false,
+        });
+    }
+    devices.sort_by(|left, right| left.serial.cmp(&right.serial));
+    devices.dedup_by(|left, right| left.serial == right.serial);
+    devices
+}
+
+#[cfg(feature = "desktop")]
+fn android_device_state(value: &str) -> TikTokAndroidDeviceState {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "device" => TikTokAndroidDeviceState::Device,
+        "unauthorized" => TikTokAndroidDeviceState::Unauthorized,
+        "offline" => TikTokAndroidDeviceState::Offline,
+        _ => TikTokAndroidDeviceState::Unknown,
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn android_device_transport(serial: &str) -> TikTokAndroidDeviceTransport {
+    let serial = serial.trim().to_ascii_lowercase();
+    if serial.starts_with("emulator-") {
+        TikTokAndroidDeviceTransport::Emulator
+    } else if serial.contains(':') {
+        TikTokAndroidDeviceTransport::Network
+    } else if !serial.is_empty() {
+        TikTokAndroidDeviceTransport::Usb
+    } else {
+        TikTokAndroidDeviceTransport::Unknown
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn merge_android_devices(
+    tikmatrix: Vec<TikTokAndroidDevice>,
+    adb: Vec<TikTokAndroidDevice>,
+) -> Vec<TikTokAndroidDevice> {
+    let mut by_serial = tikmatrix
+        .into_iter()
+        .map(|device| (device.serial.clone(), device))
+        .collect::<HashMap<_, _>>();
+    for mut device in adb {
+        if let Some(existing) = by_serial.get(&device.serial) {
+            device.tikmatrix_managed |= existing.tikmatrix_managed;
+            if device.model.is_none() {
+                device.model = existing.model.clone();
+            }
+            if device.product.is_none() {
+                device.product = existing.product.clone();
+            }
+        }
+        by_serial.insert(device.serial.clone(), device);
+    }
+    let mut devices = by_serial.into_values().collect::<Vec<_>>();
+    devices.sort_by(|left, right| left.serial.cmp(&right.serial));
+    devices
+}
+
+#[cfg(feature = "desktop")]
+fn adb_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    push_configured_executable(&mut candidates, "CST_ADB_PATH");
+    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        candidates.push(
+            appdata
+                .join("com.tikmatrix")
+                .join("platform-tools")
+                .join(windows_executable("adb")),
+        );
+    }
+    for variable in ["ANDROID_SDK_ROOT", "ANDROID_HOME"] {
+        if let Some(root) = std::env::var_os(variable).map(PathBuf::from) {
+            candidates.push(root.join("platform-tools").join(windows_executable("adb")));
+        }
+    }
+    if let Some(localappdata) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        candidates.push(
+            localappdata
+                .join("Android")
+                .join("Sdk")
+                .join("platform-tools")
+                .join(windows_executable("adb")),
+        );
+    }
+    if let Some(path) = executable_on_path(windows_executable("adb")) {
+        candidates.push(path);
+    }
+    candidates.retain(|path| path.is_file());
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+#[cfg(feature = "desktop")]
+fn resolve_scrcpy_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    push_configured_executable(&mut candidates, "CST_SCRCPY_PATH");
+    if let Some(path) = executable_on_path(windows_executable("scrcpy")) {
+        candidates.push(path);
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        candidates.push(
+            profile
+                .join("scoop")
+                .join("apps")
+                .join("scrcpy")
+                .join("current")
+                .join(windows_executable("scrcpy")),
+        );
+    }
+    if let Some(programdata) = std::env::var_os("PROGRAMDATA").map(PathBuf::from) {
+        candidates.push(
+            programdata
+                .join("chocolatey")
+                .join("bin")
+                .join(windows_executable("scrcpy")),
+        );
+    }
+    if let Some(localappdata) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        candidates.push(
+            localappdata
+                .join("scrcpy")
+                .join(windows_executable("scrcpy")),
+        );
+        let winget = localappdata
+            .join("Microsoft")
+            .join("WinGet")
+            .join("Packages");
+        if let Some(path) = find_named_file(&winget, windows_executable("scrcpy"), 3) {
+            candidates.push(path);
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(feature = "desktop")]
+fn push_configured_executable(candidates: &mut Vec<PathBuf>, variable: &str) {
+    if let Some(path) = std::env::var_os(variable).map(PathBuf::from) {
+        candidates.push(path);
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(feature = "desktop")]
+fn find_named_file(root: &Path, name: &str, depth: u8) -> Option<PathBuf> {
+    if depth == 0 || !root.is_dir() {
+        return None;
+    }
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(name))
+        {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_named_file(&path, name, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "desktop")]
+fn windows_executable(name: &str) -> &str {
+    #[cfg(target_os = "windows")]
+    {
+        return match name {
+            "adb" => "adb.exe",
+            "scrcpy" => "scrcpy.exe",
+            value => value,
+        };
+    }
+    #[cfg(not(target_os = "windows"))]
+    name
+}
+
+#[cfg(feature = "desktop")]
+fn quiet_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+}
+
+#[cfg(feature = "desktop")]
+fn launch_scrcpy(serial: &str) -> Result<(), String> {
+    let scrcpy = resolve_scrcpy_path().ok_or_else(|| {
+        "scrcpy est introuvable. Installez-le ou configurez CST_SCRCPY_PATH.".to_string()
+    })?;
+    let mut command = quiet_command(&scrcpy);
+    command
+        .args(["--serial", serial, "--window-title"])
+        .arg(format!("TikTok - {serial}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(adb) = adb_candidates().into_iter().next() {
+        command.env("ADB", adb);
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Ouverture de scrcpy impossible : {error}"))
 }
 
 #[cfg(feature = "desktop")]
@@ -1837,7 +2881,7 @@ fn read_follower_usernames(path: &Path, max_count: u16) -> Result<Vec<String>, S
             .unwrap_or("")
             .trim()
             .trim_matches(['"', '\'']);
-        let Ok(username) = normalize_tiktok_username(value) else {
+        let Ok(username) = policy::normalize_tiktok_username(value) else {
             continue;
         };
         if seen.insert(username.to_ascii_lowercase()) {
@@ -1976,25 +3020,11 @@ async fn submit_tiktok_job(
                 .to_string(),
         );
     }
-    let serial = match job.device_serial.as_deref() {
-        Some(serial) if snapshot.device_serials.iter().any(|value| value == serial) => {
-            serial.to_string()
-        }
-        Some(serial) => {
-            return Err(format!(
-                "L'appareil TikMatrix demande n'est pas connecte : {serial}"
-            ))
-        }
-        None if snapshot.device_serials.len() == 1 => snapshot.device_serials[0].clone(),
-        None if snapshot.device_serials.is_empty() => {
-            return Err("Aucun appareil Android n'est connecte a TikMatrix".to_string())
-        }
-        None => {
-            return Err(
-                "Plusieurs appareils TikMatrix sont connectes ; indiquez deviceSerial".to_string(),
-            )
-        }
-    };
+    let serial = select_tikmatrix_sender_serial(
+        &snapshot,
+        job.sender_account.as_deref(),
+        job.device_serial.as_deref(),
+    )?;
 
     let port = tikmatrix_port()?;
     let base = format!("http://127.0.0.1:{port}");
@@ -2136,6 +3166,67 @@ fn select_tikmatrix_serial(
 }
 
 #[cfg(feature = "desktop")]
+fn select_tikmatrix_sender_serial(
+    snapshot: &TikMatrixSnapshot,
+    sender_account: Option<&str>,
+    requested_serial: Option<&str>,
+) -> Result<String, String> {
+    let Some(sender_account) = sender_account else {
+        return select_tikmatrix_serial(snapshot, requested_serial);
+    };
+    let sender_account =
+        policy::normalize_tiktok_username(sender_account).map_err(|error| error.to_string())?;
+    let candidates = snapshot
+        .accounts
+        .iter()
+        .filter(|account| {
+            account.username.eq_ignore_ascii_case(&sender_account)
+                && account.logged_in
+                && account.enabled
+                && requested_serial.is_none_or(|serial| account.device_serial == serial)
+        })
+        .collect::<Vec<_>>();
+    let account = match candidates.as_slice() {
+        [account] => *account,
+        [] => {
+            return Err(format!(
+                "Le compte emetteur {sender_account} n'est plus connecte ou actif dans TikMatrix"
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "Le compte emetteur {sender_account} est associe a plusieurs appareils ; indiquez deviceSerial"
+            ))
+        }
+    };
+    if !snapshot
+        .device_serials
+        .iter()
+        .any(|serial| serial == &account.device_serial)
+    {
+        return Err(format!(
+            "L'appareil TikMatrix du compte emetteur {sender_account} n'est pas connecte"
+        ));
+    }
+    let active_on_device = snapshot
+        .accounts
+        .iter()
+        .filter(|candidate| {
+            candidate.device_serial == account.device_serial
+                && candidate.logged_in
+                && candidate.enabled
+        })
+        .count();
+    if active_on_device > 1 {
+        return Err(
+            "Plusieurs comptes TikTok actifs partagent l'appareil emetteur ; l'identite d'envoi ne peut pas etre garantie"
+                .to_string(),
+        );
+    }
+    Ok(account.device_serial.clone())
+}
+
+#[cfg(feature = "desktop")]
 async fn get_tikmatrix_json(
     client: &reqwest::Client,
     base: &str,
@@ -2155,12 +3246,91 @@ async fn get_tikmatrix_json(
 }
 
 #[cfg(feature = "desktop")]
+async fn post_tikmatrix_json(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    body: &Value,
+) -> Result<Value, String> {
+    let response = client
+        .post(format!("{base}{path}"))
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| format!("Appel TikMatrix impossible : {error}"))?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    let value = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(
+        |_| json!({ "raw": String::from_utf8_lossy(&bytes).chars().take(300).collect::<String>() }),
+    );
+    if !status.is_success()
+        || value
+            .get("code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
+    {
+        return Err(format!(
+            "TikMatrix a refuse l'action (HTTP {}) : {}",
+            status.as_u16(),
+            value
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "desktop")]
 fn data_array(value: &Value) -> &[Value] {
     value
         .get("data")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[])
+}
+
+#[cfg(feature = "desktop")]
+fn tikmatrix_sender_account(value: &Value) -> Option<TikTokSenderAccount> {
+    let username = value
+        .get("username")
+        .and_then(Value::as_str)
+        .and_then(|username| policy::normalize_tiktok_username(username).ok())?;
+    let device_serial = ["device", "serial", "real_serial"]
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+        .and_then(|serial| policy::validate_device_serial(serial).ok())?;
+    let logged_in = value
+        .get("logined")
+        .or_else(|| value.get("logged_in"))
+        .is_some_and(tikmatrix_truthy);
+    let enabled = value
+        .get("status")
+        .map(|status| {
+            status.as_i64() == Some(0) || status.as_u64() == Some(0) || status.as_str() == Some("0")
+        })
+        .unwrap_or(true);
+    let package_name = value
+        .get("packagename")
+        .or_else(|| value.get("package_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 160)
+        .map(str::to_string);
+    Some(TikTokSenderAccount {
+        username,
+        device_serial,
+        logged_in,
+        enabled,
+        package_name,
+    })
+}
+
+#[cfg(feature = "desktop")]
+fn tikmatrix_truthy(value: &Value) -> bool {
+    value.as_bool().unwrap_or(false)
+        || value.as_i64().is_some_and(|value| value == 1)
+        || value.as_u64().is_some_and(|value| value == 1)
+        || value
+            .as_str()
+            .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
 }
 
 #[cfg(feature = "desktop")]
@@ -2204,6 +3374,7 @@ mod tests {
             min_interval_minutes: 1,
             max_interval_minutes: 2,
             device_serial: None,
+            sender_account: None,
             idempotency_key: key.to_string(),
         }
     }
@@ -2297,10 +3468,199 @@ mod tests {
     }
 
     #[test]
+    fn sender_account_is_selected_resolved_and_attached_to_the_job() {
+        let (root, manager) = manager("sender-account");
+        manager
+            .heartbeat(TikTokConnectorHeartbeatRequest {
+                connector_id: "windows-test".to_string(),
+                agent_healthy: true,
+                device_serials: vec!["emulator-5554".to_string()],
+                devices: Vec::new(),
+                scrcpy_available: true,
+                adb_error: None,
+                account_count: 1,
+                accounts: vec![TikTokSenderAccount {
+                    username: "emetteur_test".to_string(),
+                    device_serial: "emulator-5554".to_string(),
+                    logged_in: true,
+                    enabled: true,
+                    package_name: Some("com.zhiliaoapp.musically".to_string()),
+                }],
+                current_campaign_id: None,
+                error: None,
+            })
+            .unwrap();
+        let selected = manager
+            .select_sender_account("owner-1", "@emetteur_test")
+            .unwrap();
+        assert!(selected.selected);
+        assert!(selected.connected);
+        let resolved = manager
+            .resolve_sender_account("owner-1", None, None)
+            .unwrap();
+        assert_eq!(resolved.username, "@emetteur_test");
+        assert_eq!(resolved.device_serial, "emulator-5554");
+
+        let mut campaign_request = request("sender-job");
+        campaign_request.sender_account = Some(resolved.username.clone());
+        campaign_request.device_serial = Some(resolved.device_serial.clone());
+        let draft = manager
+            .prepare("owner-1", campaign_request, "human_chat")
+            .unwrap();
+        manager
+            .confirm(
+                "owner-1",
+                ConfirmTikTokDmCampaignRequest {
+                    campaign_id: draft.id,
+                    owned_accounts_confirmed: true,
+                    send_confirmed: true,
+                },
+            )
+            .unwrap();
+        let job = manager.claim_next("windows-test").unwrap().unwrap();
+        assert_eq!(job.sender_account.as_deref(), Some("@emetteur_test"));
+        assert_eq!(job.device_serial.as_deref(), Some("emulator-5554"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sender_login_actions_are_device_bound_idempotent_and_lease_bound() {
+        let (root, manager) = manager("sender-login");
+        assert!(
+            serde_json::from_value::<QueueTikTokSenderSetupRequest>(serde_json::json!({
+                "action": "open_login",
+                "password": "ne-doit-jamais-etre-accepte"
+            }))
+            .is_err()
+        );
+        manager
+            .heartbeat(TikTokConnectorHeartbeatRequest {
+                connector_id: "windows-test".to_string(),
+                agent_healthy: true,
+                device_serials: vec!["emulator-5554".to_string()],
+                devices: Vec::new(),
+                scrcpy_available: true,
+                adb_error: None,
+                account_count: 0,
+                accounts: Vec::new(),
+                current_campaign_id: None,
+                error: None,
+            })
+            .unwrap();
+        let first = manager
+            .queue_sender_setup(
+                "owner-1",
+                QueueTikTokSenderSetupRequest {
+                    action: TikTokSenderSetupActionKind::OpenLogin,
+                    device_serial: None,
+                },
+            )
+            .unwrap();
+        let duplicate = manager
+            .queue_sender_setup(
+                "owner-1",
+                QueueTikTokSenderSetupRequest {
+                    action: TikTokSenderSetupActionKind::OpenLogin,
+                    device_serial: Some("emulator-5554".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(first.id, duplicate.id);
+        assert_eq!(first.device_serial, "emulator-5554");
+
+        let job = manager
+            .claim_next_sender_setup("windows-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.action, TikTokSenderSetupActionKind::OpenLogin);
+        let claimed_duplicate = manager
+            .queue_sender_setup(
+                "owner-1",
+                QueueTikTokSenderSetupRequest {
+                    action: TikTokSenderSetupActionKind::OpenLogin,
+                    device_serial: None,
+                },
+            )
+            .unwrap();
+        assert!(serde_json::to_value(claimed_duplicate)
+            .unwrap()
+            .get("claimToken")
+            .is_none());
+        assert!(manager
+            .claim_next_sender_setup("windows-test")
+            .unwrap()
+            .is_none());
+        let submitted = manager
+            .report_sender_setup(TikTokSenderSetupReportRequest {
+                connector_id: "windows-test".to_string(),
+                action_id: job.action_id,
+                claim_token: job.claim_token,
+                success: true,
+                detail: Some("TikTok ouvert".to_string()),
+            })
+            .unwrap();
+        assert_eq!(submitted.status, TikTokSenderSetupActionStatus::Submitted);
+        assert_eq!(submitted.detail.as_deref(), Some("TikTok ouvert"));
+
+        let match_accounts = manager
+            .queue_sender_setup(
+                "owner-1",
+                QueueTikTokSenderSetupRequest {
+                    action: TikTokSenderSetupActionKind::MatchAccounts,
+                    device_serial: None,
+                },
+            )
+            .unwrap();
+        assert_ne!(match_accounts.id, first.id);
+        let scrcpy = manager
+            .queue_sender_setup(
+                "owner-1",
+                QueueTikTokSenderSetupRequest {
+                    action: TikTokSenderSetupActionKind::OpenScrcpy,
+                    device_serial: Some("emulator-5554".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(scrcpy.action, TikTokSenderSetupActionKind::OpenScrcpy);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn adb_inventory_distinguishes_usb_emulator_network_and_authorization() {
+        let devices = parse_adb_devices(
+            "List of devices attached\n\
+             R58M123ABC device product:dm3q model:SM_S918B device:dm3q transport_id:2\n\
+             emulator-5554 device product:sdk model:sdk_gphone64 transport_id:1\n\
+             192.168.1.20:5555 offline transport_id:3\n\
+             USB-NOT-AUTHORIZED unauthorized transport_id:4\n",
+        );
+        assert_eq!(devices.len(), 4);
+        assert_eq!(devices[0].transport, TikTokAndroidDeviceTransport::Network);
+        assert_eq!(devices[0].state, TikTokAndroidDeviceState::Offline);
+        let emulator = devices
+            .iter()
+            .find(|device| device.serial == "emulator-5554")
+            .unwrap();
+        assert_eq!(emulator.transport, TikTokAndroidDeviceTransport::Emulator);
+        let phone = devices
+            .iter()
+            .find(|device| device.serial == "R58M123ABC")
+            .unwrap();
+        assert_eq!(phone.transport, TikTokAndroidDeviceTransport::Usb);
+        assert_eq!(phone.model.as_deref(), Some("SM S918B"));
+        let unauthorized = devices
+            .iter()
+            .find(|device| device.serial == "USB-NOT-AUTHORIZED")
+            .unwrap();
+        assert_eq!(unauthorized.state, TikTokAndroidDeviceState::Unauthorized);
+    }
+
+    #[test]
     fn usernames_and_multiline_messages_are_rejected() {
-        assert!(normalize_tiktok_username("@bad handle").is_err());
-        assert!(normalize_tiktok_username("@ok.name_1").is_ok());
-        assert!(validate_message("ligne 1\nligne 2".to_string()).is_err());
+        assert!(policy::normalize_tiktok_username("@bad handle").is_err());
+        assert!(policy::normalize_tiktok_username("@ok.name_1").is_ok());
+        assert!(policy::validate_message("ligne 1\nligne 2".to_string()).is_err());
     }
 
     #[test]
@@ -2410,7 +3770,7 @@ mod tests {
     }
 
     #[test]
-    fn follower_pipeline_prepares_only_owned_matches_as_a_draft() {
+    fn follower_pipeline_prepares_only_matching_accounts_as_a_draft() {
         let (root, manager) = manager("followers-to-dm");
         let queued = manager
             .queue_follower_extraction(
@@ -2426,7 +3786,7 @@ mod tests {
                             "@secondaire_absent".to_string(),
                         ],
                         message: "Message de test exact".to_string(),
-                        owned_accounts_confirmed: true,
+                        owned_accounts_confirmed: false,
                     }),
                     idempotency_key: "followers-to-dm".to_string(),
                 },
@@ -2473,7 +3833,7 @@ mod tests {
         assert_eq!(campaign.recipients, vec!["@secondaire_2"]);
         assert_eq!(campaign.message, "Message de test exact");
         assert_eq!(campaign.status, TikTokDmCampaignStatus::Draft);
-        assert!(campaign.owned_accounts_confirmed);
+        assert!(!campaign.owned_accounts_confirmed);
         assert!(!campaign.send_confirmed);
         assert!(!campaign.recipients.contains(&"@inconnu_1".to_string()));
 
@@ -2508,5 +3868,33 @@ mod tests {
             vec!["@alpha", "@beta", "@gamma"]
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn tikmatrix_accounts_are_sanitized_without_credentials() {
+        let value = json!({
+            "username": "emetteur_test",
+            "device": "emulator-5554",
+            "logined": 1,
+            "status": 0,
+            "packagename": "com.zhiliaoapp.musically",
+            "pwd": "secret-qui-ne-doit-jamais-sortir"
+        });
+        let account = tikmatrix_sender_account(&value).unwrap();
+        assert_eq!(account.username, "@emetteur_test");
+        assert_eq!(account.device_serial, "emulator-5554");
+        assert!(account.logged_in);
+        assert!(account.enabled);
+        assert_eq!(
+            serde_json::to_value(account).unwrap(),
+            json!({
+                "username": "@emetteur_test",
+                "deviceSerial": "emulator-5554",
+                "loggedIn": true,
+                "enabled": true,
+                "packageName": "com.zhiliaoapp.musically"
+            })
+        );
     }
 }

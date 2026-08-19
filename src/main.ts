@@ -523,6 +523,7 @@ import {
   Trophy,
   Type,
   Upload,
+  Usb,
   Unplug,
   Users,
   Volume2,
@@ -575,6 +576,7 @@ import {
   UserCheck,
   UserPlus,
   UserX,
+  Zap,
   createElement as createLucideElement,
   type IconNode,
 } from "lucide";
@@ -776,6 +778,28 @@ const loadMessagingModule = (): Promise<MessagingModule> => {
   return messagingModulePromise;
 };
 
+type TikTokAccountsModule = typeof import("./tiktok-accounts");
+
+let tiktokAccountsModule: TikTokAccountsModule | null = null;
+let tiktokAccountsModulePromise: Promise<TikTokAccountsModule> | null = null;
+
+const loadTikTokAccountsModule = (): Promise<TikTokAccountsModule> => {
+  if (tiktokAccountsModule) return Promise.resolve(tiktokAccountsModule);
+  if (!tiktokAccountsModulePromise) {
+    tiktokAccountsModulePromise = import("./tiktok-accounts")
+      .then((module) => {
+        tiktokAccountsModule = module;
+        return module;
+      })
+      .catch((error) => {
+        tiktokAccountsModulePromise = null;
+        scheduleStaleChunkRecovery(error);
+        throw error;
+      });
+  }
+  return tiktokAccountsModulePromise;
+};
+
 type StatsViewModule = typeof import("./stats-view");
 
 let statsViewModule: StatsViewModule | null = null;
@@ -936,7 +960,9 @@ type CodexReasoningEffort = string;
 
 // Runtime CLI d'un compte / agent. Les fournisseurs API annexes sont tous
 // executes par OpenCode ; Codex et Claude Code conservent leur CLI natif.
-type Provider = "codex" | "claude" | "opencode";
+// freebuff est un TUI interactif : il ne vit qu'en onglet terminal, jamais
+// dans le flux de chat (le backend refuse explicitement un tour de chat).
+type Provider = "codex" | "claude" | "opencode" | "freebuff";
 type OpenCodeInferenceProvider =
   | "zai"
   | "zai-coding-plan"
@@ -1402,6 +1428,8 @@ type AccountLimitView = {
   source: string;
   refreshing?: boolean;
   error?: string | null;
+  // freebuff : une session occupe deja le home de ce compte.
+  sessionBusy?: boolean;
 };
 
 type AccountRateLimitBucketView = {
@@ -1491,6 +1519,7 @@ type AppView =
   | "orchestration"
   | "forum"
   | "messaging"
+  | "tiktok"
   | "discussions"
   | "history"
   | "audit"
@@ -1518,6 +1547,7 @@ const lazyModuleViews = new Set<AppView>([
   "skills",
   "forum",
   "messaging",
+  "tiktok",
   "dashboard",
   "vps",
   "video",
@@ -2678,6 +2708,7 @@ const lucideIcons = {
   Trophy,
   Type,
   Upload,
+  Usb,
   Unplug,
   UserPlus,
   Users,
@@ -2730,6 +2761,7 @@ const lucideIcons = {
   Moon,
   UserCheck,
   UserX,
+  Zap,
 };
 
 // `lucide.createIcons()` reparcourt puis remplace toutes les icones du document
@@ -3909,7 +3941,9 @@ const buildResumeCommand = (id: string, account: AccountProfile | null | undefin
     ? `${base} --resume ${id}`
     : provider === "opencode"
       ? `${base} --session ${id}`
-      : `${base} resume ${id}`;
+      : provider === "freebuff"
+        ? `${base} --continue ${id}`
+        : `${base} resume ${id}`;
 };
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -4029,11 +4063,83 @@ const codexAgentId = () =>
 // Provider d'un compte / d'un agent (defaut Codex pour les configs anterieures).
 const accountProvider = (account: AccountProfile | null | undefined): Provider =>
   account?.provider ?? "codex";
+
+// Le chat pilote les CLI en non-interactif (`codex --json`, `claude --print`,
+// `opencode run`). freebuff n'expose qu'un TUI : ni prompt en argument, ni
+// sortie structuree. Ses comptes sont donc retires des selecteurs de chat,
+// plutot que d'y etre proposes puis refuses par le backend.
+const accountSupportsChat = (account: AccountProfile | null | undefined) =>
+  accountProvider(account) !== "freebuff";
+const chatCapableAccounts = () => (settings?.accounts ?? []).filter(accountSupportsChat);
+// freebuff n'autorise qu'une session PAR COMPTE : son binaire inscrit son pid
+// dans le home du compte et refuse toute seconde instance. Le backend expose
+// cette occupation (`sessionBusy`), relue ici pour ne jamais ouvrir un
+// terminal condamne a afficher son ecran de blocage.
+const accountSessionBusy = (account: AccountProfile | null | undefined) =>
+  !!account && limitStatus.some((row) => row.id === account.id && row.sessionBusy === true);
+
+// Compte freebuff exploitable pour une nouvelle session : celui demande s'il est
+// libre, sinon le premier autre compte freebuff disponible. `null` = tous pris.
+const freeFreebuffAccount = (preferred: AccountProfile) => {
+  if (!accountSessionBusy(preferred)) return preferred;
+  return (
+    (settings?.accounts ?? []).find(
+      (candidate) =>
+        accountProvider(candidate) === "freebuff" && !accountSessionBusy(candidate),
+    ) ?? null
+  );
+};
+// Quand aucun compte freebuff n'est libre, cree automatiquement un nouveau
+// compte (nouveau home isole) puis ouvre sa connexion interactive : chaque
+// nouveau terminal obtient ainsi son propre home au lieu d'echouer. La
+// connexion reste manuelle (login par navigateur) et c'est la que s'appliquent
+// les limites par IP et par compte du service freebuff.
+const provisionFreebuffAccount = async (): Promise<AccountProfile | null> => {
+  if (!settings) return null;
+  const freebuffCount = settings.accounts.filter(
+    (candidate) => accountProvider(candidate) === "freebuff",
+  ).length;
+  const label = `Freebuff ${freebuffCount + 1}`;
+  const account = newAccountProfile(
+    label,
+    uniqueCodexHomeForLabel(label, "freebuff"),
+    null,
+    null,
+    { provider: "freebuff", model: DEFAULT_FREEBUFF_MODEL },
+  );
+  settings.accounts.push(account);
+  selectedAccountId = account.id;
+  settings.defaultAccountId = account.id;
+  try {
+    if (isRemoteMode()) {
+      const shared = await invoke<AppSettings>("add_shared_account", { account });
+      settings.accounts = shared.accounts;
+      settings.defaultAccountId = account.id;
+    } else {
+      settings = await invoke<AppSettings>("save_settings", { settings });
+    }
+  } catch (error) {
+    statusText = String(error);
+    render();
+    return null;
+  }
+  scheduleUnconnectedAccountCleanup();
+  render();
+  await reloginAccount(account.id);
+  return account;
+};
+const AGENT_ID_PROVIDERS: Record<string, Provider> = {
+  claude: "claude",
+  opencode: "opencode",
+  freebuff: "freebuff",
+  "freebuff-desktop": "freebuff",
+};
 const agentProvider = (agent: AgentProfile | null | undefined): Provider =>
-  agent?.provider ??
-  (agent?.id === "claude" ? "claude" : agent?.id === "opencode" ? "opencode" : "codex");
+  agent?.provider ?? (agent?.id ? AGENT_ID_PROVIDERS[agent.id] ?? "codex" : "codex");
 const providerLabel = (provider: Provider) =>
-  provider === "claude" ? "Claude" : provider === "opencode" ? "OpenCode" : "Codex";
+  provider === "freebuff"
+    ? "Freebuff"
+    : provider === "claude" ? "Claude" : provider === "opencode" ? "OpenCode" : "Codex";
 
 const openCodeProviderOption = (id: string | null | undefined) =>
   OPENCODE_PROVIDER_OPTIONS.find((item) => item.id === id) ?? null;
@@ -4060,6 +4166,7 @@ const parseProviderChoice = (value: string | null | undefined): {
     if (option) return { provider: "opencode", inferenceProvider: option.id };
   }
   if (value === "claude") return { provider: "claude", inferenceProvider: null };
+  if (value === "freebuff") return { provider: "freebuff", inferenceProvider: null };
   return { provider: "codex", inferenceProvider: null };
 };
 const providerChoiceValue = (
@@ -4087,12 +4194,26 @@ const isCodexAgent = (agent: AgentProfile | null | undefined) => agentProvider(a
 
 const CODEX_BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
 const CLAUDE_BYPASS_FLAG = "--dangerously-skip-permissions";
+// freebuff n'expose aucun flag de ce type : son CLI n'accepte que `login`,
+// `--continue` et `--cwd`. La chaine vide signale « aucun flag a ajouter ».
+const FREEBUFF_BYPASS_FLAG = "";
+const providerIcon = (provider: Provider) =>
+  provider === "claude"
+    ? "sparkles"
+    : provider === "opencode"
+      ? "bot"
+      : provider === "freebuff"
+        ? "zap"
+        : "cpu";
+
 const providerBypassFlag = (provider: Provider) =>
   provider === "claude"
     ? CLAUDE_BYPASS_FLAG
     : provider === "opencode"
       ? "--auto"
-      : CODEX_BYPASS_FLAG;
+      : provider === "freebuff"
+        ? FREEBUFF_BYPASS_FLAG
+        : CODEX_BYPASS_FLAG;
 
 // Le bypass est un reglage PAR COMPTE (defaut ON). Un compte sans champ `bypass`
 // (config anterieure) retombe sur le defaut global `codexBypass`, puis `true`.
@@ -4107,6 +4228,21 @@ const normalizeCodexReasoningEffort = (
 ): CodexReasoningEffort =>
   isCodexReasoningEffort(value) ? value : DEFAULT_CODEX_REASONING_EFFORT;
 
+// Chez freebuff l'intensite de raisonnement est integree au modele : le
+// choisir, c'est choisir la profondeur. V4 Flash est le seul a cumuler
+// l'illimite et une intensite `high`, d'ou son role de defaut : un nouveau
+// compte ne consomme aucun credit sans rien perdre en profondeur.
+const DEFAULT_FREEBUFF_MODEL = "deepseek/deepseek-v4-flash";
+// Les seuls identifiants que le validateur de freebuff accepte : il les
+// compare a sa propre liste compilee, et ignore silencieusement le reste.
+// Les suivants sont premium, donc factures en credits.
+const FREEBUFF_MODEL_SUGGESTIONS = [
+  DEFAULT_FREEBUFF_MODEL,
+  "deepseek/deepseek-v4-pro",
+  "openai/gpt-5.6-luna",
+  "minimax/minimax-m3",
+] as const;
+
 const providerDefaultModel = (
   provider: Provider,
   inferenceProvider: string | null = null,
@@ -4115,7 +4251,9 @@ const providerDefaultModel = (
     ? DEFAULT_CLAUDE_MODEL
     : provider === "opencode"
       ? openCodeProviderOption(inferenceProvider)?.defaultModel ?? OPENCODE_PROVIDER_OPTIONS[0].defaultModel
-      : DEFAULT_CODEX_MODEL;
+      : provider === "freebuff"
+        ? DEFAULT_FREEBUFF_MODEL
+        : DEFAULT_CODEX_MODEL;
 
 const accountModel = (account: AccountProfile | null | undefined) =>
   account?.model?.trim() ||
@@ -4165,6 +4303,7 @@ const fastModeAvailabilityLabel = (
   }
   if (provider === "claude") return "Fast mode est disponible avec les modèles Opus";
   if (provider === "codex") return `Fast mode n'est pas disponible pour ${model}`;
+  if (provider === "freebuff") return "Fast mode n'est pas pris en charge par freebuff";
   return "Fast mode n'est pas pris en charge par OpenCode";
 };
 
@@ -4179,6 +4318,7 @@ const modelSuggestionsForAccount = (
       ...(openCodeProviderOption(accountInferenceProvider(account))?.models ?? OPENCODE_MODEL_SUGGESTIONS),
     ];
   }
+  if (provider === "freebuff") return [...FREEBUFF_MODEL_SUGGESTIONS];
   return codexCatalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS;
 };
 
@@ -4356,7 +4496,9 @@ const agentRunCommand = (
   }
   if (isFirstPartyAgent(agent) && accountBypassEnabled(account)) {
     const flag = providerBypassFlag(agentProvider(agent));
-    if (!base.includes(flag)) return `${base} ${flag}`;
+    // Un flag vide (freebuff) ne doit rien ajouter : sans ce garde,
+    // `base.includes("")` resterait vrai et masquerait l'intention.
+    if (flag && !base.includes(flag)) return `${base} ${flag}`;
   }
   return base;
 };
@@ -6117,6 +6259,15 @@ const setActiveView = (view: AppView) => {
       });
     return;
   }
+  if (view === "tiktok" && !tiktokAccountsModule) {
+    void loadTikTokAccountsModule()
+      .then(() => setActiveView(view))
+      .catch((error) => {
+        statusText = `Comptes TikTok indisponibles : ${String(error)}`;
+        render();
+      });
+    return;
+  }
   if (view === "dashboard" && !statsViewModule) {
     void loadStatsViewModule()
       .then(() => setActiveView(view))
@@ -6195,6 +6346,7 @@ const setActiveView = (view: AppView) => {
     orchestration: "Chats orchestrés",
     forum: "Forum communautaire",
     messaging: "Messagerie privée",
+    tiktok: "Comptes émetteurs TikTok",
     design: "Espace Design",
     discussions: "Vue historique",
     history: "Vue historique",
@@ -6275,6 +6427,7 @@ const setActiveView = (view: AppView) => {
 
   messagingModule?.setMessagingVisible(activeView === "messaging");
   messagingModule?.startMessagingPolling(render);
+  if (activeView !== "tiktok") tiktokAccountsModule?.deactivateTikTokAccountsPanel();
 
   if (activeView !== "vps") vpsModule?.deactivateVpsPanel();
   if (activeView !== "video") videoModule?.deactivateVideoPanel();
@@ -6314,6 +6467,9 @@ const setActiveView = (view: AppView) => {
   if (activeView === "discussions") void refreshDiscussions();
   if (activeView === "forum") void forumModule?.refreshForum(render);
   if (activeView === "messaging") void messagingModule?.refreshMessaging(render);
+  if (activeView === "tiktok") {
+    tiktokAccountsModule?.activateTikTokAccountsPanel(render, isRemoteMode());
+  }
   if (activeView === "vps") vpsModule?.activateVpsPanel(render);
   if (activeView === "video") videoModule?.activateVideoPanel(render);
   if (activeView === "transcription") transcriptionModule?.activateTranscriptionPanel(render);
@@ -7619,7 +7775,12 @@ const discussionSubtitle = (discussion: DiscussionSummary): string => {
 
 const chatSelectedAccount = (): AccountProfile | null => {
   const preferred = chatDiscussion?.accountId ?? chatAccountId ?? settings?.defaultAccountId;
-  return accountById(preferred) ?? settings?.accounts[0] ?? null;
+  // Un compte freebuff ne peut pas porter un chat : s'il etait retenu
+  // (compte par defaut, ou premier de la liste), le panneau echouerait au
+  // premier envoi. On retombe sur le premier compte reellement utilisable.
+  const chosen = accountById(preferred);
+  if (chosen && accountSupportsChat(chosen)) return chosen;
+  return chatCapableAccounts()[0] ?? null;
 };
 
 const quotaAlternativeForAccount = (
@@ -9732,7 +9893,12 @@ const expertChatPaneRoot = (pane: ExpertChatPane): HTMLElement | null =>
 
 const expertChatSelectedAccount = (pane: ExpertChatPane): AccountProfile | null => {
   const preferred = pane.discussion?.accountId ?? pane.accountId ?? settings?.defaultAccountId;
-  return accountById(preferred) ?? settings?.accounts[0] ?? null;
+  // Un compte freebuff ne peut pas porter un chat : s'il etait retenu
+  // (compte par defaut, ou premier de la liste), le panneau echouerait au
+  // premier envoi. On retombe sur le premier compte reellement utilisable.
+  const chosen = accountById(preferred);
+  if (chosen && accountSupportsChat(chosen)) return chosen;
+  return chatCapableAccounts()[0] ?? null;
 };
 
 const orchestrationRunForPane = (pane: ExpertChatPane): OrchestrationSnapshot | null =>
@@ -12047,7 +12213,7 @@ const renderDiscussionRow = (discussion: DiscussionSummary, accountLabel: string
   // Compte cible : origine EN PREMIER (marquee), puis les autres. Choisir un
   // autre compte transforme la reprise en deplacement (copie fidele puis
   // archivage de la source) — logique portee par continueDiscussionWith.
-  const accounts = settings?.accounts ?? [];
+  const accounts = chatCapableAccounts();
   const target = discussionTargetFor(discussion);
   const willCopy = target !== discussion.accountId;
   const options =
@@ -12343,6 +12509,18 @@ const bindDiscussionRowUi = () => {
     button.addEventListener("click", () => {
       const pane = expertChatPanes.find((item) => item.key === button.dataset.closePane);
       if (pane) closeExpertChatPane(pane);
+    });
+  });
+  // Revenir a un terminal deja ouvert depuis la colonne de gauche.
+  document.querySelectorAll<HTMLButtonElement>("[data-open-terminal]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const session = terminalSessions.find((item) => item.key === button.dataset.openTerminal);
+      if (!session) return;
+      closeMobileOverlays();
+      activateTerminalSession(session);
+      activeView = "terminal";
+      requestTerminalFocusKey = session.key;
+      render();
     });
   });
   // Changement de compte cible : on memorise le choix et on met a jour, sans
@@ -13583,6 +13761,8 @@ function mobileViewLabel(view: AppView): string {
       return "Forum";
     case "messaging":
       return "Messagerie";
+    case "tiktok":
+      return "TikTok";
     case "discussions":
       return "Historique";
     case "chat":
@@ -13771,6 +13951,7 @@ function ensureMobileChrome(): void {
           <button type="button" role="menuitem" data-view="prompts"><i data-lucide="message-square-text"></i><span>Prompts</span></button>
           <button type="button" role="menuitem" data-view="video"><i data-lucide="wand-sparkles"></i><span>Studio IA</span></button>
           <button type="button" role="menuitem" data-view="transcription"><i data-lucide="audio-lines"></i><span>Transcrire</span></button>
+          <button type="button" role="menuitem" data-view="tiktok"><i data-lucide="music-2"></i><span>TikTok</span></button>
           <button type="button" role="menuitem" data-view="limits"><i data-lucide="calendar-clock"></i><span>Limites</span></button>
           <button type="button" role="menuitem" data-view="dashboard"><i data-lucide="bar-chart-3"></i><span>Stats</span></button>
           ${isRemoteMode() ? `<button type="button" role="menuitem" data-view="vps"><i data-lucide="server"></i><span>VPS</span></button>` : ""}
@@ -14160,7 +14341,37 @@ const renderChatSidebarConversations = (): string => {
       ? "Aucun résultat"
       : "Aucun chat. Ouvrez-en un avec l'agent de votre choix.";
 
-  return `<section class="chat-workspace-group active chat-current-environment-chats">
+  // Terminaux ouverts (tous comptes confondus) : visibles et actionnables
+  // depuis la colonne de gauche pour revenir instantanement a une session.
+  const terminalItems = terminalSessions
+    .map((session) => {
+      const account = accountById(session.accountId);
+      const label = account?.label || session.title || "Terminal";
+      const provider = accountProvider(account);
+      const current = session.key === activeTerminalKey;
+      const state = session.running
+        ? "en cours"
+        : session.loginOnly
+          ? "connexion"
+          : session.status || "ouvert";
+      return `<div class="chat-side-item ${current ? "current" : ""}">
+        <button type="button" class="chat-side-open" data-open-terminal="${escapeAttr(session.key)}" title="${escapeAttr(label)}">
+          <i class="chat-side-terminal-icon" data-lucide="${providerIcon(provider)}"></i>
+          <span class="chat-side-copy">
+            <strong>${escapeHtml(label)}</strong>
+            <small>${escapeHtml(providerLabel(provider))} - ${escapeHtml(state)}</small>
+          </span>
+        </button>
+      </div>`;
+    })
+    .join("");
+  const terminalSection = terminalSessions.length > 0
+    ? `<section class="chat-workspace-group chat-open-terminals">
+    <div class="chat-folder-section-label"><span>Terminaux ouverts</span><b>${terminalSessions.length}</b></div>
+    <div class="chat-workspace-terminals">${terminalItems}</div>
+  </section>`
+    : "";
+  return `${terminalSection}<section class="chat-workspace-group active chat-current-environment-chats">
     <div class="chat-folder-section-label"><span>Chats de cet environnement</span><b title="${escapeAttr(countTitle)}">${visibleItems.length}</b></div>
     <div class="chat-workspace-terminals">
       ${listItems || `<div class="chat-workspace-empty">${escapeHtml(emptyMessage)}</div>`}
@@ -19291,6 +19502,8 @@ const appViewTitle = (view: AppView): string => {
       return "Forum";
     case "messaging":
       return "Messagerie";
+    case "tiktok":
+      return "Comptes TikTok";
     case "discussions":
       return "Historique";
     case "history":
@@ -20629,6 +20842,10 @@ const renderActiveAppPanel = (): string => {
       return forumModule?.renderForumPanel() ?? "";
     case "messaging":
       return messagingModule?.renderMessagingPanel() ?? "";
+    case "tiktok":
+      return tiktokAccountsModule?.renderTikTokAccountsPanel({
+        remoteMode: isRemoteMode(),
+      }) ?? "";
     case "discussions":
       return renderDiscussionsPanel();
     case "history":
@@ -21386,6 +21603,9 @@ const renderChatFirstShell = () => {
           <button type="button" id="messagingToggle" class="${activeView === "messaging" ? "active" : ""}" title="Messages privés entre utilisateurs" ${activeView === "messaging" ? 'aria-current="page"' : ""}>
             <span class="chat-context-icon"><i data-lucide="mail"></i></span><span class="chat-context-copy"><strong>Messages</strong><small><span>Messagerie</span> privée</small></span><b class="chat-side-task-count messaging-nav-count" ${privateMessageUnreadCount ? "" : "hidden"} aria-label="${privateMessageUnreadCount} message${privateMessageUnreadCount === 1 ? "" : "s"} non lu${privateMessageUnreadCount === 1 ? "" : "s"}">${privateMessageUnreadCount > 99 ? "99+" : privateMessageUnreadCount}</b>
           </button>
+          <button type="button" id="tiktokToggle" class="${activeView === "tiktok" ? "active" : ""}" title="Connecter et sélectionner les comptes émetteurs TikTok" ${activeView === "tiktok" ? 'aria-current="page"' : ""}>
+            <span class="chat-context-icon"><i data-lucide="music-2"></i></span><span class="chat-context-copy"><strong>TikTok</strong><small>Comptes émetteurs</small></span>
+          </button>
           <button type="button" id="tasksToggle" class="${activeView === "tasks" ? "active" : ""}" title="Gérer les tâches" ${activeView === "tasks" ? 'aria-current="page"' : ""}>
             <span class="chat-context-icon"><i data-lucide="list-checks"></i></span><span class="chat-context-copy"><strong>Tâches</strong><small>À faire et priorités</small></span><b class="chat-side-task-count" data-task-nav-count ${activeTaskCount ? "" : "hidden"} aria-label="${activeTaskCount} tâche${activeTaskCount > 1 ? "s" : ""} à faire">${activeTaskCount > 99 ? "99+" : activeTaskCount}</b>
           </button>
@@ -21868,7 +22088,7 @@ const renderAccountsPanel = () => {
           <div class="simple-account-row">
             <div class="simple-account-identity">
               <span class="simple-account-provider-icon ${provider}" aria-hidden="true">
-                <i data-lucide="${provider === "claude" ? "sparkles" : provider === "opencode" ? "bot" : "cpu"}"></i>
+                <i data-lucide="${providerIcon(provider)}"></i>
               </span>
               <span class="simple-account-copy">
                 <strong>${escapeHtml(item.label)}</strong>
@@ -21928,6 +22148,10 @@ const renderAccountsPanel = () => {
             <label>
               <input type="radio" name="newAccountProvider" value="claude" />
               <span><i data-lucide="sparkles"></i>Claude</span>
+            </label>
+            <label>
+              <input type="radio" name="newAccountProvider" value="freebuff" />
+              <span><i data-lucide="zap"></i>Freebuff</span>
             </label>
             ${OPENCODE_PROVIDER_OPTIONS.map((option) => `
               <label>
@@ -22015,6 +22239,10 @@ const renderDiscussionArchiveModal = () => {
 const renderNewChatModal = () => {
   if (!settings || !newChatModalOpen) return "";
 
+  // Les comptes freebuff sont proposes ici : les choisir ouvre un terminal
+  // sur l'agent freebuff au lieu d'un flux de chat (voir la confirmation
+  // du nouveau chat). Ils restent en revanche exclus des reprises de
+  // discussion et des replis de panneau, ou ils n'ont aucun sens.
   const accounts = settings.accounts;
   const account = accountById(newChatAccountId) ?? accounts[0] ?? null;
   const automaticRouting = newChatRoutingMode === "automatic";
@@ -22062,7 +22290,7 @@ const renderNewChatModal = () => {
           <strong>${escapeHtml(usage.value)}</strong>
           <small>${escapeHtml(usage.caption)}</small>
         </span>
-        <i data-lucide="${accountProvider(item) === "claude" ? "sparkles" : accountProvider(item) === "opencode" ? "bot" : "cpu"}"></i>
+        <i data-lucide="${providerIcon(accountProvider(item))}"></i>
       </button>`;
     })
     .join("");
@@ -22194,6 +22422,20 @@ const openChatCountForAccount = (accountId: string): number =>
   openChatAccountIdsForQuotaSelection().filter((candidate) => candidate === accountId).length;
 
 const newChatAccountUsageFor = (account: AccountProfile) => {
+  // freebuff : l'occupation prime sur le quota. Un compte deja pris ne peut
+  // accueillir aucune seconde session, quel que soit son credit restant.
+  if (accountSessionBusy(account)) {
+    return {
+      state: "exhausted",
+      value: "occupe",
+      caption: "session",
+      announcement: "session freebuff deja ouverte sur ce compte",
+      detail:
+        `${account.label} a deja une session freebuff ouverte. freebuff n'en `
+        + "autorise qu’une par compte : un nouveau chat sera dirige vers un "
+        + "autre compte freebuff libre.",
+    };
+  }
   const status = chatQuotaStatusFor(account);
   if (status.remainingPercent !== null) {
     const serverUsedPercent = Math.round(100 - status.remainingPercent);
@@ -23503,6 +23745,7 @@ const renderNewTerminalModal = () => {
                   <select id="newAccountProvider">
                     <option value="codex" ${newTerminalAccountProvider === "codex" ? "selected" : ""}>Codex (ChatGPT)</option>
                     <option value="claude" ${newTerminalAccountProvider === "claude" ? "selected" : ""}>Claude Code</option>
+                    <option value="freebuff" ${newTerminalAccountProvider === "freebuff" ? "selected" : ""}>Freebuff</option>
                     ${OPENCODE_PROVIDER_OPTIONS.map((option) => {
                       const value = `opencode:${option.id}`;
                       const selected = value === providerChoiceValue(
@@ -24238,7 +24481,7 @@ const renderLimitCard = (account: AccountLimitView) => {
   return `
     <article class="limit-card ${limitBadgeClass(account)} ${hasFiveHourWindow ? "has-five-hour-window" : "without-five-hour-window"}" role="listitem"${rowTitle}>
       <div class="limit-card-identity">
-        <span class="limit-card-provider ${provider}"><i data-lucide="${provider === "claude" ? "sparkles" : provider === "opencode" ? "bot" : "cpu"}"></i></span>
+        <span class="limit-card-provider ${provider}"><i data-lucide="${providerIcon(provider)}"></i></span>
         <span><strong>${escapeHtml(account.label)}</strong><small>${escapeHtml(providerName)}</small></span>
       </div>
       ${quotaContent}
@@ -25429,12 +25672,24 @@ const defaultCodexHomeForLabel = (label: string, provider: Provider = "codex") =
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "") || "account";
   if (isRemoteMode()) {
-    const prefix = provider === "claude" ? "claude-" : provider === "opencode" ? "opencode-" : "";
+    const prefix = provider === "claude"
+      ? "claude-"
+      : provider === "opencode"
+        ? "opencode-"
+        : provider === "freebuff"
+          ? "freebuff-"
+          : "";
     return `${userHomeHint()}/${prefix}${slug}`;
   }
   // Home isole par compte : `.codex-<slug>` (CODEX_HOME) ou `.claude-<slug>`
   // (CLAUDE_CONFIG_DIR).
-  const prefix = provider === "claude" ? ".claude-" : provider === "opencode" ? ".opencode-" : ".codex-";
+  const prefix = provider === "claude"
+    ? ".claude-"
+    : provider === "opencode"
+      ? ".opencode-"
+      : provider === "freebuff"
+        ? ".freebuff-"
+        : ".codex-";
   return `${userHomeHint()}\\${prefix}${slug}`;
 };
 
@@ -25900,6 +26155,48 @@ const confirmNewChatModal = () => {
   newChatExecutionTargetId = null;
   newChatRoutingMode = "automatic";
   newChatModelDrafts.clear();
+  // Un compte freebuff n'ouvre pas un panneau de chat mais un onglet
+  // terminal : son CLI porte lui-meme la conversation. Le prompt eventuel
+  // n'est pas injecte, freebuff n'acceptant aucun prompt en argument.
+  if (accountProvider(account) === "freebuff") {
+    // Une session freebuff verrouille le home de SON compte : le CLI y inscrit
+    // son pid et refuse toute seconde instance. Basculer sur un autre compte
+    // freebuff libre est donc le seul moyen d'ouvrir plusieurs sessions en
+    // parallele — la limite est portee par le compte, pas par Switch.
+    const target = freeFreebuffAccount(account);
+    if (!target) {
+      void provisionFreebuffAccount().then((created) => {
+        if (created) {
+          statusText =
+            `Aucun compte freebuff libre : nouveau compte ${created.label} cree. `
+            + "Connecte-le dans le terminal ouvert.";
+          render();
+        }
+      });
+      return;
+    }
+    const notices: string[] = [];
+    if (target.id !== account.id) {
+      selectedAccountId = target.id;
+      notices.push(
+        `${account.label} etait deja occupe : freebuff demarre sur ${target.label}.`,
+      );
+    }
+    if (pendingPrompt) {
+      notices.push("Saisis ta demande directement dans l’interface de freebuff.");
+    }
+    void createNewTerminal(
+      target.id,
+      false,
+      null,
+      providerAgentId("freebuff"),
+      null,
+      pendingWorkspace,
+    );
+    if (notices.length > 0) statusText = notices.join(" ");
+    return;
+  }
+
   const pane = addExpertChatPane(account.id, {
     mode,
     pendingWorkspace,
@@ -26367,6 +26664,12 @@ const bindUi = () => {
     },
   });
   messagingModule?.bindMessagingUi({
+    rerender: render,
+    setStatus: (message) => {
+      statusText = message;
+    },
+  });
+  tiktokAccountsModule?.bindTikTokAccountsUi({
     rerender: render,
     setStatus: (message) => {
       statusText = message;
@@ -27315,6 +27618,9 @@ const bindUi = () => {
 
   document.querySelector<HTMLButtonElement>("#messagingToggle")?.addEventListener("click", () => {
     setActiveView("messaging");
+  });
+  document.querySelector<HTMLButtonElement>("#tiktokToggle")?.addEventListener("click", () => {
+    setActiveView("tiktok");
   });
 
   // Barre latérale : « Historique » (à la place de l'ancien « Comptes ») ouvre
@@ -29478,6 +29784,10 @@ const scheduleIdleTask = (task: () => void) => {
 
 const initDesktopUpdaterDeferred = () => {
   if (!("__TAURI_INTERNALS__" in window)) return;
+  // Le client Cloud est lance depuis un binaire local explicitement choisi
+  // par connect-vps.ps1. Une mise a jour/relaunch pendant l'initialisation
+  // distante coupe le tunnel SSH et le connecteur Android.
+  if (isRemoteMode()) return;
   scheduleIdleTask(() => {
     void import("./updater").then(({ initDesktopUpdater }) => initDesktopUpdater());
   });
@@ -29623,6 +29933,7 @@ window.addEventListener("beforeunload", () => {
   stopRuntimeSync();
   forumModule?.stopForumPolling();
   messagingModule?.stopMessagingPolling();
+  tiktokAccountsModule?.deactivateTikTokAccountsPanel();
   stopChatSync();
   stopChatTurnPoll();
   stopChatRuntimeClock();

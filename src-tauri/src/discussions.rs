@@ -51,7 +51,7 @@ use std::{
     process::Stdio,
     sync::{Mutex, OnceLock},
     thread,
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const TITLE_MAX_CHARS: usize = 80;
@@ -160,6 +160,7 @@ static SUMMARY_CACHE: OnceLock<Mutex<HashMap<SummaryCacheKey, CachedSummary>>> =
 static DASHBOARD_CACHE: OnceLock<Mutex<Option<CachedDashboard>>> = OnceLock::new();
 static OPENCODE_SCAN_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedOpenCodeScan>>> = OnceLock::new();
 static CUSTOM_TITLES_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CODEX_TOOL_HISTORY_REPAIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn summary_cache() -> &'static Mutex<HashMap<SummaryCacheKey, CachedSummary>> {
     SUMMARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -175,6 +176,10 @@ fn opencode_scan_cache() -> &'static Mutex<HashMap<PathBuf, CachedOpenCodeScan>>
 
 fn custom_titles_write_lock() -> &'static Mutex<()> {
     CUSTOM_TITLES_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn codex_tool_history_repair_lock() -> &'static Mutex<()> {
+    CODEX_TOOL_HISTORY_REPAIR_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -377,6 +382,14 @@ pub fn transcript_revision_for_account(account_id: &str, session_id: &str) -> Re
 
 fn discussion_files(home: &Path, provider: settings::Provider) -> Vec<PathBuf> {
     match provider {
+        // Chaque session freebuff est un dossier `chats/<horodatage>/` : son
+        // `chat-messages.json` porte les messages (et alimente l'empreinte de
+        // revision comme un rollout Codex).
+        settings::Provider::Freebuff => {
+            let mut files = Vec::new();
+            collect_freebuff_chat_files(home, &mut files);
+            files
+        }
         settings::Provider::Codex => {
             let mut files = Vec::new();
             collect_rollouts(&home.join("sessions"), &mut files);
@@ -583,6 +596,7 @@ fn scan_account(account: &AccountProfile, provider_command: &str) -> DiscussionA
                 Err(error) => (Vec::new(), Some(error)),
             }
         }
+        settings::Provider::Freebuff => (scan_freebuff_discussions(&home, account), None),
     };
     discussions.retain(|discussion| !discussion_summary_is_autonomous(discussion));
     apply_custom_titles(&home, &mut discussions);
@@ -674,7 +688,9 @@ pub fn rename_discussion_for_account(
         .cloned()
         .ok_or_else(|| "Compte introuvable".to_string())?;
     let valid_id = match account.provider {
-        settings::Provider::OpenCode => valid_opencode_session_id(&session_id),
+        settings::Provider::OpenCode | settings::Provider::Freebuff => {
+            valid_opencode_session_id(&session_id)
+        }
         settings::Provider::Codex | settings::Provider::Claude => is_uuid_shaped(&session_id),
     };
     if !valid_id {
@@ -1763,6 +1779,9 @@ pub fn move_discussion_for_account(
         settings::Provider::OpenCode => {
             Err("Le deplacement des sessions OpenCode n'est pas encore pris en charge".to_string())
         }
+        settings::Provider::Freebuff => {
+            Err("Les sessions freebuff ne sont pas exposees par Switch".to_string())
+        }
     }
 }
 
@@ -1996,7 +2015,9 @@ pub fn delete_discussion_for_account(
         .ok_or_else(|| "Compte introuvable".to_string())?;
 
     let valid_id = match account.provider {
-        settings::Provider::OpenCode => valid_opencode_session_id(&session_id),
+        settings::Provider::OpenCode | settings::Provider::Freebuff => {
+            valid_opencode_session_id(&session_id)
+        }
         settings::Provider::Codex | settings::Provider::Claude => is_uuid_shaped(&session_id),
     };
     if !valid_id {
@@ -2012,6 +2033,9 @@ pub fn delete_discussion_for_account(
         }
         settings::Provider::OpenCode => {
             delete_opencode_discussion_impl(&settings, &account, &session_id, archive)
+        }
+        settings::Provider::Freebuff => {
+            Err("Les sessions freebuff ne sont pas exposees par Switch".to_string())
         }
     }
 }
@@ -2208,6 +2232,214 @@ fn find_all_rollouts_for(sessions_dir: &Path, id: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+#[derive(Clone)]
+struct InterruptedCustomToolCall {
+    line_index: usize,
+    call_id: String,
+    timestamp: Value,
+    metadata_passthrough: Value,
+}
+
+/// Repare les rollouts Codex interrompus apres l'ecriture d'un
+/// `custom_tool_call`, mais avant celle du `custom_tool_call_output` associe.
+/// Le CLI refuse sinon de reconstruire proprement l'historique a chaque reprise
+/// et journalise indefiniment « Custom tool call output is missing ».
+///
+/// La reparation est strictement additive et reversible : une sortie
+/// synthetique explicite que l'execution a ete interrompue, tandis que le
+/// rollout original est conserve a cote avec une extension `.bak` (donc hors
+/// du scanner de sessions). Cette fonction ne doit etre appelee qu'avant de
+/// lancer le process qui reprend la session.
+pub(crate) fn repair_interrupted_codex_tool_calls(
+    codex_home: &Path,
+    session_id: &str,
+) -> Result<usize, String> {
+    if !is_uuid_shaped(session_id) {
+        return Err("Identifiant de session Codex invalide pour la reparation".to_string());
+    }
+    let _guard = codex_tool_history_repair_lock()
+        .lock()
+        .map_err(|_| "Verrou de reparation des sessions Codex indisponible".to_string())?;
+
+    let mut targets = Vec::new();
+    for directory in ["sessions", "sessions-archive", "archived_sessions"] {
+        targets.extend(find_all_rollouts_for(
+            &codex_home.join(directory),
+            session_id,
+        ));
+    }
+    targets.sort();
+    targets.dedup();
+
+    let mut repaired = 0_usize;
+    for target in targets {
+        repaired = repaired.saturating_add(repair_rollout_custom_tool_calls(&target)?);
+    }
+    if repaired > 0 {
+        if let Ok(mut cache) = summary_cache().lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = dashboard_cache().lock() {
+            *cache = None;
+        }
+    }
+    Ok(repaired)
+}
+
+fn repair_rollout_custom_tool_calls(path: &Path) -> Result<usize, String> {
+    let file = fs::File::open(path)
+        .map_err(|error| format!("Ouverture du rollout Codex impossible : {error}"))?;
+    let mut calls = HashMap::<String, InterruptedCustomToolCall>::new();
+    let mut outputs = HashSet::<String>::new();
+
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line =
+            line.map_err(|error| format!("Lecture du rollout Codex impossible : {error}"))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match payload.get("type").and_then(Value::as_str) {
+            Some("custom_tool_call") => {
+                calls
+                    .entry(call_id.to_string())
+                    .or_insert_with(|| InterruptedCustomToolCall {
+                        line_index,
+                        call_id: call_id.to_string(),
+                        timestamp: value.get("timestamp").cloned().unwrap_or(Value::Null),
+                        metadata_passthrough: payload
+                            .get("internal_chat_message_metadata_passthrough")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    });
+            }
+            Some("custom_tool_call_output") => {
+                outputs.insert(call_id.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    let mut missing_by_line = HashMap::<usize, Vec<InterruptedCustomToolCall>>::new();
+    for (call_id, call) in calls {
+        if !outputs.contains(&call_id) {
+            missing_by_line
+                .entry(call.line_index)
+                .or_default()
+                .push(call);
+        }
+    }
+    let repaired_count = missing_by_line.values().map(Vec::len).sum::<usize>();
+    if repaired_count == 0 {
+        return Ok(0);
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Nom du rollout Codex invalide".to_string())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let temporary = path.with_file_name(format!(
+        ".{file_name}.cst-tool-repair-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    let backup = path.with_file_name(format!(
+        "{file_name}.pre-cst-tool-repair-{}-{nonce}.bak",
+        std::process::id()
+    ));
+
+    let rewrite_result = (|| -> Result<(), String> {
+        let source = fs::File::open(path)
+            .map_err(|error| format!("Reouverture du rollout Codex impossible : {error}"))?;
+        let target = fs::File::create(&temporary)
+            .map_err(|error| format!("Creation du rollout Codex repare impossible : {error}"))?;
+        let mut reader = BufReader::new(source);
+        let mut writer = BufWriter::new(target);
+        let mut buffer = String::new();
+        let mut line_index = 0_usize;
+
+        loop {
+            buffer.clear();
+            let bytes = reader
+                .read_line(&mut buffer)
+                .map_err(|error| format!("Lecture du rollout Codex impossible : {error}"))?;
+            if bytes == 0 {
+                break;
+            }
+            let had_newline = buffer.ends_with('\n');
+            writer
+                .write_all(buffer.as_bytes())
+                .map_err(|error| format!("Ecriture du rollout Codex impossible : {error}"))?;
+            if let Some(calls) = missing_by_line.get(&line_index) {
+                if !had_newline {
+                    writer.write_all(b"\n").map_err(|error| {
+                        format!("Ecriture du rollout Codex impossible : {error}")
+                    })?;
+                }
+                for call in calls {
+                    let output = serde_json::json!({
+                        "timestamp": call.timestamp,
+                        "type": "response_item",
+                        "payload": {
+                            "type": "custom_tool_call_output",
+                            "call_id": call.call_id,
+                            "output": "Tool execution was interrupted before its result could be recorded. Retry the operation if it is still required.",
+                            "internal_chat_message_metadata_passthrough": call.metadata_passthrough,
+                        }
+                    });
+                    serde_json::to_writer(&mut writer, &output).map_err(|error| {
+                        format!("Serialisation de la reparation Codex impossible : {error}")
+                    })?;
+                    writer.write_all(b"\n").map_err(|error| {
+                        format!("Ecriture de la reparation Codex impossible : {error}")
+                    })?;
+                }
+            }
+            line_index = line_index.saturating_add(1);
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("Finalisation du rollout Codex impossible : {error}"))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("Synchronisation du rollout Codex impossible : {error}"))?;
+        let permissions = fs::metadata(path)
+            .map_err(|error| format!("Permissions du rollout Codex illisibles : {error}"))?
+            .permissions();
+        fs::set_permissions(&temporary, permissions).map_err(|error| {
+            format!("Permissions du rollout Codex reparees impossibles : {error}")
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = rewrite_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    fs::rename(path, &backup)
+        .map_err(|error| format!("Sauvegarde du rollout Codex impossible : {error}"))?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::rename(&backup, path);
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "Installation du rollout Codex repare impossible : {error}"
+        ));
+    }
+    Ok(repaired_count)
+}
+
 // ---------------------------------------------------------------------------
 // (e-bis) export_discussion_transcript — reprise INTER-PROVIDER (seed-as-prompt)
 // ---------------------------------------------------------------------------
@@ -2326,6 +2558,7 @@ fn collect_transcript_turns(
         settings::Provider::OpenCode => {
             extract_opencode_semantic_transcript(&load_opencode_export(account_id, session_id)?)
         }
+        settings::Provider::Freebuff => Vec::new(),
     })
 }
 
@@ -2346,6 +2579,9 @@ fn discussion_source_for_account(
     let home = expand_home(&account.codex_home)?;
 
     let file = match account.provider {
+        settings::Provider::Freebuff => {
+            return Err("Les sessions freebuff ne sont pas exposees par Switch".to_string())
+        }
         settings::Provider::Codex => {
             if !is_uuid_shaped(session_id) {
                 return Err("Identifiant de session invalide".to_string());
@@ -2601,6 +2837,7 @@ pub fn transcript_for_account(
             extract_opencode_display_transcript(&load_opencode_export(&account_id, &session_id)?),
             None,
         ),
+        settings::Provider::Freebuff => (Vec::new(), None),
     };
     Ok(DiscussionTranscript {
         session_id,
@@ -3370,6 +3607,17 @@ fn scan_account_prompts(account: &AccountProfile) -> Vec<PromptEntry> {
     let Ok(home) = expand_home(&account.codex_home) else {
         return Vec::new();
     };
+
+    let mut entries = Vec::new();
+    if account.provider == settings::Provider::Freebuff {
+        let mut files = Vec::new();
+        collect_freebuff_chat_files(&home, &mut files);
+        for file in &files {
+            scan_freebuff_chat_file(file, account, &mut entries);
+        }
+        return entries;
+    }
+
     let dir = home.join("sessions");
     if !dir.is_dir() {
         return Vec::new();
@@ -3378,11 +3626,297 @@ fn scan_account_prompts(account: &AccountProfile) -> Vec<PromptEntry> {
     let mut files = Vec::new();
     collect_rollouts(&dir, &mut files);
 
-    let mut entries = Vec::new();
     for file in &files {
         scan_prompt_file(file, account, &mut entries);
     }
     entries
+}
+
+/// Sous-dossier de `codex_home` ou freebuff range ses conversations : un
+/// dossier par projet, puis `chats/<horodatage>/chat-messages.json`.
+const FREEBUFF_CHATS_DIR: &str = ".config/manicode/projects";
+
+fn collect_freebuff_chat_files(home: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(projects) = fs::read_dir(home.join(FREEBUFF_CHATS_DIR)) else {
+        return;
+    };
+    for project in projects.flatten() {
+        if !project.path().is_dir() {
+            continue;
+        }
+        let Ok(chats) = fs::read_dir(project.path().join("chats")) else {
+            continue;
+        };
+        for chat in chats.flatten() {
+            let messages = chat.path().join("chat-messages.json");
+            if messages.is_file() {
+                out.push(messages);
+            }
+        }
+    }
+}
+
+/// Identite stable d'une session freebuff : `<projet>/<horodatage>`, pour
+/// distinguer deux sessions ouvertes a la meme seconde sous deux projets.
+fn freebuff_session_id(path: &Path) -> String {
+    let chat_dir = path.parent();
+    let chat = chat_dir
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let project = chat_dir
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if project.is_empty() {
+        chat.to_string()
+    } else {
+        format!("{project}/{chat}")
+    }
+}
+
+/// Horodatage d'ouverture d'une session freebuff a partir du nom de son
+/// dossier (`2026-08-19T17-50-50.946Z`, heure UTC, tirets au lieu de `:`).
+fn freebuff_session_started_at(path: &Path) -> i64 {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return 0;
+    };
+    let without_z = name.strip_suffix('Z').unwrap_or(name);
+    let (date_time, _fraction) = without_z.split_once('.').unwrap_or((without_z, ""));
+    chrono::NaiveDateTime::parse_from_str(date_time, "%Y-%m-%dT%H-%M-%S")
+        .ok()
+        .map(|naive| naive.and_utc().timestamp())
+        .unwrap_or(0)
+}
+
+/// Instant Unix d'un message utilisateur freebuff : l'`id` (`user-<ms>`)
+/// porte la milliseconde exacte ; sinon on retombe sur l'ouverture de session.
+fn freebuff_message_timestamp(message: &Value, fallback: i64) -> i64 {
+    message
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| id.rsplit('-').next())
+        .and_then(|suffix| suffix.parse::<i64>().ok())
+        .filter(|ms| *ms > 1_000_000_000_000)
+        .map(|ms| ms / 1000)
+        .unwrap_or(fallback)
+}
+
+/// Indexe les demandes utilisateur d'un `chat-messages.json` freebuff dans
+/// l'historique global. Seuls les messages `variant == "user"` non vides sont
+/// retenus ; le titre vient de `chat-meta.json` (premiere demande reelle) et
+/// le cwd du `run-state.json`.
+fn scan_freebuff_chat_file(path: &Path, account: &AccountProfile, out: &mut Vec<PromptEntry>) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return;
+    };
+    let Some(messages) = value.as_array() else {
+        return;
+    };
+
+    let chat_dir = path.parent().unwrap_or(path);
+    let session_id = freebuff_session_id(path);
+    let started_at = freebuff_session_started_at(chat_dir);
+    let file_path = path.to_string_lossy().to_string();
+
+    let cwd = fs::read_to_string(chat_dir.join("run-state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|state| {
+            state
+                .pointer("/sessionState/fileContext/projectRoot")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        });
+
+    let session_title = fs::read_to_string(chat_dir.join("chat-meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|meta| {
+            meta.get("firstPrompt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)
+        });
+
+    for message in messages {
+        if message.get("variant").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(text) = message.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(PromptEntry {
+            session_id: session_id.clone(),
+            account_id: account.id.clone(),
+            account_label: account.label.clone(),
+            codex_home: account.codex_home.clone(),
+            file_path: file_path.clone(),
+            cwd: cwd.clone(),
+            timestamp: freebuff_message_timestamp(message, started_at),
+            session_title: session_title.clone(),
+            text: truncate_chars(text, PROMPT_TEXT_MAX_CHARS),
+        });
+    }
+}
+
+/// Alimente la liste des discussions avec les sessions freebuff, a cote des
+/// sessions Codex/Claude/OpenCode. Une session freebuff = un dossier
+/// `chats/<horodatage>/` (le TUI ecrit un dossier par terminal) : on n'en
+/// retient que les conversations qui ont au moins une demande utilisateur.
+fn scan_freebuff_discussions(home: &Path, account: &AccountProfile) -> Vec<DiscussionSummary> {
+    let mut files = Vec::new();
+    collect_freebuff_chat_files(home, &mut files);
+    files
+        .iter()
+        .filter_map(|file| freebuff_discussion_summary(file, account))
+        .collect()
+}
+
+/// Identite stable et valide d'une session freebuff pour la liste des
+/// discussions : `<projet>-<horodatage>`, chaque composante etant assainie en
+/// `[A-Za-z0-9_-]`. Contrairement a `freebuff_session_id` (forme
+/// `<projet>/<horodatage>`, reservee a l'historique global), cette variante
+/// satisfait les validateurs d'identifiants de session (UUID ou slug OpenCode).
+fn freebuff_discussion_session_id(path: &Path) -> String {
+    let chat_dir = path.parent();
+    let chat = chat_dir
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let project = chat_dir
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let slug = |value: &str| -> String {
+        let mut out = String::with_capacity(value.len());
+        for c in value.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                out.push(c);
+            } else {
+                out.push('-');
+            }
+        }
+        out
+    };
+    let project_slug = slug(project);
+    let chat_slug = slug(chat);
+    match (project_slug.is_empty(), chat_slug.is_empty()) {
+        (true, _) => chat_slug,
+        (_, true) => project_slug,
+        (false, false) => format!("{project_slug}-{chat_slug}"),
+    }
+}
+
+/// Construit le resume d'une session freebuff pour le tableau de bord des
+/// discussions. Le titre vient de `chat-meta.json` (`firstPrompt`, la premiere
+/// demande reelle), le cwd du `run-state.json`, et l'activite recente du
+/// `messagesMtimeMs` (avec repli sur le mtime du fichier puis l'ouverture).
+fn freebuff_discussion_summary(path: &Path, account: &AccountProfile) -> Option<DiscussionSummary> {
+    let content = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&content).ok()?;
+    let messages = value.as_array()?;
+
+    let chat_dir = path.parent().unwrap_or(path);
+    let session_id = freebuff_discussion_session_id(path);
+    let started_at = freebuff_session_started_at(chat_dir);
+    let file_path = path.to_string_lossy().to_string();
+
+    let mut first_user = None;
+    let mut user_count = 0u64;
+    let mut message_count = 0u64;
+    for message in messages {
+        message_count += 1;
+        let is_user = message.get("variant").and_then(Value::as_str) == Some("user");
+        if !is_user {
+            continue;
+        }
+        let text = message.get("content").and_then(Value::as_str).map(str::trim);
+        let text = text.filter(|text| !text.is_empty());
+        if let Some(text) = text {
+            user_count += 1;
+            if first_user.is_none() {
+                first_user = Some(text.to_string());
+            }
+        }
+    }
+
+    // Session vide / avortee (aucune demande reelle) : on la filtre.
+    if user_count == 0 {
+        return None;
+    }
+
+    let cwd = fs::read_to_string(chat_dir.join("run-state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|state| {
+            state
+                .pointer("/sessionState/fileContext/projectRoot")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        });
+
+    let meta = fs::read_to_string(chat_dir.join("chat-meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+
+    let title = meta
+        .as_ref()
+        .and_then(|meta| meta.get("firstPrompt"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| first_user.clone());
+
+    let last_activity = meta
+        .as_ref()
+        .and_then(|meta| meta.get("messagesMtimeMs"))
+        .and_then(Value::as_f64)
+        .map(|ms| (ms / 1000.0) as i64)
+        .filter(|ts| *ts > 0)
+        .or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+        })
+        .unwrap_or(started_at)
+        .max(started_at);
+
+    Some(DiscussionSummary {
+        session_id: session_id.clone(),
+        // Freebuff ne distingue pas de HEAD de rollout (pas de forks Codex) :
+        // l'identite de reprise est la session elle-meme.
+        rollout_id: session_id,
+        fork_count: 1,
+        provider: settings::Provider::Freebuff,
+        account_id: account.id.clone(),
+        account_label: account.label.clone(),
+        codex_home: account.codex_home.clone(),
+        file_path,
+        cwd,
+        started_at,
+        last_activity,
+        title: title.map(|text| truncate_chars(&text, TITLE_MAX_CHARS)),
+        preview: first_user.map(|text| truncate_chars(&text, PREVIEW_MAX_CHARS)),
+        message_count,
+        total_tokens: None,
+        cli_version: None,
+    })
 }
 
 /// Vrai pour les messages `user_message` synthetiques injectes par Codex au
@@ -4043,6 +4577,121 @@ mod tests {
         assert_eq!(usage.context_window, 100_000);
         assert_eq!(usage.used_percent, 80);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_resume_repairs_only_missing_custom_tool_outputs_with_a_backup() {
+        let home = fresh_dir();
+        let session_id = "019f5701-fb46-7503-9abb-004a5316894b";
+        let directory = home.join("sessions/2026/08/18");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("rollout-2026-08-18T15-18-09-{session_id}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-08-18T15:18:00Z",
+                "type": "session_meta",
+                "payload": {"session_id": session_id, "id": session_id}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-18T15:18:09Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "missing-call",
+                    "name": "exec",
+                    "status": "completed",
+                    "input": "sleep 30",
+                    "internal_chat_message_metadata_passthrough": {"opaque": true}
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-18T15:18:10Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "complete-call",
+                    "name": "exec",
+                    "status": "completed",
+                    "input": "pwd"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-18T15:18:11Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "complete-call",
+                    "output": "ok"
+                }
+            }),
+        ];
+        let serialized = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, serialized).unwrap();
+
+        assert_eq!(
+            repair_interrupted_codex_tool_calls(&home, session_id).unwrap(),
+            1
+        );
+        let repaired = fs::read_to_string(&path).unwrap();
+        let values = repaired
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let missing_call = values
+            .iter()
+            .position(|value| {
+                value.pointer("/payload/call_id").and_then(Value::as_str) == Some("missing-call")
+                    && value.pointer("/payload/type").and_then(Value::as_str)
+                        == Some("custom_tool_call")
+            })
+            .unwrap();
+        assert_eq!(
+            values[missing_call + 1]
+                .pointer("/payload/type")
+                .and_then(Value::as_str),
+            Some("custom_tool_call_output")
+        );
+        assert_eq!(
+            values[missing_call + 1]
+                .pointer("/payload/call_id")
+                .and_then(Value::as_str),
+            Some("missing-call")
+        );
+        assert_eq!(
+            values[missing_call + 1]
+                .pointer("/payload/internal_chat_message_metadata_passthrough/opaque"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| {
+                    value.pointer("/payload/call_id").and_then(Value::as_str)
+                        == Some("complete-call")
+                        && value.pointer("/payload/type").and_then(Value::as_str)
+                            == Some("custom_tool_call_output")
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bak"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            repair_interrupted_codex_tool_calls(&home, session_id).unwrap(),
+            0
+        );
+        let _ = fs::remove_dir_all(home);
     }
 
     fn local_secs(ts: &str) -> i64 {
@@ -4785,6 +5434,112 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "<div className=x> what renders?");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn freebuff_chat_files_feed_prompt_history() {
+        let base = fresh_dir();
+        let home = base.join("home");
+        let chat = home
+            .join(".config")
+            .join("manicode")
+            .join("projects")
+            .join("proj")
+            .join("chats")
+            .join("2026-08-19T17-50-50.946Z");
+        fs::create_dir_all(&chat).unwrap();
+
+        fs::write(
+            chat.join("chat-meta.json"),
+            r#"{"messageCount":2,"firstPrompt":"premiere demande"}"#,
+        )
+        .unwrap();
+        fs::write(
+            chat.join("run-state.json"),
+            r#"{"sessionState":{"fileContext":{"projectRoot":"/srv/proj"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            chat.join("chat-messages.json"),
+            r#"[
+                {"id":"divider-1787161900000","variant":"ai","content":""},
+                {"id":"user-1787161914227","variant":"user","content":"premiere demande"},
+                {"id":"ai-1787161916000","variant":"ai","content":"reponse de l'agent"},
+                {"id":"user-1787161918000","variant":"user","content":"seconde demande"}
+            ]"#,
+        )
+        .unwrap();
+
+        let mut account = test_account("freebuff", &home);
+        account.provider = settings::Provider::Freebuff;
+
+        let entries = scan_account_prompts(&account);
+
+        assert_eq!(entries.len(), 2, "seuls les messages user sont indexes");
+        assert_eq!(entries[0].text, "premiere demande");
+        assert_eq!(entries[1].text, "seconde demande");
+        assert_eq!(entries[0].session_title.as_deref(), Some("premiere demande"));
+        assert_eq!(entries[0].session_id, "proj/2026-08-19T17-50-50.946Z");
+        assert_eq!(entries[0].account_id, "freebuff");
+        assert_eq!(entries[0].cwd.as_deref(), Some("/srv/proj"));
+        assert!(entries[0].timestamp > 0);
+        assert!(entries[1].timestamp >= entries[0].timestamp);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn freebuff_chat_files_feed_discussion_list() {
+        let base = fresh_dir();
+        let home = base.join("home");
+        let chat = home
+            .join(".config")
+            .join("manicode")
+            .join("projects")
+            .join("proj")
+            .join("chats")
+            .join("2026-08-19T17-50-50.946Z");
+        fs::create_dir_all(&chat).unwrap();
+
+        fs::write(
+            chat.join("chat-meta.json"),
+            r#"{"messageCount":2,"firstPrompt":"premiere demande","messagesMtimeMs":1787161918000.0}"#,
+        )
+        .unwrap();
+        fs::write(
+            chat.join("run-state.json"),
+            r#"{"sessionState":{"fileContext":{"projectRoot":"/srv/proj"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            chat.join("chat-messages.json"),
+            r#"[
+                {"id":"user-1787161914227","variant":"user","content":"premiere demande"},
+                {"id":"ai-1787161916000","variant":"ai","content":"reponse de l'agent"}
+            ]"#,
+        )
+        .unwrap();
+
+        let mut account = test_account("freebuff", &home);
+        account.provider = settings::Provider::Freebuff;
+
+        let discussions = scan_freebuff_discussions(&home, &account);
+
+        assert_eq!(discussions.len(), 1);
+        let summary = &discussions[0];
+        assert_eq!(summary.provider, settings::Provider::Freebuff);
+        assert_eq!(summary.session_id, "proj-2026-08-19T17-50-50-946Z");
+        assert_eq!(summary.rollout_id, summary.session_id);
+        assert_eq!(summary.account_id, "freebuff");
+        assert_eq!(summary.cwd.as_deref(), Some("/srv/proj"));
+        assert_eq!(summary.title.as_deref(), Some("premiere demande"));
+        assert_eq!(summary.preview.as_deref(), Some("premiere demande"));
+        assert_eq!(summary.message_count, 2);
+        assert!(summary.started_at > 0);
+        assert!(summary.last_activity >= summary.started_at);
+        assert_eq!(summary.total_tokens, None);
 
         let _ = fs::remove_dir_all(&base);
     }

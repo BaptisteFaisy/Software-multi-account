@@ -12,7 +12,7 @@ set "DEBUG_EXE=%APP_DIR%src-tauri\target\debug\codex-switch-terminal.exe"
 cd /d "%APP_DIR%"
 title Codex Switch Terminal
 
-if "%~1"=="" goto :menu
+if "%~1"=="" goto :run_prepapp
 call :dispatch "%~1"
 exit /b %ERRORLEVEL%
 
@@ -97,8 +97,12 @@ exit /b 1
 echo Utilisation :
 echo   "%~nx0" [app^|cloud^|web^|server^|stop^|firewall]
 echo.
-echo Sans argument, le lanceur affiche le menu interactif.
+echo Sans argument, le lanceur ouvre Switch PrepApp sur le PC.
 exit /b 0
+
+:run_prepapp
+powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\Documents\Switch-PrepApp\Start-Switch-PrepApp.ps1"
+exit /b %ERRORLEVEL%
 
 :run_app
 if exist "%RELEASE_EXE%" (

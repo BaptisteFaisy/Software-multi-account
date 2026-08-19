@@ -20,10 +20,11 @@ use crate::{
         LIST_CALENDAR_EVENTS_TOOL_NAME, LIST_OUTLOOK_MESSAGES_TOOL_NAME,
         LIST_PRIVATE_MESSAGE_CAMPAIGNS_TOOL_NAME, LIST_PRIVATE_MESSAGE_USERS_TOOL_NAME,
         LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME, LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME,
+        LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME, MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME,
         PAUSE_AUTONOMOUS_AGENT_TOOL_NAME, PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
-        QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME, SEND_OUTLOOK_EMAIL_TOOL_NAME,
-        SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME, UPDATE_AUTONOMOUS_AGENT_TOOL_NAME,
-        UPDATE_CALENDAR_EVENT_TOOL_NAME,
+        QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME, SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME,
+        SEND_OUTLOOK_EMAIL_TOOL_NAME, SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME,
+        UPDATE_AUTONOMOUS_AGENT_TOOL_NAME, UPDATE_CALENDAR_EVENT_TOOL_NAME,
     },
     creative_accounts::{self, ConnectCreativeAccountRequest, CreativeAccountIdRequest},
     discussions,
@@ -56,9 +57,11 @@ use crate::{
     },
     tiktok_messaging::{
         ConfirmTikTokDmCampaignRequest, PrepareTikTokDmCampaignRequest,
-        QueueTikTokFollowerExtractionRequest, TikTokConnectorClaimRequest,
-        TikTokConnectorHeartbeatRequest, TikTokConnectorReportRequest, TikTokDmError,
-        TikTokDmManager, TikTokFollowerResultReportRequest, TikTokFollowerSubmissionReportRequest,
+        QueueTikTokFollowerExtractionRequest, QueueTikTokSenderSetupRequest,
+        TikTokConnectorClaimRequest, TikTokConnectorHeartbeatRequest, TikTokConnectorReportRequest,
+        TikTokDmCampaign, TikTokDmCampaignStatus, TikTokDmError, TikTokDmManager,
+        TikTokFollowerResultReportRequest, TikTokFollowerSubmissionReportRequest,
+        TikTokSenderSetupActionKind, TikTokSenderSetupReportRequest,
     },
     video_generation::{self, VideoGenerationRequest, VideoGenerationStatusRequest},
     voice,
@@ -89,6 +92,7 @@ use futures_util::{SinkExt, StreamExt};
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -1199,6 +1203,18 @@ pub async fn run_from_env() -> Result<(), String> {
             post(api_confirm_tiktok_dm_campaign).layer(DefaultBodyLimit::max(4 * 1024)),
         )
         .route(
+            "/tiktok/sender-accounts",
+            get(api_list_tiktok_sender_accounts),
+        )
+        .route(
+            "/tiktok/sender-accounts/select",
+            post(api_select_tiktok_sender_account).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/tiktok/sender-login",
+            post(api_queue_tiktok_sender_setup).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
             "/tiktok/follower-extractions",
             get(api_list_tiktok_follower_extractions)
                 .post(api_queue_tiktok_follower_extraction)
@@ -1215,6 +1231,14 @@ pub async fn run_from_env() -> Result<(), String> {
         .route(
             "/tiktok/connector/jobs/report",
             post(api_tiktok_connector_report).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/sender-setup/claim",
+            post(api_tiktok_sender_setup_claim).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/tiktok/connector/sender-setup/report",
+            post(api_tiktok_sender_setup_report).layer(DefaultBodyLimit::max(8 * 1024)),
         )
         .route(
             "/tiktok/connector/follower-extractions/claim",
@@ -2860,6 +2884,99 @@ async fn api_list_tiktok_dm_campaigns(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectTikTokSenderAccountRequest {
+    username: String,
+}
+
+async fn api_list_tiktok_sender_accounts(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    let accounts = match state.tiktok_messaging.sender_accounts(actor.owner_id()) {
+        Ok(accounts) => accounts,
+        Err(error) => return tiktok_dm_api_error(&state, error),
+    };
+    let connector = match state.tiktok_messaging.connector_status() {
+        Ok(connector) => connector,
+        Err(error) => return tiktok_dm_api_error(&state, error),
+    };
+    let connector_online = connector
+        .as_ref()
+        .is_some_and(|status| status.is_online(metrics::now_ts()) && status.agent_healthy);
+    let bridge_online = connector
+        .as_ref()
+        .is_some_and(|status| status.is_online(metrics::now_ts()));
+    let devices = connector
+        .as_ref()
+        .map(|status| status.device_serials.clone())
+        .unwrap_or_default();
+    let device_details = connector
+        .as_ref()
+        .map(|status| status.devices.clone())
+        .unwrap_or_default();
+    let scrcpy_available = connector
+        .as_ref()
+        .is_some_and(|status| status.scrcpy_available);
+    let adb_error = connector.as_ref().and_then(|status| status.adb_error.clone());
+    let connector_error = connector.as_ref().and_then(|status| status.error.clone());
+    let setup_required = accounts.is_empty();
+    private_message_no_store(json_response(json!({
+        "accounts": accounts,
+        "devices": devices,
+        "deviceDetails": device_details,
+        "bridgeOnline": bridge_online,
+        "connectorOnline": connector_online,
+        "scrcpyAvailable": scrcpy_available,
+        "adbError": adb_error,
+        "connectorError": connector_error,
+        "setupRequired": setup_required
+    })))
+}
+
+async fn api_select_tiktok_sender_account(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<SelectTikTokSenderAccountRequest>,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state
+        .tiktok_messaging
+        .select_sender_account(actor.owner_id(), &request.username)
+    {
+        Ok(account) => private_message_no_store(json_response(account)),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_queue_tiktok_sender_setup(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<QueueTikTokSenderSetupRequest>,
+) -> Response {
+    let actor = match request_actor(&state, &headers) {
+        Ok(actor) => actor,
+        Err(response) => return response,
+    };
+    match state
+        .tiktok_messaging
+        .queue_sender_setup(actor.owner_id(), request)
+    {
+        Ok(action) => {
+            private_message_no_store((StatusCode::ACCEPTED, Json(action)).into_response())
+        }
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
 async fn api_prepare_tiktok_dm_campaign(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -2887,6 +3004,64 @@ struct ConfirmTikTokDmHttpRequest {
     owned_accounts_confirmed: bool,
     #[serde(default)]
     send_confirmed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendTikTokDmDirectToolArguments {
+    recipient: String,
+    message: String,
+    #[serde(default)]
+    min_interval_minutes: Option<u8>,
+    #[serde(default)]
+    max_interval_minutes: Option<u8>,
+    #[serde(default)]
+    device_serial: Option<String>,
+    #[serde(default)]
+    sender_account: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SendTikTokDmToolArguments {
+    Direct(SendTikTokDmDirectToolArguments),
+    Prepared(ConfirmTikTokDmCampaignRequest),
+}
+
+impl SendTikTokDmDirectToolArguments {
+    fn into_prepare_request(self, capability_token: &str) -> PrepareTikTokDmCampaignRequest {
+        let idempotency_key = self.idempotency_key.unwrap_or_else(|| {
+            let mut digest = Sha256::new();
+            digest.update(capability_token.as_bytes());
+            digest.update([0]);
+            digest.update(self.recipient.as_bytes());
+            digest.update([0]);
+            digest.update(self.message.as_bytes());
+            digest.update([0]);
+            digest.update([self.min_interval_minutes.unwrap_or(1)]);
+            digest.update([self.max_interval_minutes.unwrap_or(2)]);
+            if let Some(serial) = self.device_serial.as_deref() {
+                digest.update([0]);
+                digest.update(serial.as_bytes());
+            }
+            if let Some(sender) = self.sender_account.as_deref() {
+                digest.update([0]);
+                digest.update(sender.as_bytes());
+            }
+            format!("chat-direct:{:x}", digest.finalize())
+        });
+        PrepareTikTokDmCampaignRequest {
+            recipients: vec![self.recipient],
+            message: self.message,
+            min_interval_minutes: self.min_interval_minutes.unwrap_or(1),
+            max_interval_minutes: self.max_interval_minutes.unwrap_or(2),
+            device_serial: self.device_serial,
+            sender_account: self.sender_account,
+            idempotency_key,
+        }
+    }
 }
 
 async fn api_confirm_tiktok_dm_campaign(
@@ -2989,6 +3164,37 @@ async fn api_tiktok_connector_report(
     }
     match state.tiktok_messaging.report(request) {
         Ok(campaign) => private_message_no_store(json_response(campaign)),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_sender_setup_claim(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokConnectorClaimRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state
+        .tiktok_messaging
+        .claim_next_sender_setup(&request.connector_id)
+    {
+        Ok(job) => private_message_no_store(json_response(json!({ "job": job }))),
+        Err(error) => tiktok_dm_api_error(&state, error),
+    }
+}
+
+async fn api_tiktok_sender_setup_report(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<TikTokSenderSetupReportRequest>,
+) -> Response {
+    if let Err(response) = check_maintenance_header(&state, &headers) {
+        return response;
+    }
+    match state.tiktok_messaging.report_sender_setup(request) {
+        Ok(action) => private_message_no_store(json_response(action)),
         Err(error) => tiktok_dm_api_error(&state, error),
     }
 }
@@ -3447,6 +3653,33 @@ fn bearer_from_headers(headers: &HeaderMap) -> &str {
     value.strip_prefix("Bearer ").unwrap_or(value).trim()
 }
 
+async fn wait_for_tiktok_submission(
+    state: &Arc<ServerState>,
+    owner_id: &str,
+    mut campaign: TikTokDmCampaign,
+) -> Result<TikTokDmCampaign, TikTokDmError> {
+    for _ in 0..30 {
+        if matches!(
+            campaign.status,
+            TikTokDmCampaignStatus::Submitted
+                | TikTokDmCampaignStatus::Failed
+                | TikTokDmCampaignStatus::Cancelled
+        ) {
+            return Ok(campaign);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(current) = state
+            .tiktok_messaging
+            .list(owner_id)?
+            .into_iter()
+            .find(|current| current.id == campaign.id)
+        {
+            campaign = current;
+        }
+    }
+    Ok(campaign)
+}
+
 async fn mcp_chat_tools(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -3516,6 +3749,9 @@ async fn mcp_chat_tools(
                 && name != CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
                 && name != CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
                 && name != LIST_TIKTOK_DM_CAMPAIGNS_TOOL_NAME
+                && name != LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME
+                && name != MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME
+                && name != SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME
                 && name != PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME
                 && name != SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME
                 && name != LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME
@@ -3546,6 +3782,7 @@ async fn mcp_chat_tools(
                 | UPDATE_CALENDAR_EVENT_TOOL_NAME
                 | CREATE_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
                 | CONTROL_PRIVATE_MESSAGE_CAMPAIGN_TOOL_NAME
+                | MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME
                 | PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME
                 | SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME
                 | QUEUE_TIKTOK_FOLLOWER_EXTRACTION_TOOL_NAME => {
@@ -4075,6 +4312,134 @@ async fn mcp_chat_tools(
                         }),
                     ))
                 }
+                LIST_TIKTOK_SENDER_ACCOUNTS_TOOL_NAME => {
+                    if !arguments
+                        .as_object()
+                        .is_some_and(|arguments| arguments.is_empty())
+                    {
+                        return json_response(chat_model_tools::tool_error_response(
+                            id,
+                            "La liste des comptes emetteurs TikTok ne prend aucun argument",
+                        ));
+                    }
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    let accounts = match state.tiktok_messaging.sender_accounts(owner_id) {
+                        Ok(accounts) => accounts,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
+                                id,
+                                &error.to_string(),
+                            ))
+                        }
+                    };
+                    let connector_online = state
+                        .tiktok_messaging
+                        .connector_status()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|status| {
+                            status.is_online(metrics::now_ts()) && status.agent_healthy
+                        });
+                    let text = if !connector_online {
+                        "Le connecteur Windows TikMatrix est hors ligne. Demarrez Codex Switch Terminal Cloud et TikMatrix sur Windows."
+                    } else if accounts.is_empty() {
+                        "Aucun compte emetteur n'est reconnu. Connectez-vous dans l'application TikTok de l'appareil Android, resolvez localement le code ou captcha si necessaire, puis lancez Match Accounts dans TikMatrix."
+                    } else {
+                        "Comptes emetteurs TikTok reconnus par TikMatrix. Selectionnez-en un avant l'envoi si aucun n'est deja selectionne."
+                    };
+                    json_response(chat_model_tools::tool_microsoft_data_response(
+                        id,
+                        text,
+                        json!({
+                            "accounts": accounts,
+                            "connectorOnline": connector_online,
+                            "secretsStoredOnVps": false
+                        }),
+                    ))
+                }
+                MANAGE_TIKTOK_SENDER_LOGIN_TOOL_NAME => {
+                    let request =
+                        match serde_json::from_value::<QueueTikTokSenderSetupRequest>(arguments) {
+                            Ok(request) => request,
+                            Err(error) => {
+                                return json_response(chat_model_tools::tool_error_response(
+                                    id,
+                                    &format!(
+                                        "Arguments invalides pour la connexion TikTok : {error}"
+                                    ),
+                                ))
+                            }
+                        };
+                    let action_kind = request.action;
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    match state.tiktok_messaging.queue_sender_setup(owner_id, request) {
+                        Ok(action) => {
+                            let text = match action_kind {
+                                TikTokSenderSetupActionKind::OpenLogin => format!(
+                                    "Ouverture de TikTok demandee sur l'appareil {}. Saisissez vos identifiants et resolvez le captcha ou la verification uniquement dans la fenetre TikTok locale. Revenez ensuite dans ce chat et dites que la connexion est terminee.",
+                                    action.device_serial
+                                ),
+                                TikTokSenderSetupActionKind::MatchAccounts => format!(
+                                    "Synchronisation du compte demandee sur l'appareil {}. Attendez quelques secondes, puis verifiez le compte emetteur reconnu.",
+                                    action.device_serial
+                                ),
+                                TikTokSenderSetupActionKind::OpenScrcpy => format!(
+                                    "Ouverture de scrcpy demandee sur l'appareil {}. La fenetre apparait sur le poste Windows qui execute le connecteur.",
+                                    action.device_serial
+                                ),
+                            };
+                            json_response(chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &text,
+                                json!({
+                                    "action": action,
+                                    "credentialsRequestedInChat": false,
+                                    "tikTokTokenStoredOnVps": false,
+                                    "sessionStorage": "TikTok/TikMatrix local"
+                                }),
+                            ))
+                        }
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
+                SELECT_TIKTOK_SENDER_ACCOUNT_TOOL_NAME => {
+                    let request =
+                        match serde_json::from_value::<SelectTikTokSenderAccountRequest>(arguments)
+                        {
+                            Ok(request) => request,
+                            Err(error) => {
+                                return json_response(chat_model_tools::tool_error_response(
+                                    id,
+                                    &format!(
+                                    "Arguments invalides pour le compte emetteur TikTok : {error}"
+                                ),
+                                ))
+                            }
+                        };
+                    let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
+                    match state
+                        .tiktok_messaging
+                        .select_sender_account(owner_id, &request.username)
+                    {
+                        Ok(account) => json_response(
+                            chat_model_tools::tool_microsoft_data_response(
+                                id,
+                                &format!(
+                                    "{} est maintenant le compte emetteur TikTok par defaut sur l'appareil {}.",
+                                    account.username, account.device_serial
+                                ),
+                                json!({ "account": account }),
+                            ),
+                        ),
+                        Err(error) => json_response(chat_model_tools::tool_error_response(
+                            id,
+                            &error.to_string(),
+                        )),
+                    }
+                }
                 PREPARE_TIKTOK_DM_CAMPAIGN_TOOL_NAME => {
                     let request =
                         match serde_json::from_value::<PrepareTikTokDmCampaignRequest>(arguments) {
@@ -4114,31 +4479,115 @@ async fn mcp_chat_tools(
                 }
                 SEND_TIKTOK_DM_CAMPAIGN_TOOL_NAME => {
                     let request =
-                        match serde_json::from_value::<ConfirmTikTokDmCampaignRequest>(arguments) {
+                        match serde_json::from_value::<SendTikTokDmToolArguments>(arguments) {
                             Ok(request) => request,
                             Err(error) => {
                                 return json_response(chat_model_tools::tool_error_response(
                                     id,
-                                    &format!(
-                                        "Arguments invalides pour la confirmation TikTok : {error}"
-                                    ),
+                                    &format!("Arguments invalides pour l'envoi TikTok : {error}"),
                                 ))
                             }
                         };
                     let owner_id = context.user_id.as_deref().unwrap_or("server-admin");
-                    match state.tiktok_messaging.confirm(owner_id, request) {
-                        Ok(campaign) => json_response(
-                            chat_model_tools::tool_microsoft_data_response(
+                    let queued = match request {
+                        SendTikTokDmToolArguments::Prepared(request) => {
+                            state.tiktok_messaging.confirm(owner_id, request)
+                        }
+                        SendTikTokDmToolArguments::Direct(mut request) => {
+                            let connector = match state.tiktok_messaging.connector_status() {
+                                Ok(connector) => connector,
+                                Err(error) => {
+                                    return json_response(chat_model_tools::tool_error_response(
+                                        id,
+                                        &error.to_string(),
+                                    ))
+                                }
+                            };
+                            if !connector.as_ref().is_some_and(|status| {
+                                status.is_online(metrics::now_ts()) && status.agent_healthy
+                            }) {
+                                return json_response(chat_model_tools::tool_error_response(
+                                    id,
+                                    "Le connecteur Windows TikMatrix est hors ligne ou indisponible. Demarrez l'application Windows et TikMatrix, puis recommencez l'envoi.",
+                                ));
+                            }
+                            let created_by = if context.scope == ChatToolScope::PersonalDataOnly {
+                                "autonomous_agent"
+                            } else {
+                                "human_chat"
+                            };
+                            let sender = match state.tiktok_messaging.resolve_sender_account(
+                                owner_id,
+                                request.sender_account.as_deref(),
+                                request.device_serial.as_deref(),
+                            ) {
+                                Ok(sender) => sender,
+                                Err(error) => {
+                                    return json_response(chat_model_tools::tool_error_response(
+                                        id,
+                                        &error.to_string(),
+                                    ))
+                                }
+                            };
+                            request.sender_account = Some(sender.username);
+                            request.device_serial = Some(sender.device_serial);
+                            state
+                                .tiktok_messaging
+                                .prepare(owner_id, request.into_prepare_request(token), created_by)
+                                .and_then(|campaign| {
+                                    state.tiktok_messaging.confirm(
+                                        owner_id,
+                                        ConfirmTikTokDmCampaignRequest {
+                                            campaign_id: campaign.id,
+                                            owned_accounts_confirmed: true,
+                                            send_confirmed: true,
+                                        },
+                                    )
+                                })
+                        }
+                    };
+                    let campaign = match queued {
+                        Ok(campaign) => campaign,
+                        Err(error) => {
+                            return json_response(chat_model_tools::tool_error_response(
                                 id,
-                                "Campagne TikTok confirmee et placee dans la file du connecteur Windows.",
-                                json!({ "campaign": campaign }),
-                            ),
-                        ),
-                        Err(error) => json_response(chat_model_tools::tool_error_response(
-                            id,
-                            &error.to_string(),
-                        )),
-                    }
+                                &error.to_string(),
+                            ))
+                        }
+                    };
+                    let campaign =
+                        match wait_for_tiktok_submission(&state, owner_id, campaign).await {
+                            Ok(campaign) => campaign,
+                            Err(error) => {
+                                return json_response(chat_model_tools::tool_error_response(
+                                    id,
+                                    &error.to_string(),
+                                ))
+                            }
+                        };
+                    let text = match campaign.status {
+                        TikTokDmCampaignStatus::Submitted => {
+                            "TikMatrix a accepte la tache d'envoi TikTok. La livraison finale depend ensuite de TikTok."
+                        }
+                        TikTokDmCampaignStatus::Failed => {
+                            "TikMatrix a refuse ou n'a pas pu lancer l'envoi TikTok."
+                        }
+                        TikTokDmCampaignStatus::Cancelled => {
+                            "L'envoi TikTok a ete annule."
+                        }
+                        _ => {
+                            "L'envoi TikTok est dans la file du connecteur Windows et reste en cours de traitement."
+                        }
+                    };
+                    json_response(chat_model_tools::tool_microsoft_data_response(
+                        id,
+                        text,
+                        json!({
+                            "campaign": campaign,
+                            "tikMatrixAccepted": campaign.status == TikTokDmCampaignStatus::Submitted,
+                            "deliveryConfirmed": false
+                        }),
+                    ))
                 }
                 LIST_TIKTOK_FOLLOWER_EXTRACTIONS_TOOL_NAME => {
                     if !arguments
@@ -7147,6 +7596,22 @@ fn auth_or(
 }
 
 fn request_actor(state: &Arc<ServerState>, headers: &HeaderMap) -> Result<RequestActor, Response> {
+    // Le client distant joint le jeton administrateur technique a toutes les
+    // requetes, y compris lorsqu'un cookie utilisateur valide est present.
+    // Privilegier ce cookie conserve l'identite nominative necessaire aux
+    // espaces partages et applique leurs controles d'acces utilisateur.
+    match state.auth.identity_from_headers(headers) {
+        Ok(Some(identity)) => return Ok(RequestActor::User(identity)),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &error,
+                &state.config,
+            ))
+        }
+    }
+
     let bearer = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -7155,19 +7620,11 @@ fn request_actor(state: &Arc<ServerState>, headers: &HeaderMap) -> Result<Reques
     if crate::security::constant_time_eq(provided.as_bytes(), state.config.admin_token.as_bytes()) {
         return Ok(RequestActor::Administrator);
     }
-    match state.auth.identity_from_headers(headers) {
-        Ok(Some(identity)) => Ok(RequestActor::User(identity)),
-        Ok(None) => Err(api_error(
-            StatusCode::UNAUTHORIZED,
-            "authentification requise",
-            &state.config,
-        )),
-        Err(error) => Err(api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &error,
-            &state.config,
-        )),
-    }
+    Err(api_error(
+        StatusCode::UNAUTHORIZED,
+        "authentification requise",
+        &state.config,
+    ))
 }
 
 fn require_user_actor(
@@ -7275,8 +7732,12 @@ fn api_error(status: StatusCode, message: &str, config: &ServerConfig) -> Respon
 }
 
 fn agent_start_status(error: &str) -> StatusCode {
-    if error.starts_with("capacite agents atteinte") {
+    if error.starts_with("capacite agents atteinte")
+        || error.starts_with("capacite chats atteinte")
+    {
         StatusCode::TOO_MANY_REQUESTS
+    } else if error.starts_with("memoire insuffisante") {
+        StatusCode::SERVICE_UNAVAILABLE
     } else if error.contains("deja vivant") || error.contains("déjà en cours") {
         StatusCode::CONFLICT
     } else {
@@ -7547,6 +8008,30 @@ mod tests {
             serde_json::from_str(r#"{"draining":true,"ttlSeconds":12}"#).unwrap();
         assert!(request.draining);
         assert_eq!(request.ttl_seconds, Some(12));
+    }
+
+    #[test]
+    fn direct_tiktok_tool_builds_one_idempotent_campaign_request() {
+        let arguments = json!({
+            "recipient": "@compte_test",
+            "message": "Bonjour depuis le VPS"
+        });
+        let build = || {
+            let request =
+                serde_json::from_value::<SendTikTokDmToolArguments>(arguments.clone()).unwrap();
+            let SendTikTokDmToolArguments::Direct(request) = request else {
+                panic!("le format direct doit etre selectionne");
+            };
+            request.into_prepare_request("capability-token")
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(first.recipients, vec!["@compte_test"]);
+        assert_eq!(first.message, "Bonjour depuis le VPS");
+        assert_eq!(first.min_interval_minutes, 1);
+        assert_eq!(first.max_interval_minutes, 2);
+        assert_eq!(first.idempotency_key, second.idempotency_key);
+        assert!(first.idempotency_key.starts_with("chat-direct:"));
     }
 
     #[test]

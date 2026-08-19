@@ -11,7 +11,11 @@ services:
     ports:
       - "127.0.0.1:{{ cst_remote_port }}:8080"
     volumes:
-      - /srv/cst:/srv/cst
+      - type: bind
+        source: /srv/cst
+        target: /srv/cst
+        bind:
+          propagation: rslave
     # Sans plafond, une derive du runtime consomme toute la RAM de l'hote PUIS
     # tout son swap. Le noyau ne declenche alors aucun OOM-kill (le swap absorbe
     # la demande) et la VM entiere part en thrashing : plus rien n'est ordonnance,

@@ -351,6 +351,56 @@
         group: root
         mode: "0644"
 
+    - name: Relever les services externes exclus du rebuild CST
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - --all
+          - --filter
+          - label=com.codex-switch-terminal.rebuild-policy=exclude
+          - --format
+          - "{{ '{{' }}.ID{{ '}}' }}|{{ '{{' }}.Names{{ '}}' }}"
+      register: cst_protected_containers_before
+      changed_when: false
+
+    - name: Relever les services externes exclus actuellement actifs
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - --filter
+          - label=com.codex-switch-terminal.rebuild-policy=exclude
+          - --format
+          - "{{ '{{' }}.ID{{ '}}' }}|{{ '{{' }}.Names{{ '}}' }}"
+      register: cst_running_protected_containers_before
+      changed_when: false
+
+    - name: Detecter une collision entre un service exclu et la pile CST
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - --all
+          - --quiet
+          - --filter
+          - label=com.codex-switch-terminal.rebuild-policy=exclude
+          - --filter
+          - label=com.docker.compose.project=codex-switch-terminal
+      register: cst_protected_project_collisions
+      changed_when: false
+
+    - name: Bloquer le rebuild si un service exclu n'est pas isole et actif
+      ansible.builtin.assert:
+        that:
+          - cst_protected_project_collisions.stdout | trim | length == 0
+          - >-
+            (cst_protected_containers_before.stdout_lines | sort) ==
+            (cst_running_protected_containers_before.stdout_lines | sort)
+        fail_msg: >-
+          Un service externe marque exclude est arrete ou partage le projet
+          Compose codex-switch-terminal. Isolez-le avant de reconstruire CST.
+
     - name: Demarrer ou mettre a jour le runtime
       ansible.builtin.command:
         argv:
@@ -360,7 +410,6 @@
           - /opt/codex-switch-terminal/compose.yaml
           - up
           - --detach
-          - --remove-orphans
           - --wait
           - --wait-timeout
           - "180"
@@ -380,6 +429,21 @@
       retries: 20
       delay: 3
       until: cst_health.status == 200 and (cst_health.json.ok | default(false))
+
+    - name: Verifier que les services exclus sont restes actifs et inchanges
+      ansible.builtin.command:
+        argv:
+          - docker
+          - ps
+          - --filter
+          - label=com.codex-switch-terminal.rebuild-policy=exclude
+          - --format
+          - "{{ '{{' }}.ID{{ '}}' }}|{{ '{{' }}.Names{{ '}}' }}"
+      register: cst_protected_containers_after
+      changed_when: false
+      failed_when: >-
+        (cst_protected_containers_after.stdout_lines | sort) !=
+        (cst_protected_containers_before.stdout_lines | sort)
 
     # La sonde ci-dessus a valide la nouvelle image : on peut purger sans risque.
     # Sans cette retention, chaque deploiement empilait une image ~3,9 Go et le

@@ -32,6 +32,7 @@ mod telegram_notifications;
 #[cfg(feature = "desktop")]
 mod terminal;
 mod tiktok_messaging;
+mod tiktok_messaging_policy;
 mod video_generation;
 mod voice;
 mod vps_deploy;

@@ -34,6 +34,17 @@ test("les routes d'authentification et le profil sont exposes", () => {
   assert.match(backend, /mot de passe actuel est requis/);
 });
 
+test("la session utilisateur prime sur le jeton administrateur distant", () => {
+  const requestActor = server.match(
+    /fn request_actor\([\s\S]*?\n\}\n\nfn require_user_actor/,
+  )?.[0];
+  assert.ok(requestActor, "request_actor doit rester present");
+  assert.ok(
+    requestActor.indexOf("identity_from_headers") < requestActor.indexOf('get("authorization")'),
+    "le cookie nominatif doit etre resolu avant le jeton administrateur",
+  );
+});
+
 test("l'interface bloque l'application jusqu'a la connexion puis expose le profil", () => {
   assert.match(frontend, /Créer votre compte/);
   assert.match(frontend, /Continuer avec Google/);
@@ -58,6 +69,13 @@ test("une erreur Failed to fetch propose une reparation automatique", () => {
   assert.match(platform, /key\.startsWith\("codex-terminal-static-"\)/);
   assert.match(styles, /\.remote-login-repair/);
   assert.match(styles, /\.account-auth-repair/);
+});
+
+test("une configuration d'authentification nulle ne fait pas planter le client", () => {
+  assert.match(
+    frontend,
+    /if \(!authConfig \|\| typeof authConfig\.enabled !== "boolean" \|\| !authConfig\.enabled\)/,
+  );
 });
 
 test("l'inscription reste accessible dans une petite fenetre", () => {

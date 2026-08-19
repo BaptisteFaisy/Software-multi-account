@@ -66,8 +66,8 @@ public class MainActivity extends Activity {
 
     private static final String PREFS = "cst";
     private static final String KEY_BASE = "baseUrl";
-    private static final String KEY_VPS_ROUTE_MIGRATED = "vpsRouteMigrated20260720";
-    private static final String LEGACY_PC_BASE_URL = "https://pc-fixe-cst.tail3a8bdf.ts.net";
+    private static final String KEY_PC_ROUTE_MIGRATED = "pcRouteMigrated20260817";
+    private static final String LEGACY_VPS_BASE_URL = "https://cst-google-trial.tail3a8bdf.ts.net";
     private static final String LEGACY_KEY_TOKEN = "token";
     private static final int REQUEST_FILE_CHOOSER = 1001;
     private static final int REQUEST_WEB_PERMISSIONS = 1002;
@@ -287,20 +287,20 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Bascule une seule fois les installations existantes du serveur PC vers
-     * le VPS embarque. Les URL personnalisees restent intactes et l'utilisateur
-     * peut toujours choisir une autre cible apres cette migration.
+     * Bascule une seule fois les installations existantes de l'ancien VPS vers
+     * le serveur PC embarque. Les URL personnalisees restent intactes et
+     * l'utilisateur peut toujours choisir une autre cible apres cette migration.
      */
     private void migrateLegacyServerRoute() {
-        if (preferences.getBoolean(KEY_VPS_ROUTE_MIGRATED, false)) {
+        if (preferences.getBoolean(KEY_PC_ROUTE_MIGRATED, false)) {
             return;
         }
 
         SharedPreferences.Editor editor = preferences.edit()
-                .putBoolean(KEY_VPS_ROUTE_MIGRATED, true);
+                .putBoolean(KEY_PC_ROUTE_MIGRATED, true);
         String saved = normalizeServerUrl(preferences.getString(KEY_BASE, ""));
         String bundled = normalizeServerUrl(getString(R.string.server_url));
-        if (LEGACY_PC_BASE_URL.equals(saved) && bundled != null) {
+        if (LEGACY_VPS_BASE_URL.equals(saved) && bundled != null) {
             editor.putString(KEY_BASE, bundled);
         }
         editor.apply();
@@ -320,6 +320,21 @@ public class MainActivity extends Activity {
             throw new IllegalStateException("L'URL serveur embarquee doit utiliser HTTPS.");
         }
         return bundled;
+    }
+
+    /**
+     * Le pont JavaScript conserve une URL de base sans query string pour les
+     * appels API. Seule la navigation initiale ajoute l'identifiant du build
+     * frontend demande, et uniquement pour la cible PC embarquee.
+     */
+    private String currentStartupUrl() {
+        String base = currentBaseUrl();
+        String bundled = normalizeServerUrl(getString(R.string.server_url));
+        String startup = getString(R.string.server_start_url).trim();
+        if (base.equals(bundled) && base.equals(normalizeServerUrl(startup))) {
+            return startup;
+        }
+        return base;
     }
 
     /** N'accepte que HTTPS, sans identifiants, query string ni fragment. */
@@ -358,7 +373,7 @@ public class MainActivity extends Activity {
         hideConnectionError();
         progressBar.setProgress(5);
         progressBar.setVisibility(View.VISIBLE);
-        webView.loadUrl(currentBaseUrl());
+        webView.loadUrl(currentStartupUrl());
     }
 
     private void showConnectionError(String details) {

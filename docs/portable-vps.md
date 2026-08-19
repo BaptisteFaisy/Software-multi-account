@@ -209,6 +209,25 @@ Le premier passage genere aussi la paire `~/.ssh/id_ed25519` si elle n'existe
 pas. Une VM deja creee par CST est reutilisee ou redemarree sans supprimer ses
 donnees.
 
+## Services externes exclus des rebuilds CST
+
+Un service metier heberge sur le meme VPS doit utiliser son propre projet
+Compose et son propre dossier sous `/opt`. Duello suit cette regle avec la pile
+`/opt/duello/compose.yaml`, distincte de `codex-switch-terminal`, et le label
+`com.codex-switch-terminal.rebuild-policy=exclude`.
+
+Avant un rebuild, le playbook memorise les identifiants de tous les conteneurs
+portant ce label, refuse de continuer si l'un d'eux est arrete ou rattache au
+projet Compose CST, puis verifie apres `/healthz` que les memes conteneurs sont
+toujours actifs. Le deploiement CST n'utilise pas `--remove-orphans` et ses
+purges d'images ne peuvent pas supprimer une image encore utilisee par Duello.
+
+Cette garantie couvre le remplacement de l'image et du conteneur CST, pas la
+suppression de la VM ni le remplacement de son disque. Avant une reinstallation
+du systeme, une reimage fournisseur ou une migration de VM, sauvegarde Duello
+et deplace-le vers un stockage ou un VPS distinct. Les fichiers d'exploitation
+et la procedure se trouvent dans [`deploy/duello`](../deploy/duello/README.md).
+
 ## Choisir Oracle pour un nouveau chat
 
 Une fois le profil connecte :

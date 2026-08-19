@@ -1,14 +1,15 @@
 # Messages TikTok de test depuis un chat VPS
 
 Codex Switch Terminal peut preparer sur le VPS une campagne de messages directs,
-puis la transmettre au poste Windows qui execute TikMatrix et l'emulateur
+puis la transmettre au poste Windows qui execute TikMatrix et l'appareil
 Android. L'API TikMatrix reste exclusivement sur `127.0.0.1` : aucun port de
 l'agent n'est publie sur Internet ou dans le tunnel SSH.
 
 ## Prerequis locaux
 
 - TikMatrix doit etre lance et son agent local doit etre operationnel.
-- L'emulateur Android doit etre visible dans TikMatrix.
+- Un appareil Android autorise doit etre visible par ADB : telephone USB,
+  emulateur ou appareil ADB reseau.
 - TikTok global (`com.zhiliaoapp.musically`) doit etre installe.
 - Le compte expediteur doit etre connecte.
 - **Match Accounts** doit avoir reconnu au moins un compte.
@@ -17,10 +18,73 @@ l'agent n'est publie sur Internet ou dans le tunnel SSH.
 
 Aucun mot de passe, code 2FA, cookie ou jeton TikTok n'est transmis au VPS.
 
+## Telephone physique USB et scrcpy
+
+Le telephone reste branche au poste Windows ; le VPS ne recoit jamais l'USB.
+Le client Cloud remonte au VPS un inventaire limite aux metadonnees ADB
+(numero de serie, modele, etat et type de transport), puis execute localement
+les actions demandees depuis l'onglet TikTok.
+
+1. activer les **options developpeur** et le **debogage USB** sur Android ;
+2. brancher le telephone et accepter son empreinte RSA sur l'ecran ;
+3. verifier qu'il apparait en etat `device` avec `adb devices -l` ;
+4. installer `scrcpy`, ou definir `CST_SCRCPY_PATH` vers son executable ;
+5. garder Codex Switch Terminal Cloud ouvert et choisir le telephone dans
+   l'onglet **TikTok** ;
+6. cliquer sur **Afficher avec scrcpy**. La fenetre s'ouvre sur Windows, pas
+   dans le navigateur du VPS.
+
+`CST_ADB_PATH` permet aussi d'imposer un `adb.exe` precis. Sans surcharge, le
+connecteur cherche celui de TikMatrix, celui du SDK Android puis celui du
+`PATH`. Un appareil `unauthorized` reste visible mais aucune action ne peut
+etre lancee avant l'acceptation de la demande sur le telephone.
+
+## Connecter et selectionner le compte emetteur
+
+La connexion TikTok ne se fait pas dans le navigateur du VPS. Elle reste dans
+l'application TikTok de l'appareil Android pilote par TikMatrix :
+
+1. demarrer TikMatrix, l'appareil Android et Codex Switch Terminal Cloud ;
+2. dans un chat VPS, demander `connecte mon compte emetteur TikTok` ;
+3. le chat appelle `manage_tiktok_sender_login` avec `open_login` et le
+   connecteur ouvre TikTok sur l'appareil local ;
+4. saisir les identifiants et resoudre le code e-mail, la 2FA ou le captcha
+   directement dans cette fenetre TikTok, jamais dans le chat ;
+5. revenir dans le chat et dire `la connexion TikTok est terminee` ;
+6. le chat appelle `manage_tiktok_sender_login` avec `match_accounts`, puis
+   verifie le compte avec `list_tiktok_sender_accounts` ;
+7. demander `utilise @mon_compte comme compte emetteur TikTok`.
+
+`list_tiktok_sender_accounts` retourne uniquement le `@username`, le numero de
+l'appareil et les indicateurs connecte/actif. `select_tiktok_sender_account`
+memorise le choix pour le proprietaire sur le VPS. Aucun secret TikTok n'entre
+dans cette liaison.
+
+La session d'authentification persistante est conservee par l'application
+TikTok dans l'appareil Android et referencee par TikMatrix. Le systeme
+n'extrait pas le token TikTok et ne le copie pas sur le VPS : les envois
+ulterieurs reutilisent la session locale tant qu'elle reste valide. Sur un VPS
+sans ecran physique, il faut garder une interface distante (RDP/VNC ou la
+console de l'emulateur) accessible pour saisir le mot de passe et effectuer les
+verifications interactives.
+
+Pour garantir que le message part du bon compte, un seul compte connecte et
+actif est accepte par appareil. Si plusieurs comptes TikMatrix sont actifs sur
+le meme appareil, il faut desactiver les autres dans **Manage Accounts** ou
+dedier un appareil a chaque emetteur.
+
 ## Utilisation dans un chat
 
-La demande peut contenir le message exact et jusqu'a cinq comptes secondaires
-controles par l'utilisateur :
+Une fois l'emetteur selectionne, un ordre direct peut contenir le destinataire
+et le message exact :
+
+```text
+Envoie a @compte_test le message exact : Ceci est un test.
+```
+
+Le VPS utilise le compte emetteur selectionne, puis attend le retour
+d'acceptation de TikMatrix. L'ancien flux de brouillon reste disponible pour
+jusqu'a cinq comptes secondaires controles par l'utilisateur :
 
 ```text
 Prepare ce message pour mes comptes de test :

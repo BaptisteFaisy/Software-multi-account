@@ -21125,6 +21125,17 @@ body.chat-context-sidebar-resizing {
     background: #0d0e0c;
   }
 
+  /* Le compositeur Android privilegie les reglages du modele : les boutons
+     Question, Preuve et skills epingles ne sont pas affiches dans l'app, et
+     l'intensite reste visible meme sur les telephones de moins de 620 px. */
+  :root.native-android .chat-agent-tools {
+    display: none !important;
+  }
+
+  :root.native-android .chat-app-layout .chat-effort-select {
+    display: inline-flex;
+  }
+
   :root.native-android .m-tab.active svg {
     filter: none;
   }

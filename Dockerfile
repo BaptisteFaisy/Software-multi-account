@@ -85,13 +85,14 @@ RUN curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o /tmp/rustup-ini
 # OpenRouter). Sans lui, `opencode auth login --provider <id>` echouait en
 # « command not found » et le terminal de connexion restait ouvert sans fin.
 RUN --mount=type=cache,id=cst-runtime-npm-${TARGETARCH},target=/home/cst/.npm,uid=10001,gid=10001,sharing=locked \
-    npm install --global --prefix /home/cst/.local @openai/codex @anthropic-ai/claude-code opencode-ai \
+    npm install --global --prefix /home/cst/.local @openai/codex @anthropic-ai/claude-code opencode-ai freebuff \
     && command -v codex >/dev/null \
     && codex --version \
     && command -v claude >/dev/null \
     && claude --version \
     && command -v opencode >/dev/null \
-    && opencode --version
+    && opencode --version \
+    && command -v freebuff >/dev/null
 
 # `opencode auth login` bootstrape son environnement AVANT d'afficher son invite :
 # telechargement du catalogue models.dev (3,2 Mo) puis installation de
@@ -124,6 +125,20 @@ RUN --mount=type=cache,id=cst-runtime-npm-${TARGETARCH},target=/home/cst/.npm,ui
     test -s "${CST_OPENCODE_RUNTIME_DIR}/cache/opencode/models.json"; \
     test -d "${CST_OPENCODE_RUNTIME_DIR}/config/opencode/node_modules/@opencode-ai/plugin"; \
     rm -rf /tmp/opencode-warmup
+
+# Le paquet npm `freebuff` n'est qu'un lanceur : le vrai CLI est un binaire Bun
+# de ~140 Mo qu'il telecharge dans `~/.config/manicode` au premier demarrage
+# (50 Mo compresses). Sans ce pre-amorcage, le premier onglet freebuff resterait
+# muet le temps du telechargement — exactement le symptome traite juste au-dessus
+# pour OpenCode, et que l'utilisateur lit comme un terminal casse.
+#
+# `--version` est la seule entree qui declenche la recuperation du binaire puis
+# rend la main : le TUI, lui, ne se termine jamais de lui-meme et ne peut donc
+# pas servir de pre-chauffage dans un build. Aucun identifiant n'y transite, la
+# connexion se fait par `freebuff login` dans le home du compte.
+RUN set -eu; \
+    freebuff --version >/dev/null; \
+    test -s /home/cst/.config/manicode/freebuff
 
 USER root
 COPY --from=server-build /tmp/cst-server /usr/local/bin/cst-server
