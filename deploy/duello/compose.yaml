@@ -1,0 +1,42 @@
+name: duello
+
+services:
+  server:
+    # This stable local tag deliberately does not follow CST image rebuilds.
+    image: ${DUELLO_RUNTIME_IMAGE:-duello-runtime:node22-codex}
+    pull_policy: never
+    container_name: duello-server
+    restart: unless-stopped
+    init: true
+    entrypoint:
+      - /usr/sbin/gosu
+      - cst
+    command:
+      - node
+      - scripts/tunnel.mjs
+    working_dir: ${DUELLO_PROJECT_PATH:?DUELLO_PROJECT_PATH must point to the Duello project}
+    environment:
+      CODEX_BIN: /home/cst/.local/bin/codex
+      OPENAI_ACCOUNTS_DIR: /srv/cst/codex-homes
+    volumes:
+      - ${DUELLO_PROJECT_PATH}:${DUELLO_PROJECT_PATH}
+      - /srv/cst/codex-homes:/srv/cst/codex-homes
+    labels:
+      com.codex-switch-terminal.rebuild-policy: exclude
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 256
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$(curl -sS -o /dev/null -w '%{http_code}'
+          http://127.0.0.1:8787/health)" = 401 &&
+          curl -fsS http://127.0.0.1:8891/ >/dev/null
+      interval: 15s
+      timeout: 5s
+      start_period: 45s
+      retries: 6
