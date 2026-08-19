@@ -1487,6 +1487,10 @@ type PersistedTerminalRecord = {
   key: string;
   accountId: string;
   agentId: string;
+  // Identifiant du PTY cote noeud. Il survit au rechargement de la page :
+  // c'est par lui que l'onglet suivant se rattache au terminal encore vivant
+  // au lieu d'en relancer un.
+  ptyId?: number | null;
   codexSessionId?: string | null;
   folderPath?: string | null;
   workspaceId?: string | null;
@@ -3920,6 +3924,10 @@ const loadOpenTerminalRecords = (): PersistedTerminalState => {
           key: item.key,
           accountId: item.accountId,
           agentId: typeof item.agentId === "string" ? item.agentId : "codex",
+          ptyId:
+            typeof item.ptyId === "number" && Number.isInteger(item.ptyId) && item.ptyId > 0
+              ? item.ptyId
+              : null,
           codexSessionId: typeof item.codexSessionId === "string" ? item.codexSessionId : null,
           folderPath:
             typeof item.folderPath === "string"
@@ -3966,6 +3974,7 @@ const persistTerminalSessions = () => {
         key: session.key,
         accountId: session.accountId,
         agentId: session.agentId,
+        ptyId: session.ptyId,
         codexSessionId: session.codexSessionId,
         folderPath: session.folderPath,
         workspaceId: session.workspaceId,
@@ -12695,6 +12704,30 @@ const openDiscussionForSession = (accountId: string, sessionId: string) => {
   }
 };
 
+// Rattache une session restauree a son PTY encore vivant sur le noeud.
+// Renvoie false si le terminal n'existe plus : l'appelant repart alors sur
+// un demarrage normal, avec reprise de la discussion.
+const attachRestoredTerminal = async (
+  session: TerminalSession,
+  ptyId: number,
+): Promise<boolean> => {
+  try {
+    await invoke("attach_terminal", {
+      id: ptyId,
+      cols: session.terminal.cols,
+      rows: session.terminal.rows,
+    });
+  } catch {
+    return false;
+  }
+  session.ptyId = ptyId;
+  session.running = true;
+  session.status = "Rattache";
+  terminalSessionsByPtyId.set(ptyId, session);
+  terminalLastOutputAt.set(session.key, Date.now());
+  return true;
+};
+
 const restoreTerminals = async () => {
   if (!settings) return;
   const state = loadOpenTerminalRecords();
@@ -12717,6 +12750,7 @@ const restoreTerminals = async () => {
   }
 
   const restored: TerminalSession[] = [];
+  const reattached = new Set<string>();
   for (const record of records) {
     const account = settings.accounts.find((candidate) => candidate.id === record.accountId);
     if (!account) continue;
@@ -12741,6 +12775,14 @@ const restoreTerminals = async () => {
     if (session.codexSessionId) claimedSessionIds.add(session.codexSessionId);
     terminalSessions.push(session);
     restored.push(session);
+    // Le PTY appartient au noeud et a survecu au rechargement : s'y rattacher
+    // evite de laisser un processus orphelin derriere soi et de repartir sur
+    // une session neuve a chaque rechargement de la page.
+    if (isRemoteMode() && typeof record.ptyId === "number") {
+      if (await attachRestoredTerminal(session, record.ptyId)) {
+        reattached.add(session.key);
+      }
+    }
   }
 
   if (restored.length === 0) return;
@@ -12756,7 +12798,9 @@ const restoreTerminals = async () => {
   if (activeView === "terminal" || activeView === "chat") render();
 
   for (let index = 0; index < restored.length; index += TERMINAL_RESTORE_CONCURRENCY) {
-    const batch = restored.slice(index, index + TERMINAL_RESTORE_CONCURRENCY);
+    const batch = restored
+      .slice(index, index + TERMINAL_RESTORE_CONCURRENCY)
+      .filter((session) => !reattached.has(session.key));
     await Promise.all(batch.map((session) => {
       const command = isPlausibleSessionId(session.codexSessionId)
         ? buildResumeCommand(session.codexSessionId, accountById(session.accountId))
@@ -30077,11 +30121,18 @@ window.addEventListener("beforeunload", () => {
   if (!isRemoteMode() && (kombaiStatus?.running || kombaiStatus?.started)) {
     void invoke("kombai_stop").catch(() => undefined);
   }
-  terminalSessions.forEach((session) => {
-    if (session.ptyId !== null) {
-      void invoke("stop_terminal", { id: session.ptyId }).catch(() => undefined);
-    }
-  });
+  // Un onglet web parle a un noeud partage : ses terminaux vivent dans le
+  // serveur et doivent survivre au rechargement comme a la fermeture de
+  // l'onglet, exactement comme Kombai juste au-dessus. Le chargement suivant
+  // s'y rattache par l'identifiant persiste. En desktop local, les PTY meurent
+  // avec l'application : on les ferme pour ne pas laisser d'orphelins.
+  if (!isRemoteMode()) {
+    terminalSessions.forEach((session) => {
+      if (session.ptyId !== null) {
+        void invoke("stop_terminal", { id: session.ptyId }).catch(() => undefined);
+      }
+    });
+  }
 });
 
 initPwaSupport();

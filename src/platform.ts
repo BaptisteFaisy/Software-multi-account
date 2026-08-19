@@ -911,6 +911,8 @@ async function remoteInvoke<T>(command: string, args: Record<string, any>): Prom
       return pickRemotePoolAccount<T>();
     case "start_terminal":
       return startRemoteTerminal<T>(args);
+    case "attach_terminal":
+      return attachRemoteTerminal<T>(args);
     case "terminal_output_snapshot":
       return (remoteTerminalOutput.get(Number(args.id)) ?? "") as T;
     case "list_dir":
@@ -2102,6 +2104,31 @@ async function startRemoteTerminal<T>(args: Record<string, any>): Promise<T> {
       if (!remoteTerminalRoutes.has(requestedId)) remotePendingTerminalInput.clear(requestedId);
     }
   }
+}
+
+/**
+ * Rattache cet onglet a un terminal deja vivant sur le noeud, sans en creer
+ * un nouveau : les PTY appartiennent au serveur et survivent au rechargement
+ * d'une page.
+ *
+ * Le redimensionnement sert de sonde : le serveur repond une erreur sur un
+ * identifiant inconnu, ce qui evite de croire a un rattachement reussi puis
+ * d'afficher un terminal muet. Sur un PTY vivant il declenche un SIGWINCH,
+ * que les interfaces plein ecran traduisent par un redessin complet — c'est
+ * ce qui restitue l'affichage, le serveur ne rejouant pas l'historique.
+ */
+async function attachRemoteTerminal<T>(args: Record<string, unknown>): Promise<T> {
+  const id = Number(args.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error("Identifiant de terminal invalide.");
+  }
+  const cols = Number(args.cols) > 0 ? Number(args.cols) : 80;
+  const rows = Number(args.rows) > 0 ? Number(args.rows) : 24;
+  const route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute();
+  await apiAt(route, "POST", `/api/terminals/${id}/resize`, { cols, rows });
+  remoteTerminalRoutes.set(id, route);
+  openTerminalSocket(id, route);
+  return { id } as T;
 }
 
 function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? defaultRemoteRoute()) {
