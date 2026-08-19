@@ -4307,20 +4307,38 @@ const fastModeAvailabilityLabel = (
   return "Fast mode n'est pas pris en charge par OpenCode";
 };
 
-const modelSuggestionsForAccount = (
-  account: AccountProfile | null | undefined,
+const modelSuggestionsForProvider = (
+  provider: Provider,
+  inferenceProvider: string | null = null,
   codexCatalog: AccountModelView[] | undefined = undefined,
 ): string[] => {
-  const provider = accountProvider(account);
   if (provider === "claude") return [...CLAUDE_MODEL_SUGGESTIONS];
   if (provider === "opencode") {
     return [
-      ...(openCodeProviderOption(accountInferenceProvider(account))?.models ?? OPENCODE_MODEL_SUGGESTIONS),
+      ...(openCodeProviderOption(inferenceProvider)?.models ?? OPENCODE_MODEL_SUGGESTIONS),
     ];
   }
   if (provider === "freebuff") return [...FREEBUFF_MODEL_SUGGESTIONS];
   return codexCatalog?.map((model) => model.id) ?? CODEX_MODEL_SUGGESTIONS;
 };
+
+const modelSuggestionsForAccount = (
+  account: AccountProfile | null | undefined,
+  codexCatalog: AccountModelView[] | undefined = undefined,
+): string[] =>
+  modelSuggestionsForProvider(
+    accountProvider(account),
+    accountInferenceProvider(account),
+    codexCatalog,
+  );
+
+// Datalist propre a un champ de modele. Les modales de creation laissent
+// choisir le fournisseur juste a cote du champ : la liste doit suivre ce
+// choix, sinon un compte freebuff se voit proposer le catalogue Codex.
+const renderModelSuggestionDatalist = (id: string, models: string[]) =>
+  `<datalist id="${escapeAttr(id)}">${models
+    .map((model) => `<option value="${escapeAttr(model)}"></option>`)
+    .join("")}</datalist>`;
 
 // Codex ET Claude gerent une intensite de raisonnement. Claude Code l'expose
 // via `--effort` (verifie sur le CLI 2.1.x) ; OpenCode ne la gere pas.
@@ -4459,7 +4477,7 @@ const reasoningEffortOptions = (selected: string | null | undefined) => {
 
 const renderCodexModelSuggestions = () => `
   <datalist id="codexModelSuggestions">
-    ${[...CODEX_MODEL_SUGGESTIONS, ...CLAUDE_MODEL_SUGGESTIONS, ...OPENCODE_MODEL_SUGGESTIONS]
+    ${[...CODEX_MODEL_SUGGESTIONS, ...CLAUDE_MODEL_SUGGESTIONS, ...OPENCODE_MODEL_SUGGESTIONS, ...FREEBUFF_MODEL_SUGGESTIONS]
       .map((model) => `<option value="${escapeAttr(model)}"></option>`)
       .join("")}
   </datalist>
@@ -14220,12 +14238,47 @@ const renderFolderTerminalGroups = (sessions: TerminalSession[]): string => {
     .join("");
 };
 
+// Terminaux ouverts (tous comptes confondus) : visibles et actionnables
+// depuis la colonne de gauche pour revenir instantanement a une session.
+// Cette liste ne depend d'aucun environnement : elle doit donc rester
+// affichee meme quand aucun n'est encore choisi, sinon un terminal ouvert
+// devient introuvable depuis la vue chat.
+const renderChatSidebarOpenTerminals = (): string => {
+  if (terminalSessions.length === 0) return "";
+  const terminalItems = terminalSessions
+    .map((session) => {
+      const account = accountById(session.accountId);
+      const label = account?.label || session.title || "Terminal";
+      const provider = accountProvider(account);
+      const current = session.key === activeTerminalKey;
+      const state = session.running
+        ? "en cours"
+        : session.loginOnly
+          ? "connexion"
+          : session.status || "ouvert";
+      return `<div class="chat-side-item ${current ? "current" : ""}">
+        <button type="button" class="chat-side-open" data-open-terminal="${escapeAttr(session.key)}" title="${escapeAttr(label)}">
+          <i class="chat-side-terminal-icon" data-lucide="${providerIcon(provider)}"></i>
+          <span class="chat-side-copy">
+            <strong>${escapeHtml(label)}</strong>
+            <small>${escapeHtml(providerLabel(provider))} - ${escapeHtml(state)}</small>
+          </span>
+        </button>
+      </div>`;
+    })
+    .join("");
+  return `<section class="chat-workspace-group chat-open-terminals">
+    <div class="chat-folder-section-label"><span>Terminaux ouverts</span><b>${terminalSessions.length}</b></div>
+    <div class="chat-workspace-terminals">${terminalItems}</div>
+  </section>`;
+};
+
 const renderChatSidebarConversations = (): string => {
   const query = chatSidebarSearch.trim().toLocaleLowerCase();
   const environmentPath = userEnvironmentPath(currentWorkspace());
 
   if (!environmentPath) {
-    return `<button type="button" class="chat-side-empty chat-side-choose-environment" id="chooseEnvironmentFromSidebar">
+    return `${renderChatSidebarOpenTerminals()}<button type="button" class="chat-side-empty chat-side-choose-environment" id="chooseEnvironmentFromSidebar">
       <i data-lucide="folders"></i>
       <strong>Choisir un environnement</strong>
       <small>Les chats et les agents apparaitront ici.</small>
@@ -14341,37 +14394,7 @@ const renderChatSidebarConversations = (): string => {
       ? "Aucun résultat"
       : "Aucun chat. Ouvrez-en un avec l'agent de votre choix.";
 
-  // Terminaux ouverts (tous comptes confondus) : visibles et actionnables
-  // depuis la colonne de gauche pour revenir instantanement a une session.
-  const terminalItems = terminalSessions
-    .map((session) => {
-      const account = accountById(session.accountId);
-      const label = account?.label || session.title || "Terminal";
-      const provider = accountProvider(account);
-      const current = session.key === activeTerminalKey;
-      const state = session.running
-        ? "en cours"
-        : session.loginOnly
-          ? "connexion"
-          : session.status || "ouvert";
-      return `<div class="chat-side-item ${current ? "current" : ""}">
-        <button type="button" class="chat-side-open" data-open-terminal="${escapeAttr(session.key)}" title="${escapeAttr(label)}">
-          <i class="chat-side-terminal-icon" data-lucide="${providerIcon(provider)}"></i>
-          <span class="chat-side-copy">
-            <strong>${escapeHtml(label)}</strong>
-            <small>${escapeHtml(providerLabel(provider))} - ${escapeHtml(state)}</small>
-          </span>
-        </button>
-      </div>`;
-    })
-    .join("");
-  const terminalSection = terminalSessions.length > 0
-    ? `<section class="chat-workspace-group chat-open-terminals">
-    <div class="chat-folder-section-label"><span>Terminaux ouverts</span><b>${terminalSessions.length}</b></div>
-    <div class="chat-workspace-terminals">${terminalItems}</div>
-  </section>`
-    : "";
-  return `${terminalSection}<section class="chat-workspace-group active chat-current-environment-chats">
+  return `${renderChatSidebarOpenTerminals()}<section class="chat-workspace-group active chat-current-environment-chats">
     <div class="chat-folder-section-label"><span>Chats de cet environnement</span><b title="${escapeAttr(countTitle)}">${visibleItems.length}</b></div>
     <div class="chat-workspace-terminals">
       ${listItems || `<div class="chat-workspace-empty">${escapeHtml(emptyMessage)}</div>`}
@@ -22338,7 +22361,8 @@ const renderNewChatModal = () => {
             ${accounts.length ? "" : `<div class="empty">Ajoutez un agent dans les paramètres pour démarrer.</div>`}
             <label>
               <span>Modele</span>
-              <input id="newChatModel" list="codexModelSuggestions" value="${escapeAttr(modelValue)}" placeholder="${escapeAttr(providerDefaultModel(provider, accountInferenceProvider(account)))}" autocomplete="off" spellcheck="false" maxlength="160" ${account ? "" : "disabled"} />
+              <input id="newChatModel" list="newChatModelSuggestions" value="${escapeAttr(modelValue)}" placeholder="${escapeAttr(providerDefaultModel(provider, accountInferenceProvider(account)))}" autocomplete="off" spellcheck="false" maxlength="160" ${account ? "" : "disabled"} />
+              ${renderModelSuggestionDatalist("newChatModelSuggestions", modelSuggestionsForAccount(account, account ? chatModelCatalogs.get(account.id) : undefined))}
             </label>
             <label>
               <span>Mode</span>
@@ -23758,7 +23782,8 @@ const renderNewTerminalModal = () => {
                 </label>
                 <label>
                   <span>Modele par defaut</span>
-                  <input id="newAccountModel" list="codexModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${escapeAttr(providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider))}" />
+                  <input id="newAccountModel" list="newAccountModelSuggestions" value="${escapeAttr(newTerminalAccountModel)}" placeholder="${escapeAttr(providerDefaultModel(newTerminalAccountProvider, newTerminalInferenceProvider))}" />
+                  ${renderModelSuggestionDatalist("newAccountModelSuggestions", modelSuggestionsForProvider(newTerminalAccountProvider, newTerminalInferenceProvider))}
                 </label>
                 ${newTerminalAccountProvider === "codex"
                   ? `<label title="Intensite de raisonnement (Codex)">
@@ -23800,8 +23825,9 @@ const renderNewTerminalModal = () => {
               </select>
             </label>
             <label>
-              <span>Modele Codex par defaut</span>
-              <input id="newTerminalModel" list="codexModelSuggestions" value="${escapeAttr(accountModel(account))}" ${account ? "" : "disabled"} />
+              <span>${escapeHtml(`Modele ${providerLabel(accountProvider(account))} par defaut`)}</span>
+              <input id="newTerminalModel" list="newTerminalModelSuggestions" value="${escapeAttr(accountModel(account))}" ${account ? "" : "disabled"} />
+              ${renderModelSuggestionDatalist("newTerminalModelSuggestions", modelSuggestionsForAccount(account, account ? chatModelCatalogs.get(account.id) : undefined))}
             </label>
             ${accountProvider(account) === "codex"
               ? `<label>
