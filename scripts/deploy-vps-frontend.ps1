@@ -130,7 +130,8 @@ try {
   $mountsJson = Invoke-Remote `
     -Command "sudo -n docker inspect -f '{{json .Mounts}}' $containerName" `
     -Capture
-  $distMount = @($mountsJson | ConvertFrom-Json) |
+  $mounts = $mountsJson | ConvertFrom-Json
+  $distMount = $mounts |
     Where-Object { [string]$_.Destination -eq $containerDistDir } |
     Select-Object -First 1
   $hostActiveDir = ([string]$distMount.Source).Trim()

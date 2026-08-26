@@ -27,6 +27,7 @@ test("la publication cible le conteneur configure sans renommer un bind mount", 
   assert.match(script, /\$containerName = \(\[string\]\$profileData\.containerName\)\.Trim\(\)/);
   assert.match(script, /docker inspect[^\r\n]+\$containerName/);
   assert.match(script, /docker inspect -f '\{\{json \.Mounts\}\}' \$containerName/);
+  assert.match(script, /\$mounts = \$mountsJson \| ConvertFrom-Json\s+\$distMount = \$mounts \|/);
   assert.match(script, /\$hostActiveDir = \(\[string\]\$distMount\.Source\)\.Trim\(\)/);
   assert.match(script, /cp -a \$hostActiveDir \$backupDir/);
   assert.match(script, /cp -a \$stageDir\/\. \$hostActiveDir\//);
