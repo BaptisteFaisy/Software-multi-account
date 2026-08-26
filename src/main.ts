@@ -32,6 +32,7 @@ import {
   type UnlistenFn,
 } from "./platform";
 import { initPwaSupport } from "./pwa";
+import { initWebAutoUpdate } from "./web-update";
 import {
   consumeRemoteCodexLoginOutput,
   copyRemoteCodexLoginCode,
@@ -30136,6 +30137,7 @@ window.addEventListener("beforeunload", () => {
 });
 
 initPwaSupport();
+initWebAutoUpdate();
 
 void boot().catch((error) => {
   if (isRemoteMode()) {
