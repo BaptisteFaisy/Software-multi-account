@@ -26,11 +26,13 @@ test("la publication conserve le mode avec cle explicite", () => {
 test("la publication cible le conteneur configure sans renommer un bind mount", () => {
   assert.match(script, /\$containerName = \(\[string\]\$profileData\.containerName\)\.Trim\(\)/);
   assert.match(script, /docker inspect[^\r\n]+\$containerName/);
-  assert.match(script, /docker exec -u 0 \$containerName cp -a \$activeDir\/\. \$backupDir\//);
-  assert.match(script, /docker exec -u 0 \$containerName cp -a \$stageDir\/\. \$activeDir\//);
+  assert.match(script, /docker inspect -f '\{\{json \.Mounts\}\}' \$containerName/);
+  assert.match(script, /\$hostActiveDir = \(\[string\]\$distMount\.Source\)\.Trim\(\)/);
+  assert.match(script, /cp -a \$hostActiveDir \$backupDir/);
+  assert.match(script, /cp -a \$stageDir\/\. \$hostActiveDir\//);
   assert.match(
     script,
     /docker exec \$containerName curl -fsS http:\/\/127\.0\.0\.1:8080\/healthz/,
   );
-  assert.doesNotMatch(script, /docker exec[^\r\n]+ mv \$activeDir \$backupDir/);
+  assert.doesNotMatch(script, /docker exec[^\r\n]+ (?:cp|mv) [^\r\n]+\$containerDistDir/);
 });

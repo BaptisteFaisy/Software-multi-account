@@ -73,11 +73,7 @@ $deployId = [guid]::NewGuid().ToString("N")
 $archiveName = "cst-frontend-$deployId.tar.gz"
 $localArchive = Join-Path $env:TEMP $archiveName
 $remoteArchive = "/tmp/$archiveName"
-$containerArchive = "/tmp/$archiveName"
-$containerRoot = "/opt/codex-switch-terminal"
-$activeDir = "$containerRoot/dist"
-$stageDir = "$containerRoot/.frontend-stage-$deployId"
-$backupDir = "$containerRoot/dist.previous-$deployId"
+$containerDistDir = "/opt/codex-switch-terminal/dist"
 $localIndexHash = (Get-FileHash -LiteralPath $indexPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
 $sshArgs = @(
@@ -131,6 +127,25 @@ try {
   $beforeHealth = Invoke-Remote `
     -Command "sudo -n docker exec $containerName curl -fsS http://127.0.0.1:8080/healthz" `
     -Capture
+  $mountsJson = Invoke-Remote `
+    -Command "sudo -n docker inspect -f '{{json .Mounts}}' $containerName" `
+    -Capture
+  $distMount = @($mountsJson | ConvertFrom-Json) |
+    Where-Object { [string]$_.Destination -eq $containerDistDir } |
+    Select-Object -First 1
+  $hostActiveDir = ([string]$distMount.Source).Trim()
+  if (-not $hostActiveDir) {
+    throw "Le montage hote de $containerDistDir est introuvable pour $containerName."
+  }
+  if (
+    $hostActiveDir -notmatch '^/[A-Za-z0-9._/-]+/dist$' -or
+    $hostActiveDir -match '(^|/)\.\.(/|$)'
+  ) {
+    throw "Chemin hote du frontend refuse : $hostActiveDir"
+  }
+  $stageDir = "$hostActiveDir.frontend-stage-$deployId"
+  $backupDir = "$hostActiveDir.previous-$deployId"
+  Invoke-Remote -Command "test -d $hostActiveDir -a -w $hostActiveDir"
 
   & tar -C $resolvedSource -czf $localArchive .
   if ($LASTEXITCODE -ne 0) {
@@ -142,34 +157,32 @@ try {
     throw "Impossible de transferer l'archive frontend."
   }
 
-  Invoke-Remote -Command "sudo -n docker cp $remoteArchive ${containerName}:$containerArchive"
-  Invoke-Remote -Command "sudo -n docker exec -u 0 $containerName mkdir $stageDir"
-  Invoke-Remote -Command "sudo -n docker exec -u 0 $containerName tar -xzf $containerArchive -C $stageDir"
-  Invoke-Remote -Command "sudo -n docker exec $containerName test -s $stageDir/index.html"
+  Invoke-Remote -Command "install -d -m 0755 $stageDir"
+  Invoke-Remote -Command "tar -xzf $remoteArchive -C $stageDir"
+  Invoke-Remote -Command "test -s $stageDir/index.html"
 
   $remoteTikTokBundle = Invoke-Remote `
-    -Command "sudo -n docker exec $containerName find $stageDir/assets -maxdepth 1 -type f -name tiktok-accounts-*.js" `
+    -Command "find $stageDir/assets -maxdepth 1 -type f -name tiktok-accounts-*.js" `
     -Capture
   if (-not $remoteTikTokBundle.Trim()) {
     throw "Le bundle TikTok est absent du dossier de preparation distant."
   }
 
-  # Le repertoire dist de production peut etre un bind mount Docker. Une copie
-  # conserve ce montage actif, contrairement a un renommage du point de montage.
-  Invoke-Remote -Command "sudo -n docker exec -u 0 $containerName mkdir $backupDir"
-  Invoke-Remote -Command "sudo -n docker exec -u 0 $containerName cp -a $activeDir/. $backupDir/"
+  # Le repertoire dist est monte en lecture seule dans le conteneur. La copie
+  # se fait donc dans sa source hote, sans modifier ni redemarrer le conteneur.
+  Invoke-Remote -Command "cp -a $hostActiveDir $backupDir"
   $switched = $true
   try {
-    Invoke-Remote -Command "sudo -n docker exec -u 0 $containerName cp -a $stageDir/. $activeDir/"
+    Invoke-Remote -Command "cp -a $stageDir/. $hostActiveDir/"
   }
   catch {
-    Invoke-Remote -Command "sudo -n docker exec -u 0 $containerName cp -a $backupDir/. $activeDir/"
+    Invoke-Remote -Command "cp -a $backupDir/. $hostActiveDir/"
     $switched = $false
     throw
   }
 
   $remoteHashLine = Invoke-Remote `
-    -Command "sudo -n docker exec $containerName sha256sum $activeDir/index.html" `
+    -Command "sha256sum $hostActiveDir/index.html" `
     -Capture
   $remoteIndexHash = ($remoteHashLine -split '\s+')[0].ToLowerInvariant()
   if ($remoteIndexHash -ne $localIndexHash) {
