@@ -21,4 +21,41 @@ if [ ! -e "$ownership_marker" ]; then
   chmod 0600 "$ownership_marker"
 fi
 
+# Pont SSH retour depuis les terminaux Switch vers le PC fixe. En production,
+# le PC maintient un reverse-forward Tailscale vers l'hote VPS ; le conteneur
+# atteint son extremite via host.docker.internal. Les alias explicites evitent
+# qu'un agent conclue a tort que le pont est absent faute de daemon Tailscale
+# dans le conteneur.
+ssh_dir=/srv/cst/ssh
+if [ -s "$ssh_dir/id_back" ]; then
+  local_host=${CST_SSH_LOCAL_HOST:-host.docker.internal}
+  local_port=${CST_SSH_LOCAL_PORT:-22}
+  local_user=${CST_SSH_LOCAL_USER:-jeanp}
+
+  install -d -m 0700 -o cst -g cst /home/cst/.ssh
+  if [ ! -e "$ssh_dir/known_hosts" ]; then
+    : > "$ssh_dir/known_hosts"
+  fi
+  chown cst:cst "$ssh_dir/id_back" "$ssh_dir/known_hosts"
+  chmod 0600 "$ssh_dir/id_back" "$ssh_dir/known_hosts"
+
+  cat > /home/cst/.ssh/config <<EOF
+# PC -> Tailscale -> VPS -> conteneur -> PC.
+# Le transport Tailscale tourne hors du conteneur.
+Host local pc pc-fixe pc-fixe-tailscale
+  HostName $local_host
+  Port $local_port
+  User $local_user
+  IdentityFile $ssh_dir/id_back
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+  UserKnownHostsFile $ssh_dir/known_hosts
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  ConnectTimeout 10
+EOF
+  chown cst:cst /home/cst/.ssh/config
+  chmod 0600 /home/cst/.ssh/config
+fi
+
 exec /usr/sbin/gosu cst "$@"
