@@ -31,6 +31,7 @@ import {
   type RuntimeSyncTopic,
   type UnlistenFn,
 } from "./platform";
+import { TerminalFocusTracker } from "./terminal-focus";
 import { initPwaSupport } from "./pwa";
 import { initWebAutoUpdate } from "./web-update";
 import {
@@ -1976,13 +1977,10 @@ let pendingTerminalCreations = 0;
 // Un double clic (ou deux handlers rapproches) partage la meme creation de
 // terminal de connexion pour un compte donne.
 const loginTerminalCreations = new Map<string, Promise<TerminalSession | null>>();
-// Terminal qui detenait le focus juste avant le dernier render() (capture avant
-// la destruction du DOM) : restaure de facon synchrone au remontage pour ne pas
-// perdre les frappes lors d'un re-render incident (ex: sortie d'un PTY voisin).
-let focusedTerminalKeyBeforeRender: string | null = null;
-// Terminal a focaliser volontairement au prochain montage (nouveau terminal,
-// selection dans la liste, affichage du mur de terminaux).
-let requestTerminalFocusKey: string | null = null;
+// Le focus xterm doit survivre aux reconstructions completes du DOM et aux
+// modales intermediaires. La demande n'est consommee qu'une fois le vrai champ
+// de saisie du terminal focalise.
+const terminalFocusTracker = new TerminalFocusTracker();
 let globalMobileListenersBound = false;
 let mobileRefitTimer = 0;
 let unlistenData: UnlistenFn | null = null;
@@ -2485,6 +2483,33 @@ const DIALOG_FOCUSABLE_SELECTOR = [
 const activeModalDialog = (): HTMLElement | null =>
   [...document.querySelectorAll<HTMLElement>(".modal-backdrop [role='dialog']")].at(-1) ?? null;
 
+const restoreMountedTerminalFocus = (): void => {
+  let attempts = 0;
+  const restore = () => {
+    if (activeModalDialog()) {
+      if (attempts++ < 50) window.setTimeout(restore, 100);
+      return;
+    }
+    const session =
+      terminalSessions.find((candidate) =>
+        candidate.key === activeTerminalKey && candidate.terminal.element?.isConnected,
+      ) ??
+      terminalSessions.find((candidate) => candidate.terminal.element?.isConnected);
+    if (!session) {
+      if (attempts++ < 50) window.setTimeout(restore, 100);
+      return;
+    }
+    terminalFocusTracker.request(session.key);
+    session.terminal.focus();
+    if (session.terminal.element?.contains(document.activeElement)) {
+      terminalFocusTracker.confirm(session.key);
+      return;
+    }
+    if (attempts++ < 50) window.setTimeout(restore, 100);
+  };
+  window.setTimeout(restore, 0);
+};
+
 const isVisibleDialogControl = (element: HTMLElement): boolean => {
   const style = window.getComputedStyle(element);
   return (
@@ -2540,15 +2565,49 @@ const resolveDialogFocusTarget = (target: DialogFocusTarget | null): HTMLElement
 };
 
 const restoreDialogTrigger = (target: DialogFocusTarget | null) => {
-  window.setTimeout(() => {
-    const candidate = resolveDialogFocusTarget(target);
+  const restoreWhenMounted = () => {
     const dialog = activeModalDialog();
-    if (candidate && (!dialog || dialog.contains(candidate))) {
+    const terminalPane =
+      document.querySelector<HTMLElement>("[data-expert-terminal-pane].active") ??
+      document.querySelector<HTMLElement>("[data-expert-terminal-pane]");
+    const terminalInput = terminalPane?.querySelector<HTMLTextAreaElement>(
+      ".xterm-helper-textarea",
+    );
+    const terminalViewIsMounting =
+      (activeView === "terminal" || document.body.classList.contains("m-terminal-focus")) &&
+      terminalSessions.length > 0;
+    if (!dialog && terminalPane && terminalInput && !terminalInput.disabled) {
+      const terminalSession = terminalSessions.find((session) =>
+        session.terminal.element?.contains(terminalInput),
+      );
+      if (terminalSession) {
+        terminalFocusTracker.request(terminalSession.key);
+        terminalSession.terminal.focus();
+      } else {
+        terminalInput.focus({ preventScroll: true });
+      }
+      if (
+        document.activeElement === terminalInput ||
+        terminalSession?.terminal.element?.contains(document.activeElement)
+      ) {
+        if (terminalSession) terminalFocusTracker.confirm(terminalSession.key);
+        return;
+      }
+      window.setTimeout(restoreWhenMounted, 100);
+      return;
+    }
+    if (dialog || terminalPane || terminalViewIsMounting) {
+      window.setTimeout(restoreWhenMounted, 100);
+      return;
+    }
+    const candidate = resolveDialogFocusTarget(target);
+    if (candidate) {
       candidate.focus();
       return;
     }
     syncActiveDialogAccessibility();
-  }, 0);
+  };
+  window.setTimeout(restoreWhenMounted, 0);
 };
 
 const syncActiveDialogAccessibility = () => {
@@ -4961,7 +5020,7 @@ const toggleExpertTerminalFullscreen = (session: TerminalSession) => {
   expertTerminalFullscreenKey =
     expertTerminalFullscreenKey === session.key ? null : session.key;
   activateTerminalSession(session);
-  requestTerminalFocusKey = session.key;
+  terminalFocusTracker.request(session.key);
   statusText = expertTerminalFullscreenKey
     ? `Terminal en plein ecran: ${terminalTitle(session)}`
     : "Mur de terminaux";
@@ -6524,6 +6583,7 @@ const setActiveView = (view: AppView) => {
   if (activeView === "chat") startAllExpertChatWork();
   else stopAllExpertChatWork();
 
+  if (activeView === "terminal") restoreMountedTerminalFocus();
   render();
 
   if (activeView === "pool") {
@@ -12453,7 +12513,7 @@ const bindWorkspaceSwitcherUi = (root: ParentNode = document) => {
       );
       if (!session) return;
       activateTerminalSession(session);
-      requestTerminalFocusKey = session.key;
+      terminalFocusTracker.request(session.key);
       activeView = "terminal";
       stopLimitPoll();
       stopUsagePoll();
@@ -12623,7 +12683,7 @@ const bindDiscussionRowUi = () => {
         activeView === "chat" &&
         expertChatWallTerminals().some((item) => item.key === session.key);
       if (!shownInChatWall) activeView = "terminal";
-      requestTerminalFocusKey = session.key;
+      terminalFocusTracker.request(session.key);
       render();
     });
   });
@@ -21867,10 +21927,24 @@ const render = () => {
   else stopLimitPoll();
 
   const activeEl = document.activeElement;
-  focusedTerminalKeyBeforeRender =
+  const focusedTerminalKey =
     (activeEl &&
       terminalSessions.find((session) => session.terminal.element?.contains(activeEl))?.key) ||
     null;
+  const focusIsInsideModal =
+    activeEl instanceof Element && !!activeEl.closest(".modal-backdrop");
+  const modalTransitionOrOpen =
+    focusIsInsideModal ||
+    newTerminalModalOpen ||
+    agentsModalOpen ||
+    workspaceModalOpen ||
+    terminalEnvironmentMenuOpen;
+  terminalFocusTracker.observe(focusedTerminalKey, {
+    // Pendant un remplacement de DOM, Chrome peut remettre brievement le focus
+    // sur body/#app. Ce focus neutre ne doit pas rendre le terminal muet.
+    neutral: !activeEl || activeEl === document.body || activeEl === app,
+    blocked: modalTransitionOrOpen,
+  });
 
   // Preserve la position de defilement des vues admin (comptes, limites,
   // stats…). renderChatFirstShell remplace tout le DOM (app.innerHTML), ce qui
@@ -26399,6 +26473,9 @@ const openNewTerminalModal = (folderPath: string | null | undefined = undefined)
 
 const closeNewTerminalModal = () => {
   const returnFocus = takeDialogTrigger("new-terminal");
+  // Arm the recovery before rendering. Even if a provider-specific binding
+  // aborts the render tail, the scheduled callback still restores xterm.
+  restoreMountedTerminalFocus();
   newTerminalModalOpen = false;
   render();
   restoreDialogTrigger(returnFocus);
@@ -27089,7 +27166,13 @@ const bindUi = () => {
       meta.textContent = `${session.proxySummary} | ${displayProjectDir(session.workspacePath ?? session.folderPath ?? session.projectDir)}`;
     }
     persistTerminalSessions();
-    if (focus) session.terminal.focus();
+    if (focus) {
+      terminalFocusTracker.request(session.key);
+      session.terminal.focus();
+      if (session.terminal.element?.contains(document.activeElement)) {
+        terminalFocusTracker.confirm(session.key);
+      }
+    }
   };
 
   document.querySelectorAll<HTMLButtonElement>("[data-focus-terminal]").forEach((button) => {
@@ -27183,12 +27266,34 @@ const bindUi = () => {
 
   document.querySelectorAll<HTMLElement>("[data-expert-terminal-pane]").forEach((pane) => {
     pane.addEventListener("pointerdown", (event) => {
-      if ((event.target as HTMLElement).closest("[data-close-terminal],[data-toggle-chat-sidebar],[data-toggle-terminal-fullscreen]")) return;
       const session = terminalSessions.find(
         (candidate) => candidate.key === pane.dataset.expertTerminalPane,
       );
-      if (session) focusExpertSession(session, true);
-    });
+      if (!session) return;
+
+      // Capture avant xterm : certaines couches internes arretent la propagation
+      // de pointerdown. La tuile cliquee devient donc toujours la cible active.
+      focusExpertSession(session, false);
+      const target = event.target as HTMLElement;
+      if (!target.closest("[data-terminal-host]")) return;
+      terminalFocusTracker.request(session.key);
+      window.requestAnimationFrame(() => {
+        if (!terminalSessions.includes(session) || document.querySelector(".modal-backdrop")) return;
+        if (!session.terminal.element?.contains(document.activeElement)) session.terminal.focus();
+        if (session.terminal.element?.contains(document.activeElement)) {
+          terminalFocusTracker.confirm(session.key);
+        }
+      });
+    }, true);
+
+    pane.addEventListener("focusin", (event) => {
+      const session = terminalSessions.find(
+        (candidate) => candidate.key === pane.dataset.expertTerminalPane,
+      );
+      if (!session || !session.terminal.element?.contains(event.target as Node)) return;
+      focusExpertSession(session, false);
+      terminalFocusTracker.confirm(session.key);
+    }, true);
 
   });
 
@@ -27216,7 +27321,7 @@ const bindUi = () => {
       );
       if (!session) return;
       activateTerminalSession(session);
-      requestTerminalFocusKey = session.key;
+      terminalFocusTracker.request(session.key);
       activeView = "terminal";
       stopLimitPoll();
       stopUsagePoll();
@@ -28811,6 +28916,10 @@ const createTerminalSession = async (
   };
 
   terminal.onData((data) => {
+    // onData appartient a cette instance xterm : ne jamais router via le
+    // terminal globalement actif, qui peut changer entre deux clics.
+    terminalFocusTracker.confirm(session.key);
+    activeTerminalKey = session.key;
     if (session.ptyId !== null) {
       void invoke("write_terminal", { id: session.ptyId, data }).catch(() => undefined);
     }
@@ -28843,7 +28952,7 @@ const mountExpertTerminals = () => {
     agentsModalOpen ||
     workspaceModalOpen ||
     terminalEnvironmentMenuOpen;
-  const focusKey = requestTerminalFocusKey ?? focusedTerminalKeyBeforeRender;
+  const focusKey = terminalFocusTracker.target(modalOpen);
   if (!modalOpen && focusKey) {
     const claudeCodeInput = Array.from(
       document.querySelectorAll<HTMLInputElement>("[data-claude-login-code-input]"),
@@ -28854,8 +28963,12 @@ const mountExpertTerminals = () => {
     if (claudeCodeInput) claudeCodeInput.focus();
     else if (openCodeKeyInput) openCodeKeyInput.focus();
     else sessionByKey.get(focusKey)?.terminal.focus();
+    const focused =
+      document.activeElement === claudeCodeInput ||
+      document.activeElement === openCodeKeyInput ||
+      !!sessionByKey.get(focusKey)?.terminal.element?.contains(document.activeElement);
+    if (focused) terminalFocusTracker.confirm(focusKey);
   }
-  requestTerminalFocusKey = null;
   requestAnimationFrame(() => fitAndResizeExpertTerminals());
 };
 
@@ -28965,7 +29078,7 @@ const createNewTerminalOnce = async (
   releaseTerminalSlot();
   if (!backgroundLogin) {
     activateTerminalSession(session);
-    requestTerminalFocusKey = session.key;
+    terminalFocusTracker.request(session.key);
     activeView = "terminal";
     stopLimitPoll();
     stopUsagePoll();
@@ -29026,7 +29139,7 @@ const createNewTerminal = async (
     }
     activateTerminalSession(existingLogin);
     activeView = "terminal";
-    requestTerminalFocusKey = existingLogin.key;
+    terminalFocusTracker.request(existingLogin.key);
     statusText = "Connexion deja ouverte dans le terminal affiche";
     render();
     return existingLogin;
@@ -29096,13 +29209,13 @@ const applyRemoteClaudeLoginOutput = (session: TerminalSession, data: string) =>
       .then(() => {
         if (!terminalSessions.includes(session)) return;
         statusText = "Copie le code affiché par Claude, puis colle-le dans ce terminal";
-        requestTerminalFocusKey = session.key;
+        terminalFocusTracker.request(session.key);
         render();
       })
       .catch(() => {
         if (!terminalSessions.includes(session)) return;
         statusText = "Ouverture automatique bloquée : clique sur le lien Claude dans ce terminal";
-        requestTerminalFocusKey = session.key;
+        terminalFocusTracker.request(session.key);
         render();
       });
     return update.type;
@@ -29133,7 +29246,7 @@ const applyOpenCodeLoginOutput = (session: TerminalSession, data: string) => {
   const update = consumeOpenCodeLoginOutput(session.key, data);
   if (update.type === "prompt") {
     statusText = `Colle la clé API ${accountProviderLabel(accountById(session.accountId))} puis valide`;
-    requestTerminalFocusKey = session.key;
+    terminalFocusTracker.request(session.key);
     render();
     return update.type;
   }
@@ -29388,6 +29501,7 @@ const closeTerminalSession = async (key: string) => {
     forgetOpenCodeLoginOutput(session.key);
   }
   if (expertTerminalFullscreenKey === key) expertTerminalFullscreenKey = null;
+  terminalFocusTracker.forget(key);
   const closedWorkspaceKey = terminalWorkspaceDescriptor(session).key;
   const ptyId = session.ptyId;
   if (ptyId !== null) terminalSessionsByPtyId.delete(ptyId);

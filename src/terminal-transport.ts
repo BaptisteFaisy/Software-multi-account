@@ -28,6 +28,21 @@ export class TerminalInputBuffer {
   }
 }
 
+export const terminalInputRequiresBuffer = ({
+  socketOpen,
+  socketConnecting,
+  terminalStarting,
+  routeKnown,
+}: {
+  socketOpen: boolean;
+  socketConnecting: boolean;
+  terminalStarting: boolean;
+  routeKnown: boolean;
+}) => !socketOpen && (socketConnecting || terminalStarting || routeKnown);
+
+export const terminalSessionIsMissingError = (error: unknown) =>
+  /session terminal introuvable|terminal[^\n]*not found|\b404\b[^\n]*terminal/i.test(String(error));
+
 export const terminalTransportErrorMessage = (baseUrl: string, error: unknown) => {
   const raw = String(error);
   if (

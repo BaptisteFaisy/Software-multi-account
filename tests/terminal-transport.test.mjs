@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   TerminalInputBuffer,
+  terminalInputRequiresBuffer,
+  terminalSessionIsMissingError,
   terminalTransportErrorMessage,
 } from "../src/terminal-transport.ts";
 
@@ -33,6 +35,34 @@ test("fermer un terminal supprime sa saisie en attente", () => {
   buffer.clear(12);
 
   assert.equal(buffer.take(12), "");
+});
+
+test("une frappe reste bufferisee pendant toute reconnexion d'un PTY connu", () => {
+  assert.equal(terminalInputRequiresBuffer({
+    socketOpen: false,
+    socketConnecting: false,
+    terminalStarting: false,
+    routeKnown: true,
+  }), true);
+  assert.equal(terminalInputRequiresBuffer({
+    socketOpen: false,
+    socketConnecting: true,
+    terminalStarting: false,
+    routeKnown: false,
+  }), true);
+  assert.equal(terminalInputRequiresBuffer({
+    socketOpen: true,
+    socketConnecting: false,
+    terminalStarting: false,
+    routeKnown: true,
+  }), false);
+});
+
+test("seule une disparition confirmee du PTY autorise l'abandon du buffer", () => {
+  assert.equal(terminalSessionIsMissingError(new Error("Session terminal introuvable")), true);
+  assert.equal(terminalSessionIsMissingError(new Error("404 terminal not found")), true);
+  assert.equal(terminalSessionIsMissingError(new TypeError("Failed to fetch")), false);
+  assert.equal(terminalSessionIsMissingError(new Error("WebSocket closed")), false);
 });
 
 test("une panne fetch devient un message terminal utile", () => {

@@ -2,7 +2,12 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl as tauriOpenUrl } from "@tauri-apps/plugin-opener";
-import { TerminalInputBuffer, terminalTransportErrorMessage } from "./terminal-transport";
+import {
+  TerminalInputBuffer,
+  terminalInputRequiresBuffer,
+  terminalSessionIsMissingError,
+  terminalTransportErrorMessage,
+} from "./terminal-transport";
 import {
   rankRemoteAllocations,
   type RemoteAllocationObservation,
@@ -2154,7 +2159,7 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
     if (remoteSockets.get(id) !== socket) return;
     remoteTerminalReconnectAttempts.delete(id);
     const pending = takePendingTerminalInput(id);
-    if (pending) socket.send(JSON.stringify({ type: "input", data: pending }));
+    if (pending) sendRemoteTerminalSocketInput(id, socket, route, pending);
   });
 
   socket.addEventListener("message", (event) => {
@@ -2195,15 +2200,59 @@ function openTerminalSocket(id: number, route = remoteTerminalRoutes.get(id) ?? 
   });
 }
 
+function sendRemoteTerminalSocketInput(
+  id: number,
+  socket: WebSocket,
+  route: RemoteTerminalRoute,
+  data: string,
+) {
+  try {
+    socket.send(JSON.stringify({ type: "input", data }));
+    return true;
+  } catch {
+    // send() peut echouer alors que readyState vaut encore OPEN. La frappe doit
+    // rester dans la file du bon PTY et repartir apres reconnexion, jamais etre
+    // jetee ni envoyee au terminal actif suivant.
+    queuePendingTerminalInput(id, data);
+    if (remoteSockets.get(id) === socket) remoteSockets.delete(id);
+    try {
+      socket.close();
+    } catch {
+      // La reconnexion ci-dessous est la source de verite.
+    }
+    scheduleRemoteTerminalReconnect(id, route);
+    return false;
+  }
+}
+
 function writeRemoteTerminal(id: number, data: string) {
+  if (!data) return;
   const socket = remoteSockets.get(id);
   if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "input", data }));
+    sendRemoteTerminalSocketInput(
+      id,
+      socket,
+      remoteTerminalRoutes.get(id) ?? defaultRemoteRoute(),
+      data,
+    );
     return;
   }
 
-  if (socket?.readyState === WebSocket.CONNECTING || remoteStartingTerminals.has(id)) {
+  const routeKnown = remoteTerminalRoutes.has(id);
+  if (terminalInputRequiresBuffer({
+    socketOpen: false,
+    socketConnecting: socket?.readyState === WebSocket.CONNECTING,
+    terminalStarting: remoteStartingTerminals.has(id),
+    routeKnown,
+  })) {
     queuePendingTerminalInput(id, data);
+    if (
+      routeKnown &&
+      socket?.readyState !== WebSocket.CONNECTING &&
+      !remoteTerminalReconnectTimers.has(id)
+    ) {
+      scheduleRemoteTerminalReconnect(id, remoteTerminalRoutes.get(id) ?? defaultRemoteRoute());
+    }
     return;
   }
 
@@ -2297,13 +2346,33 @@ function scheduleRemoteTerminalReconnect(id: number, route: RemoteTerminalRoute)
   const attempt = (remoteTerminalReconnectAttempts.get(id) ?? 0) + 1;
   remoteTerminalReconnectAttempts.set(id, attempt);
   if (attempt > REMOTE_TERMINAL_MAX_RECONNECTS) {
-    remoteTerminalRoutes.delete(id);
-    remotePendingTerminalInput.clear(id);
-    emit("pty-data", {
-      id,
-      data: "\r\nConnexion au terminal perdue. Ouvre un nouveau terminal pour continuer.\r\n",
-    });
-    emit("pty-exit", { id });
+    // Une coupure reseau longue ne signifie pas que le PTY (et donc le modele
+    // Freebuff) est mort. On garde toutes les frappes et on ne ferme la session
+    // qu'apres une preuve REST explicite que le terminal n'existe plus.
+    const timer = window.setTimeout(() => {
+      remoteTerminalReconnectTimers.delete(id);
+      if (!remoteTerminalRoutes.has(id) || remoteStoppingTerminals.has(id)) return;
+      void apiAt(route, "POST", `/api/terminals/${id}/write`, { data: "" })
+        .then(() => {
+          remoteTerminalReconnectAttempts.delete(id);
+          openTerminalSocket(id, remoteTerminalRoutes.get(id) ?? route);
+        })
+        .catch((error) => {
+          if (terminalSessionIsMissingError(error)) {
+            remoteTerminalRoutes.delete(id);
+            remotePendingTerminalInput.clear(id);
+            emit("pty-data", {
+              id,
+              data: "\r\nLe terminal n'existe plus sur le serveur. Ouvre un nouveau terminal pour continuer.\r\n",
+            });
+            emit("pty-exit", { id });
+            return;
+          }
+          remoteTerminalReconnectAttempts.set(id, REMOTE_TERMINAL_MAX_RECONNECTS);
+          scheduleRemoteTerminalReconnect(id, remoteTerminalRoutes.get(id) ?? route);
+        });
+    }, 5_000);
+    remoteTerminalReconnectTimers.set(id, timer);
     return;
   }
 
